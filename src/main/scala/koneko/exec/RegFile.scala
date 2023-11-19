@@ -8,13 +8,13 @@ import koneko._
 class RegFile extends Module {
   val read = IO(Vec(2, new Bundle {
     val num = Input(UInt(5.W))
-    val value = Output(UInt(5.W))
+    val value = Output(UInt(32.W))
   }))
 
   val write = IO(new Bundle {
     val en = Input(Bool())
     val num = Input(UInt(5.W))
-    val value = Input(UInt(5.W))
+    val value = Input(UInt(32.W))
   })
 
   val regs = dontTouch(Reg(Vec(32, UInt(32.W)))) // Disable DCE for RegFile

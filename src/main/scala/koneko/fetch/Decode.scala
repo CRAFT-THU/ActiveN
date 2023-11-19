@@ -85,8 +85,7 @@ object InstrIsJump extends BoolDecodeField[InstrPattern] {
   override def name: String = "Decode is jump"
   override def genTable(op: InstrPattern): BitPat = (op.jumpType match {
     case Some(JumpType.Jump) => y
-    case Some(_) => n
-    case _ => dc
+    case _ => n
   })
 }
 
@@ -94,8 +93,7 @@ object InstrIsBranch extends BoolDecodeField[InstrPattern] {
   override def name: String = "Decode is br"
   override def genTable(op: InstrPattern): BitPat = (op.jumpType match {
     case Some(JumpType.Branch) => y
-    case Some(_) => n
-    case _ => dc
+    case _ => n
   })
 }
 
@@ -181,7 +179,7 @@ class Decode extends Module {
     ImmLowFormat, Imm11Format, ImmMidFormat, ImmHighFormat
   )
   val dectbl = new DecodeTable(opcodes, dectraits);
-  val decout = dectbl.decode(instr)
+  val decout = dectbl.decode(instr(6, 2))
 
   // TODO: illegal instr if instr(0, 1) != 0x3 (C instructions)
   decoded.adder1pc := decout(InstrAdder1PC)
@@ -203,7 +201,7 @@ class Decode extends Module {
     instr(31),
   )))
   val imm_12_19 = Mux(decout(ImmMidFormat), instr(19, 12), VecInit(Seq.fill(8)(instr(31))).asUInt)
-  val imm_20_31 = Mux(decout(ImmHighFormat), instr(31, 20), VecInit(Seq.fill(8)(instr(31))).asUInt)
+  val imm_20_31 = Mux(decout(ImmHighFormat), instr(31, 20), VecInit(Seq.fill(12)(instr(31))).asUInt)
 
   decoded.imm := imm_20_31 ## imm_12_19 ## imm_11 ## imm_5_10 ## imm_0_4
 }

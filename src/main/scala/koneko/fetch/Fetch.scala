@@ -19,16 +19,18 @@ class Fetch(implicit val params: CoreParameters) extends Module {
   val npc = Wire(UInt(32.W))
   val step = WireDefault(false.B)
 
-  val pc = RegEnable(npc, params.initVec.U(32.W), step)
+  val pc = RegInit(params.initVec.U(32.W))
   val fpc = Mux(ctrl.br.valid, ctrl.br.bits, pc)
   npc := fpc + 4.U
+  pc := Mux(step, npc, fpc)
 
   // Fetch
   val icache = Module(new ICache)
   icache.mem <> mem
   icache.input.bits := fpc
   icache.input.valid := true.B
-  step := icache.input.ready
+  icache.kill := ctrl.br.valid
+  step := icache.input.fire
 
   // Decode
   val sentFpc = RegEnable(fpc, step)

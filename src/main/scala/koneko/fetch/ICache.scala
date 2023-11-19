@@ -12,6 +12,7 @@ class Metadata(implicit val params: CoreParameters) extends Bundle {
 
 class ICache(implicit val params: CoreParameters) extends Module {
   val input = IO(Flipped(DecoupledIO(UInt(32.W))))
+  val kill = IO(Input(Bool()))
   val mem = IO(new Bundle {
     val req = Decoupled(new MemReq)
     val resp = Flipped(Valid(new MemResp))
@@ -45,6 +46,8 @@ class ICache(implicit val params: CoreParameters) extends Module {
 
   val s1reset = RegInit(true.B)
   val s1rstCnt = RegInit(0.U(params.i$IndexLen.W))
+  s1reset := Mux(s1rstCnt.andR, false.B, s1reset)
+  s1rstCnt := Mux(s1reset, s1rstCnt + 1.U, s1rstCnt)
 
   val s1refillCnt = RegInit(0.U((params.i$OffsetLen - 2).W))
   val s1refillComplete = Wire(Bool())
@@ -58,12 +61,11 @@ class ICache(implicit val params: CoreParameters) extends Module {
   output.bits := Mux(s1hit, s1datamux, s1refilledCapture)
 
   // Refiller
-  mem.req.valid := !s1sent && !s1hit
   mem.req.bits.addr := s1pctag ## s1pcidx ## 0.U(params.i$OffsetLen.W)
-  mem.req.bits.burst := log2Up(params.i$BlockSize).U
+  mem.req.bits.burst := log2Up(params.i$BlockSize / 4).U
   mem.req.bits.wbe := 0.U
   mem.req.bits.wdata := DontCare
-  mem.req.valid := s1valid && !s1hit
+  mem.req.valid := s1valid && !s1sent && !s1hit
   s1sent := MuxCase(s1sent, Seq(
     s0step -> false.B,
     mem.req.fire -> true.B
@@ -72,6 +74,14 @@ class ICache(implicit val params: CoreParameters) extends Module {
   s1refillCompleted := MuxCase(s1refillCompleted, Seq(
     s0step -> false.B,
     s1refillComplete -> true.B
+  ))
+  val s1blocked = !s1hit && !s1refillCompleted
+
+  // Killing
+  val killed = Reg(Bool())
+  killed := MuxCase(killed, Seq(
+    s0step -> false.B,
+    kill -> true.B
   ))
 
   // Writing
@@ -85,16 +95,17 @@ class ICache(implicit val params: CoreParameters) extends Module {
   s1refillComplete := dataWriteEnable && s1refillCnt.andR
 
   val metadataWriteIdx = Mux(s1reset, s1rstCnt, s1refillCnt)
+  val metadataWriteMask = Mux(s1reset, VecInit(Seq.fill(params.i$Assoc)(true.B)), s1victimMap)
   val metadataWriteVal = Wire(new Metadata)
   metadataWriteVal.valid := !s1reset
   metadataWriteVal.tag := s1pctag
   val metadataWriteEnable = s1reset || dataWriteEnable
   when(metadataWriteEnable) {
-    metadata.write(metadataWriteIdx, VecInit(Seq.fill(params.i$Assoc)(metadataWriteVal)), s1victimMap)
+    metadata.write(metadataWriteIdx, VecInit(Seq.fill(params.i$Assoc)(metadataWriteVal)), metadataWriteMask)
   }
 
   // Scheduler
-  s0step := !s1valid || output.fire
+  s0step := !s1reset && (!s1valid || ((output.ready || kill || killed) && !s1blocked))
   input.ready := s0step
-  output.valid := s1valid && (s1hit || s1refillCompleted)
+  output.valid := s1valid && !kill && !killed && !s1blocked
 }

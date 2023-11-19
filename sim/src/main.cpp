@@ -33,6 +33,7 @@ int main(int argc, char **argv) {
     cout<<"Input not a 4-byte aligned file"<<endl;
     return 1;
   }
+  cout<<"Total input size: "<<input_size<<endl;
   char *mem = new (std::align_val_t(4)) char[input_size];
   input.seekg(0);
   input.read(mem, input_size);
@@ -56,7 +57,6 @@ int main(int argc, char **argv) {
   uint64_t clk = 0;
   core.reset = true;
   for(; clk < RESET_LENGTH * 2; ++clk) {
-    cout<<"Reset"<<endl;
     core.clock = clk % 2 == 0;
     core.reset = true;
     core.eval();
@@ -77,11 +77,13 @@ int main(int argc, char **argv) {
     if(!clk_level) { // About to go into posedge, update queues
       if(core.mem_resp_valid) mem_resps.pop_front();
       if(core.mem_req_valid && core.mem_req_ready) {
-        for(uint32_t i = 0; i < 1ull << core.mem_req_bits_burst; ++i) {
-          uint32_t addr = i + core.mem_req_bits_addr;
-          if(addr - MEM_BASE > input_size) mem_resps.push_back(0);
+        cout<<"Req: "<<core.mem_req_bits_addr<<", Burst: "<<(uint64_t) core.mem_req_bits_burst<<endl;
+        for(uint32_t i = 0; i < ((uint64_t) 1) << ((uint64_t) core.mem_req_bits_burst); ++i) {
+          uint32_t addr = i * 4 + core.mem_req_bits_addr;
+          if(addr - MEM_BASE >= input_size) mem_resps.push_back(0);
           else {
-            uint32_t offset = (addr - MEM_BASE) >> 4;
+            uint32_t offset = (addr - MEM_BASE) / 4;
+            cout<<"Read at: "<<offset<<" = "<<mem_aligned[offset]<<endl;
             mem_resps.push_back(mem_aligned[offset]);
           }
         }
