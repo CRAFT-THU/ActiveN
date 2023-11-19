@@ -1,6 +1,7 @@
 /mill
 /out
 /.idea
+/.vscode
 
 /Core.anno.json
 /Core.sv
