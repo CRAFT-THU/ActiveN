@@ -17,7 +17,5 @@ class Core(implicit val params: CoreParameters) extends Module {
 
   fetch.mem <> mem
   fetch.decoded <> exec.dec
-
-  fetch.ctrl.br.valid := false.B
-  fetch.ctrl.br.bits := DontCare
+  fetch.ctrl.br <> exec.br
 }

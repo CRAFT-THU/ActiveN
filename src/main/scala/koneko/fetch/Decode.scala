@@ -10,7 +10,17 @@ object InstrType extends Enumeration {
   val R, I, S, B, U, J = Value
 }
 
-case class InstrPattern(val name: String, val opcode: String, val ty: InstrType.Value, val isOPImm: Option[Boolean] = None) extends DecodePattern {
+object JumpType extends Enumeration {
+  val Jump, Branch = Value
+}
+
+case class InstrPattern(
+  val name: String,
+  val opcode: String,
+  val ty: InstrType.Value,
+  val isOPImm: Option[Boolean] = None,
+  val jumpType: Option[JumpType.Value] = None,
+) extends DecodePattern {
   override def bitPat: BitPat = BitPat("b" + opcode)
 }
 
@@ -68,6 +78,24 @@ object InstrRDIgnore extends BoolDecodeField[InstrPattern] {
   override def genTable(op: InstrPattern): BitPat = (op.ty match {
     case InstrType.S | InstrType.B => y
     case _ => n
+  })
+}
+
+object InstrIsJump extends BoolDecodeField[InstrPattern] {
+  override def name: String = "Decode is jump"
+  override def genTable(op: InstrPattern): BitPat = (op.jumpType match {
+    case Some(JumpType.Jump) => y
+    case Some(_) => n
+    case _ => dc
+  })
+}
+
+object InstrIsBranch extends BoolDecodeField[InstrPattern] {
+  override def name: String = "Decode is br"
+  override def genTable(op: InstrPattern): BitPat = (op.jumpType match {
+    case Some(JumpType.Branch) => y
+    case Some(_) => n
+    case _ => dc
   })
 }
 
@@ -137,18 +165,19 @@ class Decode extends Module {
   val opcodes = Seq(
     InstrPattern("LUI", "01101", InstrType.U),
     InstrPattern("AUIPC", "00101",  InstrType.U),
-    InstrPattern("JAL", "11011", InstrType.J),
-    InstrPattern("JALR", "11001", InstrType.I),
+    InstrPattern("JAL", "11011", InstrType.J, jumpType = Some(JumpType.Jump)),
+    InstrPattern("JALR", "11001", InstrType.I, jumpType = Some(JumpType.Jump)),
 
-    InstrPattern("BRANCH", "11000", InstrType.B, Some(false)),
+    InstrPattern("BRANCH", "11000", InstrType.B, isOPImm = Some(false), jumpType = Some(JumpType.Branch)),
     InstrPattern("LOAD", "00000", InstrType.I),
     InstrPattern("STORE", "01000", InstrType.S),
-    InstrPattern("OP-IMM", "00100", InstrType.I, Some(true)),
-    InstrPattern("OP", "01100", InstrType.R, Some(false)),
+    InstrPattern("OP-IMM", "00100", InstrType.I, isOPImm = Some(true)),
+    InstrPattern("OP", "01100", InstrType.R, isOPImm = Some(false)),
   )
   val dectraits = Seq(
     InstrAdder1PC, InstrAdder2Imm, InstrALU2Imm,
     InstrRDALU, InstrRDImm, InstrRDPCLink, InstrRDIgnore,
+    InstrIsJump, InstrIsBranch,
     ImmLowFormat, Imm11Format, ImmMidFormat, ImmHighFormat
   )
   val dectbl = new DecodeTable(opcodes, dectraits);
@@ -162,6 +191,8 @@ class Decode extends Module {
   decoded.rdalu := decout(InstrRDALU)
   decoded.rdpclink := decout(InstrRDPCLink)
   decoded.rdimm := decout(InstrRDImm)
+  decoded.isJump := decout(InstrIsJump)
+  decoded.isBr := decout(InstrIsBranch)
 
   // Imm extraction
   val imm_0_4 = Mux(decout(ImmLowFormat), instr(24, 20), instr(11, 7))

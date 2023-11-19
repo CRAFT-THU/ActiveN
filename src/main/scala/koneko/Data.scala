@@ -22,6 +22,9 @@ class uOp extends Bundle {
   val rdimm = Bool()
   val rdignore = Bool()
 
+  val isJump = Bool()
+  val isBr = Bool()
+
   val rs1 = UInt(5.W)
   val rs2 = UInt(5.W)
   val rd = UInt(5.W)

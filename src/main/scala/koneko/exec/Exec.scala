@@ -7,6 +7,7 @@ import koneko._
 
 class Exec extends Module {
   val dec = IO(Flipped(Decoupled(new uOp)))
+  val br = IO(Output(Valid(UInt(32.W))))
   val s0uop = dec.bits
 
   // Output consumed
@@ -17,6 +18,7 @@ class Exec extends Module {
   regfile.read(1).num := s0uop.rs2
 
   // --- Stage ---
+  // FIXME: move staging later so no bubble is introduced
 
   val valid = RegEnable(dec.valid, false.B, s0step)
   val uop = RegEnable(s0uop, s0step)
@@ -81,6 +83,18 @@ class Exec extends Module {
 
   // TODO: multicycle
   val s1done = true.B
+
+  // Branching
+  br.bits := added
+  val brfire = Mux1H(Seq(
+    (uop.funct3 === "b000".U) -> eq,
+    (uop.funct3 === "b001".U) -> !eq,
+    (uop.funct3 === "b100".U) -> lt,
+    (uop.funct3 === "b101".U) -> !lt,
+    (uop.funct3 === "b110".U) -> ltu,
+    (uop.funct3 === "b111".U) -> !ltu,
+  ))
+  br.valid := (uop.isBr && brfire) || uop.isJump
 
   // Scheduling
   s0step := !valid || s1done
