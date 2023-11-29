@@ -7,7 +7,7 @@ import koneko._
 
 class Metadata(implicit val params: CoreParameters) extends Bundle {
   val valid = Bool()
-  val tag = UInt()
+  val tag = UInt(params.i$TagLen.W)
 }
 
 class ICache(implicit val params: CoreParameters) extends Module {
@@ -19,7 +19,7 @@ class ICache(implicit val params: CoreParameters) extends Module {
   })
   val output = IO(DecoupledIO(UInt(32.W)))
 
-  /*
+  /*(valid && isWFI)
    * Storages
    */
   // TODO: use SRAM API
@@ -27,14 +27,14 @@ class ICache(implicit val params: CoreParameters) extends Module {
   val data = Mem(params.i$Sets * params.i$BlockSize / 4, Vec(params.i$Assoc, UInt(32.W)))
 
   val s0pc = input.bits
-  val s0pcidx = (s0pc >> params.i$OffsetLen)(params.i$IndexLen - 1, 0)
+  val s0pcidx = dontTouch((s0pc >> params.i$OffsetLen)(params.i$IndexLen - 1, 0))
   val s0pcdataidx = s0pc(params.i$IndexLen + params.i$OffsetLen - 1, 2)
   val s0step = Wire(Bool())
 
   val s1pc = RegEnable(s0pc, s0step)
   val s1pcidx = (s1pc >> params.i$OffsetLen)(params.i$IndexLen - 1, 0)
 
-  val s1pctag = s1pc >> (params.i$OffsetLen + params.i$IndexLen)
+  val s1pctag = dontTouch(s1pc >> (params.i$OffsetLen + params.i$IndexLen))
   val s1metadata = RegEnable(metadata(s0pcidx), s0step)
   val s1data = RegEnable(data(s0pcdataidx), s0step)
   val s1valid = RegEnable(input.valid, false.B, s0step)
@@ -64,6 +64,7 @@ class ICache(implicit val params: CoreParameters) extends Module {
   mem.req.bits.addr := s1pctag ## s1pcidx ## 0.U(params.i$OffsetLen.W)
   mem.req.bits.burst := log2Up(params.i$BlockSize / 4).U
   mem.req.bits.wbe := 0.U
+  mem.req.bits.write := false.B
   mem.req.bits.wdata := DontCare
   mem.req.valid := s1valid && !s1sent && !s1hit
   s1sent := MuxCase(s1sent, Seq(
@@ -94,12 +95,12 @@ class ICache(implicit val params: CoreParameters) extends Module {
   s1refillCnt := Mux(dataWriteEnable, s1refillCnt + 1.U, s1refillCnt)
   s1refillComplete := dataWriteEnable && s1refillCnt.andR
 
-  val metadataWriteIdx = Mux(s1reset, s1rstCnt, s1refillCnt)
+  val metadataWriteIdx = Mux(s1reset, s1rstCnt, s1pcidx)
   val metadataWriteMask = Mux(s1reset, VecInit(Seq.fill(params.i$Assoc)(true.B)), s1victimMap)
   val metadataWriteVal = Wire(new Metadata)
   metadataWriteVal.valid := !s1reset
   metadataWriteVal.tag := s1pctag
-  val metadataWriteEnable = s1reset || dataWriteEnable
+  val metadataWriteEnable = s1reset || s1refillComplete
   when(metadataWriteEnable) {
     metadata.write(metadataWriteIdx, VecInit(Seq.fill(params.i$Assoc)(metadataWriteVal)), metadataWriteMask)
   }

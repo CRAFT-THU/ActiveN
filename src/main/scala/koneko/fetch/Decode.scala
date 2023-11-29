@@ -20,6 +20,7 @@ case class InstrPattern(
   val ty: InstrType.Value,
   val isOPImm: Option[Boolean] = None,
   val jumpType: Option[JumpType.Value] = None,
+  val memIsWrite: Option[Boolean] = None,
 ) extends DecodePattern {
   override def bitPat: BitPat = BitPat("b" + opcode)
 }
@@ -35,7 +36,7 @@ object InstrAdder1PC extends BoolDecodeField[InstrPattern] {
 object InstrAdder2Imm extends BoolDecodeField[InstrPattern] {
   override def name: String = "Decode Adder 2 is Imm"
   override def genTable(op: InstrPattern): BitPat = (op.ty match {
-    case InstrType.I | InstrType.U | InstrType.J | InstrType.B => y
+    case InstrType.I | InstrType.U | InstrType.J | InstrType.B | InstrType.S => y
     case _ => n
   })
 }
@@ -93,6 +94,47 @@ object InstrIsBranch extends BoolDecodeField[InstrPattern] {
   override def name: String = "Decode is br"
   override def genTable(op: InstrPattern): BitPat = (op.jumpType match {
     case Some(JumpType.Branch) => y
+    case _ => n
+  })
+}
+
+object InstrIsMem extends BoolDecodeField[InstrPattern] {
+  override def name: String = "Decode is mem"
+  override def genTable(op: InstrPattern): BitPat = (op.memIsWrite match {
+    case Some(_) => y
+    case _ => n
+  })
+}
+
+object InstrIsSystem extends BoolDecodeField[InstrPattern] {
+  override def name: String = "Decode is system"
+  override def genTable(op: InstrPattern): BitPat = (op.name match {
+    case "SYSTEM" => y
+    case _ => n
+  })
+}
+
+object InstrMemIsWrite extends BoolDecodeField[InstrPattern] {
+  override def name: String = "Decode mem op is write"
+  override def genTable(op: InstrPattern): BitPat = (op.memIsWrite match {
+    case Some(true) => y
+    case Some(false) => n
+    case _ => dc
+  })
+}
+
+object InstrIsAM extends BoolDecodeField[InstrPattern] {
+  override def name: String = "Decode is AM"
+  override def genTable(op: InstrPattern): BitPat = (op.name match {
+    case "AM" => y
+    case _ => n
+  })
+}
+
+object InstrIsFP extends BoolDecodeField[InstrPattern] {
+  override def name: String = "Decode is FP"
+  override def genTable(op: InstrPattern): BitPat = (op.name match {
+    case "OP-FP" => y
     case _ => n
   })
 }
@@ -167,15 +209,23 @@ class Decode extends Module {
     InstrPattern("JALR", "11001", InstrType.I, jumpType = Some(JumpType.Jump)),
 
     InstrPattern("BRANCH", "11000", InstrType.B, isOPImm = Some(false), jumpType = Some(JumpType.Branch)),
-    InstrPattern("LOAD", "00000", InstrType.I),
-    InstrPattern("STORE", "01000", InstrType.S),
+    InstrPattern("LOAD", "00000", InstrType.I, memIsWrite = Some(false)),
+    InstrPattern("STORE", "01000", InstrType.S, memIsWrite = Some(true)),
     InstrPattern("OP-IMM", "00100", InstrType.I, isOPImm = Some(true)),
     InstrPattern("OP", "01100", InstrType.R, isOPImm = Some(false)),
+    InstrPattern("AM", "00010", InstrType.R, isOPImm = Some(false)), // Custom-0
+    InstrPattern("SYSTEM", "11100", InstrType.I), // Doesn't use adder result
+    InstrPattern("OP-FP", "10100", InstrType.R),
   )
+
   val dectraits = Seq(
     InstrAdder1PC, InstrAdder2Imm, InstrALU2Imm,
     InstrRDALU, InstrRDImm, InstrRDPCLink, InstrRDIgnore,
     InstrIsJump, InstrIsBranch,
+    InstrIsMem, InstrMemIsWrite,
+    InstrIsSystem,
+    InstrIsAM,
+    InstrIsFP,
     ImmLowFormat, Imm11Format, ImmMidFormat, ImmHighFormat
   )
   val dectbl = new DecodeTable(opcodes, dectraits);
@@ -191,6 +241,11 @@ class Decode extends Module {
   decoded.rdimm := decout(InstrRDImm)
   decoded.isJump := decout(InstrIsJump)
   decoded.isBr := decout(InstrIsBranch)
+  decoded.isMem := decout(InstrIsMem)
+  decoded.memIsWrite := decout(InstrMemIsWrite)
+  decoded.isAM := decout(InstrIsAM)
+  decoded.isSystem := decout(InstrIsSystem)
+  decoded.isFP := decout(InstrIsFP)
 
   // Imm extraction
   val imm_0_4 = Mux(decout(ImmLowFormat), instr(24, 20), instr(11, 7))

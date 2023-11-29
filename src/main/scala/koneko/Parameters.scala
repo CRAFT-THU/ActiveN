@@ -8,7 +8,12 @@ case class CoreParameters(
   val i$Lines: Int,
   val i$BlockSize: Int,
   val i$Assoc: Int,
+  val memDst: Int,
+  val memTagBase: Int,
+  val scratchpadSize: Int,
+  val useFPU: Boolean,
 ) {
+  require(scratchpadSize % 4 == 0)
   def i$Sets = i$Lines / i$Assoc
   def i$OffsetLen = log2Up(i$BlockSize)
   def i$InstrOffsetLen = log2Up(i$BlockSize / 4)

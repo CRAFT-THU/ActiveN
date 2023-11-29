@@ -7,6 +7,7 @@ class MemReq extends Bundle {
   val burst = UInt(3.W) // 1, 2, 4, 8, 16, 32, 64, 128
   val wdata = UInt(32.W)
   val wbe = UInt(4.W)
+  val write = Bool()
 }
 
 class MemResp extends Bundle {
@@ -24,6 +25,15 @@ class uOp extends Bundle {
 
   val isJump = Bool()
   val isBr = Bool()
+
+  val isMem = Bool()
+  val memIsWrite = Bool()
+
+  val isAM = Bool()
+
+  val isSystem = Bool()
+
+  val isFP = Bool()
 
   val rs1 = UInt(5.W)
   val rs2 = UInt(5.W)

@@ -17,7 +17,30 @@ class RegFile extends Module {
     val value = Input(UInt(32.W))
   })
 
+  val bankedWrite = IO(Input(new Bundle {
+    val en = Bool()
+    val regs = Vec(4, UInt(32.W))
+    val offset = UInt(2.W)
+    val cnt = UInt(2.W) // 0, 1, 2, 3
+  }))
+
   val regs = dontTouch(Reg(Vec(32, UInt(32.W)))) // Disable DCE for RegFile
+
+  val bankedWriteResult = Wire(regs.cloneType)
+  for(i <- 0 until 32) {
+    if(i < 10) {
+      bankedWriteResult(i) := regs(i)
+    } else {
+      val diff = i - 10
+      val doffset = diff >> 2
+      val didx = diff % 4
+      bankedWriteResult(i) := Mux(doffset.U === bankedWrite.offset && didx.U <= bankedWrite.cnt, bankedWrite.regs(didx), regs(i))
+    }
+  }
+
+  when(bankedWrite.en) {
+    regs := bankedWriteResult
+  }
 
   when(write.en) {
     regs(write.num) := write.value // Actually may write regs(0), but we mask them at the read part

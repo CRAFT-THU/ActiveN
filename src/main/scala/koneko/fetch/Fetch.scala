@@ -16,24 +16,24 @@ class Fetch(implicit val params: CoreParameters) extends Module {
   val decoded = IO(Decoupled(new uOp))
 
   // PC Control
-  val npc = Wire(UInt(32.W))
   val step = WireDefault(false.B)
 
   val pc = RegInit(params.initVec.U(32.W))
-  val fpc = Mux(ctrl.br.valid, ctrl.br.bits, pc)
-  npc := fpc + 4.U
-  pc := Mux(step, npc, fpc)
+  pc := Mux(ctrl.br.valid,
+    ctrl.br.bits,
+    Mux(step, pc + 4.U, pc)
+  )
 
   // Fetch
   val icache = Module(new ICache)
   icache.mem <> mem
-  icache.input.bits := fpc
-  icache.input.valid := true.B
+  icache.input.bits := pc
+  icache.input.valid := !ctrl.br.valid
   icache.kill := ctrl.br.valid
   step := icache.input.fire
 
   // Decode
-  val sentFpc = RegEnable(fpc, step)
+  val sentFpc = RegEnable(pc, step)
   val decode = Module(new Decode)
   decode.pc := sentFpc
   decode.instr := icache.output.bits
