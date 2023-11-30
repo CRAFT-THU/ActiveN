@@ -1,7 +1,7 @@
 use std::{path::PathBuf, fs::File};
 
 use clap::Parser;
-use rand::SeedableRng;
+use rand::{SeedableRng, Rng};
 use rand_distr::{Geometric, Distribution, Uniform};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use std::io::Write;
@@ -11,8 +11,10 @@ struct Args {
     #[clap(short, long)]
     core_cnt: usize,
 
-    #[clap(short, long, default_value="1000")]
-    neuron_per_core: usize,
+    // #[clap(short, long, default_value="1000")]
+    // neuron_per_core: usize,
+    #[clap(short, long, default_value="10000")]
+    tot_neuron: usize,
 
     #[clap(long, default_value="0.01")]
     connectivity: f64,
@@ -35,8 +37,11 @@ struct Args {
     #[clap(long, default_value="0.2")]
     max_weight: f32,
 
-    #[clap(long, default_value="-0.1")]
+    #[clap(long, default_value="0")]
     min_weight: f32,
+
+    #[clap(long, default_value="0.2")]
+    inh_ratio: f64,
 
     #[clap(short, long)]
     dump: Option<PathBuf>,
@@ -56,7 +61,7 @@ struct Neigh {
 struct Neuron {
     state: f32,
     input: f32,
-    neigh: Vec<Neigh>
+    neigh: Vec<Neigh>,
 }
 
 #[derive(Default, Clone)]
@@ -89,6 +94,9 @@ fn dump(base: &PathBuf, cores: &Vec<Core>) -> anyhow::Result<()> {
 
         let mut spm_file = base.clone();
         spm_file.push(format!("spm.{}.bin", ci));
+        spm.resize(16384 / 4, 0);
+        spm[16384 / 4 - 1] = c.neurons.len() as u32;
+
         let spm_slice: &[u8] = unsafe {
             core::slice::from_raw_parts(spm.as_slice().as_ptr() as *const u8, spm.len() * 4)
         };
@@ -151,29 +159,46 @@ fn main() -> anyhow::Result<()> {
 
     let e_neg_tau = std::f32::consts::E.powf(-args.tau);
 
-    let nn = args.core_cnt * args.neuron_per_core;
     let neigh_dist = Geometric::new(args.connectivity)?;
     let weight_dist = Uniform::new(args.min_weight, args.max_weight);
     let init_state_dist = Uniform::new(0f32, args.threshold);
+
+    let mut core_nn_cnt = vec![args.tot_neuron / args.core_cnt; args.core_cnt];
+    for i in 0..(args.tot_neuron % args.core_cnt) {
+        core_nn_cnt[i] += 1;
+    }
 
     // Generate
     let mut cores: Vec<Core> = vec![Default::default(); args.core_cnt];
     let mut max_syn_per_neuron = 0;
     for core in 0..args.core_cnt {
         println!("Gen: core {}", core);
-        cores[core].neurons.reserve(args.neuron_per_core);
-        for _ in 0..args.neuron_per_core {
+        cores[core].neurons.reserve(core_nn_cnt[core]);
+        for _ in 0..core_nn_cnt[core] {
+            let is_inh = rng.gen_bool(args.inh_ratio);
+
             let mut neigh = Vec::new();
             let mut cur = 0u64;
+            let mut cur_core = 0usize;
 
             loop {
                 cur += neigh_dist.sample(&mut rng);
-                if cur >= nn as u64 { break; }
+
+                while cur_core < args.core_cnt && cur as usize >= core_nn_cnt[cur_core] {
+                    cur -= core_nn_cnt[cur_core] as u64;
+                    cur_core += 1;
+                }
+                if cur_core >= args.core_cnt {
+                    break;
+                }
+
+                let w = weight_dist.sample(&mut rng);
                 neigh.push(Neigh {
-                    core: (cur / args.neuron_per_core as u64) as u16,
-                    neuron: (cur % args.neuron_per_core as u64) as u16,
-                    weight: weight_dist.sample(&mut rng),
-                })
+                    core: cur_core as u16,
+                    neuron: cur as u16,
+                    weight: if is_inh { -w } else { w },
+                });
+                cur += 1;
             }
 
             max_syn_per_neuron = max_syn_per_neuron.max(neigh.len());
@@ -213,7 +238,7 @@ fn main() -> anyhow::Result<()> {
 
         for c in 0..args.core_cnt {
             print!(".");
-            for n in 0..args.neuron_per_core {
+            for n in 0..core_nn_cnt[c] {
                 if cores[c].neurons[n].state > args.threshold {
                     cores[c].neurons[n].state = 0f32;
                     fired += 1;
@@ -228,7 +253,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        println!("\nRound {}, firing rate {} ({})", i, fired as f64 / nn as f64, fired);
+        println!("\nRound {}, firing rate {} ({})", i, fired as f64 / args.tot_neuron as f64, fired);
     }
 
     Ok(())
