@@ -20,6 +20,8 @@ class Exec(implicit val param: CoreParameters) extends Module {
       val data = UInt(32.W)
       val tag = UInt(16.W)
     }))
+
+    val idling = Output(Bool())
   })
 
   val cfg = IO(Input(new Bundle {
@@ -77,9 +79,9 @@ class Exec(implicit val param: CoreParameters) extends Module {
   val and = rs1val & alu2
 
   // Shifts
-  val sll = rs1val >> alu2(4, 0)
-  val srl = rs1val << alu2(4, 0)
-  val sra = (rs1val.asSInt << alu2(4, 0)).asUInt
+  val sll = rs1val << alu2(4, 0)
+  val srl = rs1val >> alu2(4, 0)
+  val sra = (rs1val.asSInt >> alu2(4, 0)).asUInt
 
   // ALU result
   val ealuval = Mux1H(Seq(
@@ -139,25 +141,36 @@ class Exec(implicit val param: CoreParameters) extends Module {
     b.argcnt := a
   }
 
-  biu.ext <> ext
+  val isYield = dontTouch(uop.isAM && uop.funct7(0))
+  val yieldTag = rs2val >> 16
+  val yieldTarget = handlers(yieldTag.asUInt)
+  val yieldAcked = biu.br.valid
+
+  biu.ext.in <> ext.in
+  biu.ext.out <> ext.out
   biu.msg.bits.reg(0) := rs1val
   biu.msg.bits.reg(1) := rs2val
   biu.msg.bits.enq := uop.funct3(1, 0)
   biu.msg.bits.send := uop.funct3(2)
   biu.msg.bits.target := rs2val
   biu.msg.bits.tag := rs2val >> 16
-  biu.msg.valid := valid && uop.isAM // TODO: funct7 arbitration?
+  biu.msg.valid := valid && uop.isAM && (!isYield || yieldAcked) // TODO: funct7 arbitration?
 
   val idling = RegInit(false.B)
-  val isWFI = dontTouch(uop.isSystem && uop.funct3 === 0.U && uop.rs2 === 5.U)
+  ext.idling := idling
+
+  val isWFI = uop.isSystem && uop.funct3 === 0.U && uop.rs2 === 5.U
   idling := MuxCase(idling, Seq(
     biu.br.fire -> false.B,
     (valid && isWFI) -> true.B,
   ))
-  biu.br.ready := idling || (valid && isWFI)
+  biu.br.ready := idling || (valid && isWFI) || (valid && isYield)
   val biuBr = Wire(Valid(UInt(32.W)))
-  biuBr.valid := idling || (valid && isWFI)
-  biuBr.bits := biu.br.bits.target // If idling, Spin at some random address
+  biuBr.valid := (idling && biu.br.valid) || (valid && isWFI) || (valid && isYield)
+  biuBr.bits := MuxCase(uop.pc, Seq(
+      biu.br.valid -> biu.br.bits.target,
+      (valid && isYield) -> yieldTarget,
+  ))
   regfile.bankedWrite.en := biu.br.fire
   regfile.bankedWrite.regs := biu.br.bits.regs
   regfile.bankedWrite.offset := 0.U // TODO: allow regs > 4

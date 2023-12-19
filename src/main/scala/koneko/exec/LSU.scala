@@ -35,8 +35,23 @@ class LSU(implicit val param: CoreParameters) extends Module {
   // val valid = RegInit(false.B)
 
   // TODO: use SRAM
-  // val scratchpad = Mem(param.scratchpadSize / 4, Vec(4, UInt(8.W)))
+  class SPMElab extends Module {
+    val io = IO(new Bundle {
+      val hartid = Input(UInt(32.W))
+      val addr = Input(UInt(32.W))
+      val wdata = Input(UInt(32.W))
+      val we = Input(UInt(4.W))
+
+      val data = Output(UInt(32.W))
+    })
+
+    val scratchpad = Mem(param.scratchpadSize / 4, Vec(4, UInt(8.W)))
+    io.data := scratchpad(io.addr).asUInt
+    scratchpad.write(io.addr, io.wdata.asTypeOf(Vec(4, UInt(8.W))), io.we.asBools)
+  }
+
   val spm = Module(new SPM)
+  spm.io.clock := clock
   spm.io.hartid := hartid
 
   val wmapped = Mux1H(Seq(
@@ -70,7 +85,7 @@ class LSU(implicit val param: CoreParameters) extends Module {
   // val rdata = mem.resp.bits
 
   val alignedAddr = (req.bits.addr >> 2) ## 0.U(2.W)
-  spm.io.clock := clock
+  // spm.io.clock := clock
   spm.io.addr := alignedAddr
   spm.io.we := Mux(req.fire && req.bits.write, wbe, 0.U)
   spm.io.wdata := wmapped

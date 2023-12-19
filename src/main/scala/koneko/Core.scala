@@ -24,6 +24,8 @@ class Core(implicit val params: CoreParameters) extends Module {
       val data = UInt(32.W)
       val tag = UInt(16.W)
     }))
+
+    val idling = Output(Bool())
   })
 
   val cfg = IO(Input(new Bundle {
