@@ -13,34 +13,25 @@ struct Args {
 
     // #[clap(short, long, default_value="1000")]
     // neuron_per_core: usize,
-    #[clap(short, long, default_value="10000")]
+    #[clap(short, long, default_value="82601")]
     tot_neuron: usize,
 
-    #[clap(long, default_value="0.01")]
+    #[clap(long, default_value="0.081167")]
     connectivity: f64,
 
     #[clap(short, long, default_value="100")]
     pre_simulate: usize,
 
-    #[clap(long, default_value="1")]
-    injective: f32,
-
     #[clap(long, default_value="0.1")]
     tau: f32,
 
-    #[clap(long, default_value="10")]
+    #[clap(long, default_value="15")]
     threshold: f32,
 
     #[clap(long, default_value="19260817")]
     seed: u64,
 
-    #[clap(long, default_value="0.2")]
-    max_weight: f32,
-
-    #[clap(long, default_value="0")]
-    min_weight: f32,
-
-    #[clap(long, default_value="0.2")]
+    #[clap(long, default_value="0.273786")]
     inh_ratio: f64,
 
     #[clap(short, long)]
@@ -61,6 +52,7 @@ struct Neigh {
 struct Neuron {
     state: f32,
     input: f32,
+    inj: f32,
     neigh: Vec<Neigh>,
 }
 
@@ -160,7 +152,9 @@ fn main() -> anyhow::Result<()> {
     let e_neg_tau = std::f32::consts::E.powf(-args.tau);
 
     let neigh_dist = Geometric::new(args.connectivity)?;
-    let weight_dist = Uniform::new(args.min_weight, args.max_weight);
+    let ext_weight_dist = Uniform::new(0.85, 0.92);
+    let inh_weight_dist = Uniform::new(-2.5f32, -2.44);
+    let inj_weight_dist = Uniform::new(0.3, 0.8);
     let init_state_dist = Uniform::new(0f32, args.threshold);
 
     let mut core_nn_cnt = vec![args.tot_neuron / args.core_cnt; args.core_cnt];
@@ -192,20 +186,22 @@ fn main() -> anyhow::Result<()> {
                     break;
                 }
 
-                let w = weight_dist.sample(&mut rng);
+                let w = if is_inh { inh_weight_dist } else { ext_weight_dist } .sample(&mut rng);
                 neigh.push(Neigh {
                     core: cur_core as u16,
                     neuron: cur as u16,
-                    weight: if is_inh { -w } else { w },
+                    weight: w as f32
                 });
                 cur += 1;
             }
 
             max_syn_per_neuron = max_syn_per_neuron.max(neigh.len());
+            let inj = inj_weight_dist.sample(&mut rng);
 
             cores[core].neurons.push(Neuron {
                 state: init_state_dist.sample(&mut rng),
-                input: args.injective,
+                input: inj,
+                inj,
                 neigh,
             })
         }
@@ -232,7 +228,7 @@ fn main() -> anyhow::Result<()> {
         for c in cores.iter_mut() {
             for n in c.neurons.iter_mut() {
                 n.state += n.input;
-                n.input = args.injective;
+                n.input = n.inj
             }
         }
 
