@@ -19,6 +19,5 @@ class FPU extends BlackBox() {
     val rs2b0 = Input(Bool())
 
     val valid = Input(Bool())
-    val ready = Output(Bool())
   })
 }

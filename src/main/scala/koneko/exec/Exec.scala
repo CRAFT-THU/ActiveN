@@ -6,8 +6,10 @@ import chisel3.util._
 import koneko._
 
 class Exec(implicit val param: CoreParameters) extends Module {
-  val dec = IO(Flipped(Decoupled(new uOp)))
-  val br = IO(Output(Valid(UInt(32.W))))
+  val dec = IO(Flipped(
+      Vec(param.SMEP, Decoupled(new uOp))
+  ))
+  val brs = IO(Output(Vec(param.SMEP, Valid(UInt(32.W)))))
   val ext = IO(new Bundle {
     val out = Decoupled(new Bundle {
       val dst = UInt(16.W)
@@ -21,7 +23,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
       val tag = UInt(16.W)
     }))
 
-    val idling = Output(Bool())
+    val idlings = Output(UInt(param.SMEP.W))
   })
 
   val cfg = IO(Input(new Bundle {
@@ -39,22 +41,37 @@ class Exec(implicit val param: CoreParameters) extends Module {
   // Actual configuration
   //////////////////////////
 
-  val s0uop = dec.bits
+  val s0uops = dec.map(_.bits)
+  val busyMap = RegInit(0.U(param.SMEP.W))
+  val issuable = dec.map(_.valid).zip(busyMap.asBools).map({ case (v, b) => v && !b })
+  val issueSel = PriorityEncoderOH(issuable)
 
   // Output consumed
   val s0step = Wire(Bool())
 
-  val regfile = Module(new RegFile)
-  regfile.read(0).num := s0uop.rs1
-  regfile.read(1).num := s0uop.rs2
+  // Set busyMap based on delay
+  // Remember to check that issueSel != 0!
+  val s0uop = Mux1H(issueSel, s0uops)
+  val s0delayed = s0uop.isMul || s0uop.isFP
+  // busymap always unsets (because we have max 2-cycle instrs)
+  busyMap := Mux(s0delayed, VecInit(issueSel).asUInt, 0.U)
+
+  for((d, i) <- dec.zip(issueSel)) d.ready := i && s0step
+
+  val regfiles = for(_ <- 0 until param.SMEP) yield Module(new RegFile)
+  for((r, u) <- regfiles.zip(s0uops)) {
+    r.read(0).num := u.rs1
+    r.read(1).num := u.rs2
+  }
 
   // --- Stage ---
   // TODO: investigate about moving br forward one cycle
 
-  val valid = RegEnable(dec.valid, false.B, s0step)
-  val uop = RegEnable(s0uop, s0step)
-  val rs1val = RegEnable(regfile.read(0).value, s0step)
-  val rs2val = RegEnable(regfile.read(1).value, s0step)
+  val valid = RegEnable(VecInit(issueSel).asUInt.orR, false.B, s0step)
+  val uop = RegEnable(Mux1H(issueSel, s0uops), s0step)
+  val rs1val = RegEnable(Mux1H(issueSel, regfiles.map(_.read(0).value)), s0step)
+  val rs2val = RegEnable(Mux1H(issueSel, regfiles.map(_.read(1).value)), s0step)
+  val delayed = RegEnable(s0delayed, s0step)
 
   // rs1 + rs2, used for AUIPC, Load/Store addresses, and OP +
   val adder1val = Mux(uop.adder1pc, uop.pc, rs1val)
@@ -95,16 +112,15 @@ class Exec(implicit val param: CoreParameters) extends Module {
     (uop.funct3 === "b111".U) -> and,
   ))
   val mul = Module(new Mul)
-  mul.input.bits.rs1 := rs1val
-  mul.input.bits.rs2 := rs2val
-  mul.input.valid := isMul
-  mul.input.bits.rs1signed := uop.funct3(1, 0) =/= 3.U
-  mul.input.bits.rs2signed := !uop.funct3(1)
-  mul.input.bits.low := uop.funct3 === 0.U
-  mul.input.bits.high := uop.funct3(1, 0) =/= 0.U && !uop.funct3(2)
-  mul.input.bits.mid := uop.funct3(2)
+  mul.input.rs1 := rs1val
+  mul.input.rs2 := rs2val
+  mul.input.rs1signed := uop.funct3(1, 0) =/= 3.U
+  mul.input.rs2signed := !uop.funct3(1)
+  mul.input.low := uop.funct3 === 0.U
+  mul.input.high := uop.funct3(1, 0) =/= 0.U && !uop.funct3(2)
+  mul.input.mid := uop.funct3(2)
   val mulval = mul.output
-  val aluval = Mux(isMul, mulval, ealuval)
+  // val aluval = Mux(isMul, mulval, ealuval)
 
   // FPU, remove if
   val fpu = if(param.useFPU) {
@@ -156,25 +172,31 @@ class Exec(implicit val param: CoreParameters) extends Module {
   biu.msg.bits.tag := rs2val >> 16
   biu.msg.valid := valid && uop.isAM && (!isYield || yieldAcked) // TODO: funct7 arbitration?
 
-  val idling = RegInit(false.B)
-  ext.idling := idling
-
   val isWFI = uop.isSystem && uop.funct3 === 0.U && uop.rs2 === 5.U
-  idling := MuxCase(idling, Seq(
-    biu.br.fire -> false.B,
-    (valid && isWFI) -> true.B,
-  ))
-  biu.br.ready := idling || (valid && isWFI) || (valid && isYield)
-  val biuBr = Wire(Valid(UInt(32.W)))
-  biuBr.valid := (idling && biu.br.valid) || (valid && isWFI) || (valid && isYield)
-  biuBr.bits := MuxCase(uop.pc, Seq(
+  val idlings = RegInit(0.U(param.SMEP.W))
+  val idlingsCur = Mux(valid && (isWFI || isYield), uop.smsel, 0.U)
+  val idlingsMasked: UInt = idlings | idlingsCur
+
+  biu.br.ready := idlingsMasked.orR
+  val biuSel = PriorityEncoderOH(idlingsMasked)
+  idlings := idlingsMasked & (~Mux(biu.br.fire, biuSel, 0.U)).asUInt
+  ext.idlings := idlings
+
+  val biuBrs = for(i <- 0 until param.SMEP) yield {
+    val biuBr = Wire(Valid(UInt(32.W)))
+    biuBr.valid := idlingsMasked(i)
+    biuBr.bits := MuxCase(param.initVec.U, Seq(
       biu.br.valid -> biu.br.bits.target,
       (valid && isYield) -> yieldTarget,
-  ))
-  regfile.bankedWrite.en := biu.br.fire
-  regfile.bankedWrite.regs := biu.br.bits.regs
-  regfile.bankedWrite.offset := 0.U // TODO: allow regs > 4
-  regfile.bankedWrite.cnt := biu.br.bits.argcnt
+    ))
+    for ((r, active) <- regfiles.zip(biuSel.asBools)) {
+      r.bankedWrite.en := biu.br.fire && active
+      r.bankedWrite.regs := biu.br.bits.regs
+      r.bankedWrite.offset := 0.U // TODO: allow regs > 4
+      r.bankedWrite.cnt := biu.br.bits.argcnt
+    }
+    biuBr
+  }
 
   // CSR
   val csrmapping = Seq(
@@ -211,40 +233,53 @@ class Exec(implicit val param: CoreParameters) extends Module {
    * - AUIPC, OP[-IMM]: aluval
    * - LUI: uop.imm
    */
-  var rdsrc = Seq(
-    uop.rdalu -> aluval,
+  val rdsrc = Seq(
+    // uop.rdalu -> aluval,
+    uop.rdalu -> ealuval,
     uop.rdpclink -> pclink,
     uop.rdimm -> (uop.imm >> 12) ## 0.U(12.W),
     uop.isMem -> lsu.resp,
     uop.isSystem -> csrRdata, // Only CSR here
   )
 
+  val delayedUop = RegNext(uop)
+  val delayedIsMul = RegNext(uop.rdalu)
+  val delayedIsFP = RegNext(uop.isFP)
+  var delayedRdsrc = Seq(
+    delayedIsMul -> mulval,
+  )
+
   if(param.useFPU) {
-    rdsrc = Seq(
-      uop.isFP -> fpu.get.io.r,
-    ) ++ rdsrc
+    delayedRdsrc = Seq(
+      delayedIsFP -> fpu.get.io.r,
+    ) ++delayedRdsrc
   }
 
   val rdval = Mux1H(rdsrc)
-  regfile.write.en := valid && !uop.rdignore
-  regfile.write.num := uop.rd
-  regfile.write.value := rdval
+  val delayedRdval = Mux1H(delayedRdsrc)
+
+  val delayedSent = RegNext(delayed && valid)
+
+  assert(!delayed || s0step) // Delayed -> s0step
+  assert(!delayedSent || !delayedUop.rdignore) // Delayed sent -> uop have meaningful rd
+  assert(!(delayedSent && valid) || delayedUop.smsel =/= uop.smsel) // When delayed sent, rd cannot be the same
+
+  for((r, i) <- regfiles.zipWithIndex) {
+    val matchDelayed = delayedSent && delayedUop.smsel(i)
+    val matchCur = uop.smsel(i)
+    r.write.en := matchDelayed || (matchCur && valid && !uop.rdignore)
+    r.write.num := Mux(matchDelayed, delayedUop.rd, uop.rd)
+    r.write.value := Mux(matchDelayed, delayedRdval, rdval)
+  }
 
   var s1donesrc = Seq(
     uop.isMem -> lsu.req.ready,
     uop.isAM -> biu.msg.ready,
-    (uop.rdalu && isMul) -> mul.input.ready,
   )
-  if(param.useFPU) {
-    s1donesrc = Seq(
-      uop.isFP -> fpu.get.io.ready,
-    ) ++ s1donesrc
-  }
 
   val s1done = MuxCase(true.B, s1donesrc)
 
-    // Branching
-  br.bits := Mux(biuBr.valid, biuBr.bits, (added >> 1) ## 0.U(1.W))
+  // Branching
   val brfire = Mux1H(Seq(
     (uop.funct3 === "b000".U) -> eq,
     (uop.funct3 === "b001".U) -> !eq,
@@ -253,9 +288,12 @@ class Exec(implicit val param: CoreParameters) extends Module {
     (uop.funct3 === "b110".U) -> ltu,
     (uop.funct3 === "b111".U) -> !ltu,
   ))
-  br.valid := biuBr.valid || (valid && ((uop.isBr && brfire) || uop.isJump))
+
+  for(((br, biuBr), idx) <- brs.zip(biuBrs).zipWithIndex) {
+    br.bits := Mux(biuBr.valid, biuBr.bits, (added >> 1) ## 0.U(1.W))
+    br.valid := biuBr.valid || uop.smsel(idx) && (valid && ((uop.isBr && brfire) || uop.isJump))
+  }
 
   // Scheduling
   s0step := !valid || s1done
-  dec.ready := s0step
 }

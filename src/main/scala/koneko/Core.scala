@@ -25,7 +25,7 @@ class Core(implicit val params: CoreParameters) extends Module {
       val tag = UInt(16.W)
     }))
 
-    val idling = Output(Bool())
+    val idlings = Output(UInt(params.SMEP.W))
   })
 
   val cfg = IO(Input(new Bundle {
@@ -43,5 +43,5 @@ class Core(implicit val params: CoreParameters) extends Module {
   exec.ext <> ext
   fetch.mem <> mem
   fetch.decoded <> exec.dec
-  fetch.ctrl.br <> exec.br
+  fetch.ctrl.br <> exec.brs
 }

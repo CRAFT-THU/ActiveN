@@ -17,26 +17,19 @@ module FPU (
   input logic rs2b0,
 
   input logic valid,
-  output logic ready
 );
-  int cnt;
-  reg is_ready;
   reg [31:0] result;
+  reg [31:0] holding;
 
-  assign ready = is_ready;
   assign r = result;
 
   always_ff @(posedge clock or posedge reset) begin // Update data on negedge
-    if(cnt == 0 && valid && !reset) begin
-      result <= softfpu_compute(a, b, funct7, funct3, rs2b0);
-    end
-
-    if(!reset && valid && !is_ready) begin
-      is_ready <= (cnt + 1) == softfpu_delay(funct7, funct3);
-      cnt <= cnt + 1;
+    if(!reset) begin
+      holding <= valid ? 0'hdeadbeef : softfpu_compute(a, b, funct7, funct3, rs2b0);
+      result <= holding;
     end else begin
-      is_ready <= '0;
-      cnt <= 0;
+      holding <= 0'hdeadbeef;
+      result <= 0'hdeadbeef;
     end
   end
 endmodule

@@ -14,7 +14,7 @@ class MemResp extends Bundle {
   val data = UInt(32.W)
 }
 
-class uOp extends Bundle {
+class uOp(implicit val param: CoreParameters) extends Bundle {
   val adder1pc = Bool()
   val adder2imm = Bool()
   val alu2imm = Bool()
@@ -45,4 +45,8 @@ class uOp extends Bundle {
   // Actually embedded inside imm
   val funct7 = UInt(7.W)
   val funct3 = UInt(3.W)
+
+  val smsel = UInt(param.SMEP.W)
+
+  def isMul = rdalu && !alu2imm && funct7(1)
 }

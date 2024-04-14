@@ -187,9 +187,10 @@ object ImmHighFormat extends BoolDecodeField[InstrPattern] {
   })
 }
 
-class Decode extends Module {
+class Decode(implicit val params: CoreParameters) extends Module {
   val instr = IO(Input(UInt(32.W)))
   val pc = IO(Input(UInt(32.W)))
+  val smsel = IO(Input(UInt(params.SMEP.W)))
   val decoded = IO(Output(new uOp))
 
   // Static field extractions
@@ -199,6 +200,7 @@ class Decode extends Module {
   decoded.funct7 := instr(31, 25)
   decoded.funct3 := instr(14, 12)
   decoded.pc := pc
+  decoded.smsel := smsel
 
   // Control signals
   // TODO: add CSR, add WFI

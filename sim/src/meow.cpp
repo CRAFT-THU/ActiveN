@@ -37,6 +37,8 @@ uint32_t *text_aligned;
 
 bool exiting = false;
 
+const size_t SMT_RATIO = 1;
+
 void sighandler(int s) {
   exiting = true;
 }
@@ -299,7 +301,7 @@ static inline void tick() {
   for(auto &c : cores) c->step_negedge();
   if(TRACE) tracer->dump(global_tick * 2 + 1);
   for(auto &c : cores)
-    if(c->core->ext_idling)
+    if(c->core->ext_idlings == (1 << SMT_RATIO) - 1)
       c->idle_cycle_cnt += 1;
 
   if(global_tick % 10000 == 0) {
@@ -343,7 +345,7 @@ bool meow_noc_tick(int inflight) {
   while(mem_tick <= noc_tick * mem_freq_ratio) dram_tick();
 
   bool all_idling = dram_pending.empty();
-  for(auto c : cores) if(!c->core->ext_idling) all_idling = false;
+  for(auto c : cores) if(!c->core->ext_idlings == (1 << SMT_RATIO) - 1) all_idling = false;
 
   if(global_tick % 1000 == 0) {
     cout<<"[Meow] noc inflight flits: "<<inflight<<endl;
