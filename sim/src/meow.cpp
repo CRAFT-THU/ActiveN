@@ -330,6 +330,7 @@ static inline void dram_tick() {
       if(new_at >= req.end) {
         dram_pending.erase(it++);
         std::cout<<"[Meow M"<<mem_tick<<"] memory read finished, outstanding "<<dram_pending.size()<<"/"<<dram_ticket_gen<<endl;
+        std::cout<<"[Meow M"<<mem_tick<<"] dram flits pending: "<<dram_flits.size()<<endl;
       } else {
         req.at = new_at;
         it++;
@@ -465,7 +466,7 @@ void meow_softmem_write(size_t core, uint32_t addr, uint32_t wdata, uint8_t we) 
   if(we == 0) return;
   if(core >= cores.size()) throw std::runtime_error("Invalid core id");
   if(addr >= 16384 || addr % 4 != 0) {
-    cout<<core<<" ==> "<<addr<<", we = "<<(int) we<<endl;
+    cout<<"[Meow] OoB / unaligned spm access: "<<core<<" ==> "<<addr<<", we = "<<(int) we<<endl;
     // throw std::runtime_error("Unaligned spm write");
     return;
   }

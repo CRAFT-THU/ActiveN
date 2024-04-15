@@ -24,9 +24,10 @@ _start:
 
   li t0, 16384 - 4;
   lw t0, 0(t0) // Neuron count
-  slli s1, t0, 2 // * 20
-  add s1, s1, t0
-  slli s1, s1, 2
+  # slli s1, t0, 2 // * 20
+  # add s1, s1, t0
+  # slli s1, s1, 2
+  slli s1, t0, 4 // * 16
   li s0, 0
 
 # adder:
