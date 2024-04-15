@@ -174,7 +174,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   val isWFI = uop.isSystem && uop.funct3 === 0.U && uop.rs2 === 5.U
   val idlings = RegInit(0.U(param.SMEP.W))
-  val idlingsCur = Mux(valid && (isWFI || isYield), uop.smsel, 0.U)
+  val idlingsCur = Mux(valid && isWFI, uop.smsel, 0.U) // Yield never transition to idling state
   val idlingsMasked: UInt = idlings | idlingsCur
 
   biu.br.ready := idlingsMasked.orR
@@ -184,7 +184,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   val biuBrs = for(i <- 0 until param.SMEP) yield {
     val biuBr = Wire(Valid(UInt(32.W)))
-    biuBr.valid := idlingsMasked(i)
+    biuBr.valid := idlingsMasked(i) || valid && isYield
     biuBr.bits := MuxCase(param.initVec.U, Seq(
       biu.br.valid -> biu.br.bits.target,
       (valid && isYield) -> yieldTarget,
@@ -266,7 +266,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   for((r, i) <- regfiles.zipWithIndex) {
     val matchDelayed = delayedSent && delayedUop.smsel(i)
-    val matchCur = uop.smsel(i)
+    val matchCur = uop.smsel(i) && !delayed
     r.write.en := matchDelayed || (matchCur && valid && !uop.rdignore)
     r.write.num := Mux(matchDelayed, delayedUop.rd, uop.rd)
     r.write.value := Mux(matchDelayed, delayedRdval, rdval)

@@ -19,16 +19,13 @@ module FPU (
   input logic valid,
 );
   reg [31:0] result;
-  reg [31:0] holding;
 
   assign r = result;
 
   always_ff @(posedge clock or posedge reset) begin // Update data on negedge
     if(!reset) begin
-      holding <= valid ? 0'hdeadbeef : softfpu_compute(a, b, funct7, funct3, rs2b0);
-      result <= holding;
+      result <= valid ? softfpu_compute(a, b, funct7, funct3, rs2b0) : 0'hdeadbeef;
     end else begin
-      holding <= 0'hdeadbeef;
       result <= 0'hdeadbeef;
     end
   end

@@ -56,18 +56,18 @@ class Fetch(implicit val params: CoreParameters) extends Module {
   val decodedHoldingValid = for(_ <- 0 until params.SMEP) yield RegInit(false.B)
   for(((d, dec), idx) <- decodedHoldingValid.zip(decoded).zipWithIndex) {
     d := MuxCase(d, Seq(
-      dec.ready -> false.B,
+      (refilling || dec.ready) -> false.B,
 
       // dec is not ready
       (sel(idx) && !ctrl.br(idx).valid) -> true.B,
     ))
-    dec.valid := d || (sel(idx) && !ctrl.br(idx).valid)
+    dec.valid := !refilling && (d || (sel(idx) && !ctrl.br(idx).valid))
     dec.bits := Mux(d, decodedHolding(idx), decode.decoded)
   }
+  for((d, h) <- decodedHoldingValid.zip(decodedHolding)) {
+    h := Mux(d, h, decode.decoded)
+  }
   fetchable := ~VecInit(decodedHoldingValid).asUInt
-
-  // FIXME: alternative ingress
-  mem.req.noenq()
 
   // Scheduling
   // step := icache.input.fire
