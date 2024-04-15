@@ -174,17 +174,17 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   val isWFI = uop.isSystem && uop.funct3 === 0.U && uop.rs2 === 5.U
   val idlings = RegInit(0.U(param.SMEP.W))
-  val idlingsCur = Mux(valid && isWFI, uop.smsel, 0.U) // Yield never transition to idling state
+  val idlingsCur = Mux(valid && (isWFI || isYield), uop.smsel, 0.U)
   val idlingsMasked: UInt = idlings | idlingsCur
 
   biu.br.ready := idlingsMasked.orR
   val biuSel = PriorityEncoderOH(idlingsMasked)
-  idlings := idlingsMasked & (~Mux(biu.br.fire, biuSel, 0.U)).asUInt
+  idlings := (idlings | Mux(valid && isWFI, uop.smsel, 0.U)) & (~Mux(biu.br.fire, biuSel, 0.U)).asUInt // Ignore isYield during idling updates
   ext.idlings := idlings
 
   val biuBrs = for(i <- 0 until param.SMEP) yield {
     val biuBr = Wire(Valid(UInt(32.W)))
-    biuBr.valid := idlingsMasked(i) || valid && isYield
+    biuBr.valid := idlingsMasked(i)
     biuBr.bits := MuxCase(param.initVec.U, Seq(
       biu.br.valid -> biu.br.bits.target,
       (valid && isYield) -> yieldTarget,
