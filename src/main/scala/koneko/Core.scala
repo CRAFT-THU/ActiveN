@@ -43,5 +43,6 @@ class Core(implicit val params: CoreParameters) extends Module {
   exec.ext <> ext
   fetch.mem <> mem
   fetch.decoded <> exec.dec
+  fetch.busy <> exec.busy
   fetch.ctrl.br <> exec.brs
 }

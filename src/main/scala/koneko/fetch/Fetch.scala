@@ -14,6 +14,7 @@ class Fetch(implicit val params: CoreParameters) extends Module {
     val br = Vec(params.SMEP, Flipped(Valid(UInt(32.W))))
   })
   val decoded = IO(Vec(params.SMEP, Decoupled(new uOp)))
+  val busy = IO(Input(UInt(params.SMEP.W)))
 
   // PC Control
   val step = WireDefault(false.B)
@@ -59,7 +60,7 @@ class Fetch(implicit val params: CoreParameters) extends Module {
       (refilling || dec.ready) -> false.B,
 
       // dec is not ready
-      (sel(idx) && !ctrl.br(idx).valid) -> true.B,
+      sel(idx) -> true.B,
     ))
     dec.valid := !refilling && (d || (sel(idx) && !ctrl.br(idx).valid))
     dec.bits := Mux(d, decodedHolding(idx), decode.decoded)
@@ -67,7 +68,8 @@ class Fetch(implicit val params: CoreParameters) extends Module {
   for((d, h) <- decodedHoldingValid.zip(decodedHolding)) {
     h := Mux(d, h, decode.decoded)
   }
-  fetchable := ~VecInit(decodedHoldingValid).asUInt
+  fetchable := ~VecInit(decodedHoldingValid.zip(ctrl.br).map({ case (d, b) => d || b.valid })).asUInt & ~busy
+  assert(!sel.orR || !ctrl.br(OHToUInt(sel)).valid)
 
   // Scheduling
   // step := icache.input.fire

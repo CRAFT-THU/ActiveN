@@ -5,7 +5,7 @@ import chisel3.util._
 
 import koneko._
 
-class RegFile extends Module {
+class RegFile(val smtid: Int) extends Module {
   val read = IO(Vec(2, new Bundle {
     val num = Input(UInt(5.W))
     val value = Output(UInt(32.W))
@@ -24,7 +24,13 @@ class RegFile extends Module {
     val cnt = UInt(2.W) // 0, 1, 2, 3
   }))
 
-  val regs = dontTouch(Reg(Vec(32, UInt(32.W)))) // Disable DCE for RegFile
+  // Disable DCE for RegFile
+  val regs = dontTouch(RegInit({
+    val init = Wire(Vec(32, UInt(32.W)))
+    init := DontCare
+    init(10) := smtid.U
+    init
+  }))
 
   val bankedWriteResult = Wire(regs.cloneType)
   for(i <- 0 until 32) {

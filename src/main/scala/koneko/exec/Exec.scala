@@ -9,6 +9,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
   val dec = IO(Flipped(
       Vec(param.SMEP, Decoupled(new uOp))
   ))
+  val busy = IO(Output(UInt(param.SMEP.W)))
   val brs = IO(Output(Vec(param.SMEP, Valid(UInt(32.W)))))
   val ext = IO(new Bundle {
     val out = Decoupled(new Bundle {
@@ -58,11 +59,13 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   for((d, i) <- dec.zip(issueSel)) d.ready := i && s0step
 
-  val regfiles = for(_ <- 0 until param.SMEP) yield Module(new RegFile)
+  val regfiles = for(i <- 0 until param.SMEP) yield Module(new RegFile(i))
   for((r, u) <- regfiles.zip(s0uops)) {
     r.read(0).num := u.rs1
     r.read(1).num := u.rs2
   }
+
+  busy := busyMap
 
   // --- Stage ---
   // TODO: investigate about moving br forward one cycle
@@ -171,20 +174,20 @@ class Exec(implicit val param: CoreParameters) extends Module {
   biu.msg.bits.target := rs2val
   biu.msg.bits.tag := rs2val >> 16
   biu.msg.valid := valid && uop.isAM && (!isYield || yieldAcked) // TODO: funct7 arbitration?
+  assert(!(valid && uop.isAM && biu.msg.fire) || s0step)
 
   val isWFI = uop.isSystem && uop.funct3 === 0.U && uop.rs2 === 5.U
   val idlings = RegInit(0.U(param.SMEP.W))
-  val idlingsCur = Mux(valid && (isWFI || isYield), uop.smsel, 0.U)
-  val idlingsMasked: UInt = idlings | idlingsCur
+  val idlingsMasked: UInt = idlings | Mux(valid && isWFI, uop.smsel, 0.U)
 
-  biu.br.ready := idlingsMasked.orR
-  val biuSel = PriorityEncoderOH(idlingsMasked)
-  idlings := (idlings | Mux(valid && isWFI, uop.smsel, 0.U)) & (~Mux(biu.br.fire, biuSel, 0.U)).asUInt // Ignore isYield during idling updates
+  biu.br.ready := s0step && (idlingsMasked.orR || valid && isYield)
+  val biuSel = Mux(valid && isYield, uop.smsel, PriorityEncoderOH(idlingsMasked)) // Yielding guy takes precidence
+  idlings := idlingsMasked & (~Mux(biu.br.fire, biuSel, 0.U)).asUInt // Yielding guy never transitions to idling
   ext.idlings := idlings
 
   val biuBrs = for(i <- 0 until param.SMEP) yield {
     val biuBr = Wire(Valid(UInt(32.W)))
-    biuBr.valid := idlingsMasked(i)
+    biuBr.valid := (idlingsMasked | Mux(valid && isYield, uop.smsel, 0.U))(i)
     biuBr.bits := MuxCase(param.initVec.U, Seq(
       biu.br.valid -> biu.br.bits.target,
       (valid && isYield) -> yieldTarget,
@@ -274,7 +277,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   var s1donesrc = Seq(
     uop.isMem -> lsu.req.ready,
-    uop.isAM -> biu.msg.ready,
+    uop.isAM -> (!biu.msg.valid || biu.msg.ready),
   )
 
   val s1done = MuxCase(true.B, s1donesrc)

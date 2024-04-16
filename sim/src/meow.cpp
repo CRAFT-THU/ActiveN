@@ -27,8 +27,8 @@ size_t CORE_CNT = 99;
 size_t noc_tick = 0;
 size_t global_tick = 0;
 size_t mem_tick = 0;
-double core_freq_ratio = 0.16625; // Core running at 1/8 xNoC freq
-double mem_freq_ratio = 0.5; // 3200: 1.6GHz
+double core_freq_ratio = 0.15625 / 2; // Core running at 1/8 xNoC freq
+double mem_freq_ratio = 0.5 / 2; // 3200: 1.6GHz
 
 bool this_cycle_accepted = false; // NoC
 
@@ -37,7 +37,7 @@ uint32_t *text_aligned;
 
 bool exiting = false;
 
-const size_t SMT_RATIO = 1;
+const size_t SMT_RATIO = 2;
 
 void sighandler(int s) {
   exiting = true;
@@ -58,6 +58,8 @@ struct ongoing_mem_access {
 
 std::map<uint64_t, ongoing_mem_access> dram_pending;
 
+std::unordered_multimap<uint64_t, uint64_t> dram_read_end;
+
 struct core_data_t {
   std::unique_ptr<rtl> core;
   size_t core_id;
@@ -72,6 +74,8 @@ struct core_data_t {
   std::map<uint32_t, std::vector<raw_in_flit>> incomplete_flits;
 
   uint8_t *spm;
+
+  int memory_flit_cnt = 0;
 
   core_data_t(size_t core_id) {
     sprintf(name, "core.%lu", core_id);
@@ -118,7 +122,6 @@ struct core_data_t {
       }
     }
     if(core->ext_in_valid && core->ext_in_ready) {
-      // if(LOG && core_id == 0) cout<<"[Meow] Message accepted at "<<name<<endl;
       in_flits.pop_front();
     }
 
@@ -162,10 +165,24 @@ uint32_t *dram_content;
 std::deque<raw_out_flit> dram_flits;
 
 void mem_read_cb(int idx, uint64_t addr) {
-  auto len = mem[idx]->GetBurstLength() * mem[idx]->GetBusBits() / 8 / 8;
+  auto mem_line = mem[idx]->GetBurstLength() * mem[idx]->GetBusBits() / 8;
+  auto len = mem_line / 8;
+  auto aligned = addr - (addr % mem_line); // TODO: fix head / tail
+  std::optional<uint64_t> end = {};
+  auto end_lookup = dram_read_end.find(addr);
+  if(end_lookup != dram_read_end.end()) {
+    end = { end_lookup->second / 4 };
+    dram_read_end.erase(end_lookup);
+  }
+
   addr /= 4;
+  aligned /= 4;
+
   for(int i = 0; i < len; i ++) {
-    uint32_t base = addr + i * 2;
+    uint32_t base = aligned + i * 2;
+    if(base < addr) continue;
+    if(end && base >= *end) break;
+
     uint32_t col = dram_content[base];
     uint32_t data = dram_content[base + 1];
     uint16_t dst = (col >> 16) + 1;
@@ -186,6 +203,8 @@ void mem_read_cb(int idx, uint64_t addr) {
       .first = false,
       .last = true,
     });
+
+    cores[dst-1]->memory_flit_cnt++;
   }
 }
 
@@ -266,6 +285,19 @@ void meow_setup() {
   if(fstat(dram_fd, &dram_stat) == -1) throw std::runtime_error("Unable to stat dram content");
   dram_content = static_cast<uint32_t *>(mmap(NULL, dram_stat.st_size, PROT_READ, MAP_SHARED, dram_fd, 0));
 
+  // Stat dram content
+  int *dst_stat = new int[CORE_CNT];
+  for(int i = 0; i < CORE_CNT; ++i) dst_stat[i] = 0;
+  for(size_t i = 0; i < dram_stat.st_size / 8; ++i) {
+    uint32_t spec = dram_content[i * 2];
+    uint16_t dst = spec >> 16;
+    if(dst >= CORE_CNT) std::cout<<"Invalid dst: "<<dst<<" at "<<i * 8<<std::endl;
+    else dst_stat[dst] ++;
+  }
+  std::cout<<"Stat: "<<std::endl;
+  for(int i = 0; i < CORE_CNT; ++i)
+    std::cout<<"> Core "<<i<<": "<<dst_stat[i]<<std::endl;
+
   for(int i = 0; i < CORE_CNT; ++i) {
     auto c = cores[i];
     auto spm_path = data_cfg + "/spm." + std::to_string(i) + ".bin";
@@ -304,6 +336,9 @@ static inline void tick() {
     if(c->core->ext_idlings == (1 << SMT_RATIO) - 1)
       c->idle_cycle_cnt += 1;
 
+  if(global_tick % 1000 == 0) {
+      cout<<"[Meow] Core 0 reamining flit cnt: "<<cores[0]->in_flits.size()<<endl;
+  }
   if(global_tick % 10000 == 0) {
     cout<<"[Meow] Core tick: "<<global_tick<<endl;
     double total_idle_cnt = 0;
@@ -324,10 +359,11 @@ static inline void dram_tick() {
     auto &req = it->second;
     auto aligned = req.at - (req.at % mem_line); // TODO: fix head / tail
     auto sel = (aligned >> 10) % mem.size(); // TODO: figure out best one
-    if(mem[sel]->WillAcceptTransaction(aligned, false)) {
-      mem[sel]->AddTransaction(aligned, false);
+    if(mem[sel]->WillAcceptTransaction(req.at, false)) {
+      mem[sel]->AddTransaction(req.at, false);
       uint32_t new_at = aligned + mem_line;
       if(new_at >= req.end) {
+        dram_read_end.emplace(req.at, req.end);
         dram_pending.erase(it++);
         std::cout<<"[Meow M"<<mem_tick<<"] memory read finished, outstanding "<<dram_pending.size()<<"/"<<dram_ticket_gen<<endl;
         std::cout<<"[Meow M"<<mem_tick<<"] dram flits pending: "<<dram_flits.size()<<endl;
@@ -346,7 +382,7 @@ bool meow_noc_tick(int inflight) {
   while(mem_tick <= noc_tick * mem_freq_ratio) dram_tick();
 
   bool all_idling = dram_pending.empty();
-  for(auto c : cores) if(!c->core->ext_idlings == (1 << SMT_RATIO) - 1) all_idling = false;
+  for(auto c : cores) if(c->core->ext_idlings != (1 << SMT_RATIO) - 1) all_idling = false;
 
   if(global_tick % 1000 == 0) {
     cout<<"[Meow] noc inflight flits: "<<inflight<<endl;
@@ -358,7 +394,10 @@ bool meow_noc_tick(int inflight) {
     cout<<"[Meow] DRAM Cycles: "<<mem_tick<<endl;
     cout<<"[Meow] Core Cycles: "<<global_tick<<endl;
     double total_idle_cnt = 0;
-    for(auto &c : cores) total_idle_cnt += c->idle_cycle_cnt;
+    for(auto &c : cores) {
+      cout<<"[Meow] MFlit at "<<c->core_id<<": "<<c->memory_flit_cnt<<endl;
+      total_idle_cnt += c->idle_cycle_cnt;
+    }
     cout<<"[Meow] Idle "<<total_idle_cnt / cores.size()<<" // "<<global_tick<<" = "<<total_idle_cnt / cores.size() / global_tick<<endl;
 
     exiting = true;
@@ -366,8 +405,9 @@ bool meow_noc_tick(int inflight) {
   return done;
 }
 
+int total_dram_flits = 0;
+
 std::optional<std::vector<raw_out_flit>> meow_accept_flit(int node_id) {
-  // if(LOG) cout<<"[Meow] Accepting from node "<<node_id<<endl;
   if(global_tick < RESET_LENGTH + 5) return {};
 
   if(node_id == 0) {
@@ -379,6 +419,8 @@ std::optional<std::vector<raw_out_flit>> meow_accept_flit(int node_id) {
     assert(!dram_flits.empty() && dram_flits.front().last);
     result.push_back(dram_flits.front());
     dram_flits.pop_front();
+    total_dram_flits += 2;
+    if(LOG && total_dram_flits % 1000 == 0) cout<<"[Meow] DRAM total flits = "<<total_dram_flits<<endl;
     return { result };
   }
 
@@ -400,7 +442,7 @@ std::optional<std::vector<raw_out_flit>> meow_accept_flit(int node_id) {
       .last = true,
     };
 
-    if(LOG && core == 0) cout<<"[Meow] Outgoing msg from "<<core->name<<": ("<<flit.dst<<") <= ["<<flit.tag<<"]: 0x"<<hex<<flit.data<<dec<<endl;
+    if(LOG) cout<<"[Meow] Outgoing msg from "<<core->name<<": ("<<flit.dst<<") <= ["<<flit.tag<<"]: 0x"<<hex<<flit.data<<dec<<endl;
     vector<raw_out_flit> result;
     result.push_back(flit);
 
@@ -419,7 +461,7 @@ void meow_retire_flit(int node_id, raw_in_flit flit) {
       auto pending = dram_half[src];
       dram_half.erase(src);
       int ticket = ++dram_ticket_gen;
-      cout<<"[Meow] DRAM read: core."<<src-1<<" -> [0x"<<hex<<pending<<", 0x"<<flit.data<<")"<<dec<<endl;
+      cout<<"[Meow] DRAM read: core."<<src-1<<" -> [0x"<<hex<<pending<<", 0x"<<flit.data<<") = "<<dec<<flit.data - pending<<endl;
       dram_pending.insert_or_assign(dram_ticket_gen, ongoing_mem_access {
         .start = pending,
         .end = flit.data,

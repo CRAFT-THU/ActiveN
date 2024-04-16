@@ -12,31 +12,33 @@ class EvQueue(implicit val param: CoreParameters) extends Module {
   // TODO: arbitrary alignment
 
   // TODO: configurable queue length
-  val ram = Mem(1, Vec(4, UInt(32.W))) // TODO: calculate power as 16 lines
+  val ram = Mem(32, Vec(4, UInt(32.W))) // TODO: calculate power as 16 lines
   val cnt = RegInit(0.U(5.W))
 
   val head = RegInit(0.U(6.W)) // 1 + log2up(32)
   val tail = RegInit(0.U(6.W)) // 1 + log2up(32)
 
   val empty = head === tail
-  val full = head(4, 0) === tail(4, 0) && tail(5) =/= tail(5)
+  val full = head(4, 0) === tail(4, 0) && head(5) =/= tail(5)
 
   enq.ready := !full
   // TODO: support alignment > 4
   val last = cnt === alignment - 1.U
   when(enq.fire) {
-    ram.write(tail, VecInit(Seq.fill(4)(enq.bits)), UIntToOH(cnt(1, 0)).asBools)
+    ram.write(tail(4, 0), VecInit(Seq.fill(4)(enq.bits)), UIntToOH(cnt(1, 0)).asBools)
     cnt := Mux(last, 0.U, cnt + 1.U)
     tail := Mux(last, tail + 1.U, tail)
   }
 
+  val nhead = Mux(deq.fire, head + 1.U, head)
+  head := nhead
   deq.valid := !empty
-  deq.bits := RegNext(VecInit(ram.read(head).zipWithIndex.map({
-    case (o, i) => Mux(i.U === cnt && enq.fire, enq.bits, o)
+  deq.bits := RegNext(VecInit(ram.read(nhead).zipWithIndex.map({
+    case (o, i) => Mux(
+      nhead(4, 0) === tail(4,0) && i.U === cnt && enq.fire,
+      enq.bits, o
+    )
   })))
-  when(deq.fire) {
-    head := head + 1.U
-  }
 }
 
 class BIU(implicit val param: CoreParameters) extends Module {

@@ -1,6 +1,6 @@
 funct7 = "0000001"
 rs2 = 18
-rs1 = 0
+rs1 = 10
 funct3 = "101"
 rd = 0
 opcode = "00010"

@@ -12,7 +12,7 @@ case class CoreParameters(
   val memTagBase: Int,
   val scratchpadSize: Int,
   val useFPU: Boolean,
-  val SMEP: Int = 1,
+  val SMEP: Int = 2,
 ) {
   require(scratchpadSize % 4 == 0)
   def i$Sets = i$Lines / i$Assoc

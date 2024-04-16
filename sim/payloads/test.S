@@ -1,7 +1,7 @@
   .section .text
   .globl _start
 _start:
-
+  mv s0, a0
   la t0, spike
   csrw 0x700, t0 # Handler for tag0
   li t0, 2
@@ -20,7 +20,7 @@ _start:
   li s4, 0x3f67a36d // e^{-0.1}
   li s5, 0x3f800000 // 1
 
-  // s0 iterator, s1 end, s2 self fire, s3 threshold, s4 tau, s5 injective
+  // a0 iterator, s1 end, s2 self fire, s3 threshold, s4 tau, s5 injective
 
   li t0, 16384 - 4;
   lw t0, 0(t0) // Neuron count
@@ -28,7 +28,8 @@ _start:
   # add s1, s1, t0
   # slli s1, s1, 2
   slli s1, t0, 4 // * 16
-  li s0, 0
+  li a0, 0
+  bnez s0, loopwfi
 
 # adder:
 #   lw t0, 0(s0)
@@ -41,29 +42,38 @@ _start:
 # 
 #   li s0, 0
 
-updateOne:
-  beq s0, s1, loopwfi
-  lw t0, 0(s0)
-  lw t1, 4(s0)
+init:
+  lw t0, 0(a0)
+  lw t1, 4(a0)
   fadd.S f5, f5, f6
+  sw t0, 0(a0)
+  sw x0, 4(a0)
+  addi a0, a0, 16
+  bne a0, s1, init
+
+  li a0, 0
+
+updateOne:
+  beq a0, s1, loopwfi
+  lw t0, 0(a0)
 
   flt.s t1, f5, fs3
   beqz t1, 1f // Fired
 
   fmul.s f5, f5, fs4
-  sw t0, 0(s0)
-  addi s0, s0, 16
-  .word 0x0320500b // fire.yield.1 x0, s2
+  sw t0, 0(a0)
+  addi a0, a0, 16
+  .word 0x0325500b // fire.yield.1 a0, s2
   // wfi
 
 1:
-  sw x0, 0(s0)
-  lw t0, 8(s0)
-  lw t1, 12(s0)
+  sw x0, 0(a0)
+  lw t0, 8(a0)
+  lw t1, 12(a0)
   .word 0x0062a00b // queue.2 t0, t1
   .word 0x0000400b // fire.0 x0
-  addi s0, s0, 16
-  .word 0x0320500b // fire.yield.1 x0, s2
+  addi a0, a0, 16
+  .word 0x0325500b // fire.yield.1 a0, s2
   # wfi
 
 spike:
