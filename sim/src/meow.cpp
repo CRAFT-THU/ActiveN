@@ -27,7 +27,7 @@ size_t CORE_CNT = 99;
 size_t noc_tick = 0;
 size_t global_tick = 0;
 size_t mem_tick = 0;
-double core_freq_ratio = 0.15625 / 2; // Core running at 1/8 xNoC freq
+double core_freq_ratio = 0.15625; // Core running at 1/8 xNoC freq
 double mem_freq_ratio = 0.5 / 2; // 3200: 1.6GHz
 
 bool this_cycle_accepted = false; // NoC
@@ -65,6 +65,8 @@ struct core_data_t {
   size_t core_id;
 
   size_t idle_cycle_cnt = 0;
+  size_t non_idle_cycle_cnt = 0;
+  size_t working_cycle_cnt = 0;
 
   char name[128];
 
@@ -325,6 +327,20 @@ bool meow_stopped() {
   return exiting;
 }
 
+void stat_cores() {
+  double total_idle_cnt = 0;
+  for(auto &c : cores) total_idle_cnt += c->idle_cycle_cnt;
+  cout<<"[Meow] Avg idle cycle: "<<total_idle_cnt / cores.size()<<" // "<<global_tick<<" = "<<total_idle_cnt / cores.size() / global_tick<<endl;
+
+  double total_non_idle_cnt = 0;
+  double total_working_cnt = 0;
+  for(auto &c : cores) {
+    total_non_idle_cnt += c->non_idle_cycle_cnt;
+    total_working_cnt += c->working_cycle_cnt;
+  }
+  cout<<"[Meow] Avg working ratio: "<<total_working_cnt / cores.size()<<" // "<<total_non_idle_cnt / cores.size()<<" = "<<total_working_cnt / total_non_idle_cnt<<endl;
+}
+
 static inline void tick() {
   ++global_tick;
 
@@ -332,18 +348,22 @@ static inline void tick() {
   if(TRACE) tracer->dump(global_tick * 2);
   for(auto &c : cores) c->step_negedge();
   if(TRACE) tracer->dump(global_tick * 2 + 1);
-  for(auto &c : cores)
+  for(auto &c : cores) {
     if(c->core->ext_idlings == (1 << SMT_RATIO) - 1)
       c->idle_cycle_cnt += 1;
+    else
+      c->non_idle_cycle_cnt += 1;
+    
+    if(c->core->ext_working)
+      c->working_cycle_cnt += 1;
+  }
 
   if(global_tick % 1000 == 0) {
       cout<<"[Meow] Core 0 reamining flit cnt: "<<cores[0]->in_flits.size()<<endl;
   }
   if(global_tick % 10000 == 0) {
     cout<<"[Meow] Core tick: "<<global_tick<<endl;
-    double total_idle_cnt = 0;
-    for(auto &c : cores) total_idle_cnt += c->idle_cycle_cnt;
-    cout<<"[Meow] Idle "<<total_idle_cnt / cores.size()<<" // "<<global_tick<<" = "<<total_idle_cnt / cores.size() / global_tick<<endl;
+    stat_cores();
   }
 }
 
@@ -393,12 +413,9 @@ bool meow_noc_tick(int inflight) {
     cout<<"[Meow] NoC Cycles: "<<noc_tick<<endl;
     cout<<"[Meow] DRAM Cycles: "<<mem_tick<<endl;
     cout<<"[Meow] Core Cycles: "<<global_tick<<endl;
-    double total_idle_cnt = 0;
-    for(auto &c : cores) {
+    stat_cores();
+    for(auto &c : cores)
       cout<<"[Meow] MFlit at "<<c->core_id<<": "<<c->memory_flit_cnt<<endl;
-      total_idle_cnt += c->idle_cycle_cnt;
-    }
-    cout<<"[Meow] Idle "<<total_idle_cnt / cores.size()<<" // "<<global_tick<<" = "<<total_idle_cnt / cores.size() / global_tick<<endl;
 
     exiting = true;
   }

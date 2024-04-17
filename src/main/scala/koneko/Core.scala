@@ -26,6 +26,7 @@ class Core(implicit val params: CoreParameters) extends Module {
     }))
 
     val idlings = Output(UInt(params.SMEP.W))
+    val working = Output(Bool())
   })
 
   val cfg = IO(Input(new Bundle {
