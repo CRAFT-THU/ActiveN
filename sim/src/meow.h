@@ -11,7 +11,7 @@ bool meow_noc_tick(int inflight);
 bool meow_stopped();
 
 struct raw_out_flit {
-    uint16_t dst;
+    int16_t dst;
     uint32_t data;
     uint16_t tag;
     bool first;
@@ -19,12 +19,15 @@ struct raw_out_flit {
 };
 
 struct raw_in_flit {
-    uint16_t src;
+    int16_t src;
     uint32_t data;
     uint16_t tag;
 
-    int pid;
+    uint64_t pid;
     bool last;
+
+    raw_in_flit(raw_out_flit f, uint64_t p, int16_t s)
+      : src(s), data(f.data), tag(f.tag), pid(p), last(f.last) {}
 };
 
 std::optional<std::vector<raw_out_flit>> meow_accept_flit(int node_id);

@@ -15,17 +15,17 @@ set(SRCS
     src/aux.cpp
 )
 
-include_directories(${CMAKE_CURRENT_LIST_DIR}/booksim2/src)
-include_directories(${CMAKE_CURRENT_LIST_DIR}/booksim2/src/arbiters)
-include_directories(${CMAKE_CURRENT_LIST_DIR}/booksim2/src/allocators)
-include_directories(${CMAKE_CURRENT_LIST_DIR}/booksim2/src/routers)
-include_directories(${CMAKE_CURRENT_LIST_DIR}/booksim2/src/networks)
-include_directories(${CMAKE_CURRENT_LIST_DIR}/booksim2/src/power)
+# include_directories(${CMAKE_CURRENT_LIST_DIR}/booksim2/src)
+# include_directories(${CMAKE_CURRENT_LIST_DIR}/booksim2/src/arbiters)
+# include_directories(${CMAKE_CURRENT_LIST_DIR}/booksim2/src/allocators)
+# include_directories(${CMAKE_CURRENT_LIST_DIR}/booksim2/src/routers)
+# include_directories(${CMAKE_CURRENT_LIST_DIR}/booksim2/src/networks)
+# include_directories(${CMAKE_CURRENT_LIST_DIR}/booksim2/src/power)
 
-FILE(GLOB_RECURSE BOOKSIM_SRCS booksim2/src/*.cpp booksim2/src/lex.yy.c booksim2/src/y.tab.c)
+# FILE(GLOB_RECURSE BOOKSIM_SRCS booksim2/src/*.cpp booksim2/src/lex.yy.c booksim2/src/y.tab.c)
 find_library(DRAMSIM3 dramsim3)
 
-add_executable(sim ${SRCS} ${BOOKSIM_SRCS})
+add_executable(sim ${SRCS})
 
 verilate(
     sim
