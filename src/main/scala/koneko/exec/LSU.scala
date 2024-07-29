@@ -61,8 +61,8 @@ class LSU(implicit val param: CoreParameters) extends Module {
   ))
   val wbe = Mux1H(Seq(
     req.bits.len.w -> 0xF.U(4.W),
-    req.bits.len.h -> (0x3.U(4.W) << (req.bits.addr(2, 1) * 16.U)),
-    req.bits.len.b -> (0x1.U(4.W) << (req.bits.addr(2, 0) * 8.U)),
+    req.bits.len.h -> (0x3.U(4.W) << (req.bits.addr(1, 1) * 2 .U)),
+    req.bits.len.b -> (0x1.U(4.W) << req.bits.addr(1, 0)),
   ))
 
   /*
@@ -96,8 +96,8 @@ class LSU(implicit val param: CoreParameters) extends Module {
   // val rdata = scratchpad.read(alignedAddr).asUInt
   val rdata = spm.io.data
 
-  val rhalf = rdata.asTypeOf(Vec(2, UInt(16.W)))(req.bits.addr(2, 1))
-  val rbyte = rdata.asTypeOf(Vec(4, UInt(8.W)))(req.bits.addr(2, 0))
+  val rhalf = rdata.asTypeOf(Vec(2, UInt(16.W)))(req.bits.addr(1, 1))
+  val rbyte = rdata.asTypeOf(Vec(4, UInt(8.W)))(req.bits.addr(1, 0))
   val rmapped = Mux1H(Seq(
     req.bits.len.w -> rdata,
     req.bits.len.h -> VecInit(Seq.fill(16)(req.bits.rsext && rhalf(15))).asUInt ## rhalf,
