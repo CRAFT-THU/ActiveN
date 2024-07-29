@@ -72,10 +72,10 @@ int softfpu_delay(const svLogicVecVal *funct7, const svLogicVecVal *funct3) {
 }
 
 long long softmem_read(const svLogicVecVal* hartid, const svLogicVecVal* addr) {
-  return meow_softmem_read(hartid->aval - 1, addr->aval);
+  return meow_softmem_read(hartid->aval, addr->aval);
 }
 // DPI import at /root/workspace/CRAFT/Koneko/sim/../Aux.sv:4:30
 void softmem_write(const svLogicVecVal* hartid, const svLogicVecVal* addr, const svLogicVecVal* wdata, const svLogicVecVal* we) {
-  meow_softmem_write(hartid->aval - 1, addr->aval, wdata->aval, we->aval);
+  meow_softmem_write(hartid->aval, addr->aval, wdata->aval, we->aval);
 }
 }

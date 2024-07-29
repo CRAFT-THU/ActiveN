@@ -25,6 +25,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
     }))
 
     val idlings = Output(UInt(param.SMEP.W))
+    val working = Output(Bool())
   })
 
   val cfg = IO(Input(new Bundle {
@@ -75,6 +76,8 @@ class Exec(implicit val param: CoreParameters) extends Module {
   val rs1val = RegEnable(Mux1H(issueSel, regfiles.map(_.read(0).value)), s0step)
   val rs2val = RegEnable(Mux1H(issueSel, regfiles.map(_.read(1).value)), s0step)
   val delayed = RegEnable(s0delayed, s0step)
+
+  ext.working := valid
 
   // rs1 + rs2, used for AUIPC, Load/Store addresses, and OP +
   val adder1val = Mux(uop.adder1pc, uop.pc, rs1val)
