@@ -6,6 +6,8 @@ import chisel3.util._
 import koneko._
 
 class Fetch(implicit val params: CoreParameters) extends Module {
+  val INSTR_MEM_SIZE = 512
+
   val mem = IO(new Bundle {
     val req = Decoupled(new MemReq)
     val resp = Flipped(Valid(new MemResp))
@@ -42,7 +44,7 @@ class Fetch(implicit val params: CoreParameters) extends Module {
   icache.kill := VecInit(ctrl.br.zip(sentSmsel.asBools).map({ case (b, s) => b.valid && s })).asUInt.orR
   step := icache.input.fire
   */
-  val instrMem = Mem(64, UInt(32.W))
+  val instrMem = Mem(INSTR_MEM_SIZE / 4, UInt(32.W))
   val instrReadout = instrMem.read((selpc >> 2).asUInt)
   val instrValid = fetchable.orR && !VecInit(sel.asBools.zip(ctrl.br).map({ case (s, b) => s && b.valid })).asUInt.orR
   step := fetchable.orR && !refilling
@@ -76,8 +78,8 @@ class Fetch(implicit val params: CoreParameters) extends Module {
   // icache.output.ready := decoded.ready
 
   // Refilling
-  val (refillReqCnt, refillReqDone) = Counter(mem.req.fire, 256 / 4)
-  val (refillRespCnt, refillRespDone) = Counter(mem.resp.valid, 256 / 4)
+  val (refillReqCnt, refillReqDone) = Counter(mem.req.fire, INSTR_MEM_SIZE / 4)
+  val (refillRespCnt, refillRespDone) = Counter(mem.resp.valid, INSTR_MEM_SIZE / 4)
   val refillReq = RegInit(true.B)
 
   mem.req.valid := refillReq

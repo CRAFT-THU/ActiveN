@@ -21,9 +21,10 @@ using namespace std;
 
 bool TRACE = false;
 bool LOG = false;
+bool VERBOSE = false;
 
-size_t CORE_CNT = 99;
-size_t MEM_CNT = 2;
+size_t CORE_CNT = 0;
+size_t MEM_CNT = 0;
 
 size_t noc_tick = 0;
 size_t global_tick = 0;
@@ -45,6 +46,8 @@ void sighandler(int s) {
 const uint64_t RESET_LENGTH = 10;
 const uint32_t TEXT_BASE = 0x80000000ul;
 const uint32_t DATA_BASE = 0x90000000ul;
+
+const uint16_t SPIKE_TAG = 1;
 
 std::unique_ptr<VerilatedFstC> tracer;
 
@@ -78,13 +81,11 @@ struct core_data_t {
     sprintf(name, "core.%lu", core_id);
     core.reset(new rtl(name));
     this->core_id = core_id;
-    if(TRACE) core->trace(tracer.get(), 128);
     core->cfg_hartid = core_id;
   }
 
   ~core_data_t() {
     core->final();
-    if(TRACE) tracer->close();
     delete spm;
   }
 
@@ -107,19 +108,21 @@ struct core_data_t {
     // About to go into posedge, update queues
     if(core->mem_resp_valid) mem_resps.pop_front();
     if(core->mem_req_valid && core->mem_req_ready) {
-      if(LOG) cout<<"[Meow] "<<name<<" Req: "<<core->mem_req_bits_addr<<", Burst: "<<(uint64_t) core->mem_req_bits_burst<<endl;
+      if(LOG && VERBOSE) cout<<"[Meow] "<<name<<" Req: "<<core->mem_req_bits_addr<<", Burst: "<<(uint64_t) core->mem_req_bits_burst<<endl;
       for(uint32_t i = 0; i < ((uint64_t) 1) << ((uint64_t) core->mem_req_bits_burst); ++i) {
         uint32_t addr = i * 4 + core->mem_req_bits_addr;
         if(addr - TEXT_BASE >= text_size) mem_resps.push_back(0);
         else {
           uint32_t offset = (addr - TEXT_BASE) / 4;
-          if(LOG) cout<<dec<<"[Meow] Read at: "<<offset<<" = "<<text_aligned[offset]<<endl;
+          if(LOG && VERBOSE) cout<<dec<<"[Meow] Read at: "<<offset<<" = "<<text_aligned[offset]<<endl;
           mem_resps.push_back(text_aligned[offset]);
         }
       }
     }
     if(core->ext_in_valid && core->ext_in_ready) {
       in_flits.pop_front();
+    } else if(core->ext_in_valid && LOG) {
+      cout<<dec<<"Warning tick "<<global_tick<<": backpressure from core "<<name<<endl;
     }
 
     core->clock = true;
@@ -197,7 +200,7 @@ void mem_read_cb(int idx, uint64_t addr) {
     mem[idx].dram_flits.push_back(raw_out_flit {
       .dst = dst,
       .data = neuron,
-      .tag = 0,
+      .tag = SPIKE_TAG,
       .first = true,
       .last = false,
     });
@@ -205,7 +208,7 @@ void mem_read_cb(int idx, uint64_t addr) {
     mem[idx].dram_flits.push_back(raw_out_flit {
       .dst = dst,
       .data = data,
-      .tag = 0,
+      .tag = SPIKE_TAG,
       .first = false,
       .last = true,
     });
@@ -266,11 +269,18 @@ void meow_setup() {
     cores.push_back(new core_data_t(i));
   }
 
-  if(TRACE) tracer->open("./trace.fst");
+  if(TRACE) {
+    for(const auto &c : cores) c->core->trace(tracer.get(), 128);
+    tracer->open("./trace.fst");
+  }
 
   auto mem_cfg = std::getenv("MEOW_MEM");
   auto mem_log = std::getenv("MEOW_MEM_LOG");
   MEM_CNT = std::atoi(std::getenv("MEOW_MEM_CNT"));
+
+  if(CORE_CNT == 0 || MEM_CNT == 0)
+    throw std::runtime_error("Invalid MEOW_CORE_CNT or MEOW_MEM_CNT");
+
   for(int i = 0; i < MEM_CNT; ++i) {
     auto log = std::string(mem_log) + "/" + std::to_string(i);
     std::filesystem::create_directory(log);
@@ -314,6 +324,7 @@ void meow_setup() {
 }
 
 void meow_teardown() {
+  std::cout<<"[Meow] Teardown..."<<std::endl;
   for(auto &m: mem)
     m.dram->PrintStats();
 
@@ -398,9 +409,9 @@ static inline void dram_tick() {
     }
   }
 
-  if(has_finish) {
-    std::cout<<"[Meow M"<<mem_tick<<"] memory read finished, outstanding: "<<endl;
-    for(auto &m : mem) std::cout<<"  "<<m.dram_pending.size()<<endl;
+  if(has_finish && LOG) {
+    std::cout<<"[Meow M"<<mem_tick<<"] memory read finished, outstanding: ";
+    for(auto &m : mem) std::cout<<m.dram_pending.size()<<", ";
     std::cout<<"[Meow M"<<mem_tick<<"] total: "<<dram_ticket_gen<<endl;
     // std::cout<<"[Meow M"<<mem_tick<<"] dram flits pending: "<<dram_flits.size()<<endl;
   }
@@ -417,6 +428,9 @@ bool meow_noc_tick(int inflight) {
 
   if(global_tick % 1000 == 0) {
     cout<<"[Meow] noc inflight flits: "<<inflight<<endl;
+    std::cout<<"[Meow M"<<mem_tick<<"] memory outstanding: ";
+    for(auto &m : mem) std::cout<<m.dram_pending.size()<<", ";
+    std::cout<<"[Meow M"<<mem_tick<<"] total: "<<dram_ticket_gen<<endl;
   }
   bool done = all_idling && inflight == 0;
   if(done) {
@@ -472,6 +486,8 @@ std::optional<std::vector<raw_out_flit>> meow_accept_flit_core(int core_id) {
       .last = true,
     };
 
+    if(flit.tag == 0 && flit.dst < CORE_CNT)
+      cout<<"[Meow] "<<core->name<<" announced finish to "<<flit.dst<<dec<<": "<<flit.data<<" @ "<<global_tick<<endl;
     if(LOG) cout<<"[Meow] Outgoing msg from "<<core->name<<": ("<<flit.dst<<") <= ["<<flit.tag<<"]: 0x"<<hex<<flit.data<<dec<<endl;
     vector<raw_out_flit> result;
     result.push_back(flit);
@@ -489,7 +505,7 @@ void meow_retire_flit_dram(int dram_id, raw_in_flit flit) {
     auto pending = m.dram_half[src];
     m.dram_half.erase(src);
     int ticket = ++dram_ticket_gen;
-    cout<<"[Meow] DRAM "<<dram_id<<" read: core."<<src<<" -> [0x"<<hex<<pending<<", 0x"<<flit.data<<") = "<<dec<<flit.data - pending<<endl;
+    if(LOG) cout<<"[Meow] DRAM "<<dram_id<<" read: core."<<src<<" -> [0x"<<hex<<pending<<", 0x"<<flit.data<<") = "<<dec<<flit.data - pending<<endl;
     m.dram_pending.insert_or_assign(dram_ticket_gen, ongoing_mem_access {
       .start = pending,
       .end = flit.data,
@@ -569,6 +585,7 @@ int main(int argc, char **argv) {
   std::vector<std::multimap<uint64_t, raw_in_flit>> core_incoming;
   std::vector<std::multimap<uint64_t, raw_in_flit>> dram_incoming;
   uint64_t tick = 0;
+  uint64_t ext_in_tick = 0;
   uint64_t pid_gen = 0;
 
   core_incoming.resize(cores.size());
@@ -578,8 +595,8 @@ int main(int argc, char **argv) {
     for(int i = 0; i < core_incoming.size(); ++i) {
       auto &q = core_incoming[i];
 
-      auto lb = q.lower_bound(tick);
-      auto ub = q.upper_bound(tick);
+      auto lb = q.lower_bound(ext_in_tick);
+      auto ub = q.upper_bound(ext_in_tick);
       for(auto it = lb; it != ub; ++it)
         meow_retire_flit_core(i, it->second);
       q.erase(lb, ub);
@@ -621,7 +638,17 @@ int main(int argc, char **argv) {
 
     bool done = meow_noc_tick(inflights);
     ++tick;
+
+    bool blocked = false;
+    for(auto &c : cores) if(c->in_flits.size() > 1024) blocked = true;
+    if(!blocked) {
+      ++ext_in_tick;
+    } else if(LOG) {
+      std::cout<<"[Meow] NoC stalled on tick "<<tick<<std::endl;
+    }
+
     if(done && tick > 1000) break;
+    if(exiting && tick > 1000) break;
   }
   meow_teardown();
 }
