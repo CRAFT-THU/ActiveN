@@ -1,15 +1,31 @@
-use std::{path::PathBuf, fs::File};
+use std::{collections::HashMap, fs::File, path::PathBuf};
 
+use byteorder::ByteOrder;
+use byteorder::LittleEndian;
+use byteorder::WriteBytesExt;
 use clap::Parser;
+use rand::seq::SliceRandom;
 use rand::{SeedableRng, Rng};
 use rand_distr::{Geometric, Distribution, Uniform};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use std::io::Write;
+use std::io::BufReader;
+use std::io::BufWriter;
+use serde::Deserialize;
 
 #[derive(Parser)]
 struct Args {
     #[clap(short, long)]
     core_cnt: usize,
+
+    #[clap(long)]
+    load_nest_nodes: Option<PathBuf>,
+
+    #[clap(long)]
+    load_nest_conns: Option<PathBuf>,
+
+    #[clap(long)]
+    nest_randomize: bool,
 
     // #[clap(short, long, default_value="1000")]
     // neuron_per_core: usize,
@@ -108,7 +124,7 @@ fn dump(base: &PathBuf, cores: &Vec<Core>) -> anyhow::Result<()> {
 fn dump_genn(base: &PathBuf, cores: &Vec<Core>) -> anyhow::Result<()> {
     println!("Dumping(GeNN) to {}", base.display());
 
-    let mut output = File::create(base)?;
+    let mut output = BufWriter::new(File::create(base)?);
 
     let mut prefix_sum = Vec::with_capacity(cores.len());
     let mut prefix_sum_cur = 0;
@@ -117,26 +133,52 @@ fn dump_genn(base: &PathBuf, cores: &Vec<Core>) -> anyhow::Result<()> {
         prefix_sum_cur += c.neurons.len();
     }
 
-    writeln!(output, "{}", prefix_sum_cur)?;
+    output.write_u32::<LittleEndian>(prefix_sum_cur as u32)?;
     for c in cores.iter() {
         for n in c.neurons.iter() {
-            writeln!(output, "{}", n.state)?;
+            output.write_f32::<LittleEndian>(n.state)?;
+        }
+    }
+    for c in cores.iter() {
+        for n in c.neurons.iter() {
+            output.write_f32::<LittleEndian>(n.input)?;
         }
     }
 
     // Actually CSR
-    let mut tot_syn = 0;
+    let mut max_syn = 0;
     for c in cores.iter() {
         for n in c.neurons.iter() {
-            write!(output, "{} ", tot_syn)?;
-            tot_syn += n.neigh.len();
+            output.write_u32::<LittleEndian>(n.neigh.len() as u32)?;
+            max_syn = max_syn.max(n.neigh.len());
         }
     }
-    writeln!(output, "{}", tot_syn)?;
+    println!("Max syn cnt: {}", max_syn);
+
     for c in cores.iter() {
         for n in c.neurons.iter() {
+            let mut cnt = 0;
             for neigh in n.neigh.iter() {
-                writeln!(output, "{} {}", prefix_sum[neigh.core as usize] + neigh.neuron as usize, neigh.weight)?;
+                output.write_u32::<LittleEndian>(prefix_sum[neigh.core as usize] as u32 + neigh.neuron as u32)?;
+                cnt += 1;
+            }
+
+            for _ in cnt..max_syn {
+                output.write_u32::<LittleEndian>(0)?;
+            }
+        }
+    }
+
+    for c in cores.iter() {
+        for n in c.neurons.iter() {
+            let mut cnt = 0;
+            for neigh in n.neigh.iter() {
+                output.write_f32::<LittleEndian>(neigh.weight)?;
+                cnt += 1;
+            }
+
+            for _ in cnt..max_syn {
+                output.write_u32::<LittleEndian>(0)?;
             }
         }
     }
@@ -144,8 +186,23 @@ fn dump_genn(base: &PathBuf, cores: &Vec<Core>) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Deserialize)]
+struct NestNode {
+  s: f32,
+  t: f32,
+  r: f32,
+  id: usize,
+}
+
+#[derive(Deserialize)]
+struct NestConn {
+  s: usize,
+  t: usize,
+  w: f32,
+}
+
 fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(args.seed);
 
@@ -157,6 +214,16 @@ fn main() -> anyhow::Result<()> {
     let inj_weight_dist = Uniform::new(0.3, 0.8);
     let init_state_dist = Uniform::new(0f32, args.threshold);
 
+    let mut nest_nodes: Option<Vec<NestNode>> = args.load_nest_nodes.as_ref().map(|p| serde_json::from_reader(BufReader::new(std::fs::File::open(p).unwrap())).unwrap());
+    let nest_conns: Option<Vec<NestConn>> = args.load_nest_conns.as_ref().map(|p| serde_json::from_reader(BufReader::new(std::fs::File::open(p).unwrap())).unwrap());
+
+    if let Some(ref mut nodes) = nest_nodes {
+      args.tot_neuron = nodes.len();
+      if args.nest_randomize {
+        nodes.as_mut_slice().shuffle(&mut rng);
+      }
+    }
+
     let mut core_nn_cnt = vec![args.tot_neuron / args.core_cnt; args.core_cnt];
     for i in 0..(args.tot_neuron % args.core_cnt) {
         core_nn_cnt[i] += 1;
@@ -165,45 +232,86 @@ fn main() -> anyhow::Result<()> {
     // Generate
     let mut cores: Vec<Core> = vec![Default::default(); args.core_cnt];
     let mut max_syn_per_neuron = 0;
+
+    let mut nest_iter = 0;
+    let mut nest_rev_map: HashMap<usize, (usize, usize)> = HashMap::new();
+
     for core in 0..args.core_cnt {
-        println!("Gen: core {}", core);
-        cores[core].neurons.reserve(core_nn_cnt[core]);
-        for _ in 0..core_nn_cnt[core] {
-            let is_inh = rng.gen_bool(args.inh_ratio);
+      println!("Gen: core {}", core);
+      cores[core].neurons.reserve(core_nn_cnt[core]);
+      if let Some(ref nodes) = nest_nodes {
+        for nid in 0..core_nn_cnt[core] {
+            assert!(nest_iter < nodes.len());
+            let node = &nodes[nest_iter];
 
-            let mut neigh = Vec::new();
-            let mut cur = 0u64;
-            let mut cur_core = 0usize;
+            nest_rev_map.insert(node.id, (core, nid));
+            nest_iter += 1;
 
-            loop {
-                cur += neigh_dist.sample(&mut rng);
+            let state_ratio = (node.s - node.r) / (node.t - node.r);
+            let state = state_ratio * args.threshold;
 
-                while cur_core < args.core_cnt && cur as usize >= core_nn_cnt[cur_core] {
-                    cur -= core_nn_cnt[cur_core] as u64;
-                    cur_core += 1;
-                }
-                if cur_core >= args.core_cnt {
-                    break;
-                }
-
-                let w = if is_inh { inh_weight_dist } else { ext_weight_dist } .sample(&mut rng);
-                neigh.push(Neigh {
-                    core: cur_core as u16,
-                    neuron: cur as u16,
-                    weight: w as f32
-                });
-                cur += 1;
-            }
-
-            max_syn_per_neuron = max_syn_per_neuron.max(neigh.len());
-            let inj = inj_weight_dist.sample(&mut rng);
+            let INIT_FIRING_RATE = 0.1;
+            let fired = rng.gen_bool(INIT_FIRING_RATE);
 
             cores[core].neurons.push(Neuron {
-                state: init_state_dist.sample(&mut rng),
-                input: inj,
-                inj,
-                neigh,
+                state,
+                input: if fired { 1000000000f32 } else { 0f32 },
+                inj: 0f32,
+                neigh: Vec::new(),
             })
+        }
+      } else {
+        for _ in 0..core_nn_cnt[core] {
+          let is_inh = rng.gen_bool(args.inh_ratio);
+
+          let mut neigh = Vec::new();
+          let mut cur = 0u64;
+          let mut cur_core = 0usize;
+
+          loop {
+            cur += neigh_dist.sample(&mut rng);
+
+            while cur_core < args.core_cnt && cur as usize >= core_nn_cnt[cur_core] {
+                cur -= core_nn_cnt[cur_core] as u64;
+                cur_core += 1;
+              }
+              if cur_core >= args.core_cnt {
+                  break;
+              }
+
+              let w = if is_inh { inh_weight_dist } else { ext_weight_dist } .sample(&mut rng);
+              neigh.push(Neigh {
+                  core: cur_core as u16,
+                  neuron: cur as u16,
+                  weight: w as f32
+              });
+              cur += 1;
+          }
+
+          max_syn_per_neuron = max_syn_per_neuron.max(neigh.len());
+          let inj = inj_weight_dist.sample(&mut rng);
+
+          cores[core].neurons.push(Neuron {
+              state: init_state_dist.sample(&mut rng),
+              input: inj,
+              inj,
+              neigh,
+          })
+        }
+      }
+    }
+
+    if let Some(conns) = nest_conns {
+        for conn in conns.iter() {
+            let (sc, sid) = if let Some(i) = nest_rev_map.get(&conn.s) { i } else { continue };
+            let (tc, tid) = if let Some(i) = nest_rev_map.get(&conn.t) { i } else { continue };
+            let neuron = &mut cores[*sc].neurons[*sid];
+            neuron.neigh.push(Neigh {
+                core: *tc as u16,
+                neuron: *tid as u16,
+                weight: conn.w,
+            });
+            max_syn_per_neuron = max_syn_per_neuron.max(neuron.neigh.len());
         }
     }
 
