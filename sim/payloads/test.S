@@ -1,3 +1,6 @@
+// Initialization. Register usage:
+// a0 iterator, s0 dram target, s1 end, s2 self fire, s3 threshold, s4 tau, s5 injective, s8 target done, s9 hart id
+
   .section .text
   .globl _start
 _start:
@@ -20,7 +23,8 @@ _start:
 
   csrr s2, mhartid
 
-# Double DRAM
+# Setup DRAM target
+#ifdef DOUBLE_DRAM
   li t0, CORE_CNT / 4
   blt s2, t0, 0f
   li t0, CORE_CNT / 4 * 3
@@ -30,6 +34,9 @@ _start:
 0:
   li s0, 0x0000FFFF
 skip:
+#else
+  li s0, 0x0000FFFF
+#endif
 
   li s3, 0x41700000 // 10
   li s4, 0x3f67a36d // e^{-0.1}
@@ -58,8 +65,6 @@ skip:
   or s2, s2, t0
 
   bnez s9, loopwfi # WFI on secondary harts
-
-  // a0 iterator, s0 dram target, s1 end, s2 self fire, s3 threshold, s4 tau, s5 injective, s8 target done, s9 hart id
 
 # adder:
 #   lw t0, 0(s0)

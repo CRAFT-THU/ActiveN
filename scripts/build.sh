@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 BASE=$(readlink -f $(dirname $(readlink -f $0))/..)
 echo "Building inside $BASE..."
