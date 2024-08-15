@@ -30,6 +30,7 @@
             (mill.override { jre = pkgs.jdk8; })
             circt cmake ninja verilator espresso
             cargo rustc
+            python3 nodejs
             dramsim3 zlib
             crossPkgs.buildPackages.gcc
           ];
