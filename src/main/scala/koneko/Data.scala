@@ -46,7 +46,7 @@ class uOp(implicit val param: CoreParameters) extends Bundle {
   val funct7 = UInt(7.W)
   val funct3 = UInt(3.W)
 
-  val smsel = UInt(param.SMEP.W)
+  val smsel = UInt(param.pipeCnt.W)
 
   def isMul = rdalu && !alu2imm && funct7(1)
 }

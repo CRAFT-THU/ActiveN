@@ -190,7 +190,7 @@ object ImmHighFormat extends BoolDecodeField[InstrPattern] {
 class Decode(implicit val params: CoreParameters) extends Module {
   val instr = IO(Input(UInt(32.W)))
   val pc = IO(Input(UInt(32.W)))
-  val smsel = IO(Input(UInt(params.SMEP.W)))
+  val smsel = IO(Input(UInt(params.pipeCnt.W)))
   val decoded = IO(Output(new uOp))
 
   // Static field extractions

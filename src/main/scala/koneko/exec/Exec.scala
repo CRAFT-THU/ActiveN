@@ -7,10 +7,10 @@ import koneko._
 
 class Exec(implicit val param: CoreParameters) extends Module {
   val dec = IO(Flipped(
-      Vec(param.SMEP, Decoupled(new uOp))
+      Vec(param.pipeCnt, Decoupled(new uOp))
   ))
-  val busy = IO(Output(UInt(param.SMEP.W)))
-  val brs = IO(Output(Vec(param.SMEP, Valid(UInt(32.W)))))
+  val busy = IO(Output(UInt(param.pipeCnt.W)))
+  val brs = IO(Output(Vec(param.pipeCnt, Valid(UInt(32.W)))))
   val ext = IO(new Bundle {
     val out = Decoupled(new Bundle {
       val dst = UInt(16.W)
@@ -24,7 +24,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
       val tag = UInt(16.W)
     }))
 
-    val idlings = Output(UInt(param.SMEP.W))
+    val idlings = Output(UInt(param.pipeCnt.W))
     val working = Output(Bool())
   })
 
@@ -44,7 +44,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
   //////////////////////////
 
   val s0uops = dec.map(_.bits)
-  val busyMap = RegInit(0.U(param.SMEP.W))
+  val busyMap = RegInit(0.U(param.pipeCnt.W))
   val issuable = dec.map(_.valid).zip(busyMap.asBools).map({ case (v, b) => v && !b })
   val issueSel = PriorityEncoderOH(issuable)
 
@@ -60,7 +60,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   for((d, i) <- dec.zip(issueSel)) d.ready := i && s0step
 
-  val regfiles = for(i <- 0 until param.SMEP) yield Module(new RegFile(i))
+  val regfiles = for(i <- 0 until param.pipeCnt) yield Module(new RegFile(i))
   for((r, u) <- regfiles.zip(s0uops)) {
     r.read(0).num := u.rs1
     r.read(1).num := u.rs2
@@ -180,7 +180,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
   assert(!(valid && uop.isAM && biu.msg.fire) || s0step)
 
   val isWFI = uop.isSystem && uop.funct3 === 0.U && uop.rs2 === 5.U
-  val idlings = RegInit(0.U(param.SMEP.W))
+  val idlings = RegInit(0.U(param.pipeCnt.W))
   val idlingsMasked: UInt = idlings | Mux(valid && isWFI, uop.smsel, 0.U)
 
   biu.br.ready := s0step && (idlingsMasked.orR || valid && isYield)
@@ -188,7 +188,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
   idlings := idlingsMasked & (~Mux(biu.br.fire, biuSel, 0.U)).asUInt // Yielding guy never transitions to idling
   ext.idlings := idlings
 
-  val biuBrs = for(i <- 0 until param.SMEP) yield {
+  val biuBrs = for(i <- 0 until param.pipeCnt) yield {
     val biuBr = Wire(Valid(UInt(32.W)))
     biuBr.valid := (idlingsMasked | Mux(valid && isYield, uop.smsel, 0.U))(i)
     biuBr.bits := MuxCase(param.initVec.U, Seq(

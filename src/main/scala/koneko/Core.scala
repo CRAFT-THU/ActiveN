@@ -25,7 +25,7 @@ class Core(implicit val params: CoreParameters) extends Module {
       val tag = UInt(16.W)
     }))
 
-    val idlings = Output(UInt(params.SMEP.W))
+    val idlings = Output(UInt(params.pipeCnt.W))
     val working = Output(Bool())
   })
 

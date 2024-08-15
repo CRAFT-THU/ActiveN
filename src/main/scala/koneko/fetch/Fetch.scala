@@ -13,16 +13,16 @@ class Fetch(implicit val params: CoreParameters) extends Module {
     val resp = Flipped(Valid(new MemResp))
   })
   val ctrl = IO(new Bundle {
-    val br = Vec(params.SMEP, Flipped(Valid(UInt(32.W))))
+    val br = Vec(params.pipeCnt, Flipped(Valid(UInt(32.W))))
   })
-  val decoded = IO(Vec(params.SMEP, Decoupled(new uOp)))
-  val busy = IO(Input(UInt(params.SMEP.W)))
+  val decoded = IO(Vec(params.pipeCnt, Decoupled(new uOp)))
+  val busy = IO(Input(UInt(params.pipeCnt.W)))
 
   // PC Control
   val step = WireDefault(false.B)
 
-  val pcs = RegInit(VecInit(Seq.fill(params.SMEP)(params.initVec.U(32.W))))
-  val fetchable = Wire(UInt(params.SMEP.W))
+  val pcs = RegInit(VecInit(Seq.fill(params.pipeCnt)(params.initVec.U(32.W))))
+  val fetchable = Wire(UInt(params.pipeCnt.W))
   val sel = PriorityEncoderOH(fetchable)
   for(((pc, b), fetch) <- (pcs.zip(ctrl.br).zip(sel.asBools))) {
     pc := Mux(b.valid, b.bits, pc + Mux(fetch && step, 4.U, 0.U))
@@ -55,8 +55,8 @@ class Fetch(implicit val params: CoreParameters) extends Module {
   decode.smsel := sel
   decode.instr := instrReadout
 
-  val decodedHolding = for(_ <- 0 until params.SMEP) yield Reg(new uOp)
-  val decodedHoldingValid = for(_ <- 0 until params.SMEP) yield RegInit(false.B)
+  val decodedHolding = for(_ <- 0 until params.pipeCnt) yield Reg(new uOp)
+  val decodedHoldingValid = for(_ <- 0 until params.pipeCnt) yield RegInit(false.B)
   for(((d, dec), idx) <- decodedHoldingValid.zip(decoded).zipWithIndex) {
     d := MuxCase(d, Seq(
       (refilling || dec.ready) -> false.B,
