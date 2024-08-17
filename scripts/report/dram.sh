@@ -8,8 +8,13 @@ function extract() {
   RESULT=$(for LOG in $(find $WORKDIR/dram | grep dramsim3.txt); do
     grep $KW $LOG | awk '{ print $3 }'
   done | python $DIR/sum.py)
-  echo "$2: $RESULT"
+  echo "$RESULT"
 }
 
-extract average_power "Average Power (mW)"
-extract average_bandwidth "Average Bandwidth (GB/s)"
+AVG_BW=$(extract average_bandwidth)
+echo -e "DRAM:\n  Average Bandwidth (GB/s): $AVG_BW"
+
+TOT_CYC=$(extract num_cycles)
+ACT_CYC=$(extract rank_active_cycles)
+ACT_RATIO=$(python -c "print(100 * $ACT_CYC / $TOT_CYC)")
+echo "  Active Cycles: $ACT_RATIO%"

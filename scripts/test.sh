@@ -8,3 +8,6 @@ mkdir -p work
 
 # Run MVC test
 ./scripts/tasks/mvc.sh $BASE/work/mvc
+
+# Run scalability test
+./scripts/tasks/scalability.sh $BASE/work/scalability
