@@ -271,7 +271,7 @@ fn main() -> anyhow::Result<()> {
 
     if args.mnist.is_some() {
         assert_eq!(args.tot_neuron, 28 * 28 + 10);
-        assert_eq!(args.pre_simulate, 0);
+        assert_eq!(args.pre_simulate, 1);
     }
 
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(args.seed);

@@ -33,7 +33,8 @@ function work() {
   export MEOW_MEM_LOG="$WORKDIR/single/dram"
   mkdir -p $MEOW_MEM_LOG
   export MEOW_MEM_CNT=1
-  $BASE/work/bin/sim.single | tee $WORKDIR/single/log.txt
+  # The double in sim.double means SMT = 2
+  $BASE/work/bin/sim.double | tee $WORKDIR/single/log.txt
   echo "======= Simulator (single dram): Ret value: $?"
 
   export MEOW_TEXT=$WORKDIR/text/test.double.bin
@@ -42,6 +43,8 @@ function work() {
   export MEOW_MEM_CNT=2
   $BASE/work/bin/sim.double | tee $WORKDIR/double/log.txt
   echo "======= Simulator (double dram): Ret value: $?"
+
+  rm -rf $MEOW_DATA
 }
 
 work | tee $WORKDIR/log.full.txt

@@ -37,7 +37,7 @@ uint32_t *text_aligned;
 
 bool exiting = false;
 
-const size_t SMT_RATIO = 2;
+const size_t SMT_RATIO = AN_PIPE_CNT;
 
 void sighandler(int s) {
   exiting = true;
@@ -372,7 +372,7 @@ static inline void tick() {
       c->working_cycle_cnt += 1;
   }
 
-  if(global_tick % 1000 == 0) {
+  if(LOG && global_tick % 1000 == 0) {
       cout<<"[Meow] Core 0 reamining flit cnt: "<<cores[0]->in_flits.size()<<endl;
   }
   if(global_tick % 10000 == 0) {
@@ -417,7 +417,7 @@ static inline void dram_tick() {
   }
 }
 
-bool meow_noc_tick(int inflight) {
+bool meow_noc_tick(int inflight, uint64_t next) {
   noc_tick += 1;
   while(global_tick <= noc_tick * core_freq_ratio) tick();
   while(mem_tick <= noc_tick * mem_freq_ratio) dram_tick();
@@ -427,10 +427,10 @@ bool meow_noc_tick(int inflight) {
   for(auto &c : cores) if(c->core->ext_idlings != (1 << SMT_RATIO) - 1) all_idling = false;
 
   if(global_tick % 1000 == 0) {
-    cout<<"[Meow] noc inflight flits: "<<inflight<<endl;
+    if(LOG) cout<<"[Meow] noc inflight flits: "<<inflight<<", next at tick "<<next<<endl;
     std::cout<<"[Meow M"<<mem_tick<<"] memory outstanding: ";
     for(auto &m : mem) std::cout<<m.dram_pending.size()<<", ";
-    std::cout<<"[Meow M"<<mem_tick<<"] total: "<<dram_ticket_gen<<endl;
+    std::cout<<"\n[Meow M"<<mem_tick<<"] total: "<<dram_ticket_gen<<endl;
   }
   bool done = all_idling && inflight == 0;
   if(done) {
@@ -625,7 +625,7 @@ int main(int argc, char **argv) {
     for(int16_t i = 0; i < MEM_CNT; ++i)
       if(auto flits = meow_accept_flit_dram(i))
         for(auto &flit : *flits) {
-          int dist = get_dist(i, flit.dst);
+          int dist = get_dist(-i-1, flit.dst);
           auto &tq = flit.dst < 0 ? dram_incoming[-flit.dst-1] : core_incoming[flit.dst];
           int pid = pid_gen;
           if(flit.last) pid_gen++;
@@ -633,12 +633,20 @@ int main(int argc, char **argv) {
         }
 
     int inflights = 0;
-    for(auto &q : core_incoming) inflights += q.size();
+    uint64_t next = 0;
+    for(auto &q : core_incoming) {
+      inflights += q.size();
+      if(q.size() > 0) {
+        uint64_t next_tick = q.begin()->first;
+        if(next_tick > next) next = next_tick;
+      }
+    }
     for(auto &q : dram_incoming) inflights += q.size();
 
-    bool done = meow_noc_tick(inflights);
+    bool done = meow_noc_tick(inflights, next);
     ++tick;
 
+#ifdef MEOW_BLOCKING_DETECTION
     bool blocked = false;
     for(auto &c : cores) if(c->in_flits.size() > 1024) blocked = true;
     if(!blocked) {
@@ -646,6 +654,9 @@ int main(int argc, char **argv) {
     } else if(LOG) {
       std::cout<<"[Meow] NoC stalled on tick "<<tick<<std::endl;
     }
+#else
+    ++ext_in_tick;
+#endif // MEOW_BLOCKING_DETECTION
 
     if(done && tick > 1000) break;
     if(exiting && tick > 1000) break;

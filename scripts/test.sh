@@ -11,3 +11,6 @@ mkdir -p work
 
 # Run scalability test
 ./scripts/tasks/scalability.sh $BASE/work/scalability
+
+# Run enhanced core test
+./scripts/tasks/enhancement.sh $BASE/work/enhancement

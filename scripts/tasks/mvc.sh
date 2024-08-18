@@ -43,6 +43,8 @@ function work() {
   echo "======= Data generator: Ret value: $?"
   $BASE/work/bin/sim.double
   echo "======= Simulator: Ret value: $?"
+
+  rm -rf $MEOW_DATA
 }
 
 work | tee $WORKDIR/log.txt

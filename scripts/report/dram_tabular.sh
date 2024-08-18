@@ -11,5 +11,8 @@ function extract() {
   echo "$RESULT"
 }
 
-DRAM_POWER=$(extract average_power)
-python $DIR/ppa_static.py ${DRAM_POWER}
+AVG_BW=$(node -e "console.log(($(extract average_bandwidth)).toFixed(3))")
+TOT_CYC=$(extract num_cycles)
+ACT_CYC=$(extract rank_active_cycles)
+ACT_RATIO=$(node -e "console.log((100 * $ACT_CYC / $TOT_CYC).toFixed(3))")
+echo -en "$AVG_BW\t$ACT_RATIO%"

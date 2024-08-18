@@ -1,0 +1,9 @@
+> Note.
+> The utilization numbers differs from the ones presented in
+> our paper, especially for the MNIST task. This is because
+> the data in the paper was recorded before the revision. During
+> and after the revision we've optimized the synchronization
+> procedure after each round, which cause the utilization to drop.
+> This change is most obvious in tasks with shorter rounds (e.g.
+> MNIST with ~2k cycle/round). The speedup introduced by the
+> enhanced core stays relatively consistent.

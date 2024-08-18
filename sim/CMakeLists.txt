@@ -7,6 +7,12 @@ set(CMAKE_C_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+if (DEFINED ENV{AN_PIPE_CNT})
+  add_compile_definitions(AN_PIPE_CNT=$ENV{AN_PIPE_CNT})
+else()
+  add_compile_definitions(AN_PIPE_CNT=2)
+endif()
+
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 find_package(verilator HINTS $ENV{VERILATOR_ROOT})
