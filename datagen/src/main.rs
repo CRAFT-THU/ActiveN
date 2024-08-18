@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::{collections::HashMap, fs::File, path::PathBuf};
 
 use byteorder::ByteOrder;
@@ -5,13 +6,13 @@ use byteorder::LittleEndian;
 use byteorder::WriteBytesExt;
 use clap::Parser;
 use rand::seq::SliceRandom;
-use rand::{SeedableRng, Rng};
-use rand_distr::{Geometric, Distribution, Uniform};
+use rand::{Rng, SeedableRng};
+use rand_distr::{Distribution, Geometric, Uniform};
 use rand_xoshiro::Xoshiro256PlusPlus;
-use std::io::Write;
+use serde::Deserialize;
 use std::io::BufReader;
 use std::io::BufWriter;
-use serde::Deserialize;
+use std::io::Write;
 
 #[derive(Parser)]
 struct Args {
@@ -29,25 +30,25 @@ struct Args {
 
     // #[clap(short, long, default_value="1000")]
     // neuron_per_core: usize,
-    #[clap(short, long, default_value="82601")]
+    #[clap(short, long, default_value = "82601")]
     tot_neuron: usize,
 
-    #[clap(long, default_value="0.081167")]
+    #[clap(long, default_value = "0.081167")]
     connectivity: f64,
 
-    #[clap(short, long, default_value="100")]
+    #[clap(short, long, default_value = "100")]
     pre_simulate: usize,
 
-    #[clap(long, default_value="0.1")]
+    #[clap(long, default_value = "0.1")]
     tau: f32,
 
-    #[clap(long, default_value="15")]
+    #[clap(long, default_value = "15")]
     threshold: f32,
 
-    #[clap(long, default_value="19260817")]
+    #[clap(long, default_value = "19260817")]
     seed: u64,
 
-    #[clap(long, default_value="0.273786")]
+    #[clap(long, default_value = "0.273786")]
     inh_ratio: f64,
 
     #[clap(short, long)]
@@ -55,6 +56,12 @@ struct Args {
 
     #[clap(long)]
     dump_genn: Option<PathBuf>,
+
+    #[clap(long)]
+    sudoku: bool,
+
+    #[clap(long)]
+    mnist: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -74,7 +81,7 @@ struct Neuron {
 
 #[derive(Default, Clone)]
 struct Core {
-    neurons: Vec<Neuron>
+    neurons: Vec<Neuron>,
 }
 
 fn dump(base: &PathBuf, cores: &Vec<Core>) -> anyhow::Result<()> {
@@ -159,7 +166,9 @@ fn dump_genn(base: &PathBuf, cores: &Vec<Core>) -> anyhow::Result<()> {
         for n in c.neurons.iter() {
             let mut cnt = 0;
             for neigh in n.neigh.iter() {
-                output.write_u32::<LittleEndian>(prefix_sum[neigh.core as usize] as u32 + neigh.neuron as u32)?;
+                output.write_u32::<LittleEndian>(
+                    prefix_sum[neigh.core as usize] as u32 + neigh.neuron as u32,
+                )?;
                 cnt += 1;
             }
 
@@ -188,21 +197,82 @@ fn dump_genn(base: &PathBuf, cores: &Vec<Core>) -> anyhow::Result<()> {
 
 #[derive(Deserialize)]
 struct NestNode {
-  s: f32,
-  t: f32,
-  r: f32,
-  id: usize,
+    s: f32,
+    t: f32,
+    r: f32,
+    id: usize,
 }
 
 #[derive(Deserialize)]
 struct NestConn {
-  s: usize,
-  t: usize,
-  w: f32,
+    s: usize,
+    t: usize,
+    w: f32,
+}
+
+struct SudokuIterator {
+    x: usize,
+    y: usize,
+    digit: usize,
+    sub: usize,
+    pop: usize,
+}
+
+impl SudokuIterator {
+    fn new(pop: usize) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            digit: 0,
+            sub: 0,
+            pop,
+        }
+    }
+}
+
+impl Iterator for SudokuIterator {
+    type Item = (usize, usize, usize, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.x >= 9 {
+            return None;
+        }
+
+        let ret = (self.x, self.y, self.digit, self.sub);
+        if self.sub < self.pop - 1 {
+            self.sub += 1;
+            return Some(ret);
+        }
+        self.sub = 0;
+
+        if self.digit < 8 {
+            self.digit += 1;
+            return Some(ret);
+        }
+        self.digit = 0;
+
+        if self.y < 8 {
+            self.y += 1;
+            return Some(ret);
+        }
+        self.y = 0;
+
+        self.x += 1;
+        return Some(ret);
+    }
 }
 
 fn main() -> anyhow::Result<()> {
     let mut args = Args::parse();
+
+    if args.sudoku {
+        assert_eq!(args.tot_neuron % (9 * 9 * 9), 0);
+    }
+
+    if args.mnist.is_some() {
+        assert_eq!(args.tot_neuron, 28 * 28 + 10);
+        assert_eq!(args.pre_simulate, 0);
+    }
 
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(args.seed);
 
@@ -214,14 +284,20 @@ fn main() -> anyhow::Result<()> {
     let inj_weight_dist = Uniform::new(0.3, 0.8);
     let init_state_dist = Uniform::new(0f32, args.threshold);
 
-    let mut nest_nodes: Option<Vec<NestNode>> = args.load_nest_nodes.as_ref().map(|p| serde_json::from_reader(BufReader::new(std::fs::File::open(p).unwrap())).unwrap());
-    let nest_conns: Option<Vec<NestConn>> = args.load_nest_conns.as_ref().map(|p| serde_json::from_reader(BufReader::new(std::fs::File::open(p).unwrap())).unwrap());
+    let mut nest_nodes: Option<Vec<NestNode>> = args
+        .load_nest_nodes
+        .as_ref()
+        .map(|p| serde_json::from_reader(BufReader::new(std::fs::File::open(p).unwrap())).unwrap());
+    let nest_conns: Option<Vec<NestConn>> = args
+        .load_nest_conns
+        .as_ref()
+        .map(|p| serde_json::from_reader(BufReader::new(std::fs::File::open(p).unwrap())).unwrap());
 
     if let Some(ref mut nodes) = nest_nodes {
-      args.tot_neuron = nodes.len();
-      if args.nest_randomize {
-        nodes.as_mut_slice().shuffle(&mut rng);
-      }
+        args.tot_neuron = nodes.len();
+        if args.nest_randomize {
+            nodes.as_mut_slice().shuffle(&mut rng);
+        }
     }
 
     let mut core_nn_cnt = vec![args.tot_neuron / args.core_cnt; args.core_cnt];
@@ -236,75 +312,211 @@ fn main() -> anyhow::Result<()> {
     let mut nest_iter = 0;
     let mut nest_rev_map: HashMap<usize, (usize, usize)> = HashMap::new();
 
+    let mut sudoku_rev_map: HashMap<(usize, usize, usize, usize), (usize, usize)> = HashMap::new();
+
     for core in 0..args.core_cnt {
-      println!("Gen: core {}", core);
-      cores[core].neurons.reserve(core_nn_cnt[core]);
-      if let Some(ref nodes) = nest_nodes {
-        for nid in 0..core_nn_cnt[core] {
-            assert!(nest_iter < nodes.len());
-            let node = &nodes[nest_iter];
+        println!("Gen: core {}", core);
+        cores[core].neurons.reserve(core_nn_cnt[core]);
+        if let Some(ref nodes) = nest_nodes {
+            for nid in 0..core_nn_cnt[core] {
+                assert!(nest_iter < nodes.len());
+                let node = &nodes[nest_iter];
 
-            nest_rev_map.insert(node.id, (core, nid));
-            nest_iter += 1;
+                nest_rev_map.insert(node.id, (core, nid));
+                nest_iter += 1;
 
-            let state_ratio = (node.s - node.r) / (node.t - node.r);
-            let state = state_ratio * args.threshold;
+                let state_ratio = (node.s - node.r) / (node.t - node.r);
+                let state = state_ratio * args.threshold;
 
-            let INIT_FIRING_RATE = 0.1;
-            let fired = rng.gen_bool(INIT_FIRING_RATE);
+                let INIT_FIRING_RATE = 0.1;
+                let fired = rng.gen_bool(INIT_FIRING_RATE);
 
-            cores[core].neurons.push(Neuron {
-                state,
-                input: if fired { 1000000000f32 } else { 0f32 },
-                inj: 0f32,
-                neigh: Vec::new(),
-            })
+                cores[core].neurons.push(Neuron {
+                    state,
+                    input: if fired { 1000000000f32 } else { 0f32 },
+                    inj: 0f32,
+                    neigh: Vec::new(),
+                })
+            }
+        } else if !args.sudoku && args.mnist.is_none() {
+            for _ in 0..core_nn_cnt[core] {
+                let is_inh = rng.gen_bool(args.inh_ratio);
+
+                let mut neigh = Vec::new();
+                let mut cur = 0u64;
+                let mut cur_core = 0usize;
+
+                loop {
+                    cur += neigh_dist.sample(&mut rng);
+
+                    while cur_core < args.core_cnt && cur as usize >= core_nn_cnt[cur_core] {
+                        cur -= core_nn_cnt[cur_core] as u64;
+                        cur_core += 1;
+                    }
+                    if cur_core >= args.core_cnt {
+                        break;
+                    }
+
+                    let w = if is_inh {
+                        inh_weight_dist
+                    } else {
+                        ext_weight_dist
+                    }
+                    .sample(&mut rng);
+                    neigh.push(Neigh {
+                        core: cur_core as u16,
+                        neuron: cur as u16,
+                        weight: w as f32,
+                    });
+                    cur += 1;
+                }
+
+                max_syn_per_neuron = max_syn_per_neuron.max(neigh.len());
+                let inj = inj_weight_dist.sample(&mut rng);
+
+                cores[core].neurons.push(Neuron {
+                    state: init_state_dist.sample(&mut rng),
+                    input: inj,
+                    inj,
+                    neigh,
+                })
+            }
         }
-      } else {
-        for _ in 0..core_nn_cnt[core] {
-          let is_inh = rng.gen_bool(args.inh_ratio);
+    }
 
-          let mut neigh = Vec::new();
-          let mut cur = 0u64;
-          let mut cur_core = 0usize;
+    if args.sudoku {
+        let pop = args.tot_neuron / (9 * 9 * 9);
+        let mut it: SudokuIterator = SudokuIterator::new(pop);
+        for c in 0..args.core_cnt {
+            for n in 0..core_nn_cnt[c] {
+                let ident = it.next().unwrap();
 
-          loop {
-            cur += neigh_dist.sample(&mut rng);
+                sudoku_rev_map.insert(ident, (c, cores[c].neurons.len()));
 
-            while cur_core < args.core_cnt && cur as usize >= core_nn_cnt[cur_core] {
-                cur -= core_nn_cnt[cur_core] as u64;
-                cur_core += 1;
-              }
-              if cur_core >= args.core_cnt {
-                  break;
-              }
-
-              let w = if is_inh { inh_weight_dist } else { ext_weight_dist } .sample(&mut rng);
-              neigh.push(Neigh {
-                  core: cur_core as u16,
-                  neuron: cur as u16,
-                  weight: w as f32
-              });
-              cur += 1;
-          }
-
-          max_syn_per_neuron = max_syn_per_neuron.max(neigh.len());
-          let inj = inj_weight_dist.sample(&mut rng);
-
-          cores[core].neurons.push(Neuron {
-              state: init_state_dist.sample(&mut rng),
-              input: inj,
-              inj,
-              neigh,
-          })
+                cores[c].neurons.push(Neuron {
+                    state: init_state_dist.sample(&mut rng) * 2.0,
+                    input: 0f32,
+                    inj: 0f32,
+                    neigh: Vec::new(),
+                });
+            }
         }
-      }
+
+        assert_eq!(it.next(), None);
+        let mut coll = Vec::new();
+
+        for (ident, at) in sudoku_rev_map.iter() {
+            coll.clear();
+
+            // Ext
+            for sub in 0..pop {
+                let sub_at = sudoku_rev_map
+                    .get(&(ident.0, ident.1, ident.2, sub))
+                    .unwrap();
+                coll.push((sub_at.0, sub_at.1, true));
+            }
+
+            // Inh
+            for digit in 0..9 {
+                if digit != ident.2 {
+                    for sub in 0..pop {
+                        let sub_at = sudoku_rev_map.get(&(ident.0, ident.1, digit, sub)).unwrap();
+                        coll.push((sub_at.0, sub_at.1, false));
+                    }
+                }
+            }
+            for x in 0..9 {
+                if x != ident.0 {
+                    for sub in 0..pop {
+                        let sub_at = sudoku_rev_map.get(&(x, ident.1, ident.2, sub)).unwrap();
+                        coll.push((sub_at.0, sub_at.1, false));
+                    }
+                }
+            }
+
+            for y in 0..9 {
+                if y != ident.1 {
+                    for sub in 0..pop {
+                        let sub_at = sudoku_rev_map.get(&(ident.0, y, ident.2, sub)).unwrap();
+                        coll.push((sub_at.0, sub_at.1, false));
+                    }
+                }
+            }
+
+            let bx = (ident.0 / 3) * 3;
+            let by = (ident.1 / 3) * 3;
+
+            for x in bx..(bx + 3) {
+                for y in by..(by + 3) {
+                    if x != ident.0 && y != ident.1 {
+                        for sub in 0..pop {
+                            let sub_at = sudoku_rev_map.get(&(x, y, ident.2, sub)).unwrap();
+                            coll.push((sub_at.0, sub_at.1, false));
+                        }
+                    }
+                }
+            }
+
+            coll.sort();
+
+            cores[at.0].neurons[at.1].neigh.reserve(coll.len());
+            for (c, n, ext) in coll.iter() {
+                let w = if *ext { 2.5f32 } else { -1.2f32 / 36f32 };
+                cores[at.0].neurons[at.1].neigh.push(Neigh {
+                    core: *c as u16,
+                    neuron: *n as u16,
+                    weight: w,
+                });
+            }
+        }
+    }
+
+    if let Some(ref probability) = args.mnist {
+        let mut all = Vec::new();
+        for c in 0..args.core_cnt {
+            for n in 0..core_nn_cnt[c] {
+                all.push((c, n));
+                cores[c].neurons.push(Neuron {
+                    state: 0f32,
+                    input: 0f32,
+                    inj: 0f32,
+                    neigh: Vec::new(),
+                });
+            }
+        }
+
+        let targets: HashSet<_> = all.choose_multiple(&mut rng, 10).collect();
+        for c in 0..args.core_cnt {
+            for n in 0..core_nn_cnt[c] {
+                if targets.contains(&(c, n)) {
+                    continue;
+                }
+                for t in targets.iter() {
+                    cores[c].neurons[n].neigh.push(Neigh {
+                        core: t.0 as u16,
+                        neuron: t.1 as u16,
+                        weight: 0f32,
+                    })
+                }
+                if rng.gen_bool(*probability) {
+                    cores[c].neurons[n].input = 1000000000f32;
+                }
+            }
+        }
     }
 
     if let Some(conns) = nest_conns {
         for conn in conns.iter() {
-            let (sc, sid) = if let Some(i) = nest_rev_map.get(&conn.s) { i } else { continue };
-            let (tc, tid) = if let Some(i) = nest_rev_map.get(&conn.t) { i } else { continue };
+            let (sc, sid) = if let Some(i) = nest_rev_map.get(&conn.s) {
+                i
+            } else {
+                continue;
+            };
+            let (tc, tid) = if let Some(i) = nest_rev_map.get(&conn.t) {
+                i
+            } else {
+                continue;
+            };
             let neuron = &mut cores[*sc].neurons[*sid];
             neuron.neigh.push(Neigh {
                 core: *tc as u16,
@@ -317,7 +529,7 @@ fn main() -> anyhow::Result<()> {
 
     println!("Gen done, max syn per neuron = {}", max_syn_per_neuron);
 
-    // Simulate 
+    // Simulate
     for i in 0..args.pre_simulate {
         println!("Round {}...", i);
 
@@ -349,7 +561,8 @@ fn main() -> anyhow::Result<()> {
 
                     for neigh in 0..cores[c].neurons[n].neigh.len() {
                         let neigh = cores[c].neurons[n].neigh[neigh].clone();
-                        cores[neigh.core as usize].neurons[neigh.neuron as usize].input += neigh.weight;
+                        cores[neigh.core as usize].neurons[neigh.neuron as usize].input +=
+                            neigh.weight;
                     }
                 } else {
                     cores[c].neurons[n].state *= e_neg_tau;
@@ -357,7 +570,12 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        println!("\nRound {}, firing rate {} ({})", i, fired as f64 / args.tot_neuron as f64, fired);
+        println!(
+            "\nRound {}, firing rate {} ({})",
+            i,
+            fired as f64 / args.tot_neuron as f64,
+            fired
+        );
     }
 
     Ok(())
