@@ -53,15 +53,23 @@ object InstrALU2Imm extends BoolDecodeField[InstrPattern] {
 object InstrRDALU extends BoolDecodeField[InstrPattern] {
   override def name: String = "Decode RD ALU"
   override def genTable(op: InstrPattern): BitPat = (op.name match {
-    case "OP" | "OP-IMM" | "AUIPC" => y
+    case "OP" | "OP-IMM" => y
     case _ => n
   })
 }
 
-object InstrRDImm extends BoolDecodeField[InstrPattern] {
-  override def name: String = "Decode RD Imm"
+object InstrRDLUI extends BoolDecodeField[InstrPattern] {
+  override def name: String = "Decode RD LUI"
   override def genTable(op: InstrPattern): BitPat = (op.name match {
     case "LUI" => y
+    case _ => n
+  })
+}
+
+object InstrRDAUIPC extends BoolDecodeField[InstrPattern] {
+  override def name: String = "Decode RD AUIPC"
+  override def genTable(op: InstrPattern): BitPat = (op.name match {
+    case "AUIPC" => y
     case _ => n
   })
 }
@@ -146,7 +154,6 @@ object InstrIsFP extends BoolDecodeField[InstrPattern] {
  * [5, 10] is consistent
  * 11
  * Mid = [12, 19] is consistent (Or extended)
- * High = [20, 31]
  */
 
 object ImmLowFormat extends BoolDecodeField[InstrPattern] {
@@ -172,18 +179,19 @@ object Imm11Format extends DecodeField[InstrPattern, UInt] {
 object ImmMidFormat extends BoolDecodeField[InstrPattern] {
   override def name: String = "Decode ImmMid = [12, 19] Format (normal = y, extended instr[31] = n)"
   override def genTable(op: InstrPattern): BitPat = (op.ty match {
-    case InstrType.J | InstrType.U => y
+    case InstrType.J => y
     case InstrType.B | InstrType.I | InstrType.S => n
-    case InstrType.R => dc // R doesn't care about imm
+    case InstrType.R | InstrType.U => dc // R doesn't care about imm
   })
 }
 
-object ImmHighFormat extends BoolDecodeField[InstrPattern] {
-  override def name: String = "Decode ImmHigh = [20, 31] Format (normal = y, extended instr[31] = n)"
+// Used for cimm
+object InstrIsU extends BoolDecodeField[InstrPattern] {
+  override def name: String = "Decode is U-type"
   override def genTable(op: InstrPattern): BitPat = (op.ty match {
     case InstrType.U => y
-    case InstrType.J | InstrType.B | InstrType.I | InstrType.S => n
-    case InstrType.R => dc // R doesn't care about imm
+    case InstrType.R => dc
+    case _ => n
   })
 }
 
@@ -222,13 +230,14 @@ class Decode(implicit val params: CoreParameters) extends Module {
 
   val dectraits = Seq(
     InstrAdder1PC, InstrAdder2Imm, InstrALU2Imm,
-    InstrRDALU, InstrRDImm, InstrRDPCLink, InstrRDIgnore,
+    InstrRDALU, InstrRDLUI, InstrRDAUIPC, InstrRDPCLink, InstrRDIgnore,
     InstrIsJump, InstrIsBranch,
     InstrIsMem, InstrMemIsWrite,
     InstrIsSystem,
     InstrIsAM,
     InstrIsFP,
-    ImmLowFormat, Imm11Format, ImmMidFormat, ImmHighFormat
+    ImmLowFormat, Imm11Format, ImmMidFormat,
+    InstrIsU,
   )
   val dectbl = new DecodeTable(opcodes, dectraits);
   val decout = dectbl.decode(instr(6, 2))
@@ -240,7 +249,8 @@ class Decode(implicit val params: CoreParameters) extends Module {
   decoded.rdignore := decout(InstrRDIgnore)
   decoded.rdalu := decout(InstrRDALU)
   decoded.rdpclink := decout(InstrRDPCLink)
-  decoded.rdimm := decout(InstrRDImm)
+  decoded.rdlui := decout(InstrRDLUI)
+  decoded.rdauipc := decout(InstrRDAUIPC)
   decoded.isJump := decout(InstrIsJump)
   decoded.isBr := decout(InstrIsBranch)
   decoded.isMem := decout(InstrIsMem)
@@ -258,7 +268,7 @@ class Decode(implicit val params: CoreParameters) extends Module {
     instr(31),
   )))
   val imm_12_19 = Mux(decout(ImmMidFormat), instr(19, 12), VecInit(Seq.fill(8)(instr(31))).asUInt)
-  val imm_20_31 = Mux(decout(ImmHighFormat), instr(31, 20), VecInit(Seq.fill(12)(instr(31))).asUInt)
-
-  decoded.imm := imm_20_31 ## imm_12_19 ## imm_11 ## imm_5_10 ## imm_0_4
+  val cimm_low = instr(31) ## imm_12_19 ## imm_11 ## imm_5_10 ## imm_0_4
+  val cimm_high = instr(31) ## instr(31, 12)
+  decoded.cimm := Mux(decout(InstrIsU), cimm_high, cimm_low)
 }

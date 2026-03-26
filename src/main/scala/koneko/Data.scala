@@ -20,7 +20,8 @@ class uOp(implicit val param: CoreParameters) extends Bundle {
   val alu2imm = Bool()
   val rdalu = Bool()
   val rdpclink = Bool()
-  val rdimm = Bool()
+  val rdlui = Bool()
+  val rdauipc = Bool()
   val rdignore = Bool()
 
   val isJump = Bool()
@@ -40,7 +41,8 @@ class uOp(implicit val param: CoreParameters) extends Bundle {
   val rd = UInt(5.W)
 
   val pc = UInt(32.W)
-  val imm = UInt(32.W)
+  // Compressed IMM, either imm[20:0] or imm [31:12]
+  val cimm = UInt(21.W)
 
   // Actually embedded inside imm
   val funct7 = UInt(7.W)
@@ -49,4 +51,7 @@ class uOp(implicit val param: CoreParameters) extends Bundle {
   val smsel = UInt(param.pipeCnt.W)
 
   def isMul = rdalu && !alu2imm && funct7(1)
+
+  def immExt = VecInit(Seq.fill(11)(cimm(20))).asUInt ## cimm
+  def immU = cimm(19, 0) ## 0.U(12.W)
 }

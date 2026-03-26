@@ -84,13 +84,13 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   ext.working := valid
 
-  // rs1 + rs2, used for AUIPC, Load/Store addresses, and OP +
+  // rs1 + rs2, used for Branch addresses, Load/Store addresses, and OP +
   val adder1val = Mux(uop.adder1pc, uop.pc, rs1val)
-  val adder2val = Mux(uop.adder2imm, uop.imm, rs2val)
+  val adder2val = Mux(uop.adder2imm, uop.immExt, rs2val)
   val added = adder1val + adder2val
 
   // Rest of ALU
-  val alu2 = Mux(uop.alu2imm, uop.imm, rs2val)
+  val alu2 = Mux(uop.alu2imm, uop.immExt, rs2val)
   val isMul = !uop.alu2imm && uop.funct7(1)
 
   // Comparisions, used for branches and
@@ -220,7 +220,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
   val csrwmapping = csrmapping.filter({ e => (e._1 >> 10) != 3 })
   val isCSR = uop.isSystem && uop.funct3(1, 0) =/= 0.U
   val csrUimmExt = Wire(UInt(32.W))
-  val csrIdx = uop.imm(11, 0)
+  val csrIdx = uop.cimm(11, 0)
   csrUimmExt := uop.rs1
   val csrWraw = Mux(uop.funct3(2), csrUimmExt, rs1val)
   for((i, c) <- csrwmapping) {
@@ -241,16 +241,15 @@ class Exec(implicit val param: CoreParameters) extends Module {
   /*
    * RD arbitration
    * - JAL[R]: pclink
-   * - AUIPC, OP[-IMM]: aluval
-   * - LUI: uop.imm
+   * - OP[-IMM]: aluval
+   * - LUI: uop.cimm
+   * - AUIPC: uop.cimm + pc
    */
-  // AUIPC: adder1pc selects PC into the adder, always use added (PC+imm)
-  // OP/OP-IMM: use ealuval (ALU result based on funct3)
-  val aluOrAdded = Mux(uop.adder1pc, added, ealuval)
   val rdsrc = Seq(
     uop.rdalu -> aluOrAdded,
     uop.rdpclink -> pclink,
-    uop.rdimm -> (uop.imm >> 12) ## 0.U(12.W),
+    uop.rdlui -> uop.immU,
+    uop.rdauipc -> (uop.immU + uop.pc),
     uop.isMem -> lsu.resp,
     uop.isSystem -> csrRdata, // Only CSR here
   )

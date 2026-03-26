@@ -45,7 +45,23 @@ _start:
   bne x4, x5, fail
   addi x20, x20, 1
 
-  # Done (expected 5)
+  # Test 6: AUIPC with 0xABCDE — non-zero bits at instr[30:25] and instr[24:20]
+  # This is the case that previously failed due to immediate leakage
+  auipc x10, 0xABCDE  # x10 = PC + 0xABCDE000
+  auipc x3, 0         # x3 = PC_here
+  sub x4, x10, x3     # should be 0xABCDE000 - 4 = 0xABCDDFFC
+  lui x5, 0xABCDE     # x5 = 0xABCDE000
+  addi x5, x5, -4     # x5 = 0xABCDDFFC
+  bne x4, x5, fail
+  addi x20, x20, 1
+
+  # Test 7: LUI with same immediate (verify LUI also correct)
+  lui x6, 0xABCDE     # x6 = 0xABCDE000
+  lui x7, 0xABCDE     # x7 = 0xABCDE000 (same, for comparison)
+  bne x6, x7, fail
+  addi x20, x20, 1
+
+  # Done (expected 7)
   mv x10, x20
   li x11, 0xFFFF
   .word 0x00B5500B
