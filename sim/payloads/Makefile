@@ -1,4 +1,4 @@
-.PHONY: clean
+.PHONY: clean all-tests
 
 default: test.single.bin test.double.bin
 
@@ -18,6 +18,27 @@ test.single: test.S
 test.single.bin: test.single
 	${PREFIX}objcopy -j .text -j .data -O binary ./test.single test.single.bin
 
+# Assembly tests (RV32IMF)
+ASM_SRCS := $(wildcard asm/*.S)
+ASM_BINS := $(ASM_SRCS:.S=.bin)
+
+asm/%.bin: asm/%.S linker.ld
+	${PREFIX}gcc -mabi=ilp32 -march=rv32imf_zicsr -nostdlib -nostartfiles -Wl,-T,linker.ld -o asm/$*.elf $<
+	${PREFIX}objcopy -j .text -j .data -O binary asm/$*.elf $@
+	rm -f asm/$*.elf
+
+# C tests (RV32I, -O1)
+C_SRCS := $(wildcard c/*.c)
+C_BINS := $(C_SRCS:.c=.bin)
+
+c/%.bin: c/%.c c/crt0.S c/linker_c.ld
+	${PREFIX}gcc -mabi=ilp32 -march=rv32i -nostdlib -nostartfiles -Wl,-T,c/linker_c.ld -O1 -o c/$*.elf c/crt0.S $<
+	${PREFIX}objcopy -j .text -j .data -O binary c/$*.elf $@
+	rm -f c/$*.elf
+
+all-tests: $(ASM_BINS) $(C_BINS)
+
 clean:
 	rm -f test.single test.double test.single.bin test.double.bin
+	rm -f asm/*.bin asm/*.elf c/*.bin c/*.elf
 

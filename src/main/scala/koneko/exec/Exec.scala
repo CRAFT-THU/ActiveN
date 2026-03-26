@@ -32,6 +32,11 @@ class Exec(implicit val param: CoreParameters) extends Module {
     val hartid = UInt(32.W)
   }))
 
+  val lsuMem = IO(new Bundle {
+    val req = Decoupled(new MemReq)
+    val resp = Flipped(Valid(new MemResp))
+  })
+
   //////////////////////////
   // Cfg CSRS
   //////////////////////////
@@ -145,7 +150,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   // LSU
   val lsu = Module(new LSU)
-  lsu.hartid := cfg.hartid
+  lsu.mem <> lsuMem
 
   lsu.req.bits.addr := added
   lsu.req.bits.len.b := uop.funct3(1, 0) === 0.U
@@ -239,9 +244,11 @@ class Exec(implicit val param: CoreParameters) extends Module {
    * - AUIPC, OP[-IMM]: aluval
    * - LUI: uop.imm
    */
+  // AUIPC: adder1pc selects PC into the adder, always use added (PC+imm)
+  // OP/OP-IMM: use ealuval (ALU result based on funct3)
+  val aluOrAdded = Mux(uop.adder1pc, added, ealuval)
   val rdsrc = Seq(
-    // uop.rdalu -> aluval,
-    uop.rdalu -> ealuval,
+    uop.rdalu -> aluOrAdded,
     uop.rdpclink -> pclink,
     uop.rdimm -> (uop.imm >> 12) ## 0.U(12.W),
     uop.isMem -> lsu.resp,

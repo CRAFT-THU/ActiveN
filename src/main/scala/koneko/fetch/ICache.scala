@@ -19,12 +19,82 @@ class ICache(implicit val params: CoreParameters) extends Module {
   })
   val output = IO(DecoupledIO(UInt(32.W)))
 
-  /*(valid && isWFI)
+  /*
    * Storages
    */
-  // TODO: use SRAM API
   val metadata = Mem(params.i$Sets, Vec(params.i$Assoc, new Metadata))
   val data = Mem(params.i$Sets * params.i$BlockSize / 4, Vec(params.i$Assoc, UInt(32.W)))
+
+  // PLRU state: (assoc-1) bits per set, tree-based pseudo-LRU
+  val plruBits = if(params.i$Assoc > 1) params.i$Assoc - 1 else 0
+  val plruState = if(plruBits > 0) Some(Mem(params.i$Sets, UInt(plruBits.W))) else None
+
+  // PLRU helper: given tree state, find victim way index
+  def plruVictim(state: UInt): UInt = {
+    if(params.i$Assoc == 1) {
+      0.U
+    } else if(params.i$Assoc == 2) {
+      state(0)
+    } else {
+      // Tree-based PLRU for power-of-2 associativity
+      val depth = log2Up(params.i$Assoc)
+      val wayBits = Wire(Vec(depth, Bool()))
+      var node = 0.U(log2Up(plruBits).W)
+      for(level <- 0 until depth) {
+        if(level == 0) {
+          wayBits(level) := state(0)
+          node = 0.U
+        } else {
+          // Node index = 2*parent + 1 + direction
+          val nodeIdx = Wire(UInt(log2Up(plruBits).W))
+          nodeIdx := node * 2.U + 1.U + wayBits(level - 1).asUInt
+          // Read the state bit at this node
+          val nodeBits = VecInit((0 until plruBits).map(i => state(i)))
+          wayBits(level) := nodeBits(nodeIdx)
+          node = nodeIdx
+        }
+      }
+      wayBits.asUInt
+    }
+  }
+
+  // PLRU helper: update tree state after accessing a specific way
+  def plruUpdate(oldState: UInt, way: UInt): UInt = {
+    if(params.i$Assoc <= 1) {
+      0.U
+    } else if(params.i$Assoc == 2) {
+      // Point away from accessed way
+      ~way(0)
+    } else {
+      val depth = log2Up(params.i$Assoc)
+      val newState = Wire(Vec(plruBits, Bool()))
+      for(i <- 0 until plruBits) newState(i) := oldState(i)
+      // Walk from root to the leaf corresponding to 'way', flipping bits to point away
+      var nodeIdx = 0
+      for(level <- 0 until depth) {
+        val nodesAtLevel = 1 << level
+        for(n <- 0 until nodesAtLevel) {
+          val treeIdx = n + nodesAtLevel - 1
+          if(treeIdx < plruBits) {
+            // This node corresponds to ways that start at n * (assoc / nodesAtLevel)
+            val waysPerNode = params.i$Assoc / (nodesAtLevel * 2)
+            val leftStart = n * 2 * waysPerNode
+            val rightStart = leftStart + waysPerNode
+            // Check if 'way' is in left subtree (point right) or right subtree (point left)
+            val wayIdx = way
+            val inLeft = wayIdx >= leftStart.U && wayIdx < rightStart.U
+            val inRight = wayIdx >= rightStart.U && wayIdx < (rightStart + waysPerNode).U
+            when(inLeft) {
+              newState(treeIdx) := true.B  // Point right (away from accessed)
+            }.elsewhen(inRight) {
+              newState(treeIdx) := false.B // Point left (away from accessed)
+            }
+          }
+        }
+      }
+      newState.asUInt
+    }
+  }
 
   val s0pc = input.bits
   val s0pcidx = dontTouch((s0pc >> params.i$OffsetLen)(params.i$IndexLen - 1, 0))
@@ -37,12 +107,16 @@ class ICache(implicit val params: CoreParameters) extends Module {
   val s1pctag = dontTouch(s1pc >> (params.i$OffsetLen + params.i$IndexLen))
   val s1metadata = RegEnable(metadata(s0pcidx), s0step)
   val s1data = RegEnable(data(s0pcdataidx), s0step)
+  val s1plru = if(plruBits > 0) Some(RegEnable(plruState.get(s0pcidx), s0step)) else None
   val s1valid = RegEnable(input.valid, false.B, s0step)
   val s1sent = Reg(Bool())
 
   val s1hitmap = VecInit(s1metadata.map(e => e.valid && e.tag === s1pctag))
   val s1hit = s1hitmap.asUInt.orR
   val s1datamux = Mux1H(s1hitmap.zip(s1data))
+
+  // Find the hit way index (for PLRU update on hit)
+  val s1hitWay = OHToUInt(s1hitmap)
 
   val s1reset = RegInit(true.B)
   val s1rstCnt = RegInit(0.U(params.i$IndexLen.W))
@@ -51,9 +125,14 @@ class ICache(implicit val params: CoreParameters) extends Module {
 
   val s1refillCnt = RegInit(0.U((params.i$OffsetLen - 2).W))
   val s1refillComplete = Wire(Bool())
-  val s1victimAssoc = 0.U // TODO: impl prng assoc
+
+  // PLRU victim selection: first try to find an invalid way, then use PLRU
+  val s1invalidWay = PriorityEncoder(s1metadata.map(!_.valid))
+  val s1allValid = VecInit(s1metadata.map(_.valid)).asUInt.andR
+  val s1plruVictimWay = if(plruBits > 0) plruVictim(s1plru.get) else 0.U
+  val s1victimAssoc = Mux(s1allValid, s1plruVictimWay, s1invalidWay)
   val s1victimMap = VecInit(Seq.tabulate(params.i$Assoc)(s1victimAssoc === _.U))
-  // TODO: merge into s1datamux
+
   val s1refilledCapture = RegEnable(
     mem.resp.bits.data,
     mem.resp.valid && s1refillCnt === (s1pc(params.i$OffsetLen - 1, 0) >> 2)
@@ -103,6 +182,19 @@ class ICache(implicit val params: CoreParameters) extends Module {
   val metadataWriteEnable = s1reset || s1refillComplete
   when(metadataWriteEnable) {
     metadata.write(metadataWriteIdx, VecInit(Seq.fill(params.i$Assoc)(metadataWriteVal)), metadataWriteMask)
+  }
+
+  // PLRU state update: on hit, update to point away from hit way; on refill, update for victim way
+  if(plruBits > 0) {
+    val plru = plruState.get
+    val curPlru = s1plru.get
+    when(s1valid && s1hit && !kill && !killed) {
+      plru.write(s1pcidx, plruUpdate(curPlru, s1hitWay))
+    }.elsewhen(s1refillComplete) {
+      plru.write(s1pcidx, plruUpdate(curPlru, s1victimAssoc))
+    }.elsewhen(s1reset) {
+      plru.write(s1rstCnt, 0.U)
+    }
   }
 
   // Scheduler

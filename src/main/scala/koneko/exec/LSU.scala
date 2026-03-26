@@ -5,7 +5,7 @@ import chisel3.util._
 
 import koneko._
 
-// Two cycle LSU
+// LSU: routes accesses to SPM (local scratchpad) or global memory
 class LSU(implicit val param: CoreParameters) extends Module {
   val req = IO(Flipped(Irrevocable(new Bundle {
     val addr = UInt(32.W)
@@ -22,37 +22,13 @@ class LSU(implicit val param: CoreParameters) extends Module {
   })))
 
   val resp = IO(Output(UInt(32.W)))
-  val hartid = IO(Input(UInt(32.W)))
 
-  /*
   val mem = IO(new Bundle {
     val req = Decoupled(new MemReq)
     val resp = Flipped(Valid(new MemResp))
   })
-  */
-
-  // val sent = Reg(Bool())
-  // val valid = RegInit(false.B)
-
-  // TODO: use SRAM
-  class SPMElab extends Module {
-    val io = IO(new Bundle {
-      val hartid = Input(UInt(32.W))
-      val addr = Input(UInt(32.W))
-      val wdata = Input(UInt(32.W))
-      val we = Input(UInt(4.W))
-
-      val data = Output(UInt(32.W))
-    })
-
-    val scratchpad = Mem(param.scratchpadSize / 4, Vec(4, UInt(8.W)))
-    io.data := scratchpad(io.addr).asUInt
-    scratchpad.write(io.addr, io.wdata.asTypeOf(Vec(4, UInt(8.W))), io.we.asBools)
-  }
 
   val spm = Module(new SPM)
-  spm.io.clock := clock
-  spm.io.hartid := hartid
 
   val wmapped = Mux1H(Seq(
     req.bits.len.w -> req.bits.wdata,
@@ -65,36 +41,54 @@ class LSU(implicit val param: CoreParameters) extends Module {
     req.bits.len.b -> (0x1.U(4.W) << req.bits.addr(1, 0)),
   ))
 
-  /*
-  mem.req.bits.addr := req.bits.addr
-  mem.req.bits.burst := 0.U
-  mem.req.bits.wdata := wmapped
-  mem.req.bits.wbe := wbe
-  mem.req.bits.write := req.bits.write
-  mem.req.valid := valid && !sent
-
-  sent := MuxCase(sent, Seq(
-    req.fire -> false.B,
-    mem.req.fire -> true.B,
-  ))
-  */
-
-  req.ready := true.B
-
-  // req.ready := mem.resp.valid
-  // val rdata = mem.resp.bits
+  // Address space routing: SPM for low addresses, global memory otherwise
+  val isSPM = req.bits.addr < param.scratchpadSize.U
 
   val alignedAddr = (req.bits.addr >> 2) ## 0.U(2.W)
-  // spm.io.clock := clock
+
+  // --- SPM path (2-cycle reads, 1-cycle writes) ---
+  val spmReadPending = RegInit(false.B)
+  spmReadPending := req.valid && isSPM && !req.bits.write && !spmReadPending
+  val spmReady = Mux(req.bits.write, true.B, spmReadPending)
+
   spm.io.addr := alignedAddr
-  spm.io.we := Mux(req.fire && req.bits.write, wbe, 0.U)
+  spm.io.we := Mux(req.fire && isSPM && req.bits.write, wbe, 0.U)
   spm.io.wdata := wmapped
 
-  // when(req.fire && req.bits.write) {
-  //  scratchpad.write(alignedAddr, wmapped.asTypeOf(Vec(4, UInt(8.W))), wbe.asTypeOf(Vec(4, Bool())))
-  //}
-  // val rdata = scratchpad.read(alignedAddr).asUInt
-  val rdata = spm.io.data
+  // --- Global memory path ---
+  val memSent = RegInit(false.B)
+  val memGotResp = RegInit(false.B)
+  val memRdata = Reg(UInt(32.W))
+
+  mem.req.valid := req.valid && !isSPM && !memSent
+  mem.req.bits.addr := alignedAddr
+  mem.req.bits.burst := 0.U
+  mem.req.bits.wdata := wmapped
+  mem.req.bits.wbe := Mux(req.bits.write, wbe, 0.U)
+  mem.req.bits.write := req.bits.write
+
+  val memReqFired = mem.req.fire
+  when(memReqFired) { memSent := true.B }
+
+  // Response may arrive on same cycle as the request (combinational path through crossbar/driver)
+  val memRespCapture = mem.resp.valid && (memSent || memReqFired)
+  when(memRespCapture) {
+    memGotResp := true.B
+    memRdata := mem.resp.bits.data
+  }
+
+  val globalDone = memGotResp || memRespCapture
+  val globalRdata = Mux(memRespCapture && !memGotResp, mem.resp.bits.data, memRdata)
+
+  when(req.fire && !isSPM) {
+    memSent := false.B
+    memGotResp := false.B
+  }
+
+  // --- Ready and response mux ---
+  req.ready := Mux(isSPM, spmReady, globalDone)
+
+  val rdata = Mux(isSPM, spm.io.data, globalRdata)
 
   val rhalf = rdata.asTypeOf(Vec(2, UInt(16.W)))(req.bits.addr(1, 1))
   val rbyte = rdata.asTypeOf(Vec(4, UInt(8.W)))(req.bits.addr(1, 0))

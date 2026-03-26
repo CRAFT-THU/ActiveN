@@ -5,6 +5,7 @@ import chisel3.util._
 
 import koneko.fetch._
 import koneko.exec._
+import koneko.bus._
 
 class Core(implicit val params: CoreParameters) extends Module {
   val mem = IO(new Bundle {
@@ -39,10 +40,16 @@ class Core(implicit val params: CoreParameters) extends Module {
 
   val fetch = Module(new Fetch)
   val exec = Module(new Exec)
+  val crossbar = Module(new Crossbar(2))
 
   exec.cfg <> cfg
   exec.ext <> ext
-  fetch.mem <> mem
+
+  // Crossbar: upstream(0) = ICache, upstream(1) = LSU global memory
+  crossbar.upstream(0) <> fetch.mem
+  crossbar.upstream(1) <> exec.lsuMem
+  crossbar.downstream <> mem
+
   fetch.decoded <> exec.dec
   fetch.busy <> exec.busy
   fetch.ctrl.br <> exec.brs

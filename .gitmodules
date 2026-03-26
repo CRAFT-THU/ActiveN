@@ -1,3 +1,6 @@
 [submodule "sim/booksim2"]
 	path = sim/booksim2
 	url = https://github.com/CircuitCoder/ActiveN-booksim2.git
+[submodule "dep/cvfpu"]
+	path = dep/cvfpu
+	url = https://github.com/openhwgroup/cvfpu.git

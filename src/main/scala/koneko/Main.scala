@@ -7,7 +7,7 @@ object Main extends App {
   val param = CoreParameters(
     initVec = BigInt("80000000", 16),
     i$Lines = 16,
-    i$Assoc = 1,
+    i$Assoc = 2,
     i$BlockSize = 64,
     memDst = 0,
     memTagBase = 0x0,
