@@ -15,6 +15,7 @@ object Koneko extends SbtModule { m =>
     "-deprecation",
     "-feature",
     "-Xcheckinit",
+    "-Ymacro-annotations",
     "-P:chiselplugin:genBundleElements"
   )
   override def ivyDeps = Agg(

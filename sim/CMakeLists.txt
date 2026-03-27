@@ -77,3 +77,35 @@ verilate(
     DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/verilated
     VERILATOR_ARGS ${VERILATOR_COMMON_ARGS}
 )
+
+# System-level simulation driver (multicore + NoC)
+if (DEFINED ENV{AN_NUM_PU})
+  set(SYSTEM_NUM_PU $ENV{AN_NUM_PU})
+else()
+  set(SYSTEM_NUM_PU 16)
+endif()
+if (DEFINED ENV{AN_NUM_MC})
+  set(SYSTEM_NUM_MC $ENV{AN_NUM_MC})
+else()
+  set(SYSTEM_NUM_MC 1)
+endif()
+
+execute_process(
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/gen_system_ports.py
+            ${SYSTEM_NUM_PU} ${SYSTEM_NUM_MC} ${CMAKE_CURRENT_BINARY_DIR}
+)
+
+set(VERILATOR_SYSTEM_ARGS -Wall -Wno-fatal -Wno-DECLFILENAME --trace-params --trace-structs --top-module System -DRANDOMIZE_REG_INIT -DRANDOMIZE_MEM_INIT -I${CVFPU_DIR}/src/common_cells/include -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNSIGNED -Wno-CASEINCOMPLETE -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-UNDRIVEN -Wno-PINMISSING)
+
+add_executable(sim_system
+    src/system.cpp
+)
+
+verilate(
+    sim_system
+    SOURCES ${CVFPU_SOURCES} ${CMAKE_SOURCE_DIR}/../System.sv ${CMAKE_SOURCE_DIR}/../Aux.sv
+    PREFIX sys_rtl
+    TRACE_FST
+    DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/sys_verilated
+    VERILATOR_ARGS ${VERILATOR_SYSTEM_ARGS}
+)

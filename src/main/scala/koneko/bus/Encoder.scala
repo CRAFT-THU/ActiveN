@@ -27,7 +27,7 @@ class Encoder(implicit val param: CoreParameters) extends Module {
   val resp = IO(Flipped(Valid(new MemResp)))
 
   // --- Response path: forward directly to crossbar ---
-  mdm.resp := resp
+  mem.resp := resp
 
   // --- Request encoding ---
   // Compute DRAM controller destination from address
@@ -42,7 +42,7 @@ class Encoder(implicit val param: CoreParameters) extends Module {
   val cumSizes = memCtrlSizes.scanLeft(BigInt(0))(_ + _) // [0, size0, size0+size1, ...]
   val numCtrls = memCtrlSizes.length
 
-  val globalAddr = mdm.req.bits.addr - 0x80000000L.U
+  val globalAddr = mem.req.bits.addr - 0x80000000L.U
   val ctrlDst = Wire(UInt(16.W))
   ctrlDst := (memDstBase + numCtrls - 1).U(16.W) // default: last controller
   for (i <- 0 until numCtrls) {
@@ -72,14 +72,14 @@ class Encoder(implicit val param: CoreParameters) extends Module {
   val reqDst = Reg(UInt(16.W))
 
   // Accept new request only when idle
-  mdm.req.ready := state === sIdle
+  mem.req.ready := state === sIdle
 
-  when(mdm.req.fire) {
+  when(mem.req.fire) {
     reqAddr := ctrlLocalAddr
-    reqId := mdm.req.bits.id
-    reqSize := mdm.req.bits.size
-    reqWdata := mdm.req.bits.wdata
-    reqWrite := mdm.req.bits.write
+    reqId := mem.req.bits.id
+    reqSize := mem.req.bits.size
+    reqWdata := mem.req.bits.wdata
+    reqWrite := mem.req.bits.write
     reqDst := ctrlDst
     state := sSendAddr
   }

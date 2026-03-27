@@ -38,7 +38,22 @@ c/%.bin: c/%.c c/crt0.S c/linker_c.ld
 
 all-tests: $(ASM_BINS) $(C_BINS)
 
+# System-level tests (multicore, RV32I + custom AM instructions)
+NUM_PU ?= 16
+
+sys/pingpong_test.bin: asm/pingpong_test.S linker.ld
+	${PREFIX}gcc -mabi=ilp32 -march=rv32imf_zicsr -nostdlib -nostartfiles -Wl,-T,linker.ld -DNUM_PU=${NUM_PU} -o sys/pingpong_test.elf $<
+	${PREFIX}objcopy -j .text -j .data -O binary sys/pingpong_test.elf $@
+	rm -f sys/pingpong_test.elf
+
+sys/sha256_concurrent.bin: sys/sha256_concurrent.S sys/sha256_lib.c sys/linker_system.ld
+	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -O1 -o sys/sha256_concurrent.elf sys/sha256_concurrent.S sys/sha256_lib.c
+	${PREFIX}objcopy -j .text -j .data -O binary sys/sha256_concurrent.elf $@
+	rm -f sys/sha256_concurrent.elf
+
+sys-tests: sys/pingpong_test.bin sys/sha256_concurrent.bin
+
 clean:
 	rm -f test.single test.double test.single.bin test.double.bin
-	rm -f asm/*.bin asm/*.elf c/*.bin c/*.elf
+	rm -f asm/*.bin asm/*.elf c/*.bin c/*.elf sys/*.bin sys/*.elf
 

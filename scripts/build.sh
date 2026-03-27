@@ -21,6 +21,22 @@ build_sim() {
   ninja
 }
 
+build_sim_system() {
+  cd $BASE
+  local pu=${1:-16}
+  local mc=${2:-1}
+
+  # Elaborate RTL, generate SystemVerilog of the System module
+  AN_SYSTEM=1 AN_NUM_PU=$pu AN_NUM_MC=$mc AN_PIPE_CNT=1 mill Koneko.run
+
+  # Verilate SystemVerilog to C++, and build simulator
+  rm -rf work/build/sim_system
+  mkdir -p work/build/sim_system
+  cd work/build/sim_system
+  AN_NUM_PU=$pu AN_NUM_MC=$mc AN_PIPE_CNT=1 cmake -GNinja $BASE/sim
+  ninja sim_system
+}
+
 build_datagen() {
   cd $BASE/datagen
   cargo build --release

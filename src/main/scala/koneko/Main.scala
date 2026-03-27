@@ -17,5 +17,14 @@ object Main extends App {
     useFPU = true,
     pipeCnt = pipeCnt,
   )
-  ChiselStage.emitSystemVerilogFile(new Core()(param), args)
+
+  val emitSystem = sys.env.get("AN_SYSTEM").nonEmpty
+  if (emitSystem) {
+    val numPU = sys.env.get("AN_NUM_PU").flatMap(_.toIntOption).getOrElse(16)
+    val numMC = sys.env.get("AN_NUM_MC").flatMap(_.toIntOption).getOrElse(1)
+    implicit val sysParam = SystemParameters(numMC, numPU, param)
+    ChiselStage.emitSystemVerilogFile(new System, args)
+  } else {
+    ChiselStage.emitSystemVerilogFile(new Core()(param), args)
+  }
 }

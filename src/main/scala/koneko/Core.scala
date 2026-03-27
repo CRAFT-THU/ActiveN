@@ -2,15 +2,17 @@ package koneko;
 
 import chisel3._
 import chisel3.util._
+import chisel3.experimental.hierarchy.{instantiable, public}
 
 import koneko.fetch._
 import koneko.exec._
 import koneko.bus._
 
+@instantiable
 class Core(implicit val params: CoreParameters) extends Module {
-  val mem = IO(Flipped(Valid(new MemResp)))
+  @public val mem = IO(Flipped(Valid(new MemResp)))
 
-  val ext = IO(new Bundle {
+  @public val ext = IO(new Bundle {
     val out = Decoupled(new Bundle {
       val dst = UInt(16.W)
       val data = UInt(32.W)
@@ -27,7 +29,7 @@ class Core(implicit val params: CoreParameters) extends Module {
     val working = Output(Bool())
   })
 
-  val cfg = IO(Input(new Bundle {
+  @public val cfg = IO(Input(new Bundle {
     val hartid = UInt(32.W)
   }))
 

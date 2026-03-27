@@ -17,14 +17,14 @@ trait Routable extends Data {
 }
 
 class Link[D <: Routable](
-  val data: D,
+  proto: D,
 ) extends Bundle {
-  val egress = Decoupled(data.cloneType)
-  val ingress = Flipped(Decoupled(data.cloneType))
+  val egress = Decoupled(proto.cloneType)
+  val ingress = Flipped(Decoupled(proto.cloneType))
 }
 
 class Router[D <: Routable](
-  val data: D,
+  data: D,
   val local: Int, // Local ID, used to determine if a message is destined for this router
   val numLinks: Int,
   val numVc: Int,
@@ -39,13 +39,27 @@ class Router[D <: Routable](
   private val numOutputs = numLinks + 1  // link egresses + local eject
   private val ejectPort = numLinks       // output port index for eject
 
-  // Route lookup: destination ID -> output port index (combinational)
-  private def routeTo(dst: UInt): UInt = {
-    val port = WireDefault(ejectPort.U(log2Ceil(numOutputs max 2).W))
-    when(dst =/= local.U) {
-      port := MuxLookup(dst, 0.U)(table.toSeq.map { case (d, l) => d.U -> l.U })
+  // Route lookup: destination ID -> 1-hot output port selection (combinational)
+  // Groups destinations by output port for a compact OR-based decoder.
+  private def routeTo(dst: UInt): Vec[Bool] = {
+    val oh = Wire(Vec(numOutputs, Bool()))
+    // Group table entries by output port: port -> Set[dst]
+    val portToDsts = table.groupMap(_._2)(_._1)
+    for (j <- 0 until numOutputs) {
+      if (j == ejectPort) {
+        // Eject port: local destination + any dst not in routing table
+        val inTable = table.keys.map(d => dst === d.U).foldLeft(false.B)(_ || _)
+        oh(j) := dst === local.U || (!inTable && dst =/= local.U).suggestName(s"eject_fallback")
+      } else {
+        val dsts = portToDsts.getOrElse(j, Set.empty)
+        if (dsts.isEmpty) {
+          oh(j) := false.B
+        } else {
+          oh(j) := dsts.map(d => dst === d.U).foldLeft(false.B)(_ || _)
+        }
+      }
     }
-    port
+    oh
   }
 
   // --- Input side: per-input-port VC buffers ---
@@ -68,8 +82,8 @@ class Router[D <: Routable](
   // Flatten: allBufs(i * numVc + v) = vcBufs(i)(v)
   val allBufs: Seq[Queue[D]] = vcBufs.flatten
 
-  // Pre-compute each buffer head's target output port
-  val bufOutPort: Seq[UInt] = allBufs.map(buf => routeTo(buf.io.deq.bits.dst))
+  // Pre-compute each buffer head's target output port (1-hot)
+  val bufOutPort: Seq[Vec[Bool]] = allBufs.map(buf => routeTo(buf.io.deq.bits.dst))
 
   // --- Output side: per-output-port arbitration ---
   val outputPorts: Seq[DecoupledIO[D]] = links.map(_.egress).toSeq :+ eject
@@ -84,7 +98,7 @@ class Router[D <: Routable](
       val arb = Module(new RRArbiter(data.cloneType, numInputs))
       for (i <- 0 until numInputs) {
         val flatIdx = i * numVc + v
-        arb.io.in(i).valid := allBufs(flatIdx).io.deq.valid && bufOutPort(flatIdx) === j.U
+        arb.io.in(i).valid := allBufs(flatIdx).io.deq.valid && bufOutPort(flatIdx)(j)
         arb.io.in(i).bits := allBufs(flatIdx).io.deq.bits
       }
       arb

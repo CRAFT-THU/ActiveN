@@ -1,8 +1,4 @@
 test.single
 test.double
-test.single.bin
-test.double.bin
-asm/*.bin
-asm/*.elf
-c/*.bin
-c/*.elf
+*.bin
+*.elf
