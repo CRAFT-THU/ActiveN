@@ -11,6 +11,8 @@ object Main extends App {
     i$BlockSize = 64,
     memDst = 0,
     memTagBase = 0x0,
+    memBusWidth = 256, // DDR4
+    memCtrlSizes = List(BigInt("100000000", 16)), // 4 GiB
     scratchpadSize = 16384,
     useFPU = true,
     pipeCnt = pipeCnt,

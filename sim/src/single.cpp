@@ -2,11 +2,11 @@
  * Single core simulation driver.
  *
  * Simulates a single core with a flat memory image.
- * - Loads a binary file as the initial memory image (instruction + data).
- * - Responds to memory read requests from the core (instruction fetch).
- * - Captures and logs all outgoing events from the core (ext.out).
- * - Uses a special event (tag == 0, dst == 0xFFFF) to signal end of simulation,
- *   with the result carried in the event payload (ext.out.data).
+ * - Loads a binary file as the initial memory image.
+ * - Memory requests arrive as event flits on ext.out (tag 0xFF00 = load, 0xFF01 = store).
+ * - Memory responses are sent on the mem bus (tag + 256-bit data).
+ * - AM events (tag != 0xFF00/0xFF01) are captured and logged.
+ * - End-of-simulation: tag == 0, dst == 0xFFFF, result in payload.
  *
  * Environment variables:
  *   MEOW_TEXT       - Path to the binary memory image
@@ -35,6 +35,7 @@ static bool exiting = false;
 
 static const uint64_t RESET_LENGTH = 10;
 static const uint32_t TEXT_BASE = 0x80000000ul;
+static const int MEM_BUS_WORDS = 256 / 32; // 8 words per beat
 
 static uint32_t *text_aligned = nullptr;
 static size_t text_size = 0;
@@ -45,10 +46,31 @@ static void sighandler(int) {
   exiting = true;
 }
 
+// Memory response: tag + 256-bit data (8 words)
+struct MemResponse {
+  uint16_t tag;
+  uint32_t data[MEM_BUS_WORDS]; // 8 words, little-endian
+};
+
+// State for collecting multi-flit memory requests
+struct MemRequestCollector {
+  bool active = false;
+  uint16_t tag = 0;       // 0xFF00 = load, 0xFF01 = store
+  uint16_t dst = 0;
+  int flit_count = 0;
+  uint32_t operands[3];   // addr, meta, wdata
+
+  void reset() {
+    active = false;
+    flit_count = 0;
+  }
+};
+
 struct SingleCoreSim {
   std::unique_ptr<rtl> core;
   uint64_t cycle = 0;
-  std::deque<uint32_t> mem_resps;
+  std::deque<MemResponse> mem_resps;
+  MemRequestCollector mem_collector;
 
   // Captured events
   struct Event {
@@ -71,13 +93,67 @@ struct SingleCoreSim {
     core->final();
   }
 
+  // Read 256-bit aligned block from backing memory at given byte address
+  MemResponse readBlock(uint32_t addr, uint16_t resp_tag) {
+    MemResponse resp;
+    resp.tag = resp_tag;
+    // Align to 32-byte boundary (256 bits)
+    uint32_t aligned = addr & ~((MEM_BUS_WORDS * 4) - 1);
+    for (int i = 0; i < MEM_BUS_WORDS; i++) {
+      uint32_t byte_addr = aligned + i * 4;
+      if (byte_addr >= TEXT_BASE && (byte_addr - TEXT_BASE) < text_size) {
+        resp.data[i] = text_aligned[(byte_addr - TEXT_BASE) / 4];
+      } else {
+        resp.data[i] = 0;
+      }
+    }
+    return resp;
+  }
+
+  void processMemRequest() {
+    auto &c = mem_collector;
+    uint32_t addr = c.operands[0] + TEXT_BASE; // local addr -> global addr
+    uint16_t resp_tag = c.operands[1] & 0xFFFF;
+
+    if (c.tag == 0xFF00) {
+      // Load: operand[0] = addr, operand[1] = returning tag
+      if (LOG) cout << "[Single] Mem load: addr=0x" << hex << addr
+                    << " resp_tag=0x" << resp_tag << dec << endl;
+      mem_resps.push_back(readBlock(addr, resp_tag));
+    } else if (c.tag == 0xFF01) {
+      // Store: operand[0] = addr, operand[1] = {size, returning_tag}, operand[2] = wdata
+      uint16_t size = (c.operands[1] >> 16) & 0xFFFF;
+      uint32_t wdata = c.operands[2];
+      if (LOG) cout << "[Single] Mem store: addr=0x" << hex << addr
+                    << " size=" << dec << size
+                    << " data=0x" << hex << wdata
+                    << " resp_tag=0x" << resp_tag << dec << endl;
+      // Write to backing memory with byte-enable based on size
+      if (addr >= TEXT_BASE && (addr - TEXT_BASE) < text_size) {
+        uint32_t offset = (addr - TEXT_BASE) / 4;
+        uint32_t old_val = text_aligned[offset];
+        uint32_t byte_off = addr & 3;
+        uint32_t mask = 0;
+        switch (size) {
+          case 0: mask = 0xFFu << (byte_off * 8); break;      // byte
+          case 1: mask = 0xFFFFu << (byte_off * 8); break;    // half-word
+          case 2: mask = 0xFFFFFFFFu; break;                   // word
+          default: mask = 0xFFFFFFFFu; break;
+        }
+        text_aligned[offset] = (old_val & ~mask) | (wdata & mask);
+      }
+      // Store also gets a response (for completion)
+      mem_resps.push_back(readBlock(addr, resp_tag));
+    }
+    c.reset();
+  }
+
   void step() {
     ++cycle;
 
     if(cycle <= RESET_LENGTH) {
       core->reset = true;
-      core->mem_resp_valid = false;
-      core->mem_req_ready = true;
+      core->mem_valid = false;
       core->ext_out_ready = false;
       core->ext_in_valid = false;
       core->clock = true;
@@ -89,69 +165,67 @@ struct SingleCoreSim {
 
     core->reset = false;
 
-    // Before posedge: advance queues based on handshake from previous cycle
-    if(core->mem_resp_valid) mem_resps.pop_front();
-    if(core->mem_req_valid && core->mem_req_ready) {
-      uint32_t base_addr = core->mem_req_bits_addr;
-      uint32_t burst_count = 1u << (uint32_t)core->mem_req_bits_burst;
-      bool is_write = core->mem_req_bits_write;
-      if(LOG) cout << "[Single] Mem " << (is_write ? "write" : "read")
-                   << ": addr=0x" << hex << base_addr
-                   << " burst=" << dec << burst_count << endl;
-      for(uint32_t i = 0; i < burst_count; ++i) {
-        uint32_t addr = base_addr + i * 4;
-        if(is_write && addr >= TEXT_BASE && (addr - TEXT_BASE) < text_size) {
-          uint32_t offset = (addr - TEXT_BASE) / 4;
-          uint8_t wbe = core->mem_req_bits_wbe;
-          uint32_t old_val = text_aligned[offset];
-          uint32_t new_val = core->mem_req_bits_wdata;
-          uint32_t result = old_val;
-          for(int b = 0; b < 4; ++b) {
-            if((wbe >> b) & 1)
-              result = (result & ~(0xFFu << (b*8))) | (new_val & (0xFFu << (b*8)));
-          }
-          text_aligned[offset] = result;
-        }
-        // Always push a response (read data or write acknowledgment)
-        if(addr >= TEXT_BASE && (addr - TEXT_BASE) < text_size) {
-          uint32_t offset = (addr - TEXT_BASE) / 4;
-          mem_resps.push_back(text_aligned[offset]);
-        } else {
-          mem_resps.push_back(0);
-        }
-      }
-    }
-
-    // Accept outgoing events from last cycle
+    // Process ext_out from previous cycle
     if(core->ext_out_ready && core->ext_out_valid) {
       uint16_t dst = (uint16_t)core->ext_out_bits_dst;
       uint32_t data = core->ext_out_bits_data;
       uint16_t tag = (uint16_t)core->ext_out_bits_tag;
 
-      Event ev = { cycle, dst, data, tag };
-      events.push_back(ev);
+      // Check if this is a memory request flit
+      if (tag == 0xFF00 || tag == 0xFF01) {
+        auto &c = mem_collector;
+        if (!c.active || c.tag != tag || c.dst != dst) {
+          // Start new memory request
+          c.active = true;
+          c.tag = tag;
+          c.dst = dst;
+          c.flit_count = 0;
+        }
+        c.operands[c.flit_count++] = data;
 
-      if(LOG) cout << "[Single] Event @" << dec << cycle
-                   << ": dst=" << dst << " data=0x" << hex << data
-                   << " tag=" << dec << tag << endl;
+        // Check if we have all flits
+        int expected = (tag == 0xFF00) ? 2 : 3;
+        if (c.flit_count >= expected) {
+          processMemRequest();
+        }
+      } else {
+        // Regular AM event
+        Event ev = { cycle, dst, data, tag };
+        events.push_back(ev);
 
-      if(tag == 0 && dst == 0xFFFF) {
-        finished = true;
-        result = data;
-        if(LOG) cout << "[Single] Simulation finished with result: " << dec << data
-                     << " (0x" << hex << data << ")" << endl;
+        if(LOG) cout << "[Single] Event @" << dec << cycle
+                     << ": dst=" << dst << " data=0x" << hex << data
+                     << " tag=" << dec << tag << endl;
+
+        if(tag == 0 && dst == 0xFFFF) {
+          finished = true;
+          result = data;
+          if(LOG) cout << "[Single] Simulation finished with result: " << dec << data
+                       << " (0x" << hex << data << ")" << endl;
+        }
       }
     }
 
-    // Set input signals before posedge
+    // Advance mem response queue
+    if(core->mem_valid) mem_resps.pop_front();
+
+    // Set mem response signals
     if(mem_resps.empty()) {
-      core->mem_resp_valid = false;
-      core->mem_resp_bits_data = 0xdeadbeef;
+      core->mem_valid = false;
+      core->mem_bits_tag = 0;
+      for (int i = 0; i < MEM_BUS_WORDS; i++) {
+        core->mem_bits_data[i] = 0;
+      }
     } else {
-      core->mem_resp_valid = true;
-      core->mem_resp_bits_data = mem_resps.front();
+      core->mem_valid = true;
+      core->mem_bits_tag = mem_resps.front().tag;
+      // Pack 8 x 32-bit words into 256-bit data
+      // Verilator represents wide signals as uint32_t arrays
+      for (int i = 0; i < MEM_BUS_WORDS; i++) {
+        core->mem_bits_data[i] = mem_resps.front().data[i];
+      }
     }
-    core->mem_req_ready = true;
+
     core->ext_in_valid = false;
 
     // Posedge

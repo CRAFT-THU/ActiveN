@@ -61,8 +61,13 @@ class LSU(implicit val param: CoreParameters) extends Module {
   val memRdata = Reg(UInt(32.W))
 
   mem.req.valid := req.valid && !isSPM && !memSent
-  mem.req.bits.addr := alignedAddr
-  mem.req.bits.burst := 0.U
+  mem.req.bits.addr := req.bits.addr // full address (byte offset needed for sub-word stores)
+  mem.req.bits.size := Mux1H(Seq(
+    req.bits.len.b -> 0.U(2.W),
+    req.bits.len.h -> 1.U(2.W),
+    req.bits.len.w -> 2.U(2.W),
+  ))
+  mem.req.bits.id := 0.U
   mem.req.bits.wdata := wmapped
   mem.req.bits.wbe := Mux(req.bits.write, wbe, 0.U)
   mem.req.bits.write := req.bits.write
@@ -70,15 +75,25 @@ class LSU(implicit val param: CoreParameters) extends Module {
   val memReqFired = mem.req.fire
   when(memReqFired) { memSent := true.B }
 
+  // Extract word from wide response based on address within the beat
+  val wordsPerBeat = param.memBusWidth / 32
+  val beatAlignBits = log2Ceil(param.memBusWidth / 8) // log2(32) = 5 for 256-bit
+  val wordInBeat = alignedAddr(beatAlignBits - 1, 2) // word offset within the beat
+  val respWords = Wire(Vec(wordsPerBeat, UInt(32.W)))
+  for (i <- 0 until wordsPerBeat) {
+    respWords(i) := mem.resp.bits.data((i + 1) * 32 - 1, i * 32)
+  }
+  val memRespWord = respWords(wordInBeat)
+
   // Response may arrive on same cycle as the request (combinational path through crossbar/driver)
   val memRespCapture = mem.resp.valid && (memSent || memReqFired)
   when(memRespCapture) {
     memGotResp := true.B
-    memRdata := mem.resp.bits.data
+    memRdata := memRespWord
   }
 
   val globalDone = memGotResp || memRespCapture
-  val globalRdata = Mux(memRespCapture && !memGotResp, mem.resp.bits.data, memRdata)
+  val globalRdata = Mux(memRespCapture && !memGotResp, memRespWord, memRdata)
 
   when(req.fire && !isSPM) {
     memSent := false.B

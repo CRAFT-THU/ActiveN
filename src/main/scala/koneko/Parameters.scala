@@ -10,11 +10,14 @@ case class CoreParameters(
   val i$Assoc: Int,
   val memDst: Int,
   val memTagBase: Int,
+  val memBusWidth: Int,
+  val memCtrlSizes: List[BigInt],
   val scratchpadSize: Int,
   val useFPU: Boolean,
   val pipeCnt: Int,
 ) {
   require(scratchpadSize % 4 == 0)
+  require(memBusWidth >= 32 && (memBusWidth & (memBusWidth - 1)) == 0, "memBusWidth must be a power of 2 and >= 32")
   def i$Sets = i$Lines / i$Assoc
   def i$OffsetLen = log2Up(i$BlockSize)
   def i$InstrOffsetLen = log2Up(i$BlockSize / 4)

@@ -42,18 +42,6 @@ class EvQueue(implicit val param: CoreParameters) extends Module {
 }
 
 class BIU(implicit val param: CoreParameters) extends Module {
-  /*
-  val ifmem = IO(new Bundle {
-    val req = Flipped(Decoupled(new MemReq))
-    val resp = Valid(new MemResp)
-  })
-
-  val lsumem = IO(new Bundle {
-    val req = Flipped(Decoupled(new MemReq))
-    val resp = Valid(new MemResp)
-  })
-  */
-
   val msg = IO(Flipped(Decoupled(new Bundle {
     val reg = Vec(2, UInt(32.W))
     val enq = UInt(2.W) // 0, 1, 2

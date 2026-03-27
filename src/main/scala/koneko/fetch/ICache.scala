@@ -109,7 +109,6 @@ class ICache(implicit val params: CoreParameters) extends Module {
   val s1data = RegEnable(data(s0pcdataidx), s0step)
   val s1plru = if(plruBits > 0) Some(RegEnable(plruState.get(s0pcidx), s0step)) else None
   val s1valid = RegEnable(input.valid, false.B, s0step)
-  val s1sent = Reg(Bool())
 
   val s1hitmap = VecInit(s1metadata.map(e => e.valid && e.tag === s1pctag))
   val s1hit = s1hitmap.asUInt.orR
@@ -124,7 +123,6 @@ class ICache(implicit val params: CoreParameters) extends Module {
   s1rstCnt := Mux(s1reset, s1rstCnt + 1.U, s1rstCnt)
 
   val s1refillCnt = RegInit(0.U((params.i$OffsetLen - 2).W))
-  val s1refillComplete = Wire(Bool())
 
   // PLRU victim selection: first try to find an invalid way, then use PLRU
   val s1invalidWay = PriorityEncoder(s1metadata.map(!_.valid))
@@ -133,27 +131,72 @@ class ICache(implicit val params: CoreParameters) extends Module {
   val s1victimAssoc = Mux(s1allValid, s1plruVictimWay, s1invalidWay)
   val s1victimMap = VecInit(Seq.tabulate(params.i$Assoc)(s1victimAssoc === _.U))
 
-  val s1refilledCapture = RegEnable(
-    mem.resp.bits.data,
-    mem.resp.valid && s1refillCnt === (s1pc(params.i$OffsetLen - 1, 0) >> 2)
-  )
-  output.bits := Mux(s1hit, s1datamux, s1refilledCapture)
+  val s1refilledCapture = Reg(UInt(32.W))
 
-  // Refiller
-  mem.req.bits.addr := s1pctag ## s1pcidx ## 0.U(params.i$OffsetLen.W)
-  mem.req.bits.burst := log2Up(params.i$BlockSize / 4).U
+  // Refiller: sends multiple requests per cache line (one per memory bus beat)
+  val wordsPerBeat = params.memBusWidth / 32
+  val beatsPerLine = params.i$BlockSize / (params.memBusWidth / 8)
+  val wordBits = log2Ceil(wordsPerBeat)
+
+  val s1refillBeatData = Reg(UInt(params.memBusWidth.W))
+  val s1refillWriting = RegInit(false.B) // serializing writes from a received beat
+  val s1reqSentForBeat = Reg(Bool())
+  val s1refillCompleted = RegInit(false.B)
+
+  // Request: word-aligned address for current beat
+  val refillBaseAddr = s1pctag ## s1pcidx ## 0.U(params.i$OffsetLen.W)
+  val curBeat = s1refillCnt >> wordBits
+  val curWordInBeat = s1refillCnt(wordBits - 1, 0)
+  val beatAddr = refillBaseAddr + (curBeat << log2Ceil(params.memBusWidth / 8))
+
+  val needRefill = s1valid && !s1hit && !s1refillCompleted && !s1refillWriting
+
+  mem.req.bits.addr := beatAddr
+  mem.req.bits.size := 2.U // word
+  mem.req.bits.id := curBeat
   mem.req.bits.wbe := 0.U
   mem.req.bits.write := false.B
   mem.req.bits.wdata := DontCare
-  mem.req.valid := s1valid && !s1sent && !s1hit
-  s1sent := MuxCase(s1sent, Seq(
+  mem.req.valid := needRefill && !s1reqSentForBeat
+
+  s1reqSentForBeat := MuxCase(s1reqSentForBeat, Seq(
     s0step -> false.B,
-    mem.req.fire -> true.B
+    mem.req.fire -> true.B,
   ))
-  val s1refillCompleted = Reg(Bool())
+
+  // Receive response: latch wide data
+  when(mem.resp.valid && needRefill && s1reqSentForBeat) {
+    s1refillBeatData := mem.resp.bits.data
+    s1refillWriting := true.B
+  }
+
+  // Serialize writes from the latched beat
+  val beatWords = VecInit(Seq.tabulate(wordsPerBeat)(i =>
+    s1refillBeatData((i + 1) * 32 - 1, i * 32)
+  ))
+  val dataWriteIdx = s1pcidx ## s1refillCnt
+  val dataWriteVal = beatWords(curWordInBeat)
+  val dataWriteEnable = s1refillWriting
+
+  when(dataWriteEnable) {
+    data.write(dataWriteIdx, VecInit(Seq.fill(params.i$Assoc)(dataWriteVal)), s1victimMap)
+    s1refillCnt := s1refillCnt + 1.U
+    when(curWordInBeat === (wordsPerBeat - 1).U) {
+      s1refillWriting := false.B
+      s1reqSentForBeat := false.B
+    }
+  }
+
+  // Capture the word corresponding to the requested PC during refill
+  val pcWordInLine = s1pc(params.i$OffsetLen - 1, 2)
+  when(dataWriteEnable && s1refillCnt === pcWordInLine) {
+    s1refilledCapture := dataWriteVal
+  }
+
+  val s1refillComplete = dataWriteEnable && s1refillCnt.andR
   s1refillCompleted := MuxCase(s1refillCompleted, Seq(
     s0step -> false.B,
-    s1refillComplete -> true.B
+    s1refillComplete -> true.B,
   ))
   val s1blocked = !s1hit && !s1refillCompleted
 
@@ -161,18 +204,10 @@ class ICache(implicit val params: CoreParameters) extends Module {
   val killed = Reg(Bool())
   killed := MuxCase(killed, Seq(
     s0step -> false.B,
-    kill -> true.B
+    kill -> true.B,
   ))
 
-  // Writing
-  val dataWriteIdx = s1pcidx ## s1refillCnt
-  val dataWriteVal = mem.resp.bits.data
-  val dataWriteEnable = mem.resp.valid
-  when(dataWriteEnable) {
-    data.write(dataWriteIdx, VecInit(Seq.fill(params.i$Assoc)(dataWriteVal)), s1victimMap)
-  }
-  s1refillCnt := Mux(dataWriteEnable, s1refillCnt + 1.U, s1refillCnt)
-  s1refillComplete := dataWriteEnable && s1refillCnt.andR
+  output.bits := Mux(s1hit, s1datamux, s1refilledCapture)
 
   val metadataWriteIdx = Mux(s1reset, s1rstCnt, s1pcidx)
   val metadataWriteMask = Mux(s1reset, VecInit(Seq.fill(params.i$Assoc)(true.B)), s1victimMap)

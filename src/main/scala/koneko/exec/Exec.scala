@@ -246,7 +246,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
    * - AUIPC: uop.cimm + pc
    */
   val rdsrc = Seq(
-    uop.rdalu -> aluOrAdded,
+    uop.rdalu -> ealuval,
     uop.rdpclink -> pclink,
     uop.rdlui -> uop.immU,
     uop.rdauipc -> (uop.immU + uop.pc),

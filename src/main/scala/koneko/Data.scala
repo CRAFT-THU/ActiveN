@@ -4,14 +4,16 @@ import chisel3._
 
 class MemReq extends Bundle {
   val addr = UInt(32.W)
-  val burst = UInt(3.W) // 1, 2, 4, 8, 16, 32, 64, 128
+  val size = UInt(2.W) // 0 = byte, 1 = half-word, 2 = word
+  val id = UInt(16.W)
   val wdata = UInt(32.W)
   val wbe = UInt(4.W)
   val write = Bool()
 }
 
-class MemResp extends Bundle {
-  val data = UInt(32.W)
+class MemResp(implicit val param: CoreParameters) extends Bundle {
+  val tag = UInt(16.W)
+  val data = UInt(param.memBusWidth.W)
 }
 
 class uOp(implicit val param: CoreParameters) extends Bundle {
