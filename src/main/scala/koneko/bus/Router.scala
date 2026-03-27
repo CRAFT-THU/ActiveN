@@ -4,10 +4,10 @@ package koneko.bus
 
 import chisel3._
 import chisel3.util._
+import chisel3.util.experimental.decode.{TruthTable, decoder}
 
 trait Routable extends Data {
   // The destination of this message
-  // 
   def dst: UInt
 
   // The priority of this message
@@ -16,55 +16,88 @@ trait Routable extends Data {
   def prio: UInt
 }
 
-class Link[D <: Routable](
-  proto: D,
-) extends Bundle {
-  val egress = Decoupled(proto.cloneType)
-  val ingress = Flipped(Decoupled(proto.cloneType))
-}
+case class Local(
+  id: Int,
+  inject: Boolean,
+  eject: Boolean,
+)
 
 class Router[D <: Routable](
   data: D,
-  val local: Int, // Local ID, used to determine if a message is destined for this router
-  val numLinks: Int,
+  val locals: Seq[Local],
+  val numIngress: Int,
+  val numEgress: Int,
   val numVc: Int,
-  val buffer: Int, // Buffer size per VC
+  val buffer: Int,
   val table: Map[Int, Int], // Routing table: dst -> egress link
 ) extends Module {
-  val links = IO(Vec(numLinks, new Link(data)))
-  val eject = IO(Decoupled(data.cloneType))
-  val inject = IO(Flipped(Decoupled(data.cloneType)))
+  private val ejectIds = locals.filter(_.eject).map(_.id).toSet
+  require(!table.keys.exists(ejectIds.contains), "forwarding table must not contain local eject IDs")
+  require(table.values.forall(e => e >= 0 && e < numEgress), "egress indices out of range")
 
-  private val numInputs = numLinks + 1   // link ingresses + local inject
-  private val numOutputs = numLinks + 1  // link egresses + local eject
-  private val ejectPort = numLinks       // output port index for eject
+  private val injectLocals = locals.zipWithIndex.filter(_._1.inject)
+  private val ejectLocals = locals.zipWithIndex.filter(_._1.eject)
+  private val numInputs = numIngress + injectLocals.length
+  private val numOutputs = numEgress + ejectLocals.length
 
-  // Route lookup: destination ID -> 1-hot output port selection (combinational)
-  // Groups destinations by output port for a compact OR-based decoder.
-  private def routeTo(dst: UInt): Vec[Bool] = {
-    val oh = Wire(Vec(numOutputs, Bool()))
-    // Group table entries by output port: port -> Set[dst]
-    val portToDsts = table.groupMap(_._2)(_._1)
-    for (j <- 0 until numOutputs) {
-      if (j == ejectPort) {
-        // Eject port: local destination + any dst not in routing table
-        val inTable = table.keys.map(d => dst === d.U).foldLeft(false.B)(_ || _)
-        oh(j) := dst === local.U || (!inTable && dst =/= local.U).suggestName(s"eject_fallback")
-      } else {
-        val dsts = portToDsts.getOrElse(j, Set.empty)
-        if (dsts.isEmpty) {
-          oh(j) := false.B
-        } else {
-          oh(j) := dsts.map(d => dst === d.U).foldLeft(false.B)(_ || _)
-        }
-      }
-    }
-    oh
+  // --- Routing truth tables ---
+  // All IDs that appear in forwarding table or as eject-local destinations
+  private val allIds = (table.keys ++ ejectLocals.map(_._1.id)).toSeq.distinct
+  private val idWidth = if (allIds.isEmpty) 1 else allIds.map(k => log2Ceil(k.max(1) + 1)).max.max(1)
+
+  // Left-padded binary string for an ID
+  private def idBits(id: Int): String = {
+    val s = id.toBinaryString
+    "0" * (idWidth - s.length) + s
   }
 
-  // --- Input side: per-input-port VC buffers ---
-  val inputPorts: Seq[DecoupledIO[D]] = links.map(_.ingress).toSeq :+ inject
+  // 1-hot bit string of width w with bit j set (bit 0 = LSB = rightmost character)
+  private def oneHot(w: Int, j: Int): String =
+    "0" * (w - 1 - j) + "1" + "0" * j
 
+  // Forward truth table: dst -> 1-hot egress selection (numEgress bits)
+  // Table entries map to their egress port; eject-local IDs map to all-zero (not forwarded)
+  private val fwdTT = if (numEgress > 0) {
+    val entries = table.toSeq.map { case (dst, eIdx) =>
+      BitPat("b" + idBits(dst)) -> BitPat("b" + oneHot(numEgress, eIdx))
+    } ++ ejectLocals.map { case (l, _) =>
+      BitPat("b" + idBits(l.id)) -> BitPat("b" + "0" * numEgress)
+    }
+    Some(TruthTable(entries, BitPat("b" + "0" * numEgress)))
+  } else None
+
+  // Local truth table: dst -> 1-hot eject-local selection (ejectLocals.length bits)
+  // Table entries map to all-zero (forwarded); eject-local IDs map to their 1-hot position
+  private val localTT = if (ejectLocals.nonEmpty) {
+    val entries = table.toSeq.map { case (dst, _) =>
+      BitPat("b" + idBits(dst)) -> BitPat("b" + "0" * ejectLocals.length)
+    } ++ ejectLocals.zipWithIndex.map { case ((l, _), k) =>
+      BitPat("b" + idBits(l.id)) -> BitPat("b" + oneHot(ejectLocals.length, k))
+    }
+    Some(TruthTable(entries, BitPat("b" + "0" * ejectLocals.length)))
+  } else None
+
+  // --- IO ---
+  val ingress = IO(Vec(numIngress, Flipped(Decoupled(data.cloneType))))
+  val egress = IO(Vec(numEgress, Decoupled(data.cloneType)))
+
+  // Conditional inject/eject ports per local
+  val injects: Seq[Option[DecoupledIO[D]]] = locals.map { l =>
+    if (l.inject) Some(IO(Flipped(Decoupled(data.cloneType)))) else None
+  }
+  val ejects: Seq[Option[DecoupledIO[D]]] = locals.map { l =>
+    if (l.eject) Some(IO(Decoupled(data.cloneType))) else None
+  }
+
+  // Ordered input ports: all ingresses, then inject-enabled locals
+  private val inputPorts: Seq[DecoupledIO[D]] =
+    ingress.toSeq ++ injectLocals.map { case (_, idx) => injects(idx).get }
+
+  // Ordered output ports: all egresses, then eject-enabled locals
+  private val outputPorts: Seq[DecoupledIO[D]] =
+    egress.toSeq ++ ejectLocals.map { case (_, idx) => ejects(idx).get }
+
+  // --- Input side: per-input-port VC buffers ---
   val vcBufs: Seq[Seq[Queue[D]]] = Seq.tabulate(numInputs) { i =>
     val bufs = Seq.tabulate(numVc) { v =>
       val q = Module(new Queue(data.cloneType, buffer))
@@ -79,16 +112,18 @@ class Router[D <: Routable](
     bufs
   }
 
-  // Flatten: allBufs(i * numVc + v) = vcBufs(i)(v)
-  val allBufs: Seq[Queue[D]] = vcBufs.flatten
+  private val allBufs: Seq[Queue[D]] = vcBufs.flatten
 
-  // Pre-compute each buffer head's target output port (1-hot)
-  val bufOutPort: Seq[Vec[Bool]] = allBufs.map(buf => routeTo(buf.io.deq.bits.dst))
+  // Decode each buffer head's target output port via truth tables
+  // Result: combined 1-hot UInt over numOutputs (bits 0..numEgress-1 = egress, rest = eject locals)
+  private val bufTargets: Seq[UInt] = allBufs.map { buf =>
+    val dstBits = buf.io.deq.bits.dst(idWidth - 1, 0)
+    val fwd = fwdTT.map(tt => decoder(dstBits, tt)).getOrElse(0.U(0.W))
+    val lcl = localTT.map(tt => decoder(dstBits, tt)).getOrElse(0.U(0.W))
+    Cat(lcl, fwd)
+  }
 
-  // --- Output side: per-output-port arbitration ---
-  val outputPorts: Seq[DecoupledIO[D]] = links.map(_.egress).toSeq :+ eject
-
-  // Dequeue grant signals (one per buffer, at most one true per cycle per buffer)
+  // --- Output side: per-output-port two-level arbitration ---
   val deqGrant = Wire(Vec(allBufs.length, Bool()))
   deqGrant := VecInit(Seq.fill(allBufs.length)(false.B))
 
@@ -97,9 +132,9 @@ class Router[D <: Routable](
     val vcArbs = Seq.tabulate(numVc) { v =>
       val arb = Module(new RRArbiter(data.cloneType, numInputs))
       for (i <- 0 until numInputs) {
-        val flatIdx = i * numVc + v
-        arb.io.in(i).valid := allBufs(flatIdx).io.deq.valid && bufOutPort(flatIdx)(j)
-        arb.io.in(i).bits := allBufs(flatIdx).io.deq.bits
+        val flat = i * numVc + v
+        arb.io.in(i).valid := allBufs(flat).io.deq.valid && bufTargets(flat)(j)
+        arb.io.in(i).bits := allBufs(flat).io.deq.bits
       }
       arb
     }
