@@ -18,8 +18,8 @@
 _start:
   csrr s0, mhartid          # s0 = hartid (1..NUM_PU)
 
-  # Use local SPM for stack (each core has its own 16KB SPM at 0x0000-0x3FFF)
-  li sp, 0x4000             # Stack top = end of SPM (grows downward)
+  # Use local SPM for stack (each core has its own 16KB SPM at 0x20000000-0x20003FFF)
+  li sp, 0x20004000         # Stack top = end of SPM (grows downward)
 
   # Register tag 0 handler (work assignment)
   la t0, work_handler
@@ -96,7 +96,7 @@ all_done:
   li a1, NUM_PU
   call sha256_buffer         # a0 = sha256_buffer(result_buffer, NUM_PU)
 
-  # Send result to MC for end-of-simulation
-  li x3, 0x8000              # MC0, tag = 0
-  .word 0x0035500b
+  # Signal end-of-simulation by writing result to peripheral stop register
+  li t0, 0x40000000
+  sw a0, 0(t0)
   wfi

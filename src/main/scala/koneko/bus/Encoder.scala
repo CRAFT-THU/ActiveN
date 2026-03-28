@@ -30,12 +30,16 @@ class Encoder(implicit val param: CoreParameters) extends Module {
   mem.resp := resp
 
   // --- Request encoding ---
-  // Compute DRAM controller destination from address
-  // memCtrlSizes defines the size of each controller.
-  // Global memory starts at 0x80000000; address within global space
-  // maps to controllers sequentially.
+  // Compute destination from address:
+  //   0x40000000-0x7FFFFFFF: peripheral (dst = 0x8000)
+  //   0x80000000+:           DRAM controller (dst = 0x8001 + X)
   val memCtrlSizes = param.memCtrlSizes
-  val memDstBase = 0x8000 // Memory controllers: dst = 0x8000 + X
+  val memDstBase = 0x8001 // Memory controllers: dst = 0x8001 + X
+  val periphDst = 0x8000  // Peripheral MMIO handler
+
+  // Peripheral detection
+  val isPeripheral = !mem.req.bits.addr(31) && mem.req.bits.addr(30)
+  val periphAddr = mem.req.bits.addr - 0x40000000L.U
 
   // For hardware lookup: build cumulative boundaries
   // Controller i handles [cumSize(i), cumSize(i+1))
@@ -59,6 +63,10 @@ class Encoder(implicit val param: CoreParameters) extends Module {
     }
   }
 
+  // Mux destination and address based on peripheral vs global memory
+  val finalDst  = Mux(isPeripheral, periphDst.U(16.W), ctrlDst)
+  val finalAddr = Mux(isPeripheral, periphAddr, ctrlLocalAddr)
+
   // FSM: encode MemReq as 2 or 3 flits
   val sIdle :: sSendAddr :: sSendMeta :: sSendWdata :: Nil = Enum(4)
   val state = RegInit(sIdle)
@@ -75,12 +83,12 @@ class Encoder(implicit val param: CoreParameters) extends Module {
   mem.req.ready := state === sIdle
 
   when(mem.req.fire) {
-    reqAddr := ctrlLocalAddr
+    reqAddr := finalAddr
     reqId := mem.req.bits.id
     reqSize := mem.req.bits.size
     reqWdata := mem.req.bits.wdata
     reqWrite := mem.req.bits.write
-    reqDst := ctrlDst
+    reqDst := finalDst
     state := sSendAddr
   }
 

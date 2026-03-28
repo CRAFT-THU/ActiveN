@@ -1,10 +1,11 @@
 /**
  * System-level simulation driver.
  *
- * Drives the System module (multicore + NoC) with flat backing memory.
- * Memory request events arrive on memOut ports (Flit: tag 0xFF00/0xFF01).
- * Responses sent on per-core memResp ports (256-bit data + tag).
- * End-of-simulation: flit with tag=0 arriving at any MC port, result in data.
+ * Drives the System module (multicore + NoC + MemIf) with flat backing memory.
+ * Memory requests arrive as GlobalMemReq per MC (id, addr, wdata[256], wbe[32], write).
+ * Responses sent as GlobalMemResp per MC (id, rdata[256]).
+ * Peripheral requests arrive via a separate peripheral MemIf (same format).
+ * End-of-simulation: peripheral write to address 0x0 (= physical 0x40000000).
  *
  * Environment:
  *   MEOW_TEXT       - Binary memory image
@@ -22,8 +23,12 @@
 #include <deque>
 #include <signal.h>
 
+#include <chrono>
+#include <iomanip>
 #include <verilated_fst_c.h>
 #include "sys_verilated/sys_rtl.h"
+
+#include "devices.h"
 
 using namespace std;
 
@@ -33,7 +38,7 @@ static bool exiting = false;
 
 static const uint64_t RESET_LENGTH = 10;
 static const uint32_t TEXT_BASE = 0x80000000ul;
-static const int MEM_BUS_WORDS = 256 / 32;
+static const int MEM_BUS_WORDS = 256 / 32; // 8
 
 static uint32_t *text_aligned = nullptr;
 static size_t text_size = 0;
@@ -42,47 +47,24 @@ static std::unique_ptr<VerilatedFstC> tracer;
 static void sighandler(int) { exiting = true; }
 
 struct MemResponse {
-  uint16_t tag;
+  uint16_t id;
   uint32_t data[MEM_BUS_WORDS];
 };
 
-struct MemRequestCollector {
-  bool active = false;
-  uint16_t tag = 0;
-  uint16_t src = 0;
-  int flit_count = 0;
-  uint32_t operands[3];
-  void reset() { active = false; flit_count = 0; }
-};
-
-static MemResponse readBlock(uint32_t addr, uint16_t resp_tag) {
-  MemResponse resp;
-  resp.tag = resp_tag;
-  uint32_t aligned = addr & ~((MEM_BUS_WORDS * 4) - 1);
-  for (int i = 0; i < MEM_BUS_WORDS; i++) {
-    uint32_t ba = aligned + i * 4;
-    if (ba >= TEXT_BASE && (ba - TEXT_BASE) < text_size)
-      resp.data[i] = text_aligned[(ba - TEXT_BASE) / 4];
-    else
-      resp.data[i] = 0;
-  }
-  return resp;
-}
-
-// Port accessor structs
-struct MemRespPort {
-  uint8_t *valid;
-  uint16_t *tag;
-  uint32_t *data;
-};
-
-struct MemOutPort {
-  uint8_t *valid;
-  uint8_t *ready;
-  uint16_t *src;
-  uint16_t *dst;
-  uint16_t *tag;
-  uint32_t *data;
+// Per-MC memory port accessors
+struct MemPort {
+  // Request (output from system)
+  uint8_t *req_valid;
+  uint8_t *req_ready;
+  uint16_t *req_id;
+  uint32_t *req_addr;
+  uint32_t *req_wdata; // WData[8]
+  uint32_t *req_wbe;
+  uint8_t *req_write;
+  // Response (input to system)
+  uint8_t *resp_valid;
+  uint16_t *resp_id;
+  uint32_t *resp_rdata; // WData[8]
 };
 
 struct SystemSim {
@@ -91,73 +73,105 @@ struct SystemSim {
   int num_pu, num_mc;
 
   std::vector<std::deque<MemResponse>> mem_resps;
-  std::vector<MemRequestCollector> src_collectors; // per-source (PU) collectors
-  std::vector<MemRespPort> resp_ports;
-  std::vector<MemOutPort> out_ports;
+  std::vector<MemPort> mem_ports;
 
-  bool finished = false;
-  uint32_t result = 0;
+  // Peripheral
+  PeripheralDevice periph;
+  std::deque<MemResponse> periph_resps;
 
   SystemSim(int pu, int mc) : num_pu(pu), num_mc(mc) {
     sys.reset(new sys_rtl("system"));
-    mem_resps.resize(num_pu);
-    src_collectors.resize(num_pu);
-    resp_ports.resize(num_pu);
-    out_ports.resize(num_mc);
-
-    // Init port accessor tables
-    for (int i = 0; i < num_pu; i++) initRespPort(i);
-    for (int i = 0; i < num_mc; i++) initOutPort(i);
+    mem_resps.resize(num_mc);
+    mem_ports.resize(num_mc);
+    for (int i = 0; i < num_mc; i++) initMemPort(i);
   }
 
   ~SystemSim() { sys->final(); }
 
-  void initRespPort(int i) {
-    auto &p = resp_ports[i];
+  void initMemPort(int i) {
+    auto &p = mem_ports[i];
     switch(i) {
-      #include "resp_ports.inc"
+      #include "mem_ports.inc"
       default: break;
     }
   }
 
-  void initOutPort(int i) {
-    auto &p = out_ports[i];
-    switch(i) {
-      #include "out_ports.inc"
-      default: break;
-    }
-  }
+  void processMemReq(int mc) {
+    auto &p = mem_ports[mc];
+    uint16_t id = *p.req_id;
+    uint32_t addr = *p.req_addr + TEXT_BASE;
+    bool is_write = *p.req_write;
 
-  void processMemRequest(int src_idx) {
-    auto &c = src_collectors[src_idx];
-    uint32_t addr = c.operands[0] + TEXT_BASE;
-    uint16_t resp_tag = c.operands[1] & 0xFFFF;
-
-    if (c.tag == 0xFF00) {
-      if (LOG) cout << "[System] Load PU" << c.src << " addr=0x" << hex << addr
-                    << " rtag=0x" << resp_tag << dec << endl;
-      mem_resps[src_idx].push_back(readBlock(addr, resp_tag));
-    } else if (c.tag == 0xFF01) {
-      uint16_t size = (c.operands[1] >> 16) & 0xFFFF;
-      uint32_t wdata = c.operands[2];
-      if (LOG) cout << "[System] Store PU" << c.src << " addr=0x" << hex << addr
-                    << " sz=" << dec << size << " data=0x" << hex << wdata
-                    << " rtag=0x" << resp_tag << dec << endl;
+    if (is_write) {
+      // Apply byte-masked write
+      uint32_t wbe = *p.req_wbe;
       if (addr >= TEXT_BASE && (addr - TEXT_BASE) < text_size) {
-        uint32_t offset = (addr - TEXT_BASE) / 4;
-        uint32_t old_val = text_aligned[offset];
-        uint32_t byte_off = addr & 3;
-        uint32_t mask = 0;
-        switch (size) {
-          case 0: mask = 0xFFu << (byte_off * 8); break;
-          case 1: mask = 0xFFFFu << (byte_off * 8); break;
-          default: mask = 0xFFFFFFFFu; break;
+        uint32_t block_base = addr & ~(uint32_t)(MEM_BUS_WORDS * 4 - 1);
+        for (int w = 0; w < MEM_BUS_WORDS; w++) {
+          uint32_t ba = block_base + w * 4;
+          uint32_t word_be = (wbe >> (w * 4)) & 0xF;
+          if (word_be && ba >= TEXT_BASE && (ba - TEXT_BASE + 3) < text_size) {
+            uint32_t offset = (ba - TEXT_BASE) / 4;
+            uint32_t old_val = text_aligned[offset];
+            uint32_t new_val = p.req_wdata[w];
+            uint32_t mask = 0;
+            for (int b = 0; b < 4; b++) {
+              if (word_be & (1 << b)) mask |= 0xFFu << (b * 8);
+            }
+            text_aligned[offset] = (old_val & ~mask) | (new_val & mask);
+          }
         }
-        text_aligned[offset] = (old_val & ~mask) | (wdata & mask);
       }
-      mem_resps[src_idx].push_back(readBlock(addr, resp_tag));
+      if (LOG) cout << "[System] Store MC" << mc << " addr=0x" << hex << addr
+                    << " id=" << dec << id << endl;
+    } else {
+      if (LOG) cout << "[System] Load MC" << mc << " addr=0x" << hex << addr
+                    << " id=" << dec << id << endl;
     }
-    c.reset();
+
+    // Return 256-bit aligned read (also for stores, as read-after-write)
+    MemResponse resp;
+    resp.id = id;
+    uint32_t aligned = addr & ~(uint32_t)(MEM_BUS_WORDS * 4 - 1);
+    for (int i = 0; i < MEM_BUS_WORDS; i++) {
+      uint32_t ba = aligned + i * 4;
+      if (ba >= TEXT_BASE && (ba - TEXT_BASE + 3) < text_size)
+        resp.data[i] = text_aligned[(ba - TEXT_BASE) / 4];
+      else
+        resp.data[i] = 0;
+    }
+    mem_resps[mc].push_back(resp);
+  }
+
+  void processPeriphReq() {
+    uint16_t id = sys->io_periph_req_bits_id;
+    uint32_t addr = sys->io_periph_req_bits_addr;
+    bool is_write = sys->io_periph_req_bits_write;
+
+    if (is_write) {
+      // Decode wdata and byte enables to extract the written value
+      uint32_t wbe = sys->io_periph_req_bits_wbe;
+      uint32_t wdata = 0;
+      // Find the first active word from the 256-bit write data
+      for (int w = 0; w < MEM_BUS_WORDS; w++) {
+        uint32_t word_be = (wbe >> (w * 4)) & 0xF;
+        if (word_be) {
+          wdata = sys->io_periph_req_bits_wdata[w];
+          break;
+        }
+      }
+      periph.write(addr, wdata);
+      if (LOG) cout << "[System] Periph write: addr=0x" << hex << addr
+                    << " data=0x" << wdata << dec << endl;
+    } else {
+      if (LOG) cout << "[System] Periph read: addr=0x" << hex << addr << dec << endl;
+    }
+
+    // Return dummy response
+    MemResponse resp;
+    resp.id = id;
+    memset(resp.data, 0, sizeof(resp.data));
+    periph_resps.push_back(resp);
   }
 
   void step() {
@@ -165,8 +179,12 @@ struct SystemSim {
 
     if (cycle <= RESET_LENGTH) {
       sys->reset = true;
-      for (int mc = 0; mc < num_mc; mc++) *out_ports[mc].ready = 0;
-      for (int i = 0; i < num_pu; i++) *resp_ports[i].valid = 0;
+      for (int mc = 0; mc < num_mc; mc++) {
+        *mem_ports[mc].req_ready = 0;
+        *mem_ports[mc].resp_valid = 0;
+      }
+      sys->io_periph_req_ready = 0;
+      sys->io_periph_resp_valid = 0;
       sys->clock = true;
       sys->eval();
       sys->clock = false;
@@ -176,50 +194,27 @@ struct SystemSim {
 
     sys->reset = false;
 
-    // Process memOut from previous cycle
+    // Process memory requests from previous cycle
     for (int mc = 0; mc < num_mc; mc++) {
-      auto &op = out_ports[mc];
-      if (*op.ready && *op.valid) {
-        uint16_t src = *op.src;
-        uint16_t dst = *op.dst;
-        uint32_t data = *op.data;
-        uint16_t tag = *op.tag;
-
-        if (tag == 0xFF00 || tag == 0xFF01) {
-          int src_idx = src - 1;
-          if (src_idx < 0 || src_idx >= num_pu) {
-            cerr << "[System] Invalid src PU " << src << endl;
-            continue;
-          }
-          auto &col = src_collectors[src_idx];
-          if (!col.active) {
-            col.active = true;
-            col.tag = tag;
-            col.src = src;
-            col.flit_count = 0;
-          }
-          col.operands[col.flit_count++] = data;
-          int expected = (tag == 0xFF00) ? 2 : 3;
-          if (col.flit_count >= expected) processMemRequest(src_idx);
-        } else {
-          if (LOG) cout << "[System] AM@MC" << mc << " src=" << src
-                       << " dst=" << dst << " data=0x" << hex << data
-                       << " tag=" << dec << tag << endl;
-          if (tag == 0) {
-            finished = true;
-            result = data;
-            cout << "[System] Finished: result=" << dec << data
-                 << " (0x" << hex << data << ")" << dec << endl;
-          }
-        }
+      auto &p = mem_ports[mc];
+      if (*p.req_ready && *p.req_valid) {
+        processMemReq(mc);
       }
     }
 
+    // Process peripheral request from previous cycle
+    if (sys->io_periph_req_ready && sys->io_periph_req_valid) {
+      processPeriphReq();
+    }
+
     // Dequeue responses that were consumed last cycle
-    for (int i = 0; i < num_pu; i++) {
-      if (*resp_ports[i].valid && !mem_resps[i].empty()) {
-        mem_resps[i].pop_front();
+    for (int mc = 0; mc < num_mc; mc++) {
+      if (*mem_ports[mc].resp_valid && !mem_resps[mc].empty()) {
+        mem_resps[mc].pop_front();
       }
+    }
+    if (sys->io_periph_resp_valid && !periph_resps.empty()) {
+      periph_resps.pop_front();
     }
 
     // Posedge
@@ -228,22 +223,39 @@ struct SystemSim {
 
     if (TRACE) tracer->dump(cycle * 2);
 
-    // Set memOut ready
-    for (int mc = 0; mc < num_mc; mc++) *out_ports[mc].ready = 1;
+    // Set memory request ready (always accept)
+    for (int mc = 0; mc < num_mc; mc++) {
+      *mem_ports[mc].req_ready = 1;
+    }
+    sys->io_periph_req_ready = 1;
 
-    // Set memResp signals
-    for (int i = 0; i < num_pu; i++) {
-      auto &rp = resp_ports[i];
-      if (mem_resps[i].empty()) {
-        *rp.valid = 0;
-        *rp.tag = 0;
-        for (int w = 0; w < MEM_BUS_WORDS; w++) rp.data[w] = 0;
+    // Set memory response signals
+    for (int mc = 0; mc < num_mc; mc++) {
+      auto &p = mem_ports[mc];
+      if (mem_resps[mc].empty()) {
+        *p.resp_valid = 0;
+        *p.resp_id = 0;
+        for (int w = 0; w < MEM_BUS_WORDS; w++) p.resp_rdata[w] = 0;
       } else {
-        auto &r = mem_resps[i].front();
-        *rp.valid = 1;
-        *rp.tag = r.tag;
-        for (int w = 0; w < MEM_BUS_WORDS; w++) rp.data[w] = r.data[w];
+        auto &r = mem_resps[mc].front();
+        *p.resp_valid = 1;
+        *p.resp_id = r.id;
+        for (int w = 0; w < MEM_BUS_WORDS; w++) p.resp_rdata[w] = r.data[w];
       }
+    }
+
+    // Set peripheral response signals
+    if (periph_resps.empty()) {
+      sys->io_periph_resp_valid = 0;
+      sys->io_periph_resp_bits_id = 0;
+      for (int w = 0; w < MEM_BUS_WORDS; w++)
+        sys->io_periph_resp_bits_rdata[w] = 0;
+    } else {
+      auto &r = periph_resps.front();
+      sys->io_periph_resp_valid = 1;
+      sys->io_periph_resp_bits_id = r.id;
+      for (int w = 0; w < MEM_BUS_WORDS; w++)
+        sys->io_periph_resp_bits_rdata[w] = r.data[w];
     }
 
     // Negedge
@@ -308,18 +320,23 @@ int main(int argc, char **argv) {
   }
 
   cout << "[System] Running (max " << max_cycles << " cycles)..." << endl;
-  while (!sim.finished && sim.cycle < max_cycles && !exiting) {
+  auto wall_start = chrono::steady_clock::now();
+  while (!sim.periph.finished && sim.cycle < max_cycles && !exiting) {
     sim.step();
   }
+  auto wall_end = chrono::steady_clock::now();
+  double wall_secs = chrono::duration<double>(wall_end - wall_start).count();
 
-  if (sim.finished) {
-    cout << "[System] Result: " << dec << sim.result << " (0x" << hex << sim.result << ")" << endl;
+  if (sim.periph.finished) {
+    cout << "[System] Result: " << dec << sim.periph.result << " (0x" << hex << sim.periph.result << ")" << endl;
     cout << "[System] Cycles: " << dec << sim.cycle << endl;
   } else {
     cout << "[System] " << (exiting ? "Interrupted" : "Timed out") << " at cycle " << sim.cycle << endl;
   }
+  cout << "[System] Speed: " << dec << (uint64_t)(sim.cycle / wall_secs) << " cycles/s" << endl;
+  cout << "[System] Runtime: " << fixed << setprecision(3) << wall_secs << "s" << endl;
 
-  if (TRACE) { tracer->close(); tracer.reset(); }
-  delete[] text_mem;
-  return sim.finished ? 0 : 1;
+  if (TRACE) tracer->close();
+  delete[] text_aligned;
+  return sim.periph.finished ? 0 : 1;
 }

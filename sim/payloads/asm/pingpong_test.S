@@ -55,7 +55,7 @@ forward:
   wfi
 
 done:
-  # Send result to MC for end-of-simulation
-  li x2, 0x8000       # MC0 destination, tag = 0
-  .word 0x0025500b    # Send a0 to MC
+  # Signal end-of-simulation by writing result to peripheral stop register
+  li t0, 0x40000000
+  sw a0, 0(t0)
   wfi

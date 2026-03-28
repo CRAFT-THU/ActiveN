@@ -1,4 +1,4 @@
-// Generate a NoC system with 2-D mesh topology.
+// Generate a NoC system with 2-D mesh topology and hardware memory interface.
 //
 // Topology:
 // 1. Grid: power-of-two nodes on a rectangular grid (1:1 or 2:1 width:height).
@@ -14,8 +14,9 @@
 // 5. Routing: standard XY routing for all traffic.
 //    - PU->PU: XY route directly.
 //    - PU->MC: XY route to the nearest MC connection node in that MC's zone.
-//    - MC never injects into the NoC. Responses bypass the NoC via direct io.memResp.
-// 6. Each MC's connection ejects are arbitrated into a single memOut per MC.
+// 6. Memory: MemIf per MC collects multi-flit requests, issues GlobalMemReq.
+//    Responses route back via MemDistributor (per cluster) to individual PUs.
+//    Cross-zone responses forwarded via inter-MemIf ring bus.
 
 package koneko
 
@@ -127,7 +128,7 @@ object Topology {
     // Inverse: (row, col) -> PU ID
     posToId: Map[(Int, Int), Int],
     puIds: Seq[Int],
-    mcIds: Seq[Int], // 0x8000, 0x8001, ...
+    mcIds: Seq[Int], // 0x8001, 0x8002, ...
     // MC ID -> cluster indices assigned to this MC
     mcZones: Map[Int, Seq[Int]],
     // MC ID -> list of connection PU IDs (one per cluster in the zone)
@@ -167,7 +168,7 @@ object Topology {
 
     // 3. MC zone assignment: split the cluster sequence into numMC continuous segments
     // Recursive bisection of cluster indices [0, numClusters)
-    val mcIds = (0 until numMC).map(_ + 0x8000)
+    val mcIds = (0 until numMC).map(_ + 0x8001)
     val clustersPerMC = numClusters / numMC
     val mcZones: Map[Int, Seq[Int]] = mcIds.zipWithIndex.map { case (mcId, mi) =>
       mcId -> (mi * clustersPerMC until (mi + 1) * clustersPerMC)
@@ -250,18 +251,31 @@ object Topology {
         }
       }
 
+      // Route to peripheral (0x8000): XY toward PU1
+      val periphId = 0x8000
+      val periphPU = 1
+      if (srcId == periphPU) {
+        // PU1 has a local eject for 0x8800, no forwarding entry
+      } else {
+        val (pr, pc) = puPos(periphPU)
+        val dir = xyRouteDir(sr, sc, pr, pc)
+        table(periphId) = dirMap(dir)
+      }
+
       srcId -> table.toMap
     }.toMap
 
     // 7. Build locals for each PU router
     //   - Local(id, inject=true, eject=true) for the core itself
     //   - Local(mcId, inject=false, eject=true) for each MC this PU connects to
+    //   - Local(0x8000, inject=false, eject=true) on PU1 for peripheral
     val puLocals: Map[Int, Seq[Local]] = puIds.map { id =>
       val coreLocal = Local(id, inject = true, eject = true)
       val mcLocals = puMcEjects.getOrElse(id, Nil).map { mcId =>
         Local(mcId, inject = false, eject = true)
       }
-      id -> (Seq(coreLocal) ++ mcLocals)
+      val periphLocal = if (id == 1) Seq(Local(0x8000, inject = false, eject = true)) else Nil
+      id -> (Seq(coreLocal) ++ mcLocals ++ periphLocal)
     }.toMap
 
     TopoInfo(gridW, gridH, puPos, posToId, puIds, mcIds, mcZones, mcConns,
@@ -277,32 +291,41 @@ class System(implicit val params: SystemParameters) extends Module {
   val topo = Topology.build(params.numPU, params.numMC)
   val flitType = new Flit
 
+  val numClusters = params.numPU / 16
+  val clustersPerMC = numClusters / params.numMC
+
   val io = IO(new Bundle {
-    val memOut = Vec(params.numMC, Decoupled(new Flit))
-    val memResp = Vec(params.numPU, Flipped(Valid(new MemResp)))
+    val mem = Vec(params.numMC, new Bundle {
+      val req  = Decoupled(new GlobalMemReq)
+      val resp = Flipped(Valid(new GlobalMemResp))
+    })
+    val periph = new Bundle {
+      val req  = Decoupled(new GlobalMemReq)
+      val resp = Flipped(Valid(new GlobalMemResp))
+    }
   })
 
   // --- Instantiate cores ---
   val coreDef = Definition(new Core)
   val cores = topo.puIds.map { id =>
     val inst = Instance(coreDef)
+    inst.suggestName(s"pu_$id")
     inst.cfg.hartid := id.U
-    inst.mem := io.memResp(id - 1)
     (id, inst)
   }.toMap
 
   // --- Instantiate PU routers ---
   val puRouters = topo.puIds.map { id =>
     val numE = topo.puNumEgress(id)
-    val numI = numE // mesh: symmetric ingress/egress count
+    val numI = numE
     val locals = topo.puLocals(id)
     val table = topo.puTables(id)
     val router = Module(new Router(flitType, locals, numI, numE, 1, 4, table))
+    router.suggestName(s"router_$id")
     (id, router)
   }.toMap
 
   // --- Connect mesh links ---
-  // For each PU, for each active direction, connect egress->neighbor's ingress
   val connectedPairs = scala.collection.mutable.Set[(Int, Int)]()
   for (id <- topo.puIds) {
     val (row, col) = topo.puPos(id)
@@ -319,7 +342,6 @@ class System(implicit val params: SystemParameters) extends Module {
       if (!connectedPairs.contains(pair)) {
         val eIdx = dirToEgress(dir)
         val nEIdx = nDirToEgress(oppDir)
-        // id.egress(eIdx) -> nid.ingress(nEIdx) and vice versa
         puRouters(nid).ingress(nEIdx) <> puRouters(id).egress(eIdx)
         puRouters(id).ingress(eIdx) <> puRouters(nid).egress(nEIdx)
         connectedPairs += pair
@@ -331,10 +353,9 @@ class System(implicit val params: SystemParameters) extends Module {
   for (id <- topo.puIds) {
     val core = cores(id)
     val router = puRouters(id)
-    val inject = router.injects(0).get // local 0 always has inject
-    val eject = router.ejects(0).get   // local 0 always has eject
+    val inject = router.injects(0).get
+    val eject = router.ejects(0).get
 
-    // Core ext.out -> router inject (add src field)
     inject.valid := core.ext.out.valid
     inject.bits.src := id.U
     inject.bits.dst := core.ext.out.bits.dst
@@ -342,7 +363,6 @@ class System(implicit val params: SystemParameters) extends Module {
     inject.bits.tag := core.ext.out.bits.tag
     core.ext.out.ready := inject.ready
 
-    // Router eject -> core ext.in
     core.ext.in.valid := eject.valid
     core.ext.in.bits.src := eject.bits.src
     core.ext.in.bits.data := eject.bits.data
@@ -350,22 +370,87 @@ class System(implicit val params: SystemParameters) extends Module {
     eject.ready := core.ext.in.ready
   }
 
-  // --- MC eject arbitration ---
-  // Each MC has connection ejects across multiple PU routers. Arbitrate into single memOut.
+  // --- Instantiate MemIfs (one per MC) ---
+  val memIfs = topo.mcIds.zipWithIndex.map { case (mcId, mcIdx) =>
+    val puStart = mcIdx * clustersPerMC * 16 + 1
+    val puEnd   = (mcIdx + 1) * clustersPerMC * 16
+    val memIf = Module(new MemIf(mcIdx, puStart, puEnd, clustersPerMC, 16))
+    memIf.suggestName(s"memif_${mcIdx + 1}")
+    io.mem(mcIdx).req <> memIf.mem.req
+    memIf.mem.resp := io.mem(mcIdx).resp
+    (mcIdx, memIf)
+  }.toMap
+
+  // --- Instantiate peripheral MemIf (no zone-of-influence, all responses go via ring) ---
+  val periphMemIf = Module(new MemIf(params.numMC, 0, 0, 1, 16))
+  periphMemIf.suggestName("memif_0")
+  io.periph.req <> periphMemIf.mem.req
+  periphMemIf.mem.resp := io.periph.resp
+  // Tie off resp(0) — no local PUs in the peripheral MemIf's zone
+  periphMemIf.resp(0).ready := true.B
+
+  // --- Connect MC eject ports to MemIf req inputs ---
   for ((mcId, mcIdx) <- topo.mcIds.zipWithIndex) {
-    val connPUs = topo.mcConns(mcId)
-    val ejectPorts: Seq[DecoupledIO[Flit]] = connPUs.map { puId =>
+    val connPUs = topo.mcConns(mcId) // one connection PU per cluster in zone
+    for ((puId, ci) <- connPUs.zipWithIndex) {
       val locals = topo.puLocals(puId)
       val mcLocalIdx = locals.indexWhere(_.id == mcId)
-      puRouters(puId).ejects(mcLocalIdx).get
-    }
+      val ejectPort = puRouters(puId).ejects(mcLocalIdx).get
 
-    if (ejectPorts.length == 1) {
-      io.memOut(mcIdx) <> ejectPorts.head
-    } else {
-      val arb = Module(new Arbiter(new Flit, ejectPorts.length))
-      ejectPorts.zipWithIndex.foreach { case (p, i) => arb.io.in(i) <> p }
-      io.memOut(mcIdx) <> arb.io.out
+      memIfs(mcIdx).req(ci).valid    := ejectPort.valid
+      memIfs(mcIdx).req(ci).bits.src := ejectPort.bits.src
+      memIfs(mcIdx).req(ci).bits.dst := ejectPort.bits.dst
+      memIfs(mcIdx).req(ci).bits.data := ejectPort.bits.data
+      memIfs(mcIdx).req(ci).bits.tag := ejectPort.bits.tag
+      ejectPort.ready := memIfs(mcIdx).req(ci).ready
+    }
+  }
+
+  // --- Connect peripheral eject port on PU1 to peripheral MemIf ---
+  {
+    val locals = topo.puLocals(1)
+    val periphLocalIdx = locals.indexWhere(_.id == 0x8000)
+    val ejectPort = puRouters(1).ejects(periphLocalIdx).get
+
+    periphMemIf.req(0).valid    := ejectPort.valid
+    periphMemIf.req(0).bits.src := ejectPort.bits.src
+    periphMemIf.req(0).bits.dst := ejectPort.bits.dst
+    periphMemIf.req(0).bits.data := ejectPort.bits.data
+    periphMemIf.req(0).bits.tag := ejectPort.bits.tag
+    ejectPort.ready := periphMemIf.req(0).ready
+  }
+
+  // --- Ring bus: MC[0] -> MC[1] -> ... -> MC[last] -> periph -> MC[0] ---
+  if (params.numMC == 1) {
+    memIfs(0).ringOut <> periphMemIf.ringIn
+    periphMemIf.ringOut <> memIfs(0).ringIn
+  } else {
+    // MC[i].ringOut -> MC[i+1].ringIn for i = 0..numMC-2
+    for (i <- 0 until params.numMC - 1) {
+      memIfs(i + 1).ringIn <> memIfs(i).ringOut
+    }
+    // MC[last].ringOut -> periph.ringIn
+    periphMemIf.ringIn <> memIfs(params.numMC - 1).ringOut
+    // periph.ringOut -> MC[0].ringIn
+    memIfs(0).ringIn <> periphMemIf.ringOut
+  }
+
+  // --- Instantiate MemDistributors (one per cluster) and connect ---
+  for (ci <- 0 until numClusters) {
+    val mcIdx = ci / clustersPerMC
+    val ciLocal = ci % clustersPerMC // cluster index within the MC's zone
+    val puStart = ci * 16 + 1
+
+    val dist = Module(new MemDistributor(puStart))
+    dist.suggestName(s"distrib_${ci + 1}")
+
+    // MemIf resp -> distributor input
+    dist.in <> memIfs(mcIdx).resp(ciLocal)
+
+    // Distributor outputs -> core mem ports
+    for (j <- 0 until 16) {
+      val puId = puStart + j
+      cores(puId).mem := dist.out(j)
     }
   }
 }

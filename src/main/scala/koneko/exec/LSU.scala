@@ -41,9 +41,15 @@ class LSU(implicit val param: CoreParameters) extends Module {
     req.bits.len.b -> (0x1.U(4.W) << req.bits.addr(1, 0)),
   ))
 
-  // Address space routing: SPM for low addresses, global memory otherwise
-  val isSPM = req.bits.addr < param.scratchpadSize.U
+  // Address space routing:
+  //   0x20000000-0x3FFFFFFF: SPM (scratchpad)
+  //   0x40000000+:           Exterior (peripheral or global memory)
+  //   Below 0x20000000:      Invalid (assert)
+  val isSPM = req.bits.addr >= 0x20000000.U && req.bits.addr < 0x40000000.U
+  assert(!req.valid || req.bits.addr >= 0x20000000.U, "Access to address below 0x20000000")
 
+  val spmAddr = req.bits.addr - 0x20000000.U
+  val spmAlignedAddr = (spmAddr >> 2) ## 0.U(2.W)
   val alignedAddr = (req.bits.addr >> 2) ## 0.U(2.W)
 
   // --- SPM path (2-cycle reads, 1-cycle writes) ---
@@ -51,7 +57,7 @@ class LSU(implicit val param: CoreParameters) extends Module {
   spmReadPending := req.valid && isSPM && !req.bits.write && !spmReadPending
   val spmReady = Mux(req.bits.write, true.B, spmReadPending)
 
-  spm.io.addr := alignedAddr
+  spm.io.addr := spmAlignedAddr
   spm.io.we := Mux(req.fire && isSPM && req.bits.write, wbe, 0.U)
   spm.io.wdata := wmapped
 
