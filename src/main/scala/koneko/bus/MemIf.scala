@@ -162,7 +162,11 @@ class MemIf(
   }
 
   // --- 3. Receive memory response ---
-  when(mem.resp.valid) {
+  // Guard: only accept response for an allocated slot. Stale responses
+  // (e.g. from a write whose slot was already freed and reallocated) are
+  // ignored.  Without this, a late response could set completed=true on a
+  // freshly reallocated slot due to Chisel last-connect-wins semantics.
+  when(mem.resp.valid && allocated(mem.resp.bits.id)) {
     data(mem.resp.bits.id)      := mem.resp.bits.rdata
     completed(mem.resp.bits.id) := true.B
   }

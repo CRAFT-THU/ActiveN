@@ -20,14 +20,6 @@ set(SRCS
     src/meow.cpp
 )
 
-# include_directories(${CMAKE_CURRENT_LIST_DIR}/booksim2/src)
-# include_directories(${CMAKE_CURRENT_LIST_DIR}/booksim2/src/arbiters)
-# include_directories(${CMAKE_CURRENT_LIST_DIR}/booksim2/src/allocators)
-# include_directories(${CMAKE_CURRENT_LIST_DIR}/booksim2/src/routers)
-# include_directories(${CMAKE_CURRENT_LIST_DIR}/booksim2/src/networks)
-# include_directories(${CMAKE_CURRENT_LIST_DIR}/booksim2/src/power)
-
-# FILE(GLOB_RECURSE BOOKSIM_SRCS booksim2/src/*.cpp booksim2/src/lex.yy.c booksim2/src/y.tab.c)
 find_library(DRAMSIM3 dramsim3)
 
 add_executable(sim ${SRCS})
@@ -95,7 +87,7 @@ execute_process(
             ${SYSTEM_NUM_PU} ${SYSTEM_NUM_MC} ${CMAKE_CURRENT_BINARY_DIR}
 )
 
-set(VERILATOR_SYSTEM_ARGS -Wall -Wno-fatal -Wno-DECLFILENAME --trace-params --trace-structs --top-module System -DRANDOMIZE_REG_INIT -DRANDOMIZE_MEM_INIT -I${CVFPU_DIR}/src/common_cells/include -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNSIGNED -Wno-CASEINCOMPLETE -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-UNDRIVEN -Wno-PINMISSING)
+set(VERILATOR_SYSTEM_ARGS -Wall -Wno-fatal -Wno-DECLFILENAME --trace-params --trace-structs --top-module System -I${CVFPU_DIR}/src/common_cells/include -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNSIGNED -Wno-CASEINCOMPLETE -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-UNDRIVEN -Wno-PINMISSING)
 
 add_executable(sim_system
     src/system.cpp
@@ -109,3 +101,5 @@ verilate(
     DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/sys_verilated
     VERILATOR_ARGS ${VERILATOR_SYSTEM_ARGS}
 )
+
+target_link_libraries(sim_system PRIVATE ${DRAMSIM3})

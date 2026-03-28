@@ -7,8 +7,13 @@
  * Peripheral requests arrive via a separate peripheral MemIf (same format).
  * End-of-simulation: peripheral write to address 0x0 (= physical 0x40000000).
  *
+ * DRAMsim3 integration: when MEOW_MEM is set, memory responses are delayed
+ * until DRAMsim3 completes the transaction (accurate timing simulation).
+ *
  * Environment:
  *   MEOW_TEXT       - Binary memory image
+ *   MEOW_MEM        - DRAMsim3 config file (optional; enables DRAM latency sim)
+ *   MEOW_MEM_LOG    - DRAMsim3 log directory (default: ".")
  *   MEOW_TRACE      - Enable FST tracing
  *   MEOW_LOG        - Enable logging
  *   MEOW_MAX_CYCLES - Max cycles (default: 10000000)
@@ -21,7 +26,9 @@
 #include <cstring>
 #include <vector>
 #include <deque>
+#include <map>
 #include <signal.h>
+#include <filesystem>
 
 #include <chrono>
 #include <iomanip>
@@ -29,6 +36,7 @@
 #include "sys_verilated/sys_rtl.h"
 
 #include "devices.h"
+#include "dramsim3/dramsim3.h"
 
 using namespace std;
 
@@ -79,6 +87,20 @@ struct SystemSim {
   PeripheralDevice periph;
   std::deque<MemResponse> periph_resps;
 
+  // DRAMsim3 state (per MC)
+  bool use_dram = false;
+  struct DramMC {
+    dramsim3::MemorySystem *dram = nullptr;
+    struct PendingReq {
+      uint64_t addr;
+      bool is_write;
+      MemResponse resp;
+    };
+    std::deque<PendingReq> submit_queue;
+    std::multimap<uint64_t, MemResponse> inflight;
+  };
+  std::vector<DramMC> dram_mcs;
+
   SystemSim(int pu, int mc) : num_pu(pu), num_mc(mc) {
     sys.reset(new sys_rtl("system"));
     mem_resps.resize(num_mc);
@@ -86,7 +108,24 @@ struct SystemSim {
     for (int i = 0; i < num_mc; i++) initMemPort(i);
   }
 
-  ~SystemSim() { sys->final(); }
+  void initDram(const char *cfg, const char *log_dir) {
+    use_dram = true;
+    dram_mcs.resize(num_mc);
+    for (int i = 0; i < num_mc; i++) {
+      auto log = std::string(log_dir) + "/" + std::to_string(i);
+      std::filesystem::create_directories(log);
+      dram_mcs[i].dram = new dramsim3::MemorySystem(
+        cfg, log.c_str(),
+        [this, i](uint64_t addr) { dramReadCb(i, addr); },
+        [this, i](uint64_t addr) { dramWriteCb(i, addr); }
+      );
+    }
+  }
+
+  ~SystemSim() {
+    sys->final();
+    for (auto &d : dram_mcs) delete d.dram;
+  }
 
   void initMemPort(int i) {
     auto &p = mem_ports[i];
@@ -96,14 +135,55 @@ struct SystemSim {
     }
   }
 
+  void dramReadCb(int mc, uint64_t addr) {
+    auto &d = dram_mcs[mc];
+    auto it = d.inflight.find(addr);
+    if (it != d.inflight.end()) {
+      mem_resps[mc].push_back(it->second);
+      d.inflight.erase(it);
+    } else {
+      cerr << "[DRAM] WARNING: read callback for unknown addr 0x" << hex << addr
+           << " on MC" << dec << mc << " cycle=" << cycle << endl;
+    }
+  }
+
+  void dramWriteCb(int mc, uint64_t addr) {
+    auto &d = dram_mcs[mc];
+    auto it = d.inflight.find(addr);
+    if (it != d.inflight.end()) {
+      // Don't deliver write responses: MemIf marks writes completed on issue.
+      // Delivering a stale write response can corrupt a reallocated slot
+      // (MemIf section 3 last-connect overrides section 1's completed := false).
+      d.inflight.erase(it);
+    } else {
+      cerr << "[DRAM] WARNING: write callback for unknown addr 0x" << hex << addr
+           << " on MC" << dec << mc << " cycle=" << cycle << endl;
+    }
+  }
+
+  MemResponse buildMemResp(int mc, uint16_t id, uint32_t addr) {
+    MemResponse resp;
+    resp.id = id;
+    uint32_t aligned = addr & ~(uint32_t)(MEM_BUS_WORDS * 4 - 1);
+    for (int i = 0; i < MEM_BUS_WORDS; i++) {
+      uint32_t ba = aligned + i * 4;
+      if (ba >= TEXT_BASE && (ba - TEXT_BASE + 3) < text_size)
+        resp.data[i] = text_aligned[(ba - TEXT_BASE) / 4];
+      else
+        resp.data[i] = 0;
+    }
+    return resp;
+  }
+
   void processMemReq(int mc) {
     auto &p = mem_ports[mc];
     uint16_t id = *p.req_id;
-    uint32_t addr = *p.req_addr + TEXT_BASE;
+    uint32_t local_addr = *p.req_addr;
+    uint32_t addr = local_addr + TEXT_BASE;
     bool is_write = *p.req_write;
 
     if (is_write) {
-      // Apply byte-masked write
+      // Apply byte-masked write to backing memory immediately
       uint32_t wbe = *p.req_wbe;
       if (addr >= TEXT_BASE && (addr - TEXT_BASE) < text_size) {
         uint32_t block_base = addr & ~(uint32_t)(MEM_BUS_WORDS * 4 - 1);
@@ -129,18 +209,16 @@ struct SystemSim {
                     << " id=" << dec << id << endl;
     }
 
-    // Return 256-bit aligned read (also for stores, as read-after-write)
-    MemResponse resp;
-    resp.id = id;
-    uint32_t aligned = addr & ~(uint32_t)(MEM_BUS_WORDS * 4 - 1);
-    for (int i = 0; i < MEM_BUS_WORDS; i++) {
-      uint32_t ba = aligned + i * 4;
-      if (ba >= TEXT_BASE && (ba - TEXT_BASE + 3) < text_size)
-        resp.data[i] = text_aligned[(ba - TEXT_BASE) / 4];
-      else
-        resp.data[i] = 0;
+    // Build the response data from backing memory
+    MemResponse resp = buildMemResp(mc, id, addr);
+
+    if (use_dram) {
+      // Queue for DRAMsim3 submission; response delayed until callback
+      dram_mcs[mc].submit_queue.push_back({(uint64_t)local_addr, is_write, resp});
+    } else {
+      // Instant response
+      mem_resps[mc].push_back(resp);
     }
-    mem_resps[mc].push_back(resp);
   }
 
   void processPeriphReq() {
@@ -186,8 +264,10 @@ struct SystemSim {
       sys->io_periph_req_ready = 0;
       sys->io_periph_resp_valid = 0;
       sys->clock = true;
+      Verilated::timeInc(1);
       sys->eval();
       sys->clock = false;
+      Verilated::timeInc(1);
       sys->eval();
       return;
     }
@@ -219,13 +299,36 @@ struct SystemSim {
 
     // Posedge
     sys->clock = true;
+    Verilated::timeInc(1);
     sys->eval();
 
     if (TRACE) tracer->dump(cycle * 2);
 
-    // Set memory request ready (always accept)
+    // Tick DRAMsim3 and submit queued transactions
+    if (use_dram) {
+      for (int mc = 0; mc < num_mc; mc++) {
+        auto &d = dram_mcs[mc];
+        d.dram->ClockTick();
+        while (!d.submit_queue.empty()) {
+          auto &req = d.submit_queue.front();
+          if (d.dram->WillAcceptTransaction(req.addr, req.is_write)) {
+            d.dram->AddTransaction(req.addr, req.is_write);
+            d.inflight.emplace(req.addr, req.resp);
+            d.submit_queue.pop_front();
+          } else {
+            break;
+          }
+        }
+      }
+    }
+
+    // Set memory request ready (backpressure if DRAMsim3 queue full)
     for (int mc = 0; mc < num_mc; mc++) {
-      *mem_ports[mc].req_ready = 1;
+      if (use_dram) {
+        *mem_ports[mc].req_ready = dram_mcs[mc].submit_queue.size() < 32 ? 1 : 0;
+      } else {
+        *mem_ports[mc].req_ready = 1;
+      }
     }
     sys->io_periph_req_ready = 1;
 
@@ -260,6 +363,7 @@ struct SystemSim {
 
     // Negedge
     sys->clock = false;
+    Verilated::timeInc(1);
     sys->eval();
     if (TRACE) tracer->dump(cycle * 2 + 1);
   }
@@ -319,6 +423,18 @@ int main(int argc, char **argv) {
     tracer->open("./trace.fst");
   }
 
+  // Run reset phase first (suppresses init assertions)
+  while (sim.cycle < RESET_LENGTH) sim.step();
+
+  // Optional DRAMsim3 integration (init after reset to avoid init assertion)
+  auto mem_cfg = getenv("MEOW_MEM");
+  if (mem_cfg && mem_cfg[0] != '\0') {
+    auto mem_log = getenv("MEOW_MEM_LOG");
+    const char *log_dir = (mem_log && mem_log[0] != '\0') ? mem_log : ".";
+    sim.initDram(mem_cfg, log_dir);
+    cout << "[System] DRAMsim3 enabled: " << mem_cfg << endl;
+  }
+
   cout << "[System] Running (max " << max_cycles << " cycles)..." << endl;
   auto wall_start = chrono::steady_clock::now();
   while (!sim.periph.finished && sim.cycle < max_cycles && !exiting) {
@@ -335,6 +451,11 @@ int main(int argc, char **argv) {
   }
   cout << "[System] Speed: " << dec << (uint64_t)(sim.cycle / wall_secs) << " cycles/s" << endl;
   cout << "[System] Runtime: " << fixed << setprecision(3) << wall_secs << "s" << endl;
+
+  if (sim.use_dram) {
+    for (int i = 0; i < num_mc; i++)
+      sim.dram_mcs[i].dram->PrintStats();
+  }
 
   if (TRACE) tracer->close();
   delete[] text_aligned;

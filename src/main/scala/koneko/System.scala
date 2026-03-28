@@ -42,7 +42,7 @@ class Flit extends Bundle with Routable {
   val dst = UInt(16.W)
   val data = UInt(32.W)
   val tag = UInt(16.W)
-  def prio = 0.U(1.W) // single VC for now
+  def prio = Mux(tag === 0xFF00.U || tag === 0xFF01.U, 0.U(1.W), 1.U(1.W))
 }
 
 // Topology computation — pure Scala, no hardware
@@ -320,7 +320,7 @@ class System(implicit val params: SystemParameters) extends Module {
     val numI = numE
     val locals = topo.puLocals(id)
     val table = topo.puTables(id)
-    val router = Module(new Router(flitType, locals, numI, numE, 1, 4, table))
+    val router = Module(new Router(flitType, locals, numI, numE, 2, 4, table))
     router.suggestName(s"router_$id")
     (id, router)
   }.toMap
@@ -374,7 +374,7 @@ class System(implicit val params: SystemParameters) extends Module {
   val memIfs = topo.mcIds.zipWithIndex.map { case (mcId, mcIdx) =>
     val puStart = mcIdx * clustersPerMC * 16 + 1
     val puEnd   = (mcIdx + 1) * clustersPerMC * 16
-    val memIf = Module(new MemIf(mcIdx, puStart, puEnd, clustersPerMC, 16))
+    val memIf = Module(new MemIf(mcIdx, puStart, puEnd, clustersPerMC, 64))
     memIf.suggestName(s"memif_${mcIdx + 1}")
     io.mem(mcIdx).req <> memIf.mem.req
     memIf.mem.resp := io.mem(mcIdx).resp
