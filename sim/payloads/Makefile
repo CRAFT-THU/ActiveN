@@ -51,7 +51,12 @@ sys/sha256_concurrent.bin: sys/sha256_concurrent.S sys/sha256_lib.c sys/linker_s
 	${PREFIX}objcopy -j .text -j .data -O binary sys/sha256_concurrent.elf $@
 	rm -f sys/sha256_concurrent.elf
 
-sys-tests: sys/pingpong_test.bin sys/sha256_concurrent.bin
+sys/spm_init.bin: sys/spm_init.S sys/linker_system.ld
+	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -O1 -o sys/spm_init.elf sys/spm_init.S
+	${PREFIX}objcopy -j .text -j .data -O binary sys/spm_init.elf $@
+	rm -f sys/spm_init.elf
+
+sys-tests: sys/pingpong_test.bin sys/sha256_concurrent.bin sys/spm_init.bin
 
 clean:
 	rm -f test.single test.double test.single.bin test.double.bin

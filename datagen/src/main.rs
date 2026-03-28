@@ -54,6 +54,9 @@ struct Args {
     #[clap(short, long)]
     dump: Option<PathBuf>,
 
+    #[clap(long, default_value = "0x80100000")]
+    dram_base: String,
+
     #[clap(long)]
     dump_genn: Option<PathBuf>,
 
@@ -84,46 +87,77 @@ struct Core {
     neurons: Vec<Neuron>,
 }
 
-fn dump(base: &PathBuf, cores: &Vec<Core>) -> anyhow::Result<()> {
+fn dump(base: &PathBuf, cores: &Vec<Core>, dram_base: u32) -> anyhow::Result<()> {
     println!("Dumping to {}", base.display());
-    // Dump
-    let mut dram = Vec::new();
-    // TODO: dram reserve
 
-    for ci in 0..cores.len() {
+    let core_cnt = cores.len();
+    let spm_size: u32 = 16384;
+
+    // Layout in the combined dram.0 file:
+    //   [0, desc_end):        Descriptor table (core_cnt * 8 bytes)
+    //   [desc_end, spm_end):  SPM initializer blocks (core_cnt * spm_size)
+    //   [spm_end, ...):       CSR neighbor data
+    let desc_size = (core_cnt as u32) * 8;
+    let spm_total = (core_cnt as u32) * spm_size;
+    let csr_file_offset = desc_size + spm_total;
+    let csr_global_base = dram_base + csr_file_offset;
+
+    // Build per-core SPM data and CSR data
+    let mut csr_data: Vec<u32> = Vec::new();
+    let mut all_spm: Vec<Vec<u32>> = Vec::new();
+
+    for ci in 0..core_cnt {
         let c = &cores[ci];
-        let mut spm = Vec::new();
+        let mut spm: Vec<u32> = Vec::new();
         for n in c.neurons.iter() {
-            let neigh_start = dram.len() * 4;
+            let neigh_start = csr_data.len() * 4;
             for neigh in n.neigh.iter() {
                 let col = ((neigh.core as u32) << 16) | (neigh.neuron as u32);
-                dram.push(col);
-                dram.push(neigh.weight.to_bits());
+                csr_data.push(col);
+                csr_data.push(neigh.weight.to_bits());
             }
-            let neigh_end = dram.len() * 4;
+            let neigh_end = csr_data.len() * 4;
             spm.push(n.state.to_bits());
             spm.push(n.input.to_bits());
-            spm.push(neigh_start as u32);
-            spm.push(neigh_end as u32);
+            // Absolute global addresses for CSR pointers
+            spm.push(csr_global_base + neigh_start as u32);
+            spm.push(csr_global_base + neigh_end as u32);
         }
-
-        let mut spm_file = base.clone();
-        spm_file.push(format!("spm.{}.bin", ci));
-        spm.resize(16384 / 4, 0);
-        spm[16384 / 4 - 1] = c.neurons.len() as u32;
-
-        let spm_slice: &[u8] = unsafe {
-            core::slice::from_raw_parts(spm.as_slice().as_ptr() as *const u8, spm.len() * 4)
-        };
-        std::fs::write(spm_file, spm_slice)?;
+        spm.resize(spm_size as usize / 4, 0);
+        spm[spm_size as usize / 4 - 1] = c.neurons.len() as u32;
+        all_spm.push(spm);
     }
 
-    let mut dram_file = base.clone();
-    dram_file.push("dram.bin");
-    let dram_slice: &[u8] = unsafe {
-        core::slice::from_raw_parts(dram.as_slice().as_ptr() as *const u8, dram.len() * 4)
-    };
-    std::fs::write(dram_file, dram_slice)?;
+    // Write combined dram.0 file
+    let mut out_file = base.clone();
+    out_file.push("dram.0");
+    let mut writer = BufWriter::new(File::create(&out_file)?);
+
+    // 1. Descriptor table
+    for ci in 0..core_cnt {
+        let spm_src = dram_base + desc_size + (ci as u32) * spm_size;
+        writer.write_u32::<LittleEndian>(spm_src)?;
+        writer.write_u32::<LittleEndian>(spm_size)?;
+    }
+
+    // 2. SPM initializer blocks
+    for spm in &all_spm {
+        for word in spm {
+            writer.write_u32::<LittleEndian>(*word)?;
+        }
+    }
+
+    // 3. CSR neighbor data
+    for word in &csr_data {
+        writer.write_u32::<LittleEndian>(*word)?;
+    }
+
+    writer.flush()?;
+    let total_size = desc_size as usize + spm_total as usize + csr_data.len() * 4;
+    println!("  dram.0: {} bytes (desc={}, spm={}, csr={})",
+        total_size, desc_size, spm_total, csr_data.len() * 4);
+    println!("  dram_base=0x{:08x}, csr_base=0x{:08x}",
+        dram_base, csr_global_base);
 
     Ok(())
 }
@@ -535,7 +569,11 @@ fn main() -> anyhow::Result<()> {
 
         if i == args.pre_simulate - 1 {
             if let Some(ref p) = args.dump {
-                dump(p, &cores)?;
+                let dram_base = u32::from_str_radix(
+                    args.dram_base.trim_start_matches("0x").trim_start_matches("0X"),
+                    16,
+                ).expect("Invalid --dram-base hex value");
+                dump(p, &cores, dram_base)?;
             }
 
             if let Some(ref p) = args.dump_genn {

@@ -405,6 +405,31 @@ int main(int argc, char **argv) {
   text_aligned = (uint32_t *)text_mem;
   cout << "[System] Loaded " << file_size << " bytes" << endl;
 
+  // Optional: load additional data file at a configurable offset
+  // MEOW_DATA      = path to data file (e.g. datagen output)
+  // MEOW_DATA_ADDR = global address to load at (default: 0x80100000)
+  auto data_path = getenv("MEOW_DATA");
+  if (data_path && data_path[0] != '\0') {
+    uint32_t data_addr = 0x80100000;
+    auto data_addr_cfg = getenv("MEOW_DATA_ADDR");
+    if (data_addr_cfg && data_addr_cfg[0] != '\0')
+      data_addr = strtoul(data_addr_cfg, nullptr, 0);
+
+    ifstream data_input(data_path, ios::binary);
+    if (!data_input) { cerr << "Error: cannot open " << data_path << endl; return 1; }
+    data_input.seekg(0, ios::end);
+    size_t data_size = data_input.tellg();
+    size_t data_off = data_addr - TEXT_BASE;
+    if (data_off + data_size > MEM_SIZE) {
+      cerr << "Error: data file too large (offset=0x" << hex << data_off
+           << " size=" << dec << data_size << " exceeds " << MEM_SIZE << ")" << endl;
+      return 1;
+    }
+    data_input.seekg(0);
+    data_input.read(text_mem + data_off, data_size);
+    cout << "[System] Data loaded: " << data_size << " bytes at 0x" << hex << data_addr << dec << endl;
+  }
+
   struct sigaction sig;
   sig.sa_handler = sighandler;
   sigemptyset(&sig.sa_mask);
