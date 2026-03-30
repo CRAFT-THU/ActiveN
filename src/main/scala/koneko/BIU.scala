@@ -76,6 +76,17 @@ class BIU(implicit val param: CoreParameters) extends Module {
     val argcnt = UInt(5.W)
   })))
 
+  // CSR broadcast input: 256-bit data from MemDistributor broadcast
+  // Contains up to 4 CSR entries (64 bits each):
+  //   entry[i] = data[64*i+63 : 64*i]
+  //   entry[i][31:16] = dest_core, entry[i][15:0] = neuron_index
+  //   entry[i][63:32] = weight
+  val bcast = IO(new Bundle {
+    val valid = Input(Bool())
+    val data  = Input(UInt(param.memBusWidth.W))
+  })
+  val hartid = IO(Input(UInt(16.W)))
+
   //////////////////////////
   // Sending
   //////////////////////////
@@ -143,11 +154,18 @@ class BIU(implicit val param: CoreParameters) extends Module {
     e.alignment := cfg(i).argcnt
   }
 
+  // Forward-declare: true when broadcast drain is writing to evqueues(bcastTag)
+  val bcastDraining = Wire(Bool())
+
   for ((e, i) <- evqueues.zipWithIndex) {
     e.enq.bits := ext.in.bits.data
     e.enq.valid := ext.in.valid && ext.in.bits.tag === i.U
   }
-  ext.in.ready := VecInit(evqueues.zipWithIndex.map({ case (e, i) => e.enq.ready && ext.in.bits.tag === i.U })).asUInt.orR
+  // Backpressure ext.in for bcastTag when broadcast drain is active
+  ext.in.ready := VecInit(evqueues.zipWithIndex.map({ case (e, i) =>
+    val base = e.enq.ready && ext.in.bits.tag === i.U
+    if (i == 1) base && !bcastDraining else base  // bcastTag = 1
+  })).asUInt.orR
 
   val evdeq = Module(new Arbiter(br.bits.cloneType, 16))
   val evdeqsMapped = evqueues.zipWithIndex.map({ case (e, i) => e.deq.map({ k => {
@@ -160,6 +178,95 @@ class BIU(implicit val param: CoreParameters) extends Module {
 
   for((i, j) <- evdeq.io.in.zip(evdeqsMapped)) i <> j
   br <> evdeq.io.out
+
+  //////////////////////////
+  // CSR broadcast processing
+  //////////////////////////
+  // Each 256-bit beat has 4 entries of 64 bits each.
+  //   entry[i] = data[64*i+63 : 64*i]
+  //   word0 = entry[i][31:0]  -> [31:16] = dest_core, [15:0] = neuron_index
+  //   word1 = entry[i][63:32] -> weight (f32)
+  // Matching entries (dest_core == hartid) are buffered in a small FIFO
+  // and drained into the EvQueue for SPIKE_TAG (tag 1) as 2-word events
+  // (word 0 = neuron_index, word 1 = weight).
+
+  val bcastTag = 1 // SPIKE_TAG
+  val numEntries = param.memBusWidth / 64 // 4 for 256-bit bus
+
+  // Buffer matching entries: each is (neuron_index: UInt(32), weight: UInt(32))
+  val bcastBuf = Module(new Queue(Vec(2, UInt(32.W)), 16))
+  bcastBuf.io.enq.valid := false.B
+  bcastBuf.io.enq.bits  := VecInit(0.U(32.W), 0.U(32.W))
+
+  // On broadcast valid, scan all entries and enqueue matches one at a time
+  // using a small FSM to iterate through entries across cycles.
+  val bcastPending = Reg(Vec(numEntries, Bool()))
+  val bcastWords   = Reg(Vec(numEntries, Vec(2, UInt(32.W))))
+  val bcastActive  = RegInit(false.B)
+
+  when(bcast.valid && !bcastActive) {
+    // Latch matching entries
+    bcastActive := false.B
+    for (i <- 0 until numEntries) {
+      val word0 = bcast.data(64 * i + 31, 64 * i)
+      val word1 = bcast.data(64 * i + 63, 64 * i + 32)
+      val dstCore = word0(31, 16)
+      val neuron  = word0(15, 0)
+      val matches = dstCore === hartid
+      bcastPending(i) := matches
+      bcastWords(i)(0) := neuron
+      bcastWords(i)(1) := word1
+      when(matches) { bcastActive := true.B }
+    }
+  }
+
+  when(bcastActive) {
+    // Find first pending entry
+    val which = PriorityEncoder(bcastPending.asUInt)
+    bcastBuf.io.enq.valid := true.B
+    bcastBuf.io.enq.bits  := bcastWords(which)
+    when(bcastBuf.io.enq.fire) {
+      bcastPending(which) := false.B
+      when(PopCount(bcastPending.asUInt) === 1.U) {
+        bcastActive := false.B
+      }
+    }
+  }
+
+  // Drain broadcast buffer into EvQueue for bcastTag, 2 words at a time
+  // The EvQueue expects individual word enqueues with alignment=2,
+  // so we need to send word0 then word1 sequentially.
+  val bcastDrainState = RegInit(false.B) // false = word0, true = word1
+  val bcastDrainEntry = Reg(Vec(2, UInt(32.W)))
+
+  // Set bcastDraining: true when broadcast drain wants the EvQueue
+  bcastDraining := (!bcastDrainState && bcastBuf.io.deq.valid) || bcastDrainState
+
+  bcastBuf.io.deq.ready := false.B
+
+  when(!bcastDrainState && bcastBuf.io.deq.valid) {
+    // word0: enqueue neuron_index
+    val eq = evqueues(bcastTag)
+    when(eq.enq.ready) {
+      // Latch the entry and send word0
+      bcastDrainEntry := bcastBuf.io.deq.bits
+      bcastBuf.io.deq.ready := true.B
+      bcastDrainState := true.B
+    }
+  }
+
+  // Override EvQueue enq for bcastTag when draining broadcast data
+  when(!bcastDrainState && bcastBuf.io.deq.valid && evqueues(bcastTag).enq.ready) {
+    evqueues(bcastTag).enq.valid := true.B
+    evqueues(bcastTag).enq.bits  := bcastBuf.io.deq.bits(0) // neuron_index
+  }
+  when(bcastDrainState) {
+    evqueues(bcastTag).enq.valid := true.B
+    evqueues(bcastTag).enq.bits  := bcastDrainEntry(1) // weight
+    when(evqueues(bcastTag).enq.fire) {
+      bcastDrainState := false.B
+    }
+  }
 }
 
 // TODO: handles local send

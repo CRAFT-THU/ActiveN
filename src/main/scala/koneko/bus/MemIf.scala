@@ -49,6 +49,7 @@ class MemIf(
   puEnd: Int,       // Last PU ID in zone (1-based, inclusive)
   numClusters: Int, // Clusters in this zone
   maxInflight: Int,
+  scatterAddrBase: BigInt = BigInt("80000000", 16), // subtracted from scatter absolute addresses
 ) extends Module {
   require(numClusters >= 1)
   require(puEnd >= puStart)
@@ -83,6 +84,19 @@ class MemIf(
   def isLocal(puId: UInt): Bool = puId >= puStart.U && puId <= puEnd.U
   def clusterOf(puId: UInt): UInt = (puId - puStart.U) >> 4
 
+  // --- Scatter (CSR-aware broadcast) FSM ---
+  // Collects 2-flit scatter commands (tag=0xFF02: base, end),
+  // issues sequential DRAM reads, broadcasts each beat to all clusters.
+  val sScatIdle :: sScatCollect :: sScatIssue :: sScatWait :: sScatBcast :: Nil = Enum(5)
+  val scatState   = RegInit(sScatIdle)
+  val scatBase    = Reg(UInt(32.W))
+  val scatEnd     = Reg(UInt(32.W))
+  val scatAddr    = Reg(UInt(32.W))  // current read address (absolute)
+  val scatData    = Reg(UInt(256.W))
+  val scatCluster = RegInit(0.U(log2Ceil(math.max(numClusters, 2)).W))
+  val scatSrc     = Reg(UInt(16.W))  // source PU (for CAM matching of 2nd flit)
+  val scatSlotId  = maxInflight.U(16.W)  // out-of-band id for scatter reads
+
   // --- 1. Flit collection ---
   // Use a single RRArbiter to select one flit per cycle, avoiding
   // multi-port allocation conflicts entirely.
@@ -95,6 +109,8 @@ class MemIf(
   val fd   = flit.bits.data
 
   val isMem = tag === 0xFF00.U || tag === 0xFF01.U
+  val isScatCmd = tag === 0xFF02.U
+  val scatCanAccept = isScatCmd && (scatState === sScatIdle || (scatState === sScatCollect && src === scatSrc))
 
   val camHits = VecInit((0 until maxInflight).map { s =>
     allocated(s) && !ready(s) && pending(s).src === src && remainingFlits(s) > 0.U
@@ -106,11 +122,26 @@ class MemIf(
   val hasFree   = freeSlots.asUInt.orR
   val freeSlot  = PriorityEncoder(freeSlots.asUInt)
 
-  // Non-memory flits: accept and drop
+  // Non-memory flits: accept and drop (except scatter commands)
   // Memory flits: CAM hit or allocate new slot
-  flit.ready := camHit || (isMem && hasFree) || !isMem
+  // Scatter flits: accepted by scatter FSM
+  flit.ready := camHit || (isMem && hasFree) || (!isMem && !isScatCmd) || scatCanAccept
 
-  when(flit.fire && (camHit || isMem)) {
+  when(flit.fire && isScatCmd) {
+    when(scatState === sScatIdle) {
+      // First scatter flit: base address
+      scatBase := fd
+      scatAddr := fd
+      scatSrc  := src
+      scatState := sScatCollect
+    }.elsewhen(scatState === sScatCollect) {
+      // Second scatter flit: end address
+      scatEnd  := fd
+      scatState := sScatIssue
+    }
+  }
+
+  when(flit.fire && !isScatCmd && (camHit || isMem)) {
     when(camHit) {
       val s = camSlot
       val totalFlits = Mux(pending(s).write, 3.U, 2.U)
@@ -148,30 +179,44 @@ class MemIf(
   val issueSlot  = PriorityEncoder(readyToIssue.asUInt)
   val issuePend  = pending(issueSlot)
 
-  mem.req.valid     := issueValid
-  mem.req.bits.id   := issueSlot
-  mem.req.bits.addr := issuePend.address
-  mem.req.bits.write := issuePend.write
+  val scatWantsIssue = scatState === sScatIssue
+
+  // Normal has priority over scatter
+  mem.req.valid     := issueValid || scatWantsIssue
+  mem.req.bits.id   := Mux(issueValid, issueSlot, scatSlotId)
+  mem.req.bits.addr := Mux(issueValid, issuePend.address, scatAddr - scatterAddrBase.U)
+  mem.req.bits.write := Mux(issueValid, issuePend.write, false.B)
   // Replicate 32-bit wdata across all words; byte-enables select correct bytes
-  mem.req.bits.wdata := Fill(8, issuePend.wdata)
+  mem.req.bits.wdata := Mux(issueValid, Fill(8, issuePend.wdata), 0.U)
   val byteOff   = issuePend.address(4, 0)
   val byteCount = (1.U << issuePend.size)(3, 0)
   val baseMask  = (1.U << byteCount)(4, 0) - 1.U
-  mem.req.bits.wbe := Mux(issuePend.write, baseMask << byteOff, 0.U)
+  mem.req.bits.wbe := Mux(issueValid && issuePend.write, baseMask << byteOff, 0.U)
 
   when(mem.req.fire) {
-    issued(issueSlot) := true.B
-    when(issuePend.write) { completed(issueSlot) := true.B }
+    when(issueValid) {
+      issued(issueSlot) := true.B
+      when(issuePend.write) { completed(issueSlot) := true.B }
+    }.otherwise {
+      scatState := sScatWait
+    }
   }
 
   // --- 3. Receive memory response ---
-  // Guard: only accept response for an allocated slot. Stale responses
-  // (e.g. from a write whose slot was already freed and reallocated) are
-  // ignored.  Without this, a late response could set completed=true on a
-  // freshly reallocated slot due to Chisel last-connect-wins semantics.
-  when(mem.resp.valid && allocated(mem.resp.bits.id)) {
-    data(mem.resp.bits.id)      := mem.resp.bits.rdata
-    completed(mem.resp.bits.id) := true.B
+  val respId = mem.resp.bits.id
+  val isScatResp = mem.resp.valid && respId === scatSlotId && scatState === sScatWait
+
+  // Normal response: guard with allocated check and scatter exclusion
+  when(mem.resp.valid && !isScatResp && respId < maxInflight.U && allocated(respId)) {
+    data(respId)      := mem.resp.bits.rdata
+    completed(respId) := true.B
+  }
+
+  // Scatter response: capture data and start broadcast
+  when(isScatResp) {
+    scatData    := mem.resp.bits.rdata
+    scatState   := sScatBcast
+    scatCluster := 0.U
   }
 
   // --- 4. Response delivery ---
@@ -194,19 +239,44 @@ class MemIf(
   val hasLocal  = localCandidates.asUInt.orR
   val localSlot = PriorityEncoder(localCandidates.asUInt)
 
-  when(hasLocal) {
-    val s    = localSlot
-    val puId = pending(s).src
-    val ci   = clusterOf(puId)
+  // Scatter broadcast: deliver to each cluster one at a time.
+  // While broadcasting, normal local delivery is paused.
+  when(scatState === sScatBcast) {
+    val ci = scatCluster
     resp(ci).valid     := true.B
-    resp(ci).bits.dst  := puId
-    resp(ci).bits.id   := pending(s).id
-    resp(ci).bits.data := data(s)
+    resp(ci).bits.dst  := 0xFFFF.U
+    resp(ci).bits.id   := 0xFFFF.U
+    resp(ci).bits.data := scatData
     when(resp(ci).ready) {
-      allocated(s) := false.B
-      completed(s) := false.B
-      ready(s)     := false.B
-      issued(s)    := false.B
+      when(scatCluster === (numClusters - 1).U) {
+        scatCluster := 0.U
+        // Advance to next beat or finish
+        val nextAddr = scatAddr + 32.U
+        when(nextAddr >= scatEnd) {
+          scatState := sScatIdle
+        }.otherwise {
+          scatAddr  := nextAddr
+          scatState := sScatIssue
+        }
+      }.otherwise {
+        scatCluster := scatCluster + 1.U
+      }
+    }
+  }.otherwise {
+    when(hasLocal) {
+      val s    = localSlot
+      val puId = pending(s).src
+      val ci   = clusterOf(puId)
+      resp(ci).valid     := true.B
+      resp(ci).bits.dst  := puId
+      resp(ci).bits.id   := pending(s).id
+      resp(ci).bits.data := data(s)
+      when(resp(ci).ready) {
+        allocated(s) := false.B
+        completed(s) := false.B
+        ready(s)     := false.B
+        issued(s)    := false.B
+      }
     }
   }
 

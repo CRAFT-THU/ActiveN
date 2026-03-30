@@ -56,7 +56,12 @@ sys/spm_init.bin: sys/spm_init.S sys/linker_system.ld
 	${PREFIX}objcopy -j .text -j .data -O binary sys/spm_init.elf $@
 	rm -f sys/spm_init.elf
 
-sys-tests: sys/pingpong_test.bin sys/sha256_concurrent.bin sys/spm_init.bin
+sys/csr_scatter_test.bin: sys/csr_scatter_test.S sys/linker_system.ld
+	${PREFIX}gcc -mabi=ilp32 -march=rv32imf_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -O1 -o sys/csr_scatter_test.elf sys/csr_scatter_test.S
+	${PREFIX}objcopy -j .text -j .data -O binary sys/csr_scatter_test.elf $@
+	rm -f sys/csr_scatter_test.elf
+
+sys-tests: sys/pingpong_test.bin sys/sha256_concurrent.bin sys/spm_init.bin sys/csr_scatter_test.bin
 
 clean:
 	rm -f test.single test.double test.single.bin test.double.bin

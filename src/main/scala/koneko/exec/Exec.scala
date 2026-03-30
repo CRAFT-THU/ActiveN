@@ -37,6 +37,12 @@ class Exec(implicit val param: CoreParameters) extends Module {
     val resp = Flipped(Valid(new MemResp))
   })
 
+  // CSR broadcast input from MemDistributor (via Core)
+  val bcast = IO(new Bundle {
+    val valid = Input(Bool())
+    val data  = Input(UInt(param.memBusWidth.W))
+  })
+
   //////////////////////////
   // Cfg CSRS
   //////////////////////////
@@ -175,6 +181,9 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   biu.ext.in <> ext.in
   biu.ext.out <> ext.out
+  biu.bcast.valid := bcast.valid
+  biu.bcast.data  := bcast.data
+  biu.hartid      := cfg.hartid(15, 0)
   biu.msg.bits.reg(0) := rs1val
   biu.msg.bits.reg(1) := rs2val
   biu.msg.bits.enq := uop.funct3(1, 0)

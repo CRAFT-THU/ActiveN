@@ -2,6 +2,12 @@
 // Buffers at most one beat of response data (256 bits).
 // Accepts from MemIf resp port, delivers to individual PU mem ports.
 //
+// Two modes:
+//   Unicast (dst = specific PU ID): delivers to that one PU.
+//   Broadcast (dst = 0xFFFF): delivers to ALL 16 PUs simultaneously.
+//     Used for CSR-aware memory scatter. Each PU's BIU inspects the
+//     256-bit payload and picks out entries addressed to it.
+//
 // PU ID range: [puStart, puStart + 16)
 
 package koneko.bus
@@ -34,10 +40,10 @@ class MemDistributor(
     valid   := true.B
   }
 
-  // Deliver to matching PU and clear buffer
+  val isBroadcast = bufDst === 0xFFFF.U
   val puIdx = bufDst - puStart.U
   for (i <- 0 until 16) {
-    out(i).valid    := valid && puIdx === i.U
+    out(i).valid    := valid && (isBroadcast || puIdx === i.U)
     out(i).bits.tag  := bufId
     out(i).bits.data := bufData
   }

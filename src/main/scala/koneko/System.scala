@@ -371,10 +371,12 @@ class System(implicit val params: SystemParameters) extends Module {
   }
 
   // --- Instantiate MemIfs (one per MC) ---
+  val cumSizes = coreParams.memCtrlSizes.scanLeft(BigInt(0))(_ + _)
   val memIfs = topo.mcIds.zipWithIndex.map { case (mcId, mcIdx) =>
     val puStart = mcIdx * clustersPerMC * 16 + 1
     val puEnd   = (mcIdx + 1) * clustersPerMC * 16
-    val memIf = Module(new MemIf(mcIdx, puStart, puEnd, clustersPerMC, 64))
+    val scatterBase = BigInt("80000000", 16) + cumSizes(mcIdx)
+    val memIf = Module(new MemIf(mcIdx, puStart, puEnd, clustersPerMC, 64, scatterBase))
     memIf.suggestName(s"memif_${mcIdx + 1}")
     io.mem(mcIdx).req <> memIf.mem.req
     memIf.mem.resp := io.mem(mcIdx).resp
