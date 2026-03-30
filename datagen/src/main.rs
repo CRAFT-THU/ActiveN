@@ -112,7 +112,8 @@ fn dump(base: &PathBuf, cores: &Vec<Core>, dram_base: u32) -> anyhow::Result<()>
         for n in c.neurons.iter() {
             let neigh_start = csr_data.len() * 4;
             for neigh in n.neigh.iter() {
-                let col = ((neigh.core as u32) << 16) | (neigh.neuron as u32);
+                // Core IDs are 1-based in the new system (PU IDs 1..core_cnt)
+                let col = ((neigh.core as u32 + 1) << 16) | (neigh.neuron as u32);
                 csr_data.push(col);
                 csr_data.push(neigh.weight.to_bits());
             }
@@ -134,10 +135,13 @@ fn dump(base: &PathBuf, cores: &Vec<Core>, dram_base: u32) -> anyhow::Result<()>
     let mut writer = BufWriter::new(File::create(&out_file)?);
 
     // 1. Descriptor table
+    // Each entry: (spm_src: u32, neuron_data_bytes: u32)
+    // neuron_data_bytes = nn_count * 16 (only the actual neuron data)
     for ci in 0..core_cnt {
         let spm_src = dram_base + desc_size + (ci as u32) * spm_size;
+        let nn_data_bytes = (cores[ci].neurons.len() as u32) * 16;
         writer.write_u32::<LittleEndian>(spm_src)?;
-        writer.write_u32::<LittleEndian>(spm_size)?;
+        writer.write_u32::<LittleEndian>(nn_data_bytes)?;
     }
 
     // 2. SPM initializer blocks

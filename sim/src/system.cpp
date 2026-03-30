@@ -34,6 +34,8 @@
 #include <iomanip>
 #include <verilated_fst_c.h>
 #include "sys_verilated/sys_rtl.h"
+#include "sys_verilated/sys_rtl___024root.h"
+#include "sys_verilated/sys_rtl_Core.h"
 
 #include "devices.h"
 #include "dramsim3/dramsim3.h"
@@ -418,9 +420,9 @@ int main(int argc, char **argv) {
   // Optional: load additional data file at a configurable offset
   // MEOW_DATA      = path to data file (e.g. datagen output)
   // MEOW_DATA_ADDR = global address to load at (default: 0x80100000)
+  uint32_t data_addr = 0x80100000;
   auto data_path = getenv("MEOW_DATA");
   if (data_path && data_path[0] != '\0') {
-    uint32_t data_addr = 0x80100000;
     auto data_addr_cfg = getenv("MEOW_DATA_ADDR");
     if (data_addr_cfg && data_addr_cfg[0] != '\0')
       data_addr = strtoul(data_addr_cfg, nullptr, 0);
@@ -460,6 +462,66 @@ int main(int argc, char **argv) {
 
   // Run reset phase first (suppresses init assertions)
   while (sim.cycle < RESET_LENGTH) sim.step();
+
+  // Pre-load SPM data from MEOW_DATA into each PU's scratchpad memory
+  // This bypasses the NoC (which can deadlock under heavy boot traffic).
+  // Enable with MEOW_SPM_PRELOAD=1
+  auto spm_preload = getenv("MEOW_SPM_PRELOAD");
+  if (spm_preload && spm_preload[0] == '1' && data_path && data_path[0] != '\0') {
+    // data_path points to dram.0 file, already loaded into text_aligned at data_addr
+    uint32_t desc_base_off = data_addr - TEXT_BASE;
+    auto getPuCore = [&](int id) -> sys_rtl_Core* {
+      auto r = sim.sys->rootp;
+      switch(id) {
+#define PU_CASE(N) case N: return r->__PVT__System__DOT__pu_##N
+        PU_CASE(1); PU_CASE(2); PU_CASE(3); PU_CASE(4);
+        PU_CASE(5); PU_CASE(6); PU_CASE(7); PU_CASE(8);
+        PU_CASE(9); PU_CASE(10); PU_CASE(11); PU_CASE(12);
+        PU_CASE(13); PU_CASE(14); PU_CASE(15); PU_CASE(16);
+#if AN_NUM_PU > 16
+        PU_CASE(17); PU_CASE(18); PU_CASE(19); PU_CASE(20);
+        PU_CASE(21); PU_CASE(22); PU_CASE(23); PU_CASE(24);
+        PU_CASE(25); PU_CASE(26); PU_CASE(27); PU_CASE(28);
+        PU_CASE(29); PU_CASE(30); PU_CASE(31); PU_CASE(32);
+#endif
+#if AN_NUM_PU > 32
+        PU_CASE(33); PU_CASE(34); PU_CASE(35); PU_CASE(36);
+        PU_CASE(37); PU_CASE(38); PU_CASE(39); PU_CASE(40);
+        PU_CASE(41); PU_CASE(42); PU_CASE(43); PU_CASE(44);
+        PU_CASE(45); PU_CASE(46); PU_CASE(47); PU_CASE(48);
+        PU_CASE(49); PU_CASE(50); PU_CASE(51); PU_CASE(52);
+        PU_CASE(53); PU_CASE(54); PU_CASE(55); PU_CASE(56);
+        PU_CASE(57); PU_CASE(58); PU_CASE(59); PU_CASE(60);
+        PU_CASE(61); PU_CASE(62); PU_CASE(63); PU_CASE(64);
+#endif
+#undef PU_CASE
+        default: return nullptr;
+      }
+    };
+    int spm_loaded = 0;
+    for (int i = 1; i <= num_pu; i++) {
+      auto core = getPuCore(i);
+      if (!core) continue;
+      // Read descriptor: desc_base + (i-1)*8
+      uint32_t desc_off = desc_base_off + (i - 1) * 8;
+      uint32_t spm_src = text_aligned[desc_off / 4];
+      uint32_t data_bytes = text_aligned[desc_off / 4 + 1];
+      uint32_t nn_count = data_bytes / 16;
+      // Copy SPM data from backing memory into scratchpad
+      uint32_t src_off = (spm_src - TEXT_BASE) / 4;
+      uint32_t nwords = data_bytes / 4;
+      auto &mem = core->__PVT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
+      for (uint32_t w = 0; w < nwords; w++) {
+        mem[w] = text_aligned[src_off + w];
+      }
+      // Write nn_count at SPM metadata location (offset 0x3FFC = word 4095)
+      mem[4095] = nn_count;
+      // Mark as initialized (SPM_STATE at offset 0x3FF8 = word 4094)
+      mem[4094] = 1;
+      spm_loaded++;
+    }
+    cout << "[System] Pre-loaded SPM for " << spm_loaded << " PUs" << endl;
+  }
 
   // Optional DRAMsim3 integration (init after reset to avoid init assertion)
   auto mem_cfg = getenv("MEOW_MEM");

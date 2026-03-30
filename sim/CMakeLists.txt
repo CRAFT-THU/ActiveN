@@ -92,6 +92,7 @@ set(VERILATOR_SYSTEM_ARGS -Wall -Wno-fatal -Wno-DECLFILENAME --trace-params --tr
 add_executable(sim_system
     src/system.cpp
 )
+target_compile_definitions(sim_system PRIVATE AN_NUM_PU=${SYSTEM_NUM_PU})
 
 verilate(
     sim_system

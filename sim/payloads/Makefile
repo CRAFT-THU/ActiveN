@@ -66,6 +66,11 @@ sys/local_send_test.bin: sys/local_send_test.S sys/linker_system.ld
 	${PREFIX}objcopy -j .text -j .data -O binary sys/local_send_test.elf $@
 	rm -f sys/local_send_test.elf
 
+sys/snn_main.bin: sys/snn_main.S sys/snn_init.c sys/linker_system.ld
+	${PREFIX}gcc -mabi=ilp32 -march=rv32imf_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -O1 -o sys/snn_main.elf sys/snn_main.S sys/snn_init.c
+	${PREFIX}objcopy -j .text -j .data -O binary sys/snn_main.elf $@
+	rm -f sys/snn_main.elf
+
 sys-tests: sys/pingpong_test.bin sys/sha256_concurrent.bin sys/spm_init.bin sys/csr_scatter_test.bin sys/local_send_test.bin
 
 clean:
