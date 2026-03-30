@@ -729,3 +729,26 @@ Implements CSR-aware memory access from the paper: when a PU fires a neuron, it 
 - **16-PU, 1-MC, DRAMsim3**: Result=16, Timer=639 cycles, Total=1414 cycles ✓ (14% increase)
 - **Scatter reads**: 4 reads at 0x80001000/20/40/60 with id=64 (scatter slot) confirmed in logs
 - **Regression**: spm_init test unchanged (Result=16, Timer=9, Cycles=149192) ✓
+
+## Task 2.4: Local Send (dst=0 → local EvQueue)
+
+### Design
+When the send instruction targets dst=0, the BIU pushes data directly to its own EvQueue (matching the specified tag) instead of sending through the NoC. This enables self-messaging without NoC overhead.
+
+### Implementation (`BIU.scala`)
+- Added `isLocalSend = sendingMsg && sendingTarget === 0.U`
+- `ext.out.valid` gated by `!isLocalSend` — local sends don't go to NoC
+- `regDeq.ready` muxed: local send uses EvQueue ready, otherwise ext.out ready
+- Local send overrides EvQueue enq for matching tag (Chisel last-connect-wins)
+- `ext.in.ready` backpressured when local send or broadcast drain targets same tag
+- `localSendReady` computed from dynamic tag match against all 16 EvQueues
+
+### Test (`sys/local_send_test.S`)
+- PU1 sends value 42 to itself via dst=0, tag=0
+- Handler receives it, writes to stop register
+- Result=42, 190 cycles ✓
+
+### Verification
+- Local send test: Result=42 ✓
+- CSR scatter regression: Result=16, Timer=559 cycles ✓  
+- SPM init regression: Result=16, Timer=9, Cycles=149192 ✓

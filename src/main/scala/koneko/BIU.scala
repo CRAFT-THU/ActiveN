@@ -138,13 +138,13 @@ class BIU(implicit val param: CoreParameters) extends Module {
   // val memMapped = Decoupled(UInt(32.W))
   // memMapped.bits := Mux(sendingMem, sendingMemAddr, param.memTagBase.U)
 
-  ext.out <> regDeq.map({ d => {
-    val w = Wire(ext.out.bits.cloneType)
-    w.dst := sendingTarget
-    w.tag := sendingTag
-    w.data := d
-    w
-  }})
+  // Local send: dst=0 means push to own EvQueue instead of ext.out
+  val isLocalSend = sendingMsg && sendingTarget === 0.U
+
+  ext.out.valid    := regDeq.valid && !isLocalSend
+  ext.out.bits.dst := sendingTarget
+  ext.out.bits.tag := sendingTag
+  ext.out.bits.data := regDeq.bits
 
   //////////////////////////
   // Recv & queues
@@ -161,10 +161,29 @@ class BIU(implicit val param: CoreParameters) extends Module {
     e.enq.bits := ext.in.bits.data
     e.enq.valid := ext.in.valid && ext.in.bits.tag === i.U
   }
-  // Backpressure ext.in for bcastTag when broadcast drain is active
+
+  // Local send: override EvQueue enq for the target tag
+  val localSendReady = VecInit(evqueues.zipWithIndex.map { case (e, i) =>
+    sendingTag === i.U && e.enq.ready
+  }).asUInt.orR
+
+  regDeq.ready := Mux(isLocalSend, localSendReady, ext.out.ready)
+
+  when(isLocalSend && regDeq.valid) {
+    for ((e, i) <- evqueues.zipWithIndex) {
+      when(sendingTag === i.U) {
+        e.enq.valid := true.B
+        e.enq.bits  := regDeq.bits
+      }
+    }
+  }
+
+  // Backpressure ext.in when broadcast drain or local send targets the same tag
   ext.in.ready := VecInit(evqueues.zipWithIndex.map({ case (e, i) =>
     val base = e.enq.ready && ext.in.bits.tag === i.U
-    if (i == 1) base && !bcastDraining else base  // bcastTag = 1
+    val bcastBlock = if (i == 1) bcastDraining else false.B
+    val localBlock = isLocalSend && sendingTag === i.U
+    base && !bcastBlock && !localBlock
   })).asUInt.orR
 
   val evdeq = Module(new Arbiter(br.bits.cloneType, 16))
