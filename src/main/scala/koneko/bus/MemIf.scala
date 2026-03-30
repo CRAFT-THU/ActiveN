@@ -84,56 +84,59 @@ class MemIf(
   def clusterOf(puId: UInt): UInt = (puId - puStart.U) >> 4
 
   // --- 1. Flit collection ---
-  for (ci <- 0 until numClusters) {
-    val flit = req(ci)
-    val src  = flit.bits.src
-    val tag  = flit.bits.tag
-    val fd   = flit.bits.data
+  // Use a single RRArbiter to select one flit per cycle, avoiding
+  // multi-port allocation conflicts entirely.
+  val flitArb = Module(new RRArbiter(req(0).bits.cloneType, numClusters))
+  for (ci <- 0 until numClusters) flitArb.io.in(ci) <> req(ci)
 
-    val isMem = tag === 0xFF00.U || tag === 0xFF01.U
+  val flit = flitArb.io.out
+  val src  = flit.bits.src
+  val tag  = flit.bits.tag
+  val fd   = flit.bits.data
 
-    val camHits = VecInit((0 until maxInflight).map { s =>
-      allocated(s) && !ready(s) && pending(s).src === src && remainingFlits(s) > 0.U
-    })
-    val camHit  = camHits.asUInt.orR
-    val camSlot = PriorityEncoder(camHits.asUInt)
+  val isMem = tag === 0xFF00.U || tag === 0xFF01.U
 
-    val freeSlots = VecInit((0 until maxInflight).map(s => !allocated(s)))
-    val hasFree   = freeSlots.asUInt.orR
-    val freeSlot  = PriorityEncoder(freeSlots.asUInt)
+  val camHits = VecInit((0 until maxInflight).map { s =>
+    allocated(s) && !ready(s) && pending(s).src === src && remainingFlits(s) > 0.U
+  })
+  val camHit  = camHits.asUInt.orR
+  val camSlot = PriorityEncoder(camHits.asUInt)
 
-    // Non-memory flits: accept and drop
-    // Memory flits: CAM hit or allocate new slot
-    flit.ready := camHit || (isMem && hasFree) || !isMem
+  val freeSlots = VecInit((0 until maxInflight).map(s => !allocated(s)))
+  val hasFree   = freeSlots.asUInt.orR
+  val freeSlot  = PriorityEncoder(freeSlots.asUInt)
 
-    when(flit.fire && (camHit || isMem)) {
-      when(camHit) {
-        val s = camSlot
-        val totalFlits = Mux(pending(s).write, 3.U, 2.U)
-        val flitIdx    = totalFlits - remainingFlits(s)
-        when(flitIdx === 1.U) {
-          pending(s).id := fd(15, 0)
-          when(pending(s).write) { pending(s).size := fd(17, 16) }
-        }
-        when(flitIdx === 2.U) {
-          pending(s).wdata := fd
-        }
-        remainingFlits(s) := remainingFlits(s) - 1.U
-        when(remainingFlits(s) === 1.U) { ready(s) := true.B }
-      }.otherwise {
-        val s = freeSlot
-        allocated(s)      := true.B
-        pending(s).src     := src
-        pending(s).address := fd
-        pending(s).write   := tag === 0xFF01.U
-        pending(s).id      := 0.U
-        pending(s).size    := 0.U
-        pending(s).wdata   := 0.U
-        ready(s)           := false.B
-        issued(s)          := false.B
-        completed(s)       := false.B
-        remainingFlits(s)  := Mux(tag === 0xFF01.U, 2.U, 1.U)
+  // Non-memory flits: accept and drop
+  // Memory flits: CAM hit or allocate new slot
+  flit.ready := camHit || (isMem && hasFree) || !isMem
+
+  when(flit.fire && (camHit || isMem)) {
+    when(camHit) {
+      val s = camSlot
+      val totalFlits = Mux(pending(s).write, 3.U, 2.U)
+      val flitIdx    = totalFlits - remainingFlits(s)
+      when(flitIdx === 1.U) {
+        pending(s).id := fd(15, 0)
+        when(pending(s).write) { pending(s).size := fd(17, 16) }
       }
+      when(flitIdx === 2.U) {
+        pending(s).wdata := fd
+      }
+      remainingFlits(s) := remainingFlits(s) - 1.U
+      when(remainingFlits(s) === 1.U) { ready(s) := true.B }
+    }.otherwise {
+      val s = freeSlot
+      allocated(s)      := true.B
+      pending(s).src     := src
+      pending(s).address := fd
+      pending(s).write   := tag === 0xFF01.U
+      pending(s).id      := 0.U
+      pending(s).size    := 0.U
+      pending(s).wdata   := 0.U
+      ready(s)           := false.B
+      issued(s)          := false.B
+      completed(s)       := false.B
+      remainingFlits(s)  := Mux(tag === 0xFF01.U, 2.U, 1.U)
     }
   }
 

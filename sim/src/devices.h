@@ -5,16 +5,29 @@
 #include <iostream>
 
 // Peripheral device: handles MMIO requests in the 0x40000000 region.
-// Write to address 0x0 (= 0x40000000 physical) signals end-of-simulation.
+// Address map (relative to 0x40000000):
+//   0x0: Write → end-of-simulation (data = result value)
+//   0x4: Write 1 → start timer, Write 0 → stop timer
+//        Timer increments every cycle while enabled.
 struct PeripheralDevice {
   bool finished = false;
   uint32_t result = 0;
+
+  bool timer_enabled = false;
+  uint64_t timer_count = 0;
+
+  // Call every cycle (before checking finished).
+  void tick() {
+    if (timer_enabled) timer_count++;
+  }
 
   // Handle a store to a peripheral address (addr relative to 0x40000000).
   void write(uint32_t addr, uint32_t data) {
     if (addr == 0) {
       finished = true;
       result = data;
+    } else if (addr == 4) {
+      timer_enabled = (data != 0);
     }
   }
 

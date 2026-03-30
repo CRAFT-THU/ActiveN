@@ -127,9 +127,18 @@ init_done_handler:
   wfi                         # Wait for more (or restart)
 
   ############################################
-  # All PUs done - end simulation
+  # All PUs done - start timer and terminate
   ############################################
 all_init_done:
+  # Start timer
+  li   t0, 0x40000004
+  li   t1, 1
+  sw   t1, 0(t0)
+
+  # Stop timer (measure just the overhead for now)
+  sw   zero, 0(t0)
+
+  # End simulation
   li   t0, 0x40000000
   sw   s1, 0(t0)              # result = done count
   wfi                         # Harmless restart (counter persists >= NUM_PU)

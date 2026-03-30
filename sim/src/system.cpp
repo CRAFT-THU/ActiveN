@@ -252,8 +252,14 @@ struct SystemSim {
     periph_resps.push_back(resp);
   }
 
+  uint64_t total_reqs = 0;
+
   void step() {
     ++cycle;
+
+    if (cycle % 50000 == 0) {
+      cerr << "[DBG] cycle=" << cycle << " reqs=" << total_reqs << endl;
+    }
 
     if (cycle <= RESET_LENGTH) {
       sys->reset = true;
@@ -279,6 +285,7 @@ struct SystemSim {
       auto &p = mem_ports[mc];
       if (*p.req_ready && *p.req_valid) {
         processMemReq(mc);
+        total_reqs++;
       }
     }
 
@@ -303,6 +310,9 @@ struct SystemSim {
     sys->eval();
 
     if (TRACE) tracer->dump(cycle * 2);
+
+    // Tick peripheral timer
+    periph.tick();
 
     // Tick DRAMsim3 and submit queued transactions
     if (use_dram) {
@@ -473,6 +483,9 @@ int main(int argc, char **argv) {
     cout << "[System] Cycles: " << dec << sim.cycle << endl;
   } else {
     cout << "[System] " << (exiting ? "Interrupted" : "Timed out") << " at cycle " << sim.cycle << endl;
+  }
+  if (sim.periph.timer_count > 0) {
+    cout << "[System] Timer: " << dec << sim.periph.timer_count << " cycles" << endl;
   }
   cout << "[System] Speed: " << dec << (uint64_t)(sim.cycle / wall_secs) << " cycles/s" << endl;
   cout << "[System] Runtime: " << fixed << setprecision(3) << wall_secs << "s" << endl;
