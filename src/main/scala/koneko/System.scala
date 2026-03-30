@@ -375,8 +375,7 @@ class System(implicit val params: SystemParameters) extends Module {
   val memIfs = topo.mcIds.zipWithIndex.map { case (mcId, mcIdx) =>
     val puStart = mcIdx * clustersPerMC * 16 + 1
     val puEnd   = (mcIdx + 1) * clustersPerMC * 16
-    val scatterBase = BigInt("80000000", 16) + cumSizes(mcIdx)
-    val memIf = Module(new MemIf(mcIdx, puStart, puEnd, clustersPerMC, 64, scatterBase))
+    val memIf = Module(new MemIf(mcIdx, puStart, puEnd, clustersPerMC, 64))
     memIf.suggestName(s"memif_${mcIdx + 1}")
     io.mem(mcIdx).req <> memIf.mem.req
     memIf.mem.resp := io.mem(mcIdx).resp
@@ -384,7 +383,26 @@ class System(implicit val params: SystemParameters) extends Module {
   }.toMap
 
   // --- Instantiate peripheral MemIf (no zone-of-influence, all responses go via ring) ---
-  val periphMemIf = Module(new MemIf(params.numMC, 0, 0, 1, 16))
+  // Config ROM at local addresses 0x28000000-0x28001000 (software: 0x68000000-0x68001000)
+  //   0x28000000: numPU (word 0)
+  //   0x28000008: numMC (word 2)
+  //   0x28000010: PUs per MC (word 4)
+  //   0x28000020: each MC's memory size (64-bit, little-endian)
+  val pusPerMC = params.numPU / params.numMC
+  val mcSize = coreParams.memCtrlSizes.head // all MCs have the same size
+  // Beat 0 at 0x28000000: 256-bit = 8 words (32-bit each), little-endian byte order
+  //   word0 = numPU, word1 = 0, word2 = numMC, word3 = 0, word4 = pusPerMC, ...
+  val beat0 = BigInt(params.numPU) |
+    (BigInt(params.numMC) << 64) |
+    (BigInt(pusPerMC) << 128)
+  // Beat 1 at 0x28000020: MC memory size (64-bit LE in words 0-1)
+  val beat1 = mcSize
+
+  val configROM = Map(
+    BigInt("28000000", 16) -> beat0,
+    BigInt("28000020", 16) -> beat1,
+  )
+  val periphMemIf = Module(new MemIf(params.numMC, 0, 0, 1, 16, configROM = configROM))
   periphMemIf.suggestName("memif_0")
   io.periph.req <> periphMemIf.mem.req
   periphMemIf.mem.resp := io.periph.resp

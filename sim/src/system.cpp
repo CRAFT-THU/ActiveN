@@ -38,6 +38,7 @@
 #include "sys_verilated/sys_rtl_Core.h"
 
 #include "devices.h"
+#include "system_config.h"
 #include "dramsim3/dramsim3.h"
 
 using namespace std;
@@ -132,7 +133,7 @@ struct SystemSim {
   void initMemPort(int i) {
     auto &p = mem_ports[i];
     switch(i) {
-      #include "mem_ports.inc"
+      SYSTEM_MEM_PORT_CASES
       default: break;
     }
   }
@@ -387,11 +388,8 @@ int main(int argc, char **argv) {
   auto log_cfg = getenv("MEOW_LOG");
   if (log_cfg && log_cfg[0] != '\0') LOG = true;
 
-  int num_pu = 16, num_mc = 1;
-  auto pu_cfg = getenv("AN_NUM_PU");
-  auto mc_cfg = getenv("AN_NUM_MC");
-  if (pu_cfg && pu_cfg[0] != '\0') num_pu = atoi(pu_cfg);
-  if (mc_cfg && mc_cfg[0] != '\0') num_mc = atoi(mc_cfg);
+  int num_pu = SYSTEM_CONFIG.numPU;
+  int num_mc = SYSTEM_CONFIG.numMC;
   cout << "[System] PUs=" << num_pu << " MCs=" << num_mc << endl;
 
   auto text_path = getenv("MEOW_TEXT");
@@ -474,26 +472,7 @@ int main(int argc, char **argv) {
       auto r = sim.sys->rootp;
       switch(id) {
 #define PU_CASE(N) case N: return r->__PVT__System__DOT__pu_##N
-        PU_CASE(1); PU_CASE(2); PU_CASE(3); PU_CASE(4);
-        PU_CASE(5); PU_CASE(6); PU_CASE(7); PU_CASE(8);
-        PU_CASE(9); PU_CASE(10); PU_CASE(11); PU_CASE(12);
-        PU_CASE(13); PU_CASE(14); PU_CASE(15); PU_CASE(16);
-#if AN_NUM_PU > 16
-        PU_CASE(17); PU_CASE(18); PU_CASE(19); PU_CASE(20);
-        PU_CASE(21); PU_CASE(22); PU_CASE(23); PU_CASE(24);
-        PU_CASE(25); PU_CASE(26); PU_CASE(27); PU_CASE(28);
-        PU_CASE(29); PU_CASE(30); PU_CASE(31); PU_CASE(32);
-#endif
-#if AN_NUM_PU > 32
-        PU_CASE(33); PU_CASE(34); PU_CASE(35); PU_CASE(36);
-        PU_CASE(37); PU_CASE(38); PU_CASE(39); PU_CASE(40);
-        PU_CASE(41); PU_CASE(42); PU_CASE(43); PU_CASE(44);
-        PU_CASE(45); PU_CASE(46); PU_CASE(47); PU_CASE(48);
-        PU_CASE(49); PU_CASE(50); PU_CASE(51); PU_CASE(52);
-        PU_CASE(53); PU_CASE(54); PU_CASE(55); PU_CASE(56);
-        PU_CASE(57); PU_CASE(58); PU_CASE(59); PU_CASE(60);
-        PU_CASE(61); PU_CASE(62); PU_CASE(63); PU_CASE(64);
-#endif
+        SYSTEM_PU_CASE_ENTRIES
 #undef PU_CASE
         default: return nullptr;
       }

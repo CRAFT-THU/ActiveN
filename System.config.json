@@ -1,0 +1,17 @@
+{
+  "numMC": 2,
+  "numPU": 64,
+  "core": {
+    "initVec": "0x80000000",
+    "iCacheLines": 16,
+    "iCacheBlockSize": 64,
+    "iCacheAssoc": 2,
+    "memDst": 0,
+    "memTagBase": 0,
+    "memBusWidth": 256,
+    "memCtrlSizes": ["0x100000000"],
+    "scratchpadSize": 16384,
+    "useFPU": true,
+    "pipeCnt": 1
+  }
+}

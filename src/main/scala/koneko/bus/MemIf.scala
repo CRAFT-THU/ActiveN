@@ -49,7 +49,9 @@ class MemIf(
   puEnd: Int,       // Last PU ID in zone (1-based, inclusive)
   numClusters: Int, // Clusters in this zone
   maxInflight: Int,
-  scatterAddrBase: BigInt = BigInt("80000000", 16), // subtracted from scatter absolute addresses
+  // Optional config ROM: maps 32-byte-aligned addresses to 256-bit values.
+  // When a read falls in this range, it is answered locally without issuing to memory.
+  configROM: Map[BigInt, BigInt] = Map.empty,
 ) extends Module {
   require(numClusters >= 1)
   require(puEnd >= puStart)
@@ -172,6 +174,10 @@ class MemIf(
   }
 
   // --- 2. Issue to external memory ---
+  // Config ROM: handle reads locally without issuing to memory
+  val configRomEntries = configROM.toSeq.sortBy(_._1)
+  val hasConfigROM = configRomEntries.nonEmpty
+
   val readyToIssue = VecInit((0 until maxInflight).map(s =>
     allocated(s) && ready(s) && !issued(s)
   ))
@@ -179,22 +185,43 @@ class MemIf(
   val issueSlot  = PriorityEncoder(readyToIssue.asUInt)
   val issuePend  = pending(issueSlot)
 
+  // Config ROM hit: intercept reads to config addresses
+  val configHit  = WireDefault(false.B)
+  val configData = WireDefault(0.U(256.W))
+  if (hasConfigROM) {
+    val alignedAddr = issuePend.address & ~(31.U(32.W))
+    for ((addr, value) <- configRomEntries) {
+      when(alignedAddr === addr.U && !issuePend.write) {
+        configHit  := true.B
+        configData := value.U(256.W)
+      }
+    }
+  }
+
+  // Handle config ROM hits immediately (mark completed without issuing to memory)
+  when(issueValid && configHit) {
+    data(issueSlot)      := configData
+    issued(issueSlot)    := true.B
+    completed(issueSlot) := true.B
+  }
+
   val scatWantsIssue = scatState === sScatIssue
 
-  // Normal has priority over scatter
-  mem.req.valid     := issueValid || scatWantsIssue
-  mem.req.bits.id   := Mux(issueValid, issueSlot, scatSlotId)
-  mem.req.bits.addr := Mux(issueValid, issuePend.address, scatAddr - scatterAddrBase.U)
-  mem.req.bits.write := Mux(issueValid, issuePend.write, false.B)
+  // Normal has priority over scatter; skip config ROM hits
+  val normalIssue = issueValid && !configHit
+  mem.req.valid     := normalIssue || scatWantsIssue
+  mem.req.bits.id   := Mux(normalIssue, issueSlot, scatSlotId)
+  mem.req.bits.addr := Mux(normalIssue, issuePend.address, scatAddr)
+  mem.req.bits.write := Mux(normalIssue, issuePend.write, false.B)
   // Replicate 32-bit wdata across all words; byte-enables select correct bytes
-  mem.req.bits.wdata := Mux(issueValid, Fill(8, issuePend.wdata), 0.U)
+  mem.req.bits.wdata := Mux(normalIssue, Fill(8, issuePend.wdata), 0.U)
   val byteOff   = issuePend.address(4, 0)
   val byteCount = (1.U << issuePend.size)(3, 0)
   val baseMask  = (1.U << byteCount)(4, 0) - 1.U
-  mem.req.bits.wbe := Mux(issueValid && issuePend.write, baseMask << byteOff, 0.U)
+  mem.req.bits.wbe := Mux(normalIssue && issuePend.write, baseMask << byteOff, 0.U)
 
   when(mem.req.fire) {
-    when(issueValid) {
+    when(normalIssue) {
       issued(issueSlot) := true.B
       when(issuePend.write) { completed(issueSlot) := true.B }
     }.otherwise {

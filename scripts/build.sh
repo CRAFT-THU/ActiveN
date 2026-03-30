@@ -33,7 +33,7 @@ build_sim_system() {
   rm -rf work/build/sim_system
   mkdir -p work/build/sim_system
   cd work/build/sim_system
-  AN_NUM_PU=$pu AN_NUM_MC=$mc AN_PIPE_CNT=1 cmake -GNinja $BASE/sim
+  cmake -GNinja $BASE/sim
   ninja sim_system
 }
 
