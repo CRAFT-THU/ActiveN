@@ -44,7 +44,7 @@ class MemDistributor(
   val puIdx = bufDst - puStart.U
   for (i <- 0 until 16) {
     out(i).valid    := valid && (isBroadcast || puIdx === i.U)
-    out(i).bits.tag  := bufId
+    out(i).bits.id  := bufId
     out(i).bits.data := bufData
   }
 

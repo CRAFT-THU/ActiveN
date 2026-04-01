@@ -64,7 +64,7 @@ class Core(implicit val params: CoreParameters) extends Module {
 
   // Memory response from external -> encoder -> crossbar
   // Broadcast responses (tag=0xFFFF from MemDistributor) go to BIU instead
-  val isBroadcast = mem.valid && mem.bits.tag === 0xFFFF.U
+  val isBroadcast = mem.valid && mem.bits.id === 0xFFFF.U
   encoder.resp.valid := mem.valid && !isBroadcast
   encoder.resp.bits  := mem.bits
   exec.bcast.valid   := isBroadcast

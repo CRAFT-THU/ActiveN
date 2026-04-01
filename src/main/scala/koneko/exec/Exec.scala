@@ -97,7 +97,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   // Rest of ALU
   val alu2 = Mux(uop.alu2imm, uop.immExt, rs2val)
-  val isMul = !uop.alu2imm && uop.funct7(1)
+  val isMul = !uop.alu2imm && uop.funct7(0)
 
   // Comparisions, used for branches and
   val lt = rs1val.asSInt < alu2.asSInt

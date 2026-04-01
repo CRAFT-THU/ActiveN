@@ -12,7 +12,7 @@ class MemReq extends Bundle {
 }
 
 class MemResp(implicit val param: CoreParameters) extends Bundle {
-  val tag = UInt(16.W)
+  val id = UInt(16.W)
   val data = UInt(param.memBusWidth.W)
 }
 
@@ -52,7 +52,7 @@ class uOp(implicit val param: CoreParameters) extends Bundle {
 
   val smsel = UInt(param.pipeCnt.W)
 
-  def isMul = rdalu && !alu2imm && funct7(1)
+  def isMul = rdalu && !alu2imm && funct7(0)
 
   def immExt = VecInit(Seq.fill(11)(cimm(20))).asUInt ## cimm
   def immU = cimm(19, 0) ## 0.U(12.W)

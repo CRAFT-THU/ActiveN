@@ -19,6 +19,9 @@ struct Args {
     #[clap(short, long)]
     core_cnt: usize,
 
+    #[clap(long, default_value = "1")]
+    num_mc: usize,
+
     #[clap(long)]
     load_nest_nodes: Option<PathBuf>,
 
@@ -87,59 +90,136 @@ struct Core {
     neurons: Vec<Neuron>,
 }
 
-fn dump(base: &PathBuf, cores: &Vec<Core>, dram_base: u32) -> anyhow::Result<()> {
+fn dump(base: &PathBuf, cores: &Vec<Core>, dram_base: u32, num_mc: usize) -> anyhow::Result<()> {
     println!("Dumping to {}", base.display());
 
     let core_cnt = cores.len();
     let spm_size: u32 = 16384;
+    let pus_per_mc = core_cnt / num_mc;
+
+    // New SPM format: per neuron = state(f32), input(f32), csr_start_mc[0..num_mc-1]
+    // Plus 1 sentinel neuron at the end with past-the-end CSR addresses
+    let words_per_neuron = 2 + num_mc; // state, input, N x csr_start
 
     // Layout in the combined dram.0 file:
     //   [0, desc_end):        Descriptor table (core_cnt * 8 bytes)
     //   [desc_end, spm_end):  SPM initializer blocks (core_cnt * spm_size)
-    //   [spm_end, ...):       CSR neighbor data
+    //   [spm_end, ...):       CSR data for each MC (concatenated, each MC's block is separate)
     let desc_size = (core_cnt as u32) * 8;
     let spm_total = (core_cnt as u32) * spm_size;
     let csr_file_offset = desc_size + spm_total;
-    let csr_global_base = dram_base + csr_file_offset;
 
-    // Build per-core SPM data and CSR data
-    let mut csr_data: Vec<u32> = Vec::new();
-    let mut all_spm: Vec<Vec<u32>> = Vec::new();
+    // Step 1: Partition CSR entries by destination MC
+    // csr_per_mc[mc] = Vec<u32> of CSR entries (col, weight pairs) for that MC
+    let mut csr_per_mc: Vec<Vec<u32>> = vec![Vec::new(); num_mc];
+    // per_neuron_csr_starts[ci][ni][mc] = byte offset within csr_per_mc[mc] where this neuron's row starts
+    let mut per_neuron_csr_starts: Vec<Vec<Vec<u32>>> = Vec::new();
 
     for ci in 0..core_cnt {
         let c = &cores[ci];
-        let mut spm: Vec<u32> = Vec::new();
+        let mut neuron_starts: Vec<Vec<u32>> = Vec::new();
         for n in c.neurons.iter() {
-            let neigh_start = csr_data.len() * 4;
+            // Record start offsets for each MC
+            let starts: Vec<u32> = (0..num_mc).map(|mc| (csr_per_mc[mc].len() * 4) as u32).collect();
+            neuron_starts.push(starts);
+
+            // Partition neighbors by target MC
             for neigh in n.neigh.iter() {
+                let target_pu = neigh.core as usize; // 0-based core index
+                let target_mc = target_pu / pus_per_mc;
+                debug_assert!(target_mc < num_mc, "target_mc={} >= num_mc={}", target_mc, num_mc);
                 // Core IDs are 1-based in the new system (PU IDs 1..core_cnt)
                 let col = ((neigh.core as u32 + 1) << 16) | (neigh.neuron as u32);
-                csr_data.push(col);
-                csr_data.push(neigh.weight.to_bits());
+                csr_per_mc[target_mc].push(col);
+                csr_per_mc[target_mc].push(neigh.weight.to_bits());
             }
-            let neigh_end = csr_data.len() * 4;
+        }
+        // Sentinel: past-the-end for last neuron
+        let sentinel: Vec<u32> = (0..num_mc).map(|mc| (csr_per_mc[mc].len() * 4) as u32).collect();
+        neuron_starts.push(sentinel);
+        per_neuron_csr_starts.push(neuron_starts);
+    }
+
+    // Step 2: Compute CSR base addresses per MC
+    // All CSR data goes into the dram.0 file sequentially after SPM data.
+    // Each MC's CSR block is at a known file offset.
+    // The MC-local address = (file_offset_of_mc_csr_block + entry_offset_within_block)
+    //   because the Encoder converts global addresses to MC-local by subtracting MC's base.
+    //   For MC0: global = dram_base + file_offset, local = global - 0x80000000
+    //   For MC1: global = dram_base + file_offset, but MC1's DRAM starts at 0x80000000 + mc_size
+    //   So local = global - (0x80000000 + mc_size) = dram_base - 0x80000000 + file_offset - mc_size
+    //
+    // Since all data is in a flat file loaded at dram_base (0x80100000),
+    // and the simulator adjusts per-MC addressing:
+    //   MC0 local_addr → global = local_addr + 0x80000000
+    //   MC1 local_addr → global = local_addr + 0x80000000 + mc_size
+    //
+    // So for MC0: CSR MC-local addr = (dram_base - 0x80000000) + file_offset
+    // For MC1: CSR MC-local addr = (dram_base - 0x80000000) + file_offset - mc_size
+    // Generalization: MC-local addr = (dram_base - 0x80000000 - mc_cumul_base) + file_offset
+
+    let mc_size: u64 = 0x100000000; // 4 GiB per MC (matching memCtrlSizes)
+    let mut csr_mc_file_offsets: Vec<u32> = Vec::new();
+    let mut cur_offset = csr_file_offset;
+    for mc in 0..num_mc {
+        csr_mc_file_offsets.push(cur_offset);
+        cur_offset += (csr_per_mc[mc].len() * 4) as u32;
+    }
+
+    // MC-local base for each MC's CSR block
+    let dram_offset_from_text = dram_base - 0x80000000u32;
+    let csr_mc_local_bases: Vec<u32> = (0..num_mc).map(|mc| {
+        let mc_cumul_base = (mc as u64) * mc_size;
+        // MC-local address of the start of this MC's CSR block
+        ((dram_offset_from_text as u64 + csr_mc_file_offsets[mc] as u64) - mc_cumul_base) as u32
+    }).collect();
+
+    // Step 3: Build SPM data
+    let mut all_spm: Vec<Vec<u32>> = Vec::new();
+    for ci in 0..core_cnt {
+        let c = &cores[ci];
+        let nn_count = c.neurons.len();
+        let mut spm: Vec<u32> = Vec::new();
+
+        // Regular neurons
+        for ni in 0..nn_count {
+            let n = &c.neurons[ni];
             spm.push(n.state.to_bits());
             spm.push(n.input.to_bits());
-            // Absolute global addresses for CSR pointers
-            spm.push(csr_global_base + neigh_start as u32);
-            spm.push(csr_global_base + neigh_end as u32);
+            for mc in 0..num_mc {
+                // MC-local start address for this neuron's CSR row in this MC
+                spm.push(csr_mc_local_bases[mc] + per_neuron_csr_starts[ci][ni][mc]);
+            }
         }
+        // Sentinel neuron (past-the-end CSR addresses)
+        spm.push(0); // state placeholder
+        spm.push(0); // input placeholder
+        for mc in 0..num_mc {
+            spm.push(csr_mc_local_bases[mc] + per_neuron_csr_starts[ci][nn_count][mc]);
+        }
+
         spm.resize(spm_size as usize / 4, 0);
-        spm[spm_size as usize / 4 - 1] = c.neurons.len() as u32;
+        // nn_count at word 4095
+        spm[spm_size as usize / 4 - 1] = nn_count as u32;      // +0x3FFC: nn_count
+        // +0x3FF8: init state (written by system.cpp preloader, not datagen)
+        // +0x3FF4: sync counter (used at runtime)
+        spm[spm_size as usize / 4 - 4] = num_mc as u32;       // +0x3FF0: num_mc
+        spm[spm_size as usize / 4 - 5] = (words_per_neuron * 4) as u32; // +0x3FEC: neuron stride
+        spm[spm_size as usize / 4 - 6] = core_cnt as u32;     // +0x3FE8: num_pu
         all_spm.push(spm);
     }
 
-    // Write combined dram.0 file
+    // Step 4: Write combined dram.0 file
     let mut out_file = base.clone();
     out_file.push("dram.0");
     let mut writer = BufWriter::new(File::create(&out_file)?);
 
     // 1. Descriptor table
     // Each entry: (spm_src: u32, neuron_data_bytes: u32)
-    // neuron_data_bytes = nn_count * 16 (only the actual neuron data)
+    // neuron_data_bytes = (nn_count + 1) * words_per_neuron * 4 (includes sentinel)
     for ci in 0..core_cnt {
         let spm_src = dram_base + desc_size + (ci as u32) * spm_size;
-        let nn_data_bytes = (cores[ci].neurons.len() as u32) * 16;
+        let nn_data_bytes = ((cores[ci].neurons.len() + 1) as u32) * (words_per_neuron as u32) * 4;
         writer.write_u32::<LittleEndian>(spm_src)?;
         writer.write_u32::<LittleEndian>(nn_data_bytes)?;
     }
@@ -151,17 +231,22 @@ fn dump(base: &PathBuf, cores: &Vec<Core>, dram_base: u32) -> anyhow::Result<()>
         }
     }
 
-    // 3. CSR neighbor data
-    for word in &csr_data {
-        writer.write_u32::<LittleEndian>(*word)?;
+    // 3. CSR data for each MC
+    for mc in 0..num_mc {
+        for word in &csr_per_mc[mc] {
+            writer.write_u32::<LittleEndian>(*word)?;
+        }
     }
 
     writer.flush()?;
-    let total_size = desc_size as usize + spm_total as usize + csr_data.len() * 4;
+    let total_csr: usize = csr_per_mc.iter().map(|v| v.len() * 4).sum();
+    let total_size = desc_size as usize + spm_total as usize + total_csr;
     println!("  dram.0: {} bytes (desc={}, spm={}, csr={})",
-        total_size, desc_size, spm_total, csr_data.len() * 4);
-    println!("  dram_base=0x{:08x}, csr_base=0x{:08x}",
-        dram_base, csr_global_base);
+        total_size, desc_size, spm_total, total_csr);
+    for mc in 0..num_mc {
+        println!("    MC{}: csr={} bytes, local_base=0x{:08x}",
+            mc, csr_per_mc[mc].len() * 4, csr_mc_local_bases[mc]);
+    }
 
     Ok(())
 }
@@ -577,7 +662,7 @@ fn main() -> anyhow::Result<()> {
                     args.dram_base.trim_start_matches("0x").trim_start_matches("0X"),
                     16,
                 ).expect("Invalid --dram-base hex value");
-                dump(p, &cores, dram_base)?;
+                dump(p, &cores, dram_base, args.num_mc)?;
             }
 
             if let Some(ref p) = args.dump_genn {

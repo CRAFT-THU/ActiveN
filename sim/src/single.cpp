@@ -50,9 +50,9 @@ static void sighandler(int) {
   exiting = true;
 }
 
-// Memory response: tag + 256-bit data (8 words)
+// Memory response: id + 256-bit data (8 words)
 struct MemResponse {
-  uint16_t tag;
+  uint16_t id;
   uint32_t data[MEM_BUS_WORDS]; // 8 words, little-endian
 };
 
@@ -85,7 +85,7 @@ struct SingleCoreSim {
   // Read 256-bit aligned block from backing memory at given byte address
   MemResponse readBlock(uint32_t addr, uint16_t resp_tag) {
     MemResponse resp;
-    resp.tag = resp_tag;
+    resp.id = resp_tag;
     // Align to 32-byte boundary (256 bits)
     uint32_t aligned = addr & ~((MEM_BUS_WORDS * 4) - 1);
     for (int i = 0; i < MEM_BUS_WORDS; i++) {
@@ -147,7 +147,7 @@ struct SingleCoreSim {
     }
     // Provide dummy response so the core can complete the request
     MemResponse resp;
-    resp.tag = resp_tag;
+    resp.id = resp_tag;
     memset(resp.data, 0, sizeof(resp.data));
     mem_resps.push_back(resp);
     collector.reset();
@@ -202,13 +202,13 @@ struct SingleCoreSim {
     // Set mem response signals
     if(mem_resps.empty()) {
       core->mem_valid = false;
-      core->mem_bits_tag = 0;
+      core->mem_bits_id = 0;
       for (int i = 0; i < MEM_BUS_WORDS; i++) {
         core->mem_bits_data[i] = 0;
       }
     } else {
       core->mem_valid = true;
-      core->mem_bits_tag = mem_resps.front().tag;
+      core->mem_bits_id = mem_resps.front().id;
       // Pack 8 x 32-bit words into 256-bit data
       // Verilator represents wide signals as uint32_t arrays
       for (int i = 0; i < MEM_BUS_WORDS; i++) {

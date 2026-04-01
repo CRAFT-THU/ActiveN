@@ -85,6 +85,17 @@ struct SystemSim {
 
   std::vector<std::deque<MemResponse>> mem_resps;
   std::vector<MemPort> mem_ports;
+  std::vector<uint64_t> mc_base; // cumulative base address per MC
+
+  sys_rtl_Core* getPuCore(int id) {
+    auto r = sys->rootp;
+    switch(id) {
+#define PU_CASE(N) case N: return r->__PVT__System__DOT__pu_##N
+      SYSTEM_PU_CASE_ENTRIES
+#undef PU_CASE
+      default: return nullptr;
+    }
+  }
 
   // Peripheral
   PeripheralDevice periph;
@@ -109,6 +120,14 @@ struct SystemSim {
     mem_resps.resize(num_mc);
     mem_ports.resize(num_mc);
     for (int i = 0; i < num_mc; i++) initMemPort(i);
+    // Compute per-MC cumulative base addresses
+    mc_base.resize(num_mc);
+    uint64_t cumul = 0;
+    for (int i = 0; i < num_mc; i++) {
+      mc_base[i] = cumul;
+      if (i < SYSTEM_CONFIG.core.numMemCtrl)
+        cumul += SYSTEM_CONFIG.core.memCtrlSizes[i];
+    }
   }
 
   void initDram(const char *cfg, const char *log_dir) {
@@ -182,7 +201,8 @@ struct SystemSim {
     auto &p = mem_ports[mc];
     uint16_t id = *p.req_id;
     uint32_t local_addr = *p.req_addr;
-    uint32_t addr = local_addr + TEXT_BASE;
+    // Convert MC-local address to global: add MC's base offset in global space
+    uint32_t addr = local_addr + TEXT_BASE + (uint32_t)mc_base[mc];
     bool is_write = *p.req_write;
 
     if (is_write) {
@@ -256,12 +276,58 @@ struct SystemSim {
   }
 
   uint64_t total_reqs = 0;
+  uint64_t mc_reqs[8] = {};
+  uint64_t mc_scat[8] = {};
+  uint64_t last_total = 0;
+  uint64_t stall_start = 0;
+  bool stall_reported = false;
 
   void step() {
     ++cycle;
 
     if (cycle % 50000 == 0) {
-      cerr << "[DBG] cycle=" << cycle << " reqs=" << total_reqs << endl;
+      cerr << "[DBG] cycle=" << cycle << " reqs=" << total_reqs;
+      for (int mc = 0; mc < num_mc; mc++)
+        cerr << " MC" << mc << "=" << mc_reqs[mc] << "(scat=" << mc_scat[mc] << ")";
+      cerr << endl;
+    }
+    if (total_reqs != last_total) {
+      last_total = total_reqs;
+      stall_start = cycle;
+      stall_reported = false;
+    } else if (cycle - stall_start == 10000 && !stall_reported) {
+      stall_reported = true;
+      cerr << "[STALL] No new reqs since cycle " << stall_start << " (reqs=" << total_reqs << ")";
+      for (int mc = 0; mc < num_mc; mc++)
+        cerr << " MC" << mc << "=" << mc_reqs[mc] << "(scat=" << mc_scat[mc] << ")";
+      cerr << endl;
+      for (int mc = 0; mc < num_mc; mc++)
+        cerr << "[STALL] MC" << mc << " resp_queue=" << mem_resps[mc].size() << endl;
+      cerr << "[STALL] periph resp_queue=" << periph_resps.size() << endl;
+      // Dump first few PU PCs
+      for (int pu = 1; pu <= min(num_pu, 4); pu++) {
+        auto core = getPuCore(pu);
+        if (core) {
+          cerr << "[STALL] PU" << pu << " pc=0x" << hex
+               << core->__PVT__exec__DOT__uop_pc
+               << " icache_s1pc=0x"
+               << core->__PVT__fetch__DOT__icache__DOT__s1pc << dec << endl;
+        }
+      }
+    }
+    // Periodic PC dump (every 5000 cycles from 2000)
+    if ((cycle >= 500 && cycle <= 1500 && cycle % 100 == 0) ||
+        (cycle >= 2000 && cycle % 5000 == 0)) {
+      auto core = getPuCore(1);
+      if (core) {
+        cerr << "[PC] cycle=" << cycle << " PU1 pc=0x" << hex
+             << core->__PVT__exec__DOT__uop_pc
+             << " a0=0x" << core->__PVT__exec__DOT__regfiles_0__DOT__regs_10
+             << " s1=0x" << core->__PVT__exec__DOT__regfiles_0__DOT__regs_9
+             << " s6=0x" << core->__PVT__exec__DOT__regfiles_0__DOT__regs_22
+             << " s7=0x" << core->__PVT__exec__DOT__regfiles_0__DOT__regs_23
+             << dec << endl;
+      }
     }
 
     if (cycle <= RESET_LENGTH) {
@@ -287,8 +353,11 @@ struct SystemSim {
     for (int mc = 0; mc < num_mc; mc++) {
       auto &p = mem_ports[mc];
       if (*p.req_ready && *p.req_valid) {
+        uint16_t rid = *p.req_id;
         processMemReq(mc);
         total_reqs++;
+        mc_reqs[mc]++;
+        if (rid == 64) mc_scat[mc]++;
       }
     }
 
@@ -468,24 +537,18 @@ int main(int argc, char **argv) {
   if (spm_preload && spm_preload[0] == '1' && data_path && data_path[0] != '\0') {
     // data_path points to dram.0 file, already loaded into text_aligned at data_addr
     uint32_t desc_base_off = data_addr - TEXT_BASE;
-    auto getPuCore = [&](int id) -> sys_rtl_Core* {
-      auto r = sim.sys->rootp;
-      switch(id) {
-#define PU_CASE(N) case N: return r->__PVT__System__DOT__pu_##N
-        SYSTEM_PU_CASE_ENTRIES
-#undef PU_CASE
-        default: return nullptr;
-      }
-    };
     int spm_loaded = 0;
     for (int i = 1; i <= num_pu; i++) {
-      auto core = getPuCore(i);
+      auto core = sim.getPuCore(i);
       if (!core) continue;
       // Read descriptor: desc_base + (i-1)*8
       uint32_t desc_off = desc_base_off + (i - 1) * 8;
       uint32_t spm_src = text_aligned[desc_off / 4];
       uint32_t data_bytes = text_aligned[desc_off / 4 + 1];
-      uint32_t nn_count = data_bytes / 16;
+      // New format: data_bytes = (nn_count+1) * words_per_neuron * 4
+      //   words_per_neuron = 2 + num_mc
+      int words_per_neuron = 2 + num_mc;
+      uint32_t nn_count = data_bytes / (words_per_neuron * 4) - 1; // subtract sentinel
       // Copy SPM data from backing memory into scratchpad
       uint32_t src_off = (spm_src - TEXT_BASE) / 4;
       uint32_t nwords = data_bytes / 4;
@@ -493,10 +556,21 @@ int main(int argc, char **argv) {
       for (uint32_t w = 0; w < nwords; w++) {
         mem[w] = text_aligned[src_off + w];
       }
-      // Write nn_count at SPM metadata location (offset 0x3FFC = word 4095)
-      mem[4095] = nn_count;
-      // Mark as initialized (SPM_STATE at offset 0x3FF8 = word 4094)
-      mem[4094] = 1;
+      // Write SPM metadata
+      mem[4095] = nn_count;             // +0x3FFC: nn_count
+      mem[4094] = 1;                    // +0x3FF8: init state (pre-loaded)
+      // +0x3FF4: sync counter (runtime)
+      mem[4092] = num_mc;               // +0x3FF0: num_mc
+      mem[4091] = words_per_neuron * 4; // +0x3FEC: neuron stride (bytes)
+      mem[4090] = num_pu;               // +0x3FE8: num_pu
+      if (i == 1) {
+        cerr << "[SPM] PU1: nn_count=" << nn_count << " num_mc=" << num_mc
+             << " stride=" << words_per_neuron*4 << " num_pu=" << num_pu
+             << " nwords=" << nwords << " src_off=" << hex << src_off << dec << endl;
+        cerr << "[SPM] PU1 mem[0..7]: ";
+        for (int w = 0; w < 8; w++) cerr << hex << mem[w] << " ";
+        cerr << dec << endl;
+      }
       spm_loaded++;
     }
     cout << "[System] Pre-loaded SPM for " << spm_loaded << " PUs" << endl;

@@ -6,29 +6,38 @@
   #   sw t0, addr → stores x5 (modified by FP operation)
   #
   # Startup: _start calls snn_init() (C) which loads SPM, configures
-  #          handlers, sets s-registers, returns a0 = SPM_BASE.
+  #          handlers, sets s-registers, returns a0 = hartid.
   #          Then jumps straight into updateOne.
   #
-  # Register assignments (s-registers, set by snn_init):
-  #   s0  = MC scatter target (0xFF028001)
-  #   s1  = end of neuron data (SPM_BASE + neuronCount * 16)
+  # Register assignments (s-registers, set after snn_init):
+  #   s0  = first MC scatter target base (0xFF028001, MC dst=0x8001)
+  #   s1  = end of neuron data (SPM_BASE + neuronCount * stride)
   #   s2  = self-fire target (0x00020000 = local send, tag=2)
   #   s3  = threshold (15.0f = 0x41700000), accessed as fs3
   #   s4  = tau decay (e^{-0.1} = 0x3f67a36d), accessed as fs4
   #   s5  = 1.0f (unused here but available)
+  #   s6  = neuron stride (bytes per neuron entry)
+  #   s7  = num_mc (number of memory controllers)
   #   s8  = sync tree expected count
   #   s9  = hartid (1-based)
+  #   s10 = num_pu (total number of PUs)
   #
-  # SPM layout per neuron (16 bytes):
+  # SPM layout per neuron (stride = 8 + 4*num_mc bytes):
   #   +0:  state (f32 raw bits)
   #   +4:  input accumulator (f32 raw bits)
-  #   +8:  CSR row start pointer (global DRAM address)
-  #   +12: CSR row end pointer (global DRAM address)
+  #   +8:  CSR start for MC0 (MC-local address)
+  #   +12: CSR start for MC1 (MC-local address, if num_mc >= 2)
+  #   ...
+  # Sentinel neuron at end has past-the-end CSR addresses.
+  # End address for neuron N in MC m = neuron (N+1)'s CSR start for MC m.
   #
   # SPM metadata (at top of 16KB SPM):
   #   0x20003FFC: neuron count
-  #   0x20003FF8: init state (0=uninit, 1=running)
+  #   0x20003FF8: init state (0=uninit, 1=preloaded, 2=configured)
   #   0x20003FF4: sync counter
+  #   0x20003FF0: num_mc
+  #   0x20003FEC: neuron stride (bytes)
+  #   0x20003FE8: num_pu
 
 #ifndef NUM_PU
 #define NUM_PU 16
@@ -38,6 +47,9 @@
 #define SPM_SIZE        16384
 #define SPM_STATE_ADDR  (SPM_BASE + SPM_SIZE - 8)   /* 0x20003FF8 */
 #define SPM_COUNTER     (SPM_BASE + SPM_SIZE - 12)   /* 0x20003FF4 */
+#define SPM_NUM_MC      (SPM_BASE + SPM_SIZE - 16)   /* 0x20003FF0 */
+#define SPM_STRIDE      (SPM_BASE + SPM_SIZE - 20)   /* 0x20003FEC */
+#define SPM_NUM_PU      (SPM_BASE + SPM_SIZE - 24)   /* 0x20003FE8 */
 
 #define STOP_ADDR       0x40000000
 #define TIMER_ADDR      0x40000004
@@ -55,21 +67,29 @@ _start:
   # State=0: uninit (need SPM copy + handler config)
   # State=1: SPM pre-loaded by driver (skip copy, still need handler config)
   # In both cases: call snn_init which handles both
-  li    sp, SPM_BASE + SPM_SIZE - 16   # Leave room for metadata
+  li    sp, SPM_BASE + SPM_SIZE - 32   # Leave room for metadata (24 bytes)
   call  snn_init               # Returns a0 = hartid
 
   # snn_init configured handlers and did SPM copy + init loop.
   # Now set up s-registers in ASM (C can't preserve callee-saved regs).
   mv    s9, a0                 # s9 = hartid (1-based)
 
-  lui   s0, 0xFF028            # s0 = 0xFF028001 (MC1 scatter target)
+  lui   s0, 0xFF028            # s0 = 0xFF028001 (MC scatter: tag=0xFF02, dst=MC0+)
   addi  s0, s0, 1
+
+  # Read stride and num_mc from SPM metadata
+  li    t0, SPM_STRIDE
+  lw    s6, 0(t0)             # s6 = neuron stride (bytes)
+  li    t0, SPM_NUM_MC
+  lw    s7, 0(t0)             # s7 = num_mc
+  li    t0, SPM_NUM_PU
+  lw    s10, 0(t0)            # s10 = num_pu
 
   li    t0, SPM_BASE + SPM_SIZE - 4
   lw    t0, 0(t0)             # neuron count
-  slli  t0, t0, 4             # * 16 bytes
+  mul   t0, t0, s6            # * stride bytes
   li    s1, SPM_BASE
-  add   s1, s1, t0            # s1 = end of neuron data
+  add   s1, s1, t0            # s1 = end of neuron data (sentinel addr)
 
   lui   s2, 0x00020            # s2 = 0x00020000 (local send, tag=2)
 
@@ -120,11 +140,10 @@ syncinc:
   j     do_wfi
 
 check_root_done:
-  li    t2, NUM_PU
-  bne   t1, t2, do_wfi
+  bne   t1, s10, do_wfi       # s10 = num_pu: wait until all PUs done
   # All done! Stop simulation.
   li    t0, STOP_ADDR
-  sw    t1, 0(t0)             # result = NUM_PU
+  sw    t1, 0(t0)             # result = num_pu
   j     do_wfi
 
   #============================================================
@@ -133,7 +152,7 @@ check_root_done:
   #============================================================
   .globl spike
 spike:
-  slli  a0, a0, 4             # neuron_id * 16
+  mul   a0, a0, s6             # neuron_id * stride
   li    t0, SPM_BASE
   add   a0, a0, t0
   lw    t0, 4(a0)             # x5/f5 = input
@@ -157,26 +176,44 @@ updateOne:
   # Not fired: decay state
   fmul.s f5, f5, fs4          # state *= tau
   sw    t0, 0(a0)             # store decayed state (x5 modified by fmul)
-  addi  a0, a0, 16
+  add   a0, a0, s6            # advance by stride
   .insn r 0x0B, 0x5, 0x1, x0, a0, s2   # yield.1 a0, s2
 
 neuron_fired:
   # Reset state to 0
   sw    zero, 0(a0)
 
-  # Load CSR row pointers
-  lw    t0, 8(a0)             # x5 = CSR start
-  lw    t1, 12(a0)            # x6 = CSR end
+  # Scatter to all MCs: for each MC m, read start from +8+4*m, end from next neuron
+  li    t3, 0                  # t3 = mc index (0-based)
+  mv    t4, s0                 # t4 = scatter target (0xFF028001 + mc_idx)
 
-  # If no synapses, skip readCSR
-  beq   t0, t1, no_synapses
+scatter_mc_loop:
+  beq   t3, s7, scatter_done  # if mc_idx == num_mc, done
 
-  # readCSR: queue(start, end), send to MC with scatter tag
+  # CSR start for this MC: at offset 8 + 4*mc_idx from current neuron
+  slli  t2, t3, 2             # t2 = mc_idx * 4
+  addi  t2, t2, 8             # t2 = 8 + mc_idx * 4
+  add   t2, a0, t2            # t2 = addr of csr_start[mc]
+  lw    t0, 0(t2)             # t0(x5) = csr_start[mc]
+
+  # CSR end for this MC: same offset in NEXT neuron
+  add   t2, t2, s6            # next neuron's same field
+  lw    t1, 0(t2)             # t1(x6) = csr_end[mc] (next neuron's start)
+
+  # If start == end, no synapses for this MC
+  beq   t0, t1, scatter_mc_next
+
+  # readCSR: queue(start, end), fire to this MC
   .insn r 0x0B, 0x2, 0x0, x0, t0, t1   # queue.2 t0(x5), t1(x6)
-  .insn r 0x0B, 0x4, 0x0, x0, x0, s0   # fire.0 s0
+  .insn r 0x0B, 0x4, 0x0, x0, x0, t4   # fire.0 t4 (scatter target for this MC)
 
-no_synapses:
-  addi  a0, a0, 16
+scatter_mc_next:
+  addi  t3, t3, 1             # mc_idx++
+  addi  t4, t4, 1             # next MC's scatter target (+1 to dst)
+  j     scatter_mc_loop
+
+scatter_done:
+  add   a0, a0, s6            # advance by stride
   .insn r 0x0B, 0x5, 0x1, x0, a0, s2   # yield.1 a0, s2
 
   #============================================================

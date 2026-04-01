@@ -32,12 +32,12 @@ class Crossbar(n: Int)(implicit val param: CoreParameters) extends Module {
   downstream.req.bits.id := arb.io.chosen ## arb.io.out.bits.id(15 - portBits, 0)
 
   // Route responses based on upstream port encoded in tag high bits
-  val respPort = downstream.resp.bits.tag(15, 16 - portBits)
-  val respTag = 0.U(portBits.W) ## downstream.resp.bits.tag(15 - portBits, 0)
+  val respPort = downstream.resp.bits.id(15, 16 - portBits)
+  val respId = 0.U(portBits.W) ## downstream.resp.bits.id(15 - portBits, 0)
 
   for ((u, i) <- upstream.zipWithIndex) {
     u.resp.valid := downstream.resp.valid && respPort === i.U
-    u.resp.bits.tag := respTag
+    u.resp.bits.id := respId
     u.resp.bits.data := downstream.resp.bits.data
   }
 }
