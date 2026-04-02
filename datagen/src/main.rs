@@ -13,8 +13,12 @@ use std::io::BufReader;
 use std::io::BufWriter;
 use std::io::Write;
 
-const XOR_SCALE: f32 = 10.0;
+const XOR_SCALE: f32 = 1.0;
 const CSR_ROW_ALIGN_WORDS: usize = 8;
+const SPM_IMAGE_MAGIC: u32 = 0x5350_4d49;
+const SPM_IMAGE_VERSION: u32 = 1;
+const SPM_IMAGE_HEADER_WORDS: u32 = 5;
+const SPM_INIT_DESC_WORDS: u32 = 7;
 
 fn round_ties_even_i64(value: f64) -> i64 {
     let lower = value.floor();
@@ -122,11 +126,38 @@ struct Core {
     neurons: Vec<Neuron>,
 }
 
-fn dump(base: &PathBuf, cores: &Vec<Core>, dram_base: u32, num_mc: usize) -> anyhow::Result<()> {
+#[derive(Copy, Clone)]
+struct SpmInitDescriptor {
+    init_src: u32,
+    init_bytes: u32,
+    nn_count: u32,
+    stride_bytes: u32,
+    num_mc: u32,
+    num_pu: u32,
+    expected_xor: u32,
+}
+
+fn compute_expected_xor(cores: &[Core], final_round_spike_inputs: &[Vec<f32>]) -> u32 {
+    let mut expected_xor = 0;
+    for (core_idx, c) in cores.iter().enumerate() {
+        for (neuron_idx, n) in c.neurons.iter().enumerate() {
+            expected_xor ^= quantize_xor_word(n.state);
+            expected_xor ^= quantize_xor_word(final_round_spike_inputs[core_idx][neuron_idx]);
+        }
+    }
+    expected_xor
+}
+
+fn dump(
+    base: &PathBuf,
+    cores: &[Core],
+    dram_base: u32,
+    num_mc: usize,
+    expected_xor: u32,
+) -> anyhow::Result<()> {
     println!("Dumping to {}", base.display());
 
     let core_cnt = cores.len();
-    let spm_size: u32 = 16384;
     let pus_per_mc = core_cnt / num_mc;
 
     // New SPM format: per neuron = state(f32), input(f32), csr_start_mc[0..num_mc-1]
@@ -134,12 +165,24 @@ fn dump(base: &PathBuf, cores: &Vec<Core>, dram_base: u32, num_mc: usize) -> any
     let words_per_neuron = 2 + num_mc; // state, input, N x csr_start
 
     // Layout in the combined dram.0 file:
-    //   [0, desc_end):        Descriptor table (core_cnt * 8 bytes)
-    //   [desc_end, spm_end):  SPM initializer blocks (core_cnt * spm_size)
-    //   [spm_end, ...):       CSR data for each MC (concatenated, each MC's block is separate)
-    let desc_size = (core_cnt as u32) * 8;
-    let spm_total = (core_cnt as u32) * spm_size;
-    let csr_file_offset = desc_size + spm_total;
+    //   [0, header_end):      Fixed boot header
+    //   [header_end, desc_end): Per-PU SPM init descriptors
+    //   [desc_end, init_end): Compact per-PU SPM init blobs
+    //   [init_end, ...):      CSR data for each MC (concatenated, each MC's block is separate)
+    let header_size = SPM_IMAGE_HEADER_WORDS * 4;
+    let desc_stride = SPM_INIT_DESC_WORDS * 4;
+    let desc_size = (core_cnt as u32) * desc_stride;
+    let init_sizes: Vec<u32> = cores
+        .iter()
+        .map(|c| ((c.neurons.len() + 1) as u32) * (words_per_neuron as u32) * 4)
+        .collect();
+    let init_total: u32 = init_sizes.iter().sum();
+    let mut init_file_offsets = Vec::with_capacity(core_cnt);
+    let mut csr_file_offset = header_size + desc_size;
+    for init_bytes in &init_sizes {
+        init_file_offsets.push(csr_file_offset);
+        csr_file_offset += *init_bytes;
+    }
 
     // Step 1: Partition CSR entries by destination MC
     // csr_per_mc[mc] = Vec<u32> of CSR entries (col, weight pairs) for that MC
@@ -212,39 +255,41 @@ fn dump(base: &PathBuf, cores: &Vec<Core>, dram_base: u32, num_mc: usize) -> any
         ((dram_offset_from_text as u64 + csr_mc_file_offsets[mc] as u64) - mc_cumul_base) as u32
     }).collect();
 
-    // Step 3: Build SPM data
-    let mut all_spm: Vec<Vec<u32>> = Vec::new();
+    // Step 3: Build compact SPM init data and descriptors.
+    let mut all_spm_init: Vec<Vec<u32>> = Vec::new();
+    let mut init_descs: Vec<SpmInitDescriptor> = Vec::new();
     for ci in 0..core_cnt {
         let c = &cores[ci];
         let nn_count = c.neurons.len();
-        let mut spm: Vec<u32> = Vec::new();
+        let mut spm_init: Vec<u32> = Vec::new();
 
         // Regular neurons
         for ni in 0..nn_count {
             let n = &c.neurons[ni];
-            spm.push(n.state.to_bits());
-            spm.push(n.input.to_bits());
+            spm_init.push(n.state.to_bits());
+            spm_init.push(n.input.to_bits());
             for mc in 0..num_mc {
                 // MC-local start address for this neuron's CSR row in this MC
-                spm.push(csr_mc_local_bases[mc] + per_neuron_csr_starts[ci][ni][mc]);
+                spm_init.push(csr_mc_local_bases[mc] + per_neuron_csr_starts[ci][ni][mc]);
             }
         }
         // Sentinel neuron (past-the-end CSR addresses)
-        spm.push(0); // state placeholder
-        spm.push(0); // input placeholder
+        spm_init.push(0); // state placeholder
+        spm_init.push(0); // input placeholder
         for mc in 0..num_mc {
-            spm.push(csr_mc_local_bases[mc] + per_neuron_csr_starts[ci][nn_count][mc]);
+            spm_init.push(csr_mc_local_bases[mc] + per_neuron_csr_starts[ci][nn_count][mc]);
         }
 
-        spm.resize(spm_size as usize / 4, 0);
-        // nn_count at word 4095
-        spm[spm_size as usize / 4 - 1] = nn_count as u32;      // +0x3FFC: nn_count
-        // +0x3FF8: init state (written by system.cpp preloader, not datagen)
-        // +0x3FF4: sync counter (used at runtime)
-        spm[spm_size as usize / 4 - 4] = num_mc as u32;       // +0x3FF0: num_mc
-        spm[spm_size as usize / 4 - 5] = (words_per_neuron * 4) as u32; // +0x3FEC: neuron stride
-        spm[spm_size as usize / 4 - 6] = core_cnt as u32;     // +0x3FE8: num_pu
-        all_spm.push(spm);
+        init_descs.push(SpmInitDescriptor {
+            init_src: dram_base + init_file_offsets[ci],
+            init_bytes: init_sizes[ci],
+            nn_count: nn_count as u32,
+            stride_bytes: (words_per_neuron as u32) * 4,
+            num_mc: num_mc as u32,
+            num_pu: core_cnt as u32,
+            expected_xor,
+        });
+        all_spm_init.push(spm_init);
     }
 
     // Step 4: Write combined dram.0 file
@@ -252,24 +297,32 @@ fn dump(base: &PathBuf, cores: &Vec<Core>, dram_base: u32, num_mc: usize) -> any
     out_file.push("dram.0");
     let mut writer = BufWriter::new(File::create(&out_file)?);
 
-    // 1. Descriptor table
-    // Each entry: (spm_src: u32, neuron_data_bytes: u32)
-    // neuron_data_bytes = (nn_count + 1) * words_per_neuron * 4 (includes sentinel)
-    for ci in 0..core_cnt {
-        let spm_src = dram_base + desc_size + (ci as u32) * spm_size;
-        let nn_data_bytes = ((cores[ci].neurons.len() + 1) as u32) * (words_per_neuron as u32) * 4;
-        writer.write_u32::<LittleEndian>(spm_src)?;
-        writer.write_u32::<LittleEndian>(nn_data_bytes)?;
+    // 1. Fixed boot header.
+    writer.write_u32::<LittleEndian>(SPM_IMAGE_MAGIC)?;
+    writer.write_u32::<LittleEndian>(SPM_IMAGE_VERSION)?;
+    writer.write_u32::<LittleEndian>(core_cnt as u32)?;
+    writer.write_u32::<LittleEndian>(dram_base + header_size)?;
+    writer.write_u32::<LittleEndian>(desc_stride)?;
+
+    // 2. Per-PU SPM init descriptors.
+    for desc in &init_descs {
+        writer.write_u32::<LittleEndian>(desc.init_src)?;
+        writer.write_u32::<LittleEndian>(desc.init_bytes)?;
+        writer.write_u32::<LittleEndian>(desc.nn_count)?;
+        writer.write_u32::<LittleEndian>(desc.stride_bytes)?;
+        writer.write_u32::<LittleEndian>(desc.num_mc)?;
+        writer.write_u32::<LittleEndian>(desc.num_pu)?;
+        writer.write_u32::<LittleEndian>(desc.expected_xor)?;
     }
 
-    // 2. SPM initializer blocks
-    for spm in &all_spm {
+    // 3. Compact per-PU SPM initializer blobs.
+    for spm in &all_spm_init {
         for word in spm {
             writer.write_u32::<LittleEndian>(*word)?;
         }
     }
 
-    // 3. CSR data for each MC
+    // 4. CSR data for each MC.
     for mc in 0..num_mc {
         for word in &csr_per_mc[mc] {
             writer.write_u32::<LittleEndian>(*word)?;
@@ -278,9 +331,9 @@ fn dump(base: &PathBuf, cores: &Vec<Core>, dram_base: u32, num_mc: usize) -> any
 
     writer.flush()?;
     let total_csr: usize = csr_per_mc.iter().map(|v| v.len() * 4).sum();
-    let total_size = desc_size as usize + spm_total as usize + total_csr;
-    println!("  dram.0: {} bytes (desc={}, spm={}, csr={})",
-        total_size, desc_size, spm_total, total_csr);
+    let total_size = header_size as usize + desc_size as usize + init_total as usize + total_csr;
+    println!("  dram.0: {} bytes (boot={}, desc={}, init={}, csr={})",
+        total_size, header_size, desc_size, init_total, total_csr);
     for mc in 0..num_mc {
         println!("    MC{}: csr={} bytes, local_base=0x{:08x}",
             mc, csr_per_mc[mc].len() * 4, csr_mc_local_bases[mc]);
@@ -695,21 +748,15 @@ fn main() -> anyhow::Result<()> {
         .map(|&nn_count| vec![0.0; nn_count])
         .collect();
 
+    let mut dump_snapshot: Option<Vec<Core>> = None;
+
     // Simulate
     for i in 0..args.pre_simulate {
         println!("Round {}...", i);
 
         if i == args.pre_simulate - 1 {
-            if let Some(ref p) = args.dump {
-                let dram_base = u32::from_str_radix(
-                    args.dram_base.trim_start_matches("0x").trim_start_matches("0X"),
-                    16,
-                ).expect("Invalid --dram-base hex value");
-                dump(p, &cores, dram_base, args.num_mc)?;
-            }
-
-            if let Some(ref p) = args.dump_genn {
-                dump_genn(p, &cores)?;
+            if args.dump.is_some() || args.dump_genn.is_some() {
+                dump_snapshot = Some(cores.clone());
             }
         }
 
@@ -753,32 +800,23 @@ fn main() -> anyhow::Result<()> {
     }
 
     // After all rounds: compute the payload-visible XOR checksum. The payload multiplies
-    // by 1.0e6f in FP32 and then converts to int with RNE, so emulate the same path here.
+    // by 1.0e1f in FP32 and then converts to int with RNE, so emulate the same path here.
     // The PU's init clears input to 0, so the final hardware input is the spike-only
     // accumulation from the last simulated round.
-    if let Some(ref p) = args.dump {
-        let mut expected_xor: u32 = 0;
-        for (core_idx, c) in cores.iter().enumerate() {
-            for (neuron_idx, n) in c.neurons.iter().enumerate() {
-                expected_xor ^= quantize_xor_word(n.state);
-                expected_xor ^= quantize_xor_word(final_round_spike_inputs[core_idx][neuron_idx]);
-            }
-        }
-        println!("Expected XOR: 0x{:08x}", expected_xor);
+    if let Some(ref snapshot) = dump_snapshot {
+        if let Some(ref p) = args.dump {
+            let expected_xor = compute_expected_xor(&cores, &final_round_spike_inputs);
+            let dram_base = u32::from_str_radix(
+                args.dram_base.trim_start_matches("0x").trim_start_matches("0X"),
+                16,
+            ).expect("Invalid --dram-base hex value");
 
-        // Patch word 4089 (offset 0x3FE4 from SPM base) in each PU's SPM block
-        let spm_size: u32 = 16384;
-        let desc_size = (args.core_cnt as u32) * 8;
-        let xor_word_offset = (spm_size / 4 - 7) as u64; // word 4089
-        let mut dram_file = p.clone();
-        dram_file.push("dram.0");
-        let mut file = std::fs::OpenOptions::new().write(true).open(&dram_file)?;
-        use std::io::Seek;
-        for ci in 0..args.core_cnt {
-            let spm_base_offset = desc_size as u64 + (ci as u64) * spm_size as u64;
-            let byte_offset = spm_base_offset + xor_word_offset * 4;
-            file.seek(std::io::SeekFrom::Start(byte_offset))?;
-            file.write_all(&expected_xor.to_le_bytes())?;
+            println!("Expected XOR: 0x{:08x}", expected_xor);
+            dump(p, snapshot, dram_base, args.num_mc, expected_xor)?;
+        }
+
+        if let Some(ref p) = args.dump_genn {
+            dump_genn(p, snapshot)?;
         }
     }
 

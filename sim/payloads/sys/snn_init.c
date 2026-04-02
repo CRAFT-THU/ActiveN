@@ -2,14 +2,15 @@
  * SNN initialization — C implementation
  *
  * Called from snn_main.S _start after stack setup.
- * Loads SPM from DRAM descriptors, configures event handlers,
- * runs the init loop (state += input, clear input).
+ * Loads compact SPM init data from DRAM using the fixed boot header,
+ * populates the runtime SPM metadata, then runs the init loop
+ * (state += input, clear input).
  *
  * Returns hartid so ASM can set up s-registers.
  *
  * Memory map:
  *   0x20000000 - 0x20003FFF : Per-PU scratchpad (SPM)
- *   0x80100000              : Descriptor table (default DESCRIPTOR_BASE)
+ *   0x80100000              : Fixed SPM boot header (default DESCRIPTOR_BASE)
  *
  * SPM layout per neuron (variable stride = 8 + 4*num_mc bytes):
  *   +0:  state (f32)
@@ -22,16 +23,38 @@
  *
  * SPM metadata (at top of SPM):
  *   [SPM_SIZE-4]:  neuron count
- *   [SPM_SIZE-8]:  init state (0=uninit, 1=preloaded, 2=configured)
+ *   [SPM_SIZE-8]:  init state (0=need init, 2=configured)
  *   [SPM_SIZE-12]: sync counter
  *   [SPM_SIZE-16]: num_mc
  *   [SPM_SIZE-20]: neuron stride (bytes)
  *   [SPM_SIZE-28]: expected XOR checksum
  *   [SPM_SIZE-32]: subtree XOR accumulator
+ *   [SPM_SIZE-36]: boot cookie
+ *
+ * Boot header at DESCRIPTOR_BASE:
+ *   +0 : magic
+ *   +4 : version
+ *   +8 : descriptor count
+ *   +12: descriptor table base (absolute address)
+ *   +16: descriptor stride in bytes
+ *
+ * Per-PU descriptor:
+ *   +0 : init_src       (absolute address)
+ *   +4 : init_bytes     (compact initializer size)
+ *   +8 : nn_count
+ *   +12: stride_bytes
+ *   +16: num_mc
+ *   +20: num_pu
+ *   +24: expected_xor
  */
 
 #define SPM_BASE        0x20000000u
 #define SPM_SIZE        16384u
+#define STOP_ADDR       0x40000000u
+#define SPM_IMAGE_MAGIC 0x53504d49u
+#define SPM_IMAGE_VERSION 1u
+#define SNN_BOOT_COOKIE 0x534e4e31u
+#define SPM_INIT_DESC_WORDS 7u
 
 #ifndef NUM_PU
 #define NUM_PU 16
@@ -46,14 +69,10 @@
 #define SPM_COUNTER   (*(volatile unsigned int *)(SPM_BASE + SPM_SIZE - 12))
 #define SPM_NUM_MC    (*(volatile unsigned int *)(SPM_BASE + SPM_SIZE - 16))
 #define SPM_STRIDE    (*(volatile unsigned int *)(SPM_BASE + SPM_SIZE - 20))
+#define SPM_NUM_PU    (*(volatile unsigned int *)(SPM_BASE + SPM_SIZE - 24))
+#define SPM_EXPECTED_XOR (*(volatile unsigned int *)(SPM_BASE + SPM_SIZE - 28))
 #define SPM_XOR_ACC   (*(volatile unsigned int *)(SPM_BASE + SPM_SIZE - 32))
-
-/* Handler addresses defined in snn_main.S */
-extern void syncinc(void);
-extern void spike(void);
-extern void updateOne(void);
-extern void xorwait(void);
-extern void xoracc(void);
+#define SPM_BOOT_COOKIE (*(volatile unsigned int *)(SPM_BASE + SPM_SIZE - 36))
 
 static inline unsigned int csrr_f14(void) {
     unsigned int id;
@@ -61,67 +80,59 @@ static inline unsigned int csrr_f14(void) {
     return id;
 }
 
-static inline void csrw_handler(int idx, void *addr) {
-    unsigned int val = (unsigned int)addr;
-    switch(idx) {
-        case 0: __asm__ volatile ("csrw 0x700, %0" :: "r"(val)); break;
-        case 1: __asm__ volatile ("csrw 0x701, %0" :: "r"(val)); break;
-        case 2: __asm__ volatile ("csrw 0x702, %0" :: "r"(val)); break;
-        case 3: __asm__ volatile ("csrw 0x703, %0" :: "r"(val)); break;
-        case 4: __asm__ volatile ("csrw 0x704, %0" :: "r"(val)); break;
-    }
-}
-
-static inline void csrw_argcnt(int idx, unsigned int cnt) {
-    switch(idx) {
-        case 0: __asm__ volatile ("csrw 0x710, %0" :: "r"(cnt)); break;
-        case 1: __asm__ volatile ("csrw 0x711, %0" :: "r"(cnt)); break;
-        case 2: __asm__ volatile ("csrw 0x712, %0" :: "r"(cnt)); break;
-        case 3: __asm__ volatile ("csrw 0x713, %0" :: "r"(cnt)); break;
-        case 4: __asm__ volatile ("csrw 0x714, %0" :: "r"(cnt)); break;
-    }
+static void boot_fail(unsigned int code) {
+    (*(volatile unsigned int *)STOP_ADDR) = code;
+    while (1)
+        __asm__ volatile ("wfi");
 }
 
 /*
  * snn_init: called once per PU on first boot.
  *
- * If SPM_STATE == 0: copies neuron data from DRAM descriptor.
- * If SPM_STATE == 1: SPM pre-loaded by driver, skip copy.
- * In both cases: configures handlers, runs init loop, sets SPM_STATE=2.
+ * Copies neuron data from the compact DRAM initializer, runs the init loop,
+ * and leaves the PU in the boot-wait state.
  * Returns: hartid (caller sets up s-registers and sync tree in ASM).
  */
 unsigned int snn_init(void) {
     unsigned int hartid = csrr_f14();
-    unsigned int state = SPM_STATE;
 
-    if (state == 0) {
-        /* Copy neuron data from global memory */
-        unsigned int *desc = (unsigned int *)(DESCRIPTOR_BASE + (hartid - 1) * 8);
-        volatile unsigned int *src = (volatile unsigned int *)desc[0];
-        unsigned int data_bytes = desc[1]; /* (nn_count+1) * stride */
-        volatile unsigned int *dst = (volatile unsigned int *)SPM_BASE;
-        unsigned int nwords = data_bytes / 4;
-        for (unsigned int i = 0; i < nwords; i++)
-            dst[i] = src[i];
-        /* Compute nn_count and stride from descriptor */
-        /* We don't know num_mc here, but stride and num_mc are written by datagen
-         * into the SPM data block at fixed offsets, which we just copied. */
-    }
-    /* state == 1: SPM already pre-loaded by driver, metadata already set */
+    volatile unsigned int *boot = (volatile unsigned int *)DESCRIPTOR_BASE;
+    if (boot[0] != SPM_IMAGE_MAGIC || boot[1] != SPM_IMAGE_VERSION)
+        boot_fail(0xbad10000u | hartid);
 
-    /* 2. Configure event handlers */
-    csrw_handler(0, syncinc);   /* tag 0: syncinc, 1 arg (count) */
-    csrw_argcnt(0, 1);
-    csrw_handler(1, spike);     /* tag 1: spike, 2 args */
-    csrw_argcnt(1, 2);
-    csrw_handler(2, updateOne); /* tag 2: updateOne, 1 arg */
-    csrw_argcnt(2, 1);
-    csrw_handler(3, xorwait);   /* tag 3: xorwait, 1 arg */
-    csrw_argcnt(3, 1);
-    csrw_handler(4, xoracc);    /* tag 4: xoracc, 1 arg */
-    csrw_argcnt(4, 1);
+    unsigned int desc_count = boot[2];
+    unsigned int desc_base = boot[3];
+    unsigned int desc_stride = boot[4];
+    if (hartid == 0 || hartid > desc_count || desc_stride < SPM_INIT_DESC_WORDS * 4)
+        boot_fail(0xbad20000u | hartid);
 
-    /* 3. Compute neuron end address using stride from SPM metadata */
+    volatile unsigned int *desc =
+        (volatile unsigned int *)(desc_base + (hartid - 1) * desc_stride);
+    volatile unsigned int *src = (volatile unsigned int *)desc[0];
+    unsigned int data_bytes = desc[1];
+    volatile unsigned int *dst = (volatile unsigned int *)SPM_BASE;
+    unsigned int nwords = data_bytes / 4;
+
+    SPM_BOOT_COOKIE = 0;
+    SPM_STATE = 0;
+    for (unsigned int i = 0; i < nwords; i++)
+        dst[i] = src[i];
+
+    SPM_NNCOUNT = desc[2];
+    SPM_STRIDE = desc[3];
+    SPM_NUM_MC = desc[4];
+    SPM_NUM_PU = desc[5];
+    SPM_EXPECTED_XOR = desc[6];
+    SPM_COUNTER = 0;
+    SPM_XOR_ACC = 0;
+
+    if (SPM_STRIDE == 0)
+        boot_fail(0xbad30000u | hartid);
+
+    if (SPM_NNCOUNT > 0 && data_bytes < (SPM_NNCOUNT + 1) * SPM_STRIDE)
+        boot_fail(0xbad40000u | hartid);
+
+    /* 2. Compute neuron end address using stride from SPM metadata */
     unsigned int nn_count = SPM_NNCOUNT;
     unsigned int stride = SPM_STRIDE;
     unsigned int nn_end = SPM_BASE + nn_count * stride;
@@ -153,10 +164,11 @@ unsigned int snn_init(void) {
         *input = 0;
     }
 
-    /* 4. Init sync counter and mark fully configured */
+    /* 3. Leave the PU waiting for the leader's runtime start signal. */
     SPM_COUNTER = 0;
     SPM_XOR_ACC = 0;
-    SPM_STATE = 2;
+    SPM_BOOT_COOKIE = SNN_BOOT_COOKIE;
+    SPM_STATE = 1;
 
     return hartid;
 }

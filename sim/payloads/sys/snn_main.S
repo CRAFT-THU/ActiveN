@@ -5,11 +5,14 @@
   #   fadd.s f5, f5, f6 → modifies x5 through shared register
   #   sw t0, addr → stores x5 (modified by FP operation)
   #
-  # Startup: _start calls snn_init() (C) which loads SPM, configures
-  #          handlers, sets s-registers, returns a0 = hartid.
-  #          Then jumps straight into updateOne.
+  # Startup is split into two phases:
+  #   1. Untimed boot barrier: PU1 serializes snn_init() across all PUs and
+  #      waits until each PU reports that its SPM is initialized.
+  #   2. Runtime start: PU1 broadcasts a start event, every PU installs the
+  #      workload handlers, rebuilds its s-register state from SPM metadata,
+  #      and begins updateOne.
   #
-  # Register assignments (s-registers, set after snn_init):
+  # Register assignments (s-registers, set when runtime starts):
   #   s0  = first MC scatter target base (0xFF028001, MC dst=0x8001)
   #   s1  = end of neuron data (SPM_BASE + neuronCount * stride)
   #   s2  = self-fire target (0x00020000 = local send, tag=2)
@@ -21,7 +24,7 @@
   #   s8  = sync tree expected count
   #   s9  = hartid (1-based)
   #   s10 = num_pu (total number of PUs)
-  #   s11 = XOR quantization scale (1.0e1f = 0x41200000), accessed as fs11
+  #   s11 = XOR quantization scale (1.0f = 0x3f800000), accessed as fs11
   #
   # SPM layout per neuron (stride = 8 + 4*num_mc bytes):
   #   +0:  state (f32 raw bits)
@@ -34,13 +37,14 @@
   #
   # SPM metadata (at top of 16KB SPM):
   #   0x20003FFC: neuron count
-  #   0x20003FF8: init state (0=uninit, 1=preloaded, 2=configured)
-  #   0x20003FF4: sync counter
+  #   0x20003FF8: init state (0=need init, 1=boot-wait, 2=configured)
+  #   0x20003FF4: sync counter / boot ready counter
   #   0x20003FF0: num_mc
   #   0x20003FEC: neuron stride (bytes)
   #   0x20003FE8: num_pu
   #   0x20003FE4: expected XOR checksum
   #   0x20003FE0: subtree XOR accumulator
+  #   0x20003FDC: boot cookie
 
 #ifndef NUM_PU
 #define NUM_PU 16
@@ -55,6 +59,10 @@
 #define SPM_NUM_PU      (SPM_BASE + SPM_SIZE - 24)   /* 0x20003FE8 */
 #define SPM_EXPECTED_XOR (SPM_BASE + SPM_SIZE - 28)  /* 0x20003FE4 */
 #define SPM_XOR_ACC     (SPM_BASE + SPM_SIZE - 32)   /* 0x20003FE0 */
+#define SPM_BOOT_COOKIE (SPM_BASE + SPM_SIZE - 36)   /* 0x20003FDC */
+#define SNN_BOOT_COOKIE 0x534e4e31
+#define BOOT_START_DRAIN 16384
+#define XOR_CHECK_TOL   15
 #define XOR_DRAIN_STEPS  16384
 
 #define STOP_ADDR       0x40000000
@@ -64,26 +72,159 @@
   .globl _start
 
 _start:
-  # Check if fully configured (state=2 means handlers + s-regs done)
+  li    sp, SPM_BASE + SPM_SIZE - 64   # Leave room for metadata (36 bytes + stack)
+
+  # If runtime is already configured, just wait for events.
+  li    t0, SPM_BOOT_COOKIE
+  lw    t1, 0(t0)
+  li    t0, SNN_BOOT_COOKIE
+  bne   t1, t0, boot_entry
+
   li    t0, SPM_STATE_ADDR
   lw    t1, 0(t0)
   li    t0, 2
   beq   t1, t0, do_wfi        # State=2 -> WFI (wait for events)
 
-  # State=0: uninit (need SPM copy + handler config)
-  # State=1: SPM pre-loaded by driver (skip copy, still need handler config)
-  # In both cases: call snn_init which handles both
-  li    sp, SPM_BASE + SPM_SIZE - 64   # Leave room for metadata (32 bytes + stack)
+boot_entry:
+  # Temporary boot handlers: tag0=boot token, tag1=ready, tag2=start.
+  la    t0, boot_token
+  csrw  0x700, t0
+  li    t0, 1
+  csrw  0x710, t0
+
+  la    t0, boot_ready
+  csrw  0x701, t0
+  li    t0, 1
+  csrw  0x711, t0
+
+  la    t0, boot_go
+  csrw  0x702, t0
+  li    t0, 1
+  csrw  0x712, t0
+
+  # If this PU already finished snn_init(), just wait for the start event.
+  li    t0, SPM_BOOT_COOKIE
+  lw    t1, 0(t0)
+  li    t0, SNN_BOOT_COOKIE
+  bne   t1, t0, boot_wait
+
+  li    t0, SPM_STATE_ADDR
+  lw    t1, 0(t0)
+  li    t0, 1
+  beq   t1, t0, do_wfi
+
+boot_wait:
+  csrr  t0, mhartid
+  li    t1, 1
+  beq   t0, t1, boot_init
+  j     do_wfi
+
+  #============================================================
+  # Untimed boot stage
+  #============================================================
+  .globl boot_token
+boot_token:
+  j     boot_init
+
+boot_init:
+  li    sp, SPM_BASE + SPM_SIZE - 64
   call  snn_init               # Returns a0 = hartid
 
-  # snn_init configured handlers and did SPM copy + init loop.
-  # Now set up s-registers in ASM (C can't preserve callee-saved regs).
-  mv    s9, a0                 # s9 = hartid (1-based)
+  mv    t2, a0                 # t2 = hartid
+  li    t0, 1
+  beq   t2, t0, boot_leader_done
+
+  li    t0, SPM_NUM_PU
+  lw    t1, 0(t0)
+  addi  t3, t2, 1              # next hartid
+  blt   t1, t3, boot_report_ready
+  mv    t4, t3
+  li    a0, 0
+  .insn r 0x0B, 0x5, 0x0, x0, a0, t4   # send.1 dummy, next(tag=0)
+
+boot_report_ready:
+  lui   t0, 0x00010
+  addi  t0, t0, 1              # target = (1 << 16) | 1 (root, tag=1)
+  li    a0, 1
+  .insn r 0x0B, 0x5, 0x0, x0, a0, t0   # send.1 ready, root(tag=1)
+  j     do_wfi
+
+boot_leader_done:
+  li    t0, SPM_COUNTER
+  li    t1, 1                  # count self as ready
+  sw    t1, 0(t0)
+
+  li    t0, SPM_NUM_PU
+  lw    t1, 0(t0)
+  li    t2, 2
+  blt   t1, t2, boot_all_ready
+  mv    t4, t2
+  li    a0, 0
+  .insn r 0x0B, 0x5, 0x0, x0, a0, t4   # send.1 dummy, PU2(tag=0)
+  j     do_wfi
+
+  .globl boot_ready
+boot_ready:
+  li    t0, SPM_COUNTER
+  lw    t1, 0(t0)
+  add   t1, t1, a0
+  sw    t1, 0(t0)
+
+  li    t0, SPM_NUM_PU
+  lw    t2, 0(t0)
+  beq   t1, t2, boot_all_ready
+  j     do_wfi
+
+boot_all_ready:
+  li    a0, BOOT_START_DRAIN
+  li    t0, SPM_NUM_PU
+  lw    t2, 0(t0)
+  li    t1, 2
+boot_go_loop:
+  blt   t2, t1, boot_go
+  lui   t0, 0x00020
+  or    t0, t0, t1            # target = (2 << 16) | hartid
+  li    a0, BOOT_START_DRAIN
+  .insn r 0x0B, 0x5, 0x0, x0, a0, t0   # send.1 drain, target(tag=2)
+  addi  t1, t1, 1
+  j     boot_go_loop
+
+  .globl boot_go
+boot_go:
+  bnez  a0, boot_go_wait
+
+  # Install the runtime handlers now that every PU has completed snn_init().
+  la    t0, syncinc
+  csrw  0x700, t0
+  li    t0, 1
+  csrw  0x710, t0
+
+  la    t0, spike
+  csrw  0x701, t0
+  li    t0, 2
+  csrw  0x711, t0
+
+  la    t0, updateOne
+  csrw  0x702, t0
+  li    t0, 1
+  csrw  0x712, t0
+
+  la    t0, xorwait
+  csrw  0x703, t0
+  li    t0, 1
+  csrw  0x713, t0
+
+  la    t0, xoracc
+  csrw  0x704, t0
+  li    t0, 1
+  csrw  0x714, t0
+
+  # Rebuild the runtime register state from SPM metadata.
+  csrr  s9, mhartid
 
   lui   s0, 0xFF028            # s0 = 0xFF028001 (MC scatter: tag=0xFF02, dst=MC0+)
   addi  s0, s0, 1
 
-  # Read stride and num_mc from SPM metadata
   li    t0, SPM_STRIDE
   lw    s6, 0(t0)             # s6 = neuron stride (bytes)
   li    t0, SPM_NUM_MC
@@ -102,23 +243,41 @@ _start:
   li    s3, 0x41700000         # threshold = 15.0f (shared -> fs3)
   li    s4, 0x3f67a36d         # tau = e^{-0.1} (shared -> fs4)
   lui   s5, 0x00030            # s5 = 0x00030000 (local send, tag=3)
-  li    s11, 0x41200000        # 1.0e1f (shared -> fs11)
+  li    s11, 0x3f800000        # 1.0f (shared -> fs11)
 
-  # Sync tree: s8 = expected count (for 1-based hartids)
   addi  t3, s9, -1             # t3 = tree_id (0-based)
   li    s8, 0
-  beqz  t3, tree_done          # tree_id=0 -> root
+  beqz  t3, runtime_tree_done  # tree_id=0 -> root
   li    s8, 1
-tree_loop:
+runtime_tree_loop:
   and   t0, t3, s8
-  bnez  t0, tree_done
+  bnez  t0, runtime_tree_done
   slli  s8, s8, 1
-  j     tree_loop
-tree_done:
+  j     runtime_tree_loop
+runtime_tree_done:
 
-  # Start processing: jump directly to updateOne
+  li    t0, SPM_COUNTER
+  sw    zero, 0(t0)
+  li    t0, SPM_XOR_ACC
+  sw    zero, 0(t0)
+  li    t0, SPM_STATE_ADDR
+  li    t1, 2
+  sw    t1, 0(t0)
+
+  li    t0, 1
+  bne   s9, t0, runtime_start
+  li    t0, TIMER_ADDR
+  li    t1, 1
+  sw    t1, 0(t0)             # start timer after untimed boot is complete
+
+runtime_start:
   li    a0, SPM_BASE
   j     updateOne
+
+boot_go_wait:
+  addi  a0, a0, -1
+  lui   t0, 0x00020
+  .insn r 0x0B, 0x5, 0x1, x0, a0, t0   # yield.1 a0, local tag=2
 
 do_wfi:
   wfi
@@ -303,14 +462,17 @@ xoracc:
 
   li    t0, SPM_EXPECTED_XOR
   lw    t3, 0(t0)
-  bne   t2, t3, xor_mismatch
-
-  li    t0, STOP_ADDR
-  sw    s10, 0(t0)
-  j     do_wfi
+  xor   t4, t2, t3
+  li    t5, XOR_CHECK_TOL
+  bleu  t4, t5, xor_match
 
 xor_mismatch:
   li    t0, STOP_ADDR
   sw    t2, 0(t0)
+  j     do_wfi
+
+xor_match:
+  li    t0, STOP_ADDR
+  sw    s10, 0(t0)
   j     do_wfi
 

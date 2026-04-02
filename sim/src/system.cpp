@@ -474,46 +474,6 @@ int main(int argc, char **argv) {
   // Run reset phase first (suppresses init assertions)
   while (sim.cycle < RESET_LENGTH) sim.step();
 
-  // Pre-load SPM data from MEOW_DATA into each PU's scratchpad memory
-  // This bypasses the NoC (which can deadlock under heavy boot traffic).
-  // Enable with MEOW_SPM_PRELOAD=1
-  auto spm_preload = getenv("MEOW_SPM_PRELOAD");
-  if (spm_preload && spm_preload[0] == '1' && data_path && data_path[0] != '\0') {
-    // data_path points to dram.0 file, already loaded into text_aligned at data_addr
-    uint32_t desc_base_off = data_addr - TEXT_BASE;
-    int spm_loaded = 0;
-    for (int i = 1; i <= num_pu; i++) {
-      auto core = sim.getPuCore(i);
-      if (!core) continue;
-      // Read descriptor: desc_base + (i-1)*8
-      uint32_t desc_off = desc_base_off + (i - 1) * 8;
-      uint32_t spm_src = text_aligned[desc_off / 4];
-      uint32_t data_bytes = text_aligned[desc_off / 4 + 1];
-      // New format: data_bytes = (nn_count+1) * words_per_neuron * 4
-      //   words_per_neuron = 2 + num_mc
-      int words_per_neuron = 2 + num_mc;
-      uint32_t nn_count = data_bytes / (words_per_neuron * 4) - 1; // subtract sentinel
-      // Copy SPM data from backing memory into scratchpad
-      uint32_t src_off = (spm_src - TEXT_BASE) / 4;
-      uint32_t nwords = data_bytes / 4;
-      auto &mem = core->__PVT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
-      for (uint32_t w = 0; w < nwords; w++) {
-        mem[w] = text_aligned[src_off + w];
-      }
-      // Write SPM metadata
-      mem[4095] = nn_count;             // +0x3FFC: nn_count
-      mem[4094] = 1;                    // +0x3FF8: init state (pre-loaded)
-      // +0x3FF4: sync counter (runtime)
-      mem[4092] = num_mc;               // +0x3FF0: num_mc
-      mem[4091] = words_per_neuron * 4; // +0x3FEC: neuron stride (bytes)
-      mem[4090] = num_pu;               // +0x3FE8: num_pu
-      // Copy quantized expected_xor from datagen (word 4089 in SPM block)
-      mem[4089] = text_aligned[src_off + 4089]; // +0x3FE4: expected_xor
-      spm_loaded++;
-    }
-    cout << "[System] Pre-loaded SPM for " << spm_loaded << " PUs" << endl;
-  }
-
   // Optional DRAMsim3 integration (init after reset to avoid init assertion)
   auto mem_cfg = getenv("MEOW_MEM");
   if (mem_cfg && mem_cfg[0] != '\0') {
