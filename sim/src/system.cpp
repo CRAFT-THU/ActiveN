@@ -275,60 +275,8 @@ struct SystemSim {
     periph_resps.push_back(resp);
   }
 
-  uint64_t total_reqs = 0;
-  uint64_t mc_reqs[8] = {};
-  uint64_t mc_scat[8] = {};
-  uint64_t last_total = 0;
-  uint64_t stall_start = 0;
-  bool stall_reported = false;
-
   void step() {
     ++cycle;
-
-    if (cycle % 50000 == 0) {
-      cerr << "[DBG] cycle=" << cycle << " reqs=" << total_reqs;
-      for (int mc = 0; mc < num_mc; mc++)
-        cerr << " MC" << mc << "=" << mc_reqs[mc] << "(scat=" << mc_scat[mc] << ")";
-      cerr << endl;
-    }
-    if (total_reqs != last_total) {
-      last_total = total_reqs;
-      stall_start = cycle;
-      stall_reported = false;
-    } else if (cycle - stall_start == 10000 && !stall_reported) {
-      stall_reported = true;
-      cerr << "[STALL] No new reqs since cycle " << stall_start << " (reqs=" << total_reqs << ")";
-      for (int mc = 0; mc < num_mc; mc++)
-        cerr << " MC" << mc << "=" << mc_reqs[mc] << "(scat=" << mc_scat[mc] << ")";
-      cerr << endl;
-      for (int mc = 0; mc < num_mc; mc++)
-        cerr << "[STALL] MC" << mc << " resp_queue=" << mem_resps[mc].size() << endl;
-      cerr << "[STALL] periph resp_queue=" << periph_resps.size() << endl;
-      // Dump first few PU PCs
-      for (int pu = 1; pu <= min(num_pu, 4); pu++) {
-        auto core = getPuCore(pu);
-        if (core) {
-          cerr << "[STALL] PU" << pu << " pc=0x" << hex
-               << core->__PVT__exec__DOT__uop_pc
-               << " icache_s1pc=0x"
-               << core->__PVT__fetch__DOT__icache__DOT__s1pc << dec << endl;
-        }
-      }
-    }
-    // Periodic PC dump (every 5000 cycles from 2000)
-    if ((cycle >= 500 && cycle <= 1500 && cycle % 100 == 0) ||
-        (cycle >= 2000 && cycle % 5000 == 0)) {
-      auto core = getPuCore(1);
-      if (core) {
-        cerr << "[PC] cycle=" << cycle << " PU1 pc=0x" << hex
-             << core->__PVT__exec__DOT__uop_pc
-             << " a0=0x" << core->__PVT__exec__DOT__regfiles_0__DOT__regs_10
-             << " s1=0x" << core->__PVT__exec__DOT__regfiles_0__DOT__regs_9
-             << " s6=0x" << core->__PVT__exec__DOT__regfiles_0__DOT__regs_22
-             << " s7=0x" << core->__PVT__exec__DOT__regfiles_0__DOT__regs_23
-             << dec << endl;
-      }
-    }
 
     if (cycle <= RESET_LENGTH) {
       sys->reset = true;
@@ -353,11 +301,7 @@ struct SystemSim {
     for (int mc = 0; mc < num_mc; mc++) {
       auto &p = mem_ports[mc];
       if (*p.req_ready && *p.req_valid) {
-        uint16_t rid = *p.req_id;
         processMemReq(mc);
-        total_reqs++;
-        mc_reqs[mc]++;
-        if (rid == 64) mc_scat[mc]++;
       }
     }
 
@@ -563,14 +507,8 @@ int main(int argc, char **argv) {
       mem[4092] = num_mc;               // +0x3FF0: num_mc
       mem[4091] = words_per_neuron * 4; // +0x3FEC: neuron stride (bytes)
       mem[4090] = num_pu;               // +0x3FE8: num_pu
-      if (i == 1) {
-        cerr << "[SPM] PU1: nn_count=" << nn_count << " num_mc=" << num_mc
-             << " stride=" << words_per_neuron*4 << " num_pu=" << num_pu
-             << " nwords=" << nwords << " src_off=" << hex << src_off << dec << endl;
-        cerr << "[SPM] PU1 mem[0..7]: ";
-        for (int w = 0; w < 8; w++) cerr << hex << mem[w] << " ";
-        cerr << dec << endl;
-      }
+      // Copy quantized expected_xor from datagen (word 4089 in SPM block)
+      mem[4089] = text_aligned[src_off + 4089]; // +0x3FE4: expected_xor
       spm_loaded++;
     }
     cout << "[System] Pre-loaded SPM for " << spm_loaded << " PUs" << endl;
@@ -590,6 +528,7 @@ int main(int argc, char **argv) {
   while (!sim.periph.finished && sim.cycle < max_cycles && !exiting) {
     sim.step();
   }
+
   auto wall_end = chrono::steady_clock::now();
   double wall_secs = chrono::duration<double>(wall_end - wall_start).count();
 

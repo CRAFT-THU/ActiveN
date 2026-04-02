@@ -30,15 +30,16 @@ class EvQueue(implicit val param: CoreParameters) extends Module {
     tail := Mux(last, tail + 1.U, tail)
   }
 
-  val nhead = Mux(deq.fire, head + 1.U, head)
-  head := nhead
+  when(deq.fire) {
+    head := head + 1.U
+  }
   deq.valid := !empty
-  deq.bits := RegNext(VecInit(ram.read(nhead).zipWithIndex.map({
+  deq.bits := VecInit(ram.read(head).zipWithIndex.map({
     case (o, i) => Mux(
-      nhead(4, 0) === tail(4,0) && i.U === cnt && enq.fire,
+      head(4, 0) === tail(4,0) && i.U === cnt && enq.fire,
       enq.bits, o
     )
-  })))
+  }))
 }
 
 class BIU(implicit val param: CoreParameters) extends Module {
@@ -212,6 +213,14 @@ class BIU(implicit val param: CoreParameters) extends Module {
   val bcastTag = 1 // SPIKE_TAG
   val numEntries = param.memBusWidth / 64 // 4 for 256-bit bus
 
+  // The MemDistributor broadcast path is valid-only, so buffer raw beats here
+  // before iterating over per-core matches.
+  val bcastBeatQ = Module(new Queue(UInt(param.memBusWidth.W), 256))
+  bcastBeatQ.io.enq.valid := bcast.valid
+  bcastBeatQ.io.enq.bits  := bcast.data
+  bcastBeatQ.io.deq.ready := false.B
+  assert(!bcast.valid || bcastBeatQ.io.enq.ready, "BIU broadcast beat queue overflow")
+
   // Buffer matching entries: each is (neuron_index: UInt(32), weight: UInt(32))
   val bcastBuf = Module(new Queue(Vec(2, UInt(32.W)), 16))
   bcastBuf.io.enq.valid := false.B
@@ -219,16 +228,17 @@ class BIU(implicit val param: CoreParameters) extends Module {
 
   // On broadcast valid, scan all entries and enqueue matches one at a time
   // using a small FSM to iterate through entries across cycles.
-  val bcastPending = Reg(Vec(numEntries, Bool()))
+  val bcastPending = RegInit(VecInit(Seq.fill(numEntries)(false.B)))
   val bcastWords   = Reg(Vec(numEntries, Vec(2, UInt(32.W))))
   val bcastActive  = RegInit(false.B)
 
-  when(bcast.valid && !bcastActive) {
+  when(!bcastActive && bcastBeatQ.io.deq.valid) {
     // Latch matching entries
+    bcastBeatQ.io.deq.ready := true.B
     bcastActive := false.B
     for (i <- 0 until numEntries) {
-      val word0 = bcast.data(64 * i + 31, 64 * i)
-      val word1 = bcast.data(64 * i + 63, 64 * i + 32)
+      val word0 = bcastBeatQ.io.deq.bits(64 * i + 31, 64 * i)
+      val word1 = bcastBeatQ.io.deq.bits(64 * i + 63, 64 * i + 32)
       val dstCore = word0(31, 16)
       val neuron  = word0(15, 0)
       val matches = dstCore === hartid

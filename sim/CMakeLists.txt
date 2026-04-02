@@ -16,13 +16,8 @@ endif()
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 find_package(verilator HINTS $ENV{VERILATOR_ROOT})
-set(SRCS
-    src/meow.cpp
-)
 
 find_library(DRAMSIM3 dramsim3)
-
-add_executable(sim ${SRCS})
 
 # cvfpu source files
 set(CVFPU_DIR ${CMAKE_SOURCE_DIR}/../dep/cvfpu)
@@ -44,17 +39,6 @@ set(CVFPU_SOURCES
 )
 
 set(VERILATOR_COMMON_ARGS -Wall -Wno-fatal -Wno-DECLFILENAME --trace-params --trace-structs --top-module Core -DRANDOMIZE_REG_INIT -DRANDOMIZE_MEM_INIT -I${CVFPU_DIR}/src/common_cells/include -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNSIGNED -Wno-CASEINCOMPLETE -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-UNDRIVEN -Wno-PINMISSING)
-
-verilate(
-    sim
-    SOURCES ${CVFPU_SOURCES} ${CMAKE_SOURCE_DIR}/../Core.sv ${CMAKE_SOURCE_DIR}/../Aux.sv
-    PREFIX rtl
-    TRACE_FST
-    DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/verilated
-    VERILATOR_ARGS ${VERILATOR_COMMON_ARGS}
-)
-
-target_link_libraries(sim PRIVATE ${DRAMSIM3})
 
 # Single-core simulation driver (no DRAM dependency)
 add_executable(sim_single

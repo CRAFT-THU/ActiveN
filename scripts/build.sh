@@ -7,7 +7,7 @@ echo "Building inside $BASE..."
 
 cd $BASE
 
-build_sim() {
+build_sim_single() {
   cd $BASE
 
   # Elaborate RTL, generate SystemVerilog of the core
@@ -18,7 +18,7 @@ build_sim() {
   mkdir -p work/build/sim
   cd work/build/sim
   cmake -GNinja $BASE/sim
-  ninja
+  ninja sim_single
 }
 
 build_sim_system() {
@@ -44,13 +44,14 @@ build_datagen() {
 
 rm -rf work/bin
 mkdir -p work/bin
-AN_PIPE_CNT=1 build_sim && cp $BASE/work/build/sim/sim $BASE/work/bin/sim.single
-AN_PIPE_CNT=2 build_sim && cp $BASE/work/build/sim/sim $BASE/work/bin/sim.double
+AN_PIPE_CNT=1 build_sim_single && cp $BASE/work/build/sim/sim_single $BASE/work/bin/sim_single
+build_sim_system ${AN_NUM_PU:-16} ${AN_NUM_MC:-1} && cp $BASE/work/build/sim_system/sim_system $BASE/work/bin/sim_system
 
 # Build datagen
 build_datagen && cp $BASE/datagen/target/release/datagen $BASE/work/bin/datagen
 
-# Try building payload
+# Build the current payloads/tests
 cd $BASE/sim/payloads
-make
+make sys/snn_main.bin
+make sys-tests all-tests
 make clean

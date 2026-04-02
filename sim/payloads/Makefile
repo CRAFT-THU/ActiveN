@@ -1,6 +1,6 @@
-.PHONY: clean all-tests
+.PHONY: clean all-tests legacy-bins
 
-default: test.single.bin test.double.bin
+default: sys/snn_main.bin
 
 CORE_CNT ?= 512
 REPORT ?= yes
@@ -17,6 +17,8 @@ test.single: test.S
 
 test.single.bin: test.single
 	${PREFIX}objcopy -j .text -j .data -O binary ./test.single test.single.bin
+
+legacy-bins: test.single.bin test.double.bin
 
 # Assembly tests (RV32IMF)
 ASM_SRCS := $(wildcard asm/*.S)

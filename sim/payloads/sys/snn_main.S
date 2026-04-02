@@ -15,12 +15,13 @@
   #   s2  = self-fire target (0x00020000 = local send, tag=2)
   #   s3  = threshold (15.0f = 0x41700000), accessed as fs3
   #   s4  = tau decay (e^{-0.1} = 0x3f67a36d), accessed as fs4
-  #   s5  = 1.0f (unused here but available)
+  #   s5  = local drain target (0x00030000 = local send, tag=3)
   #   s6  = neuron stride (bytes per neuron entry)
   #   s7  = num_mc (number of memory controllers)
   #   s8  = sync tree expected count
   #   s9  = hartid (1-based)
   #   s10 = num_pu (total number of PUs)
+  #   s11 = XOR quantization scale (1.0e1f = 0x41200000), accessed as fs11
   #
   # SPM layout per neuron (stride = 8 + 4*num_mc bytes):
   #   +0:  state (f32 raw bits)
@@ -38,6 +39,8 @@
   #   0x20003FF0: num_mc
   #   0x20003FEC: neuron stride (bytes)
   #   0x20003FE8: num_pu
+  #   0x20003FE4: expected XOR checksum
+  #   0x20003FE0: subtree XOR accumulator
 
 #ifndef NUM_PU
 #define NUM_PU 16
@@ -50,6 +53,9 @@
 #define SPM_NUM_MC      (SPM_BASE + SPM_SIZE - 16)   /* 0x20003FF0 */
 #define SPM_STRIDE      (SPM_BASE + SPM_SIZE - 20)   /* 0x20003FEC */
 #define SPM_NUM_PU      (SPM_BASE + SPM_SIZE - 24)   /* 0x20003FE8 */
+#define SPM_EXPECTED_XOR (SPM_BASE + SPM_SIZE - 28)  /* 0x20003FE4 */
+#define SPM_XOR_ACC     (SPM_BASE + SPM_SIZE - 32)   /* 0x20003FE0 */
+#define XOR_DRAIN_STEPS  16384
 
 #define STOP_ADDR       0x40000000
 #define TIMER_ADDR      0x40000004
@@ -67,7 +73,7 @@ _start:
   # State=0: uninit (need SPM copy + handler config)
   # State=1: SPM pre-loaded by driver (skip copy, still need handler config)
   # In both cases: call snn_init which handles both
-  li    sp, SPM_BASE + SPM_SIZE - 32   # Leave room for metadata (24 bytes)
+  li    sp, SPM_BASE + SPM_SIZE - 64   # Leave room for metadata (32 bytes + stack)
   call  snn_init               # Returns a0 = hartid
 
   # snn_init configured handlers and did SPM copy + init loop.
@@ -95,7 +101,8 @@ _start:
 
   li    s3, 0x41700000         # threshold = 15.0f (shared -> fs3)
   li    s4, 0x3f67a36d         # tau = e^{-0.1} (shared -> fs4)
-  li    s5, 0x3f800000         # 1.0f (shared -> fs5)
+  lui   s5, 0x00030            # s5 = 0x00030000 (local send, tag=3)
+  li    s11, 0x41200000        # 1.0e1f (shared -> fs11)
 
   # Sync tree: s8 = expected count (for 1-based hartids)
   addi  t3, s9, -1             # t3 = tree_id (0-based)
@@ -136,15 +143,32 @@ syncinc:
   addi  t0, s9, -1            # tree_id (0-based)
   xor   t0, s8, t0            # parent_tree_id
   addi  t0, t0, 1             # parent_hartid (1-based)
-  .insn r 0x0B, 0x5, 0x0, x0, t1, t0   # send.1 t1(x6), t0(x5)
+  .insn r 0x0B, 0x5, 0x0, x0, t1, t0   # send.1 t1, parent (tag=0)
   j     do_wfi
 
 check_root_done:
   bne   t1, s10, do_wfi       # s10 = num_pu: wait until all PUs done
-  # All done! Stop simulation.
-  li    t0, STOP_ADDR
-  sw    t1, 0(t0)             # result = num_pu
-  j     do_wfi
+  # All PUs done! Stop timer and start the checksum request phase.
+  li    t0, TIMER_ADDR
+  sw    zero, 0(t0)           # stop timer
+
+  li    t0, SPM_COUNTER
+  sw    zero, 0(t0)           # reuse as XOR report counter
+  li    t0, SPM_XOR_ACC
+  sw    zero, 0(t0)
+
+  li    a0, XOR_DRAIN_STEPS
+  .insn r 0x0B, 0x5, 0x0, x0, a0, s5   # send.1 a0, local tag=3
+
+  li    t0, 2
+xor_request_loop:
+  blt   s10, t0, do_wfi
+  lui   t1, 0x00030
+  or    t1, t1, t0            # target = (3 << 16) | hartid
+  li    a0, XOR_DRAIN_STEPS
+  .insn r 0x0B, 0x5, 0x0, x0, a0, t1   # send.1 a0, target(tag=3)
+  addi  t0, t0, 1
+  j     xor_request_loop
 
   #============================================================
   # Handler: spike (tag=1, 2 args: a0=neuron_id, a1=weight)
@@ -222,3 +246,71 @@ scatter_done:
 done:
   li    a0, 1                  # count = 1 (this PU done)
   j     syncinc
+
+  #============================================================
+  # Handler: xorwait (tag=3, 1 arg: a0=remaining drain steps)
+  # Allows late spike events to interleave before final checksum.
+  #============================================================
+  .globl xorwait
+xorwait:
+  beqz  a0, xor_begin
+  addi  a0, a0, -1
+  .insn r 0x0B, 0x5, 0x1, x0, a0, s5   # yield.1 a0, s5
+
+xor_begin:
+  li    t0, SPM_BASE           # current neuron address
+  li    a1, 0                  # local XOR accumulator
+
+xor_loop:
+  beq   t0, s1, xor_done
+
+  lw    t1, 0(t0)              # x6/f6 = state
+  fmul.s f6, f6, fs11, rne
+  fcvt.w.s t1, f6, rne
+  xor   a1, a1, t1
+
+  lw    t1, 4(t0)              # x6/f6 = input
+  fmul.s f6, f6, fs11, rne
+  fcvt.w.s t1, f6, rne
+  xor   a1, a1, t1
+
+  add   t0, t0, s6
+  j     xor_loop
+
+xor_done:
+  lui   t0, 0x00040
+  addi  t0, t0, 1             # target = (4 << 16) | 1 (root, tag=4)
+  .insn r 0x0B, 0x5, 0x0, x0, a1, t0   # send.1 a1, root(tag=4)
+  j     do_wfi
+
+  #============================================================
+  # Handler: xoracc (tag=4, 1 arg: a0=local_xor)
+  # Root accumulates all per-PU checksums and compares once all arrive.
+  #============================================================
+  .globl xoracc
+xoracc:
+  li    t0, SPM_COUNTER
+  lw    t1, 0(t0)
+  addi  t1, t1, 1
+  sw    t1, 0(t0)
+
+  li    t0, SPM_XOR_ACC
+  lw    t2, 0(t0)
+  xor   t2, t2, a0
+  sw    t2, 0(t0)
+
+  bne   t1, s10, do_wfi
+
+  li    t0, SPM_EXPECTED_XOR
+  lw    t3, 0(t0)
+  bne   t2, t3, xor_mismatch
+
+  li    t0, STOP_ADDR
+  sw    s10, 0(t0)
+  j     do_wfi
+
+xor_mismatch:
+  li    t0, STOP_ADDR
+  sw    t2, 0(t0)
+  j     do_wfi
+

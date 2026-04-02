@@ -1,3 +1,77 @@
+Work log for the current branch state.
+
+1. Reconstructed actual progress
+- Ignored the stale workspace TODO list and used:
+  - `copilot/instruction.md`
+  - `git log --oneline`
+  - `git diff --stat`
+- Confirmed the real baseline was:
+  - config/task-1 work committed in `8b65b8c`
+  - payload/multi-MC/mul-decode work committed in `8c9836b`
+  - current uncommitted work centered on Task 3 checksum verification plus late scatter/spike debugging.
+
+2. Root-cause work that stayed in the branch
+- `datagen/src/main.rs`
+  - added checksum quantization helper
+  - tracked last-round spike-only inputs instead of reconstructing them later with simulator-side logic
+  - padded each CSR row to `CSR_ROW_ALIGN_WORDS = 8` words so the scatter engine's 256-bit beat broadcast does not spill into neighboring rows
+  - patched expected checksum into SPM metadata (word 4089)
+- `src/main/scala/koneko/BIU.scala`
+  - fixed `EvQueue` dequeue timing by reading `ram.read(head)` directly and updating `head` only on `deq.fire`
+  - inserted a raw broadcast-beat FIFO before per-entry decode so valid-only MemDistributor broadcasts are not lost while the BIU is still draining an earlier beat
+- `src/main/scala/koneko/bus/MemIf.scala`
+  - added `respBusy` arbitration so a local ring response does not overwrite a scatter broadcast already using the same per-cluster `resp` port
+
+3. Software-side checksum implementation
+- `sim/payloads/sys/snn_init.c`
+  - registered handler tags 3 and 4 for checksum request/report
+  - initialized subtree XOR accumulator metadata
+- `sim/payloads/sys/snn_main.S`
+  - added SPM metadata locations for expected checksum and subtree accumulator
+  - kept checksum entirely inside payload software:
+    - leader finishes the normal `done` count tree
+    - leader sends a local/remote checksum-request event (`tag=3`)
+    - each PU drains for a bounded interval, computes a local checksum over its final `(state,input)` values, and reports it to PU1 with `tag=4`
+    - PU1 XOR-accumulates all reports and compares to the expected checksum from SPM metadata
+  - current quantization scale used by both datagen and payload is `10.0f` (`0x41200000`)
+
+4. Simulator cleanup
+- `sim/src/system.cpp`
+  - kept only the required metadata preload path (`expected_xor` from SPM word 4089)
+  - removed temporary simulator-side checksum aggregation and the temporary debug-only finish-delay / final-SPM-dump hooks
+  - removed transient stall/PC/request debug output used during investigation
+
+5. Validation commands used
+- Build:
+  - `cargo build --release --manifest-path datagen/Cargo.toml`
+  - `AN_SYSTEM=1 AN_NUM_PU=64 AN_NUM_MC=2 AN_PIPE_CNT=1 mill Koneko.run`
+  - `cd work/build/sim_system && ninja sim_system`
+  - `cd sim/payloads && make sys/snn_main.bin NUM_PU=64`
+- Datasets/regressions:
+  - `./datagen/target/release/datagen --core-cnt 64 --num-mc 2 --tot-neuron 128 --connectivity 0.0 --pre-simulate 1 --dump work/data_xor_sw_zero_cur`
+  - `./datagen/target/release/datagen --core-cnt 64 --num-mc 2 --tot-neuron 128 --connectivity 0.01 --pre-simulate 1 --dump work/data_xor_sw_fire_cur`
+  - `./datagen/target/release/datagen --core-cnt 64 --num-mc 2 --tot-neuron 128 --connectivity 0.05 --pre-simulate 1 --dump work/data_xor_sw_fire_strong_cur`
+  - `MEOW_TEXT=sim/payloads/sys/snn_main.bin MEOW_DATA=<dram.0> MEOW_SPM_PRELOAD=1 MEOW_MAX_CYCLES=200000 work/build/sim_system/sim_system`
+
+6. Final observed regression results on the current branch
+- zero case: `Result: 64`, `Cycles: 86945`
+- moderate spike case: `Result: 64`, `Cycles: 86979`
+- stronger spike case: `Result: 64`, `Cycles: 87032`
+
+7. Task 4 cleanup completed in this session
+- `sim/CMakeLists.txt`
+  - removed the active build target for the legacy multicore simulator (`src/meow.cpp` / `sim`)
+  - kept only `sim_single` and `sim_system` as supported simulator targets
+- `sim/payloads/Makefile`
+  - changed the default target from the old `test.single.bin test.double.bin` flow to `sys/snn_main.bin`
+  - moved the old `test.S` products behind an explicit `legacy-bins` target instead of making them default
+- `scripts/build.sh`
+  - now builds `sim_single`, `sim_system`, `datagen`, and the current system payload/tests
+  - no longer builds or installs the old `sim.single` / `sim.double` path by default
+
+8. Known remaining cleanup
+- Some legacy task scripts under `scripts/tasks/` still refer to `test.single.bin`, `test.double.bin`, and the pre-system workflow. Those scripts were not rewritten in this pass.
+
 # Detailed Work Log
 
 ## Phase 1: Core Feature Implementation

@@ -248,9 +248,11 @@ class MemIf(
 
   // --- 4. Response delivery ---
   // Default: deassert all resp ports
+  val respBusy = Wire(Vec(numClusters, Bool()))
   for (ci <- 0 until numClusters) {
     resp(ci).valid := false.B
     resp(ci).bits  := 0.U.asTypeOf(new RingResp)
+    respBusy(ci) := false.B
   }
 
   // Ring output buffer (2-deep)
@@ -274,6 +276,7 @@ class MemIf(
     resp(ci).bits.dst  := 0xFFFF.U
     resp(ci).bits.id   := 0xFFFF.U
     resp(ci).bits.data := scatData
+    respBusy(ci)       := true.B
     when(resp(ci).ready) {
       when(scatCluster === (numClusters - 1).U) {
         scatCluster := 0.U
@@ -298,6 +301,7 @@ class MemIf(
       resp(ci).bits.dst  := puId
       resp(ci).bits.id   := pending(s).id
       resp(ci).bits.data := data(s)
+      respBusy(ci)       := true.B
       when(resp(ci).ready) {
         allocated(s) := false.B
         completed(s) := false.B
@@ -336,9 +340,11 @@ class MemIf(
 
   when(ringIn.valid) {
     when(ringLocal) {
-      resp(ringCi).valid := true.B
-      resp(ringCi).bits  := ringIn.bits
-      ringIn.ready := resp(ringCi).ready
+      when(!respBusy(ringCi)) {
+        resp(ringCi).valid := true.B
+        resp(ringCi).bits  := ringIn.bits
+        ringIn.ready := resp(ringCi).ready
+      }
     }.otherwise {
       when(ringBuf.io.enq.ready) {
         ringIn.ready             := true.B

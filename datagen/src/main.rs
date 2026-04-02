@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::{collections::HashMap, fs::File, path::PathBuf};
 
-use byteorder::ByteOrder;
 use byteorder::LittleEndian;
 use byteorder::WriteBytesExt;
 use clap::Parser;
@@ -13,6 +12,39 @@ use serde::Deserialize;
 use std::io::BufReader;
 use std::io::BufWriter;
 use std::io::Write;
+
+const XOR_SCALE: f32 = 10.0;
+const CSR_ROW_ALIGN_WORDS: usize = 8;
+
+fn round_ties_even_i64(value: f64) -> i64 {
+    let lower = value.floor();
+    let frac = value - lower;
+    let rounded = if frac < 0.5 {
+        lower
+    } else if frac > 0.5 {
+        lower + 1.0
+    } else if (lower as i64) & 1 == 0 {
+        lower
+    } else {
+        lower + 1.0
+    };
+    rounded as i64
+}
+
+fn quantize_xor_word(value: f32) -> u32 {
+    if !value.is_finite() {
+        return value.to_bits();
+    }
+    let scaled = value * XOR_SCALE;
+    round_ties_even_i64(scaled as f64) as u32
+}
+
+fn pad_csr_row(words: &mut Vec<u32>) {
+    while words.len() % CSR_ROW_ALIGN_WORDS != 0 {
+        words.push(0);
+        words.push(0);
+    }
+}
 
 #[derive(Parser)]
 struct Args {
@@ -132,6 +164,12 @@ fn dump(base: &PathBuf, cores: &Vec<Core>, dram_base: u32, num_mc: usize) -> any
                 let col = ((neigh.core as u32 + 1) << 16) | (neigh.neuron as u32);
                 csr_per_mc[target_mc].push(col);
                 csr_per_mc[target_mc].push(neigh.weight.to_bits());
+            }
+
+            // Scatter reads whole 256-bit beats without a per-entry valid mask,
+            // so each per-neuron row must end on a beat boundary.
+            for mc in 0..num_mc {
+                pad_csr_row(&mut csr_per_mc[mc]);
             }
         }
         // Sentinel: past-the-end for last neuron
@@ -451,8 +489,8 @@ fn main() -> anyhow::Result<()> {
                 let state_ratio = (node.s - node.r) / (node.t - node.r);
                 let state = state_ratio * args.threshold;
 
-                let INIT_FIRING_RATE = 0.1;
-                let fired = rng.gen_bool(INIT_FIRING_RATE);
+                let init_firing_rate = 0.1;
+                let fired = rng.gen_bool(init_firing_rate);
 
                 cores[core].neurons.push(Neuron {
                     state,
@@ -511,7 +549,7 @@ fn main() -> anyhow::Result<()> {
         let pop = args.tot_neuron / (9 * 9 * 9);
         let mut it: SudokuIterator = SudokuIterator::new(pop);
         for c in 0..args.core_cnt {
-            for n in 0..core_nn_cnt[c] {
+            for _ in 0..core_nn_cnt[c] {
                 let ident = it.next().unwrap();
 
                 sudoku_rev_map.insert(ident, (c, cores[c].neurons.len()));
@@ -652,6 +690,11 @@ fn main() -> anyhow::Result<()> {
 
     println!("Gen done, max syn per neuron = {}", max_syn_per_neuron);
 
+    let mut final_round_spike_inputs: Vec<Vec<f32>> = core_nn_cnt
+        .iter()
+        .map(|&nn_count| vec![0.0; nn_count])
+        .collect();
+
     // Simulate
     for i in 0..args.pre_simulate {
         println!("Round {}...", i);
@@ -690,6 +733,10 @@ fn main() -> anyhow::Result<()> {
                         let neigh = cores[c].neurons[n].neigh[neigh].clone();
                         cores[neigh.core as usize].neurons[neigh.neuron as usize].input +=
                             neigh.weight;
+                        if i == args.pre_simulate - 1 {
+                            final_round_spike_inputs[neigh.core as usize]
+                                [neigh.neuron as usize] += neigh.weight;
+                        }
                     }
                 } else {
                     cores[c].neurons[n].state *= e_neg_tau;
@@ -703,6 +750,36 @@ fn main() -> anyhow::Result<()> {
             fired as f64 / args.tot_neuron as f64,
             fired
         );
+    }
+
+    // After all rounds: compute the payload-visible XOR checksum. The payload multiplies
+    // by 1.0e6f in FP32 and then converts to int with RNE, so emulate the same path here.
+    // The PU's init clears input to 0, so the final hardware input is the spike-only
+    // accumulation from the last simulated round.
+    if let Some(ref p) = args.dump {
+        let mut expected_xor: u32 = 0;
+        for (core_idx, c) in cores.iter().enumerate() {
+            for (neuron_idx, n) in c.neurons.iter().enumerate() {
+                expected_xor ^= quantize_xor_word(n.state);
+                expected_xor ^= quantize_xor_word(final_round_spike_inputs[core_idx][neuron_idx]);
+            }
+        }
+        println!("Expected XOR: 0x{:08x}", expected_xor);
+
+        // Patch word 4089 (offset 0x3FE4 from SPM base) in each PU's SPM block
+        let spm_size: u32 = 16384;
+        let desc_size = (args.core_cnt as u32) * 8;
+        let xor_word_offset = (spm_size / 4 - 7) as u64; // word 4089
+        let mut dram_file = p.clone();
+        dram_file.push("dram.0");
+        let mut file = std::fs::OpenOptions::new().write(true).open(&dram_file)?;
+        use std::io::Seek;
+        for ci in 0..args.core_cnt {
+            let spm_base_offset = desc_size as u64 + (ci as u64) * spm_size as u64;
+            let byte_offset = spm_base_offset + xor_word_offset * 4;
+            file.seek(std::io::SeekFrom::Start(byte_offset))?;
+            file.write_all(&expected_xor.to_le_bytes())?;
+        }
     }
 
     Ok(())

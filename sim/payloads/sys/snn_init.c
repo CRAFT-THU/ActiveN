@@ -26,6 +26,8 @@
  *   [SPM_SIZE-12]: sync counter
  *   [SPM_SIZE-16]: num_mc
  *   [SPM_SIZE-20]: neuron stride (bytes)
+ *   [SPM_SIZE-28]: expected XOR checksum
+ *   [SPM_SIZE-32]: subtree XOR accumulator
  */
 
 #define SPM_BASE        0x20000000u
@@ -44,11 +46,14 @@
 #define SPM_COUNTER   (*(volatile unsigned int *)(SPM_BASE + SPM_SIZE - 12))
 #define SPM_NUM_MC    (*(volatile unsigned int *)(SPM_BASE + SPM_SIZE - 16))
 #define SPM_STRIDE    (*(volatile unsigned int *)(SPM_BASE + SPM_SIZE - 20))
+#define SPM_XOR_ACC   (*(volatile unsigned int *)(SPM_BASE + SPM_SIZE - 32))
 
 /* Handler addresses defined in snn_main.S */
 extern void syncinc(void);
 extern void spike(void);
 extern void updateOne(void);
+extern void xorwait(void);
+extern void xoracc(void);
 
 static inline unsigned int csrr_f14(void) {
     unsigned int id;
@@ -62,6 +67,8 @@ static inline void csrw_handler(int idx, void *addr) {
         case 0: __asm__ volatile ("csrw 0x700, %0" :: "r"(val)); break;
         case 1: __asm__ volatile ("csrw 0x701, %0" :: "r"(val)); break;
         case 2: __asm__ volatile ("csrw 0x702, %0" :: "r"(val)); break;
+        case 3: __asm__ volatile ("csrw 0x703, %0" :: "r"(val)); break;
+        case 4: __asm__ volatile ("csrw 0x704, %0" :: "r"(val)); break;
     }
 }
 
@@ -70,6 +77,8 @@ static inline void csrw_argcnt(int idx, unsigned int cnt) {
         case 0: __asm__ volatile ("csrw 0x710, %0" :: "r"(cnt)); break;
         case 1: __asm__ volatile ("csrw 0x711, %0" :: "r"(cnt)); break;
         case 2: __asm__ volatile ("csrw 0x712, %0" :: "r"(cnt)); break;
+        case 3: __asm__ volatile ("csrw 0x713, %0" :: "r"(cnt)); break;
+        case 4: __asm__ volatile ("csrw 0x714, %0" :: "r"(cnt)); break;
     }
 }
 
@@ -101,12 +110,16 @@ unsigned int snn_init(void) {
     /* state == 1: SPM already pre-loaded by driver, metadata already set */
 
     /* 2. Configure event handlers */
-    csrw_handler(0, syncinc);   /* tag 0: syncinc, 1 arg */
+    csrw_handler(0, syncinc);   /* tag 0: syncinc, 1 arg (count) */
     csrw_argcnt(0, 1);
     csrw_handler(1, spike);     /* tag 1: spike, 2 args */
     csrw_argcnt(1, 2);
     csrw_handler(2, updateOne); /* tag 2: updateOne, 1 arg */
     csrw_argcnt(2, 1);
+    csrw_handler(3, xorwait);   /* tag 3: xorwait, 1 arg */
+    csrw_argcnt(3, 1);
+    csrw_handler(4, xoracc);    /* tag 4: xoracc, 1 arg */
+    csrw_argcnt(4, 1);
 
     /* 3. Compute neuron end address using stride from SPM metadata */
     unsigned int nn_count = SPM_NNCOUNT;
@@ -142,6 +155,7 @@ unsigned int snn_init(void) {
 
     /* 4. Init sync counter and mark fully configured */
     SPM_COUNTER = 0;
+    SPM_XOR_ACC = 0;
     SPM_STATE = 2;
 
     return hartid;
