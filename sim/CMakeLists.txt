@@ -38,7 +38,7 @@ set(CVFPU_SOURCES
     ${CVFPU_DIR}/src/common_cells/src/rr_arb_tree.sv
 )
 
-set(VERILATOR_COMMON_ARGS -Wall -Wno-fatal -Wno-DECLFILENAME --trace-params --trace-structs --top-module Core -DRANDOMIZE_REG_INIT -DRANDOMIZE_MEM_INIT -I${CVFPU_DIR}/src/common_cells/include -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNSIGNED -Wno-CASEINCOMPLETE -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-UNDRIVEN -Wno-PINMISSING)
+set(VERILATOR_COMMON_ARGS -Wall -Wno-fatal -Wno-DECLFILENAME --trace-params --trace-structs --top-module Core -I${CVFPU_DIR}/src/common_cells/include -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNSIGNED -Wno-CASEINCOMPLETE -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-UNDRIVEN -Wno-PINMISSING)
 
 # Single-core simulation driver (no DRAM dependency)
 add_executable(sim_single
@@ -47,7 +47,7 @@ add_executable(sim_single
 
 verilate(
     sim_single
-    SOURCES ${CVFPU_SOURCES} ${CMAKE_SOURCE_DIR}/../Core.sv ${CMAKE_SOURCE_DIR}/../Aux.sv
+  SOURCES ${CVFPU_SOURCES} ${CMAKE_SOURCE_DIR}/../System.sv ${CMAKE_SOURCE_DIR}/../Aux.sv
     PREFIX rtl
     TRACE_FST
     DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/verilated
@@ -73,12 +73,12 @@ execute_process(
 
 set(VERILATOR_SYSTEM_ARGS -Wall -Wno-fatal -Wno-DECLFILENAME --trace-params --trace-structs --top-module System -I${CVFPU_DIR}/src/common_cells/include -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNSIGNED -Wno-CASEINCOMPLETE -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-UNDRIVEN -Wno-PINMISSING)
 
-add_executable(sim_system
+add_library(system_model_lib STATIC
     src/system.cpp
 )
 
 verilate(
-    sim_system
+  system_model_lib
     SOURCES ${CVFPU_SOURCES} ${CMAKE_SOURCE_DIR}/../System.sv ${CMAKE_SOURCE_DIR}/../Aux.sv
     PREFIX sys_rtl
     TRACE_FST
@@ -86,4 +86,43 @@ verilate(
     VERILATOR_ARGS ${VERILATOR_SYSTEM_ARGS}
 )
 
-target_link_libraries(sim_system PRIVATE ${DRAMSIM3})
+target_link_libraries(system_model_lib PUBLIC ${DRAMSIM3})
+
+add_executable(sim_system
+  src/system_main.cpp
+)
+
+target_link_libraries(sim_system PRIVATE system_model_lib)
+
+# Software NoC simulator (many Core instances connected in C++)
+add_library(soft_system_model_lib STATIC
+    src/soft_system.cpp
+)
+
+verilate(
+  soft_system_model_lib
+    SOURCES ${CVFPU_SOURCES} ${CMAKE_SOURCE_DIR}/../System.sv ${CMAKE_SOURCE_DIR}/../Aux.sv
+    PREFIX soft_rtl
+    TRACE_FST
+    DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/soft_verilated
+    VERILATOR_ARGS ${VERILATOR_COMMON_ARGS}
+)
+
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(soft_system_model_lib PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+target_link_libraries(soft_system_model_lib PUBLIC ${DRAMSIM3})
+
+add_executable(sim_soft
+  src/soft_system_main.cpp
+)
+
+target_link_libraries(sim_soft PRIVATE soft_system_model_lib)
+
+add_executable(sim_cosim
+  src/cosim.cpp
+)
+
+target_link_libraries(sim_cosim PRIVATE system_model_lib soft_system_model_lib)

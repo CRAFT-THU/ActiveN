@@ -1,5 +1,48 @@
 Work log for the current branch state.
 
+10. Updated-instruction Task 2: aligned software NoC and online co-sim
+- Rebuilt a trusted `64PU / 2MC` co-sim baseline in `work/build/cosim64` and used `sim_cosim` to compare the whole-system RTL model against `SoftSystemModel` cycle by cycle.
+- Enabled FST- and WAL-based analysis locally and used them to inspect the first divergence directly from `cosim_trace.fst`.
+- First major mismatch:
+  - visible symptom near cycle `6966`: system and soft memory traces disagreed on the request address
+  - root cause: the standalone soft cores were being built from stale `Core.sv` / `Core.config.json` artifacts with `pipeCnt = 2`, while the real system RTL embedded a `pipeCnt = 1` core from `System.sv`
+  - permanent fix already kept in the branch:
+    - build standalone core-based simulation targets from `System.sv` with `--top-module Core`
+    - stop assuming stale standalone-only ports such as `ext_in_bits_src`
+- Final remaining mismatch:
+  - visible symptom near cycle `37682`: soft model emitted a peripheral write completion one cycle earlier than the RTL
+  - root cause: `SoftMemIf::processDue()` and `SoftPeriphIf::processDue()` were exposing write completion in the same cycle as issue, while the RTL only exposes completion after a register boundary
+  - permanent fix already kept in the branch:
+    - preserve immediate write side effects
+    - queue the zero-data acknowledgement into `completion_events` at `cycle + 1`
+- Validation after both fixes:
+  - trace-enabled co-sim matched through at least `50000` cycles
+  - full run matched through completion with result `0x28e2da66` in `73035` cycles
+  - temporary narrow debug logging added during the investigation was removed, and the cleaned build was revalidated
+- Documentation produced from this alignment work:
+  - `copilot/softnoc.md` explains the soft-system architecture, cycle structure, and both alignment bugs/fixes
+
+11. Updated-instruction Task 3: generated RTL duplication analysis
+- Analyzed the current `System.sv` for the `64PU / 2MC` configuration by:
+  - parsing each generated Verilog module definition
+  - reading the originating Chisel source-location comments
+  - reconstructing the instantiated hierarchy from top module `System`
+  - grouping emitted Verilog variants by originating Chisel source location
+- Key result:
+  - most duplicated project module by instance count is `EvQueue` with `1024` instances
+  - largest generated-RTL contributor is `Router` with `64` emitted variants consuming `241019` lines
+  - total project-generated RTL counted this way is `270736` lines, so `Router` is about `89%` of the project-side total
+- Wrote the report to `copilot/dup.md`, including:
+  - methodology
+  - per-module instance / variant / generated-LoC table
+  - notes on Chisel utility-module hotspots
+  - interpretation of where manual dedup work is most likely to pay off
+
+12. Current status for this pass
+- The requested writeup `copilot/softnoc.md` is now in place.
+- The follow-on no-code task from `copilot/instruction.md` is also complete via `copilot/dup.md`.
+- This pass intentionally made no further code changes.
+
 9. Updated-instruction Task 1: move SPM preload into software
 - `datagen/src/main.rs`
   - replaced the old `dram.0 = desc table + full 16KB SPM blocks + CSR` layout with:

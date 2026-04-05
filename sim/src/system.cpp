@@ -38,6 +38,7 @@
 #include "sys_verilated/sys_rtl_Core.h"
 
 #include "devices.h"
+#include "system_model.h"
 #include "system_config.h"
 #include "dramsim3/dramsim3.h"
 
@@ -53,9 +54,28 @@ static const int MEM_BUS_WORDS = 256 / 32; // 8
 
 static uint32_t *text_aligned = nullptr;
 static size_t text_size = 0;
-static std::unique_ptr<VerilatedFstC> tracer;
+static VerilatedFstC *tracer = nullptr;
+static std::unique_ptr<std::ofstream> mem_trace;
+static std::vector<MemTraceEvent> *current_mem_trace = nullptr;
+static std::vector<PeriphTraceEvent> *current_periph_trace = nullptr;
 
 static void sighandler(int) { exiting = true; }
+
+static void traceMemReq(uint64_t cycle, int mc, bool is_write, uint32_t local_addr, uint16_t id) {
+  if (current_mem_trace) {
+    current_mem_trace->push_back(MemTraceEvent{
+      .cycle = cycle,
+      .mc = mc,
+      .is_write = is_write,
+      .local_addr = local_addr,
+      .id = id,
+    });
+  }
+  if (!mem_trace) return;
+  (*mem_trace) << cycle << ' ' << mc << ' ' << (is_write ? 'W' : 'R') << ' '
+               << std::hex << std::setw(8) << std::setfill('0') << local_addr
+               << std::dec << ' ' << id << '\n';
+}
 
 struct MemResponse {
   uint16_t id;
@@ -78,10 +98,11 @@ struct MemPort {
   uint32_t *resp_rdata; // WData[8]
 };
 
-struct SystemSim {
+struct SystemModel::Impl {
   std::unique_ptr<sys_rtl> sys;
   uint64_t cycle = 0;
   int num_pu, num_mc;
+  bool reset_cycle = false;
 
   std::vector<std::deque<MemResponse>> mem_resps;
   std::vector<MemPort> mem_ports;
@@ -100,6 +121,8 @@ struct SystemSim {
   // Peripheral
   PeripheralDevice periph;
   std::deque<MemResponse> periph_resps;
+  std::vector<MemTraceEvent> last_mem_trace;
+  std::vector<PeriphTraceEvent> last_periph_trace;
 
   // DRAMsim3 state (per MC)
   bool use_dram = false;
@@ -115,7 +138,7 @@ struct SystemSim {
   };
   std::vector<DramMC> dram_mcs;
 
-  SystemSim(int pu, int mc) : num_pu(pu), num_mc(mc) {
+  Impl(int pu, int mc) : num_pu(pu), num_mc(mc) {
     sys.reset(new sys_rtl("system"));
     mem_resps.resize(num_mc);
     mem_ports.resize(num_mc);
@@ -144,7 +167,7 @@ struct SystemSim {
     }
   }
 
-  ~SystemSim() {
+  ~Impl() {
     sys->final();
     for (auto &d : dram_mcs) delete d.dram;
   }
@@ -232,6 +255,8 @@ struct SystemSim {
                     << " id=" << dec << id << endl;
     }
 
+    traceMemReq(cycle, mc, is_write, local_addr, id);
+
     // Build the response data from backing memory
     MemResponse resp = buildMemResp(mc, id, addr);
 
@@ -248,11 +273,11 @@ struct SystemSim {
     uint16_t id = sys->io_periph_req_bits_id;
     uint32_t addr = sys->io_periph_req_bits_addr;
     bool is_write = sys->io_periph_req_bits_write;
+    uint32_t wdata = 0;
 
     if (is_write) {
       // Decode wdata and byte enables to extract the written value
       uint32_t wbe = sys->io_periph_req_bits_wbe;
-      uint32_t wdata = 0;
       // Find the first active word from the 256-bit write data
       for (int w = 0; w < MEM_BUS_WORDS; w++) {
         uint32_t word_be = (wbe >> (w * 4)) & 0xF;
@@ -268,6 +293,16 @@ struct SystemSim {
       if (LOG) cout << "[System] Periph read: addr=0x" << hex << addr << dec << endl;
     }
 
+    if (current_periph_trace) {
+      current_periph_trace->push_back(PeriphTraceEvent{
+        .cycle = cycle,
+        .id = id,
+        .addr = addr,
+        .is_write = is_write,
+        .wdata = is_write ? wdata : 0,
+      });
+    }
+
     // Return dummy response
     MemResponse resp;
     resp.id = id;
@@ -275,10 +310,15 @@ struct SystemSim {
     periph_resps.push_back(resp);
   }
 
-  void step() {
+  void stepPosedge() {
     ++cycle;
+    last_mem_trace.clear();
+    last_periph_trace.clear();
+    current_mem_trace = &last_mem_trace;
+    current_periph_trace = &last_periph_trace;
+    reset_cycle = cycle <= RESET_LENGTH;
 
-    if (cycle <= RESET_LENGTH) {
+    if (reset_cycle) {
       sys->reset = true;
       for (int mc = 0; mc < num_mc; mc++) {
         *mem_ports[mc].req_ready = 0;
@@ -287,9 +327,6 @@ struct SystemSim {
       sys->io_periph_req_ready = 0;
       sys->io_periph_resp_valid = 0;
       sys->clock = true;
-      Verilated::timeInc(1);
-      sys->eval();
-      sys->clock = false;
       Verilated::timeInc(1);
       sys->eval();
       return;
@@ -324,8 +361,6 @@ struct SystemSim {
     sys->clock = true;
     Verilated::timeInc(1);
     sys->eval();
-
-    if (TRACE) tracer->dump(cycle * 2);
 
     // Tick peripheral timer
     periph.tick();
@@ -387,19 +422,139 @@ struct SystemSim {
         sys->io_periph_resp_bits_rdata[w] = r.data[w];
     }
 
-    // Negedge
+  }
+
+  void stepNegedge() {
     sys->clock = false;
     Verilated::timeInc(1);
     sys->eval();
-    if (TRACE) tracer->dump(cycle * 2 + 1);
+    current_mem_trace = nullptr;
+    current_periph_trace = nullptr;
   }
 };
 
-int main(int argc, char **argv) {
+bool loadSystemModelImage(const ModelImageConfig &config, std::string *error) {
+  unloadSystemModelImage();
+
+  ifstream text_input(config.text_path, ios::binary);
+  if (!text_input) {
+    if (error) *error = "Error: cannot open " + config.text_path;
+    return false;
+  }
+
+  text_input.seekg(0, ios::end);
+  size_t file_size = text_input.tellg();
+  if (file_size % 4 != 0) {
+    if (error) *error = "Error: not 4-byte aligned";
+    return false;
+  }
+
+  text_size = config.mem_size;
+  char *text_mem = new (align_val_t(4)) char[text_size]();
+  text_input.seekg(0);
+  text_input.read(text_mem, file_size);
+  text_aligned = reinterpret_cast<uint32_t *>(text_mem);
+
+  if (config.data_path) {
+    ifstream data_input(*config.data_path, ios::binary);
+    if (!data_input) {
+      if (error) *error = "Error: cannot open " + *config.data_path;
+      unloadSystemModelImage();
+      return false;
+    }
+    data_input.seekg(0, ios::end);
+    size_t data_size = data_input.tellg();
+    size_t data_off = config.data_addr - TEXT_BASE;
+    if (data_off + data_size > text_size) {
+      if (error) *error = "Error: data file too large";
+      unloadSystemModelImage();
+      return false;
+    }
+    data_input.seekg(0);
+    data_input.read(reinterpret_cast<char *>(text_aligned) + data_off, data_size);
+  }
+
+  return true;
+}
+
+void unloadSystemModelImage() {
+  if (!text_aligned) return;
+  delete[] reinterpret_cast<char *>(text_aligned);
+  text_aligned = nullptr;
+  text_size = 0;
+}
+
+bool openSystemModelMemTrace(const std::optional<std::string> &path, std::string *error) {
+  mem_trace.reset();
+  if (!path) return true;
+
+  mem_trace.reset(new ofstream(*path));
+  if (*mem_trace) return true;
+
+  if (error) *error = "Error: cannot open memory trace file " + *path;
+  mem_trace.reset();
+  return false;
+}
+
+void setSystemModelLogging(bool enabled) {
+  LOG = enabled;
+}
+
+SystemModel::SystemModel(int pu, int mc) : impl_(std::make_unique<Impl>(pu, mc)) {}
+SystemModel::~SystemModel() = default;
+SystemModel::SystemModel(SystemModel &&) noexcept = default;
+SystemModel &SystemModel::operator=(SystemModel &&) noexcept = default;
+
+void SystemModel::attachTrace(VerilatedFstC *trace_file, int depth) {
+  TRACE = trace_file != nullptr;
+  tracer = trace_file;
+  if (trace_file) impl_->sys->trace(trace_file, depth);
+}
+
+void SystemModel::initDram(const char *cfg, const char *log_dir) {
+  impl_->initDram(cfg, log_dir);
+}
+
+void SystemModel::stepPosedge() { impl_->stepPosedge(); }
+void SystemModel::stepNegedge() { impl_->stepNegedge(); }
+
+void SystemModel::step() {
+  impl_->stepPosedge();
+  if (TRACE && tracer) tracer->dump(impl_->cycle * 2);
+  impl_->stepNegedge();
+  if (TRACE && tracer) tracer->dump(impl_->cycle * 2 + 1);
+}
+
+void SystemModel::printDramStats() const {
+  if (!impl_->use_dram) return;
+  for (int i = 0; i < impl_->num_mc; ++i) impl_->dram_mcs[i].dram->PrintStats();
+}
+
+uint64_t SystemModel::cycle() const { return impl_->cycle; }
+bool SystemModel::finished() const { return impl_->periph.finished; }
+uint32_t SystemModel::result() const { return impl_->periph.result; }
+uint64_t SystemModel::timerCount() const { return impl_->periph.timer_count; }
+bool SystemModel::useDram() const { return impl_->use_dram; }
+
+const std::vector<MemTraceEvent> &SystemModel::lastMemTrace() const { return impl_->last_mem_trace; }
+const std::vector<PeriphTraceEvent> &SystemModel::lastPeriphTrace() const {
+  return impl_->last_periph_trace;
+}
+
+int runSystemModelFromEnv() {
+  std::unique_ptr<VerilatedFstC> owned_tracer;
+
   auto trace_cfg = getenv("MEOW_TRACE");
   if (trace_cfg && trace_cfg[0] != '\0') TRACE = true;
   auto log_cfg = getenv("MEOW_LOG");
   if (log_cfg && log_cfg[0] != '\0') LOG = true;
+
+  auto mem_trace_path = getenv("MEOW_MEM_TRACE");
+  if (mem_trace_path && mem_trace_path[0] != '\0' &&
+      !openSystemModelMemTrace(std::string(mem_trace_path))) {
+    cerr << "Error: cannot open memory trace file " << mem_trace_path << endl;
+    return 1;
+  }
 
   int num_pu = SYSTEM_CONFIG.numPU;
   int num_mc = SYSTEM_CONFIG.numMC;
@@ -415,42 +570,28 @@ int main(int argc, char **argv) {
   auto max_cfg = getenv("MEOW_MAX_CYCLES");
   if (max_cfg && max_cfg[0] != '\0') max_cycles = strtoull(max_cfg, nullptr, 10);
 
-  ifstream text_input(text_path, ios::binary);
-  if (!text_input) { cerr << "Error: cannot open " << text_path << endl; return 1; }
-  text_input.seekg(0, ios::end);
-  size_t file_size = text_input.tellg();
-  if (file_size % 4 != 0) { cerr << "Error: not 4-byte aligned" << endl; return 1; }
-  const size_t MEM_SIZE = 16 * 1024 * 1024;
-  text_size = MEM_SIZE;
-  char *text_mem = new (align_val_t(4)) char[MEM_SIZE]();
-  text_input.seekg(0);
-  text_input.read(text_mem, file_size);
-  text_aligned = (uint32_t *)text_mem;
-  cout << "[System] Loaded " << file_size << " bytes" << endl;
-
   // Optional: load additional data file at a configurable offset
   // MEOW_DATA      = path to data file (e.g. datagen output)
   // MEOW_DATA_ADDR = global address to load at (default: 0x80100000)
   uint32_t data_addr = 0x80100000;
   auto data_path = getenv("MEOW_DATA");
-  if (data_path && data_path[0] != '\0') {
-    auto data_addr_cfg = getenv("MEOW_DATA_ADDR");
-    if (data_addr_cfg && data_addr_cfg[0] != '\0')
-      data_addr = strtoul(data_addr_cfg, nullptr, 0);
+  auto data_addr_cfg = getenv("MEOW_DATA_ADDR");
+  if (data_addr_cfg && data_addr_cfg[0] != '\0') data_addr = strtoul(data_addr_cfg, nullptr, 0);
 
-    ifstream data_input(data_path, ios::binary);
-    if (!data_input) { cerr << "Error: cannot open " << data_path << endl; return 1; }
-    data_input.seekg(0, ios::end);
-    size_t data_size = data_input.tellg();
-    size_t data_off = data_addr - TEXT_BASE;
-    if (data_off + data_size > MEM_SIZE) {
-      cerr << "Error: data file too large (offset=0x" << hex << data_off
-           << " size=" << dec << data_size << " exceeds " << MEM_SIZE << ")" << endl;
-      return 1;
-    }
-    data_input.seekg(0);
-    data_input.read(text_mem + data_off, data_size);
-    cout << "[System] Data loaded: " << data_size << " bytes at 0x" << hex << data_addr << dec << endl;
+  ModelImageConfig image_cfg{
+    .text_path = text_path,
+    .data_path = (data_path && data_path[0] != '\0') ? std::optional<std::string>(data_path) : std::nullopt,
+    .data_addr = data_addr,
+  };
+  std::string image_error;
+  if (!loadSystemModelImage(image_cfg, &image_error)) {
+    cerr << image_error << endl;
+    return 1;
+  }
+
+  cout << "[System] Loaded program image" << endl;
+  if (image_cfg.data_path) {
+    cout << "[System] Data loaded at 0x" << hex << image_cfg.data_addr << dec << endl;
   }
 
   struct sigaction sig;
@@ -461,18 +602,18 @@ int main(int argc, char **argv) {
 
   if (TRACE) {
     Verilated::traceEverOn(true);
-    tracer.reset(new VerilatedFstC);
+    owned_tracer.reset(new VerilatedFstC);
   }
 
-  SystemSim sim(num_pu, num_mc);
+  SystemModel sim(num_pu, num_mc);
 
   if (TRACE) {
-    sim.sys->trace(tracer.get(), 128);
-    tracer->open("./trace.fst");
+    sim.attachTrace(owned_tracer.get(), 128);
+    owned_tracer->open("./trace.fst");
   }
 
   // Run reset phase first (suppresses init assertions)
-  while (sim.cycle < RESET_LENGTH) sim.step();
+  while (sim.cycle() < RESET_LENGTH) sim.step();
 
   // Optional DRAMsim3 integration (init after reset to avoid init assertion)
   auto mem_cfg = getenv("MEOW_MEM");
@@ -485,31 +626,29 @@ int main(int argc, char **argv) {
 
   cout << "[System] Running (max " << max_cycles << " cycles)..." << endl;
   auto wall_start = chrono::steady_clock::now();
-  while (!sim.periph.finished && sim.cycle < max_cycles && !exiting) {
+  while (!sim.finished() && sim.cycle() < max_cycles && !exiting) {
     sim.step();
   }
 
   auto wall_end = chrono::steady_clock::now();
   double wall_secs = chrono::duration<double>(wall_end - wall_start).count();
 
-  if (sim.periph.finished) {
-    cout << "[System] Result: " << dec << sim.periph.result << " (0x" << hex << sim.periph.result << ")" << endl;
-    cout << "[System] Cycles: " << dec << sim.cycle << endl;
+  if (sim.finished()) {
+    cout << "[System] Result: " << dec << sim.result() << " (0x" << hex << sim.result() << ")" << endl;
+    cout << "[System] Cycles: " << dec << sim.cycle() << endl;
   } else {
-    cout << "[System] " << (exiting ? "Interrupted" : "Timed out") << " at cycle " << sim.cycle << endl;
+    cout << "[System] " << (exiting ? "Interrupted" : "Timed out") << " at cycle " << sim.cycle() << endl;
   }
-  if (sim.periph.timer_count > 0) {
-    cout << "[System] Timer: " << dec << sim.periph.timer_count << " cycles" << endl;
+  if (sim.timerCount() > 0) {
+    cout << "[System] Timer: " << dec << sim.timerCount() << " cycles" << endl;
   }
-  cout << "[System] Speed: " << dec << (uint64_t)(sim.cycle / wall_secs) << " cycles/s" << endl;
+  cout << "[System] Speed: " << dec << (uint64_t)(sim.cycle() / wall_secs) << " cycles/s" << endl;
   cout << "[System] Runtime: " << fixed << setprecision(3) << wall_secs << "s" << endl;
 
-  if (sim.use_dram) {
-    for (int i = 0; i < num_mc; i++)
-      sim.dram_mcs[i].dram->PrintStats();
-  }
+  sim.printDramStats();
 
-  if (TRACE) tracer->close();
-  delete[] text_aligned;
-  return sim.periph.finished ? 0 : 1;
+  if (TRACE) owned_tracer->close();
+  if (mem_trace) mem_trace->flush();
+  unloadSystemModelImage();
+  return sim.finished() ? 0 : 1;
 }
