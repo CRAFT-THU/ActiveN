@@ -22,6 +22,7 @@
 #include <iostream>
 #include <fstream>
 #include <cstdlib>
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -50,7 +51,7 @@ static bool exiting = false;
 
 static const uint64_t RESET_LENGTH = 10;
 static const uint32_t TEXT_BASE = 0x80000000ul;
-static const int MEM_BUS_WORDS = 256 / 32; // 8
+static const size_t MEM_BUS_WORDS = 256 / 32; // 8
 
 static uint32_t *text_aligned = nullptr;
 static size_t text_size = 0;
@@ -273,24 +274,22 @@ struct SystemModel::Impl {
     uint16_t id = sys->io_periph_req_bits_id;
     uint32_t addr = sys->io_periph_req_bits_addr;
     bool is_write = sys->io_periph_req_bits_write;
-    uint32_t wdata = 0;
+    uint32_t rdata = 0;
+    size_t byte_offset = addr & ((MEM_BUS_WORDS * sizeof(uint32_t)) - 1);
+    size_t word_idx = byte_offset / sizeof(uint32_t);
+    uint32_t lane_wdata = sys->io_periph_req_bits_wdata[word_idx];
+
+    assert((byte_offset % sizeof(uint32_t)) == 0);
 
     if (is_write) {
-      // Decode wdata and byte enables to extract the written value
-      uint32_t wbe = sys->io_periph_req_bits_wbe;
-      // Find the first active word from the 256-bit write data
-      for (int w = 0; w < MEM_BUS_WORDS; w++) {
-        uint32_t word_be = (wbe >> (w * 4)) & 0xF;
-        if (word_be) {
-          wdata = sys->io_periph_req_bits_wdata[w];
-          break;
-        }
-      }
-      periph.write(addr, wdata);
+      assert(((sys->io_periph_req_bits_wbe >> byte_offset) & 0xf) == 0xf);
+      periph.write(addr, lane_wdata);
       if (LOG) cout << "[System] Periph write: addr=0x" << hex << addr
-                    << " data=0x" << wdata << dec << endl;
+                    << " data=0x" << lane_wdata << dec << endl;
     } else {
-      if (LOG) cout << "[System] Periph read: addr=0x" << hex << addr << dec << endl;
+      rdata = periph.read(addr);
+      if (LOG) cout << "[System] Periph read: addr=0x" << hex << addr
+                    << " data=0x" << rdata << dec << endl;
     }
 
     if (current_periph_trace) {
@@ -299,14 +298,14 @@ struct SystemModel::Impl {
         .id = id,
         .addr = addr,
         .is_write = is_write,
-        .wdata = is_write ? wdata : 0,
+        .wdata = is_write ? lane_wdata : 0,
       });
     }
 
-    // Return dummy response
     MemResponse resp;
     resp.id = id;
     memset(resp.data, 0, sizeof(resp.data));
+    if (!is_write) resp.data[word_idx] = rdata;
     periph_resps.push_back(resp);
   }
 

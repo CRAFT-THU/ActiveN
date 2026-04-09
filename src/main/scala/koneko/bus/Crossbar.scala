@@ -36,7 +36,8 @@ class Crossbar(n: Int)(implicit val param: CoreParameters) extends Module {
   val respId = 0.U(portBits.W) ## downstream.resp.bits.id(15 - portBits, 0)
 
   for ((u, i) <- upstream.zipWithIndex) {
-    u.resp.valid := downstream.resp.valid && respPort === i.U
+    val selected = respPort === i.U
+    u.resp.valid := downstream.resp.valid && selected
     u.resp.bits.id := respId
     u.resp.bits.data := downstream.resp.bits.data
   }

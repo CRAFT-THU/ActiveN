@@ -47,8 +47,8 @@ class Exec(implicit val param: CoreParameters) extends Module {
   // Cfg CSRS
   //////////////////////////
 
-  val handlers = Reg(Vec(16, UInt(32.W)))
-  val argcnts = Reg(Vec(16, UInt(5.W)))
+  val handlers = RegInit(VecInit(Seq.fill(16)(0.U(32.W))))
+  val argcnts = RegInit(VecInit(Seq.fill(16)(1.U(5.W))))
 
   //////////////////////////
   // Actual configuration
@@ -174,6 +174,10 @@ class Exec(implicit val param: CoreParameters) extends Module {
     b.argcnt := a
   }
 
+  // FIXME(meow): arrange yielding as a side effect
+  // because the target of a fire.yield may not be ourselve
+  // - isWFI & isYield should be equivalent
+  // - Future optimization: Loopback biu.br from biu.msg.fire with target = self
   val isYield = dontTouch(uop.isAM && uop.funct7(0))
   val yieldTag = rs2val >> 16
   val yieldTarget = handlers(yieldTag.asUInt)
@@ -205,6 +209,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
   val biuBrs = for(i <- 0 until param.pipeCnt) yield {
     val biuBr = Wire(Valid(UInt(32.W)))
     biuBr.valid := (idlingsMasked | Mux(valid && isYield, uop.smsel, 0.U))(i)
+    // FIXME: no initVec here
     biuBr.bits := MuxCase(param.initVec.U, Seq(
       biu.br.valid -> biu.br.bits.target,
       (valid && isYield) -> yieldTarget,

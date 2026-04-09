@@ -1,5 +1,6 @@
 #define STOP_ADDR            0x40000000
 #define TIMER_ADDR           0x40000004
+#define RNG_ADDR             0x40000010
 #define SPM_BASE             0x20000000
 #define SPM_SIZE             16384
 
@@ -24,6 +25,7 @@
 #define REGION_WORDS         16
 #define REGION_SHIFT         6
 #define DATA_PATTERN_BASE    0x13570000
+#define JITTER_MASK          0x00000fff
 
 #define TARGET_STEP_LOCAL    0x00010000
   .macro SEND1 data, target
@@ -62,6 +64,13 @@ _start:
   lw    t1, 0(t0)
   bnez  t1, do_wfi
 
+  li    t0, 1
+  bne   s0, t0, select_handler_setup
+  li    t0, TIMER_ADDR
+  li    t1, 1
+  sw    t1, 0(t0)
+
+select_handler_setup:
   li    t0, 1
   beq   s0, t0, root_handler_setup
 
@@ -130,11 +139,6 @@ handlers_done:
   li    t0, SPM_DONE
   sw    zero, 0(t0)
 
-  li    t0, 0x12345678
-  xor   t0, t0, s0
-  li    t1, SPM_PRNG
-  sw    t0, 0(t1)
-
   li    t0, SPM_READY_COUNT
   sw    zero, 0(t0)
   li    t0, SPM_REPORT_COUNT
@@ -156,16 +160,56 @@ handlers_done:
   li    t1, 1
   sw    t1, 0(t0)
 
-  li    t0, 1
-  bne   s0, t0, launch_local_step
+  li    t0, RNG_ADDR
+  lw    t1, 0(t0)
+  li    t2, JITTER_MASK
+  and   t2, t1, t2
+  addi  t2, t2, 1
+  li    t3, 3
+  li    t4, 7
 
+startup_jitter_loop:
+  beqz  t2, startup_jitter_done
+  mul   t3, t3, t4
+  addi  t2, t2, -1
+  j     startup_jitter_loop
+
+startup_jitter_done:
+  li    t0, SPM_PRNG
+  sw    t1, 0(t0)
+
+  li    t0, 1
+  beq   s0, t0, root_prepare_launch
+
+  addi  t2, s0, -2
+  slli  t2, t2, 2
+  la    t0, seed_words
+  add   t0, t0, t2
+  sw    t1, 0(t0)
+  la    t0, ready_flags
+  add   t0, t0, t2
+  li    t3, 1
+  sw    t3, 0(t0)
+  j     launch_local_step
+
+root_prepare_launch:
   li    t0, 2
   li    t1, 0
   li    t2, 0
 
 expect_core_loop:
-  li    t3, 0x12345678
-  xor   t3, t3, t0
+  addi  t6, t0, -2
+  slli  t6, t6, 2
+  la    a0, ready_flags
+  add   a0, a0, t6
+
+expect_wait_seed:
+  lw    a1, 0(a0)
+  beqz  a1, expect_wait_seed
+
+  la    a0, seed_words
+  add   a0, a0, t6
+  lw    t3, 0(a0)
   li    t4, 0
 
 expect_iter_loop:
@@ -205,14 +249,6 @@ expect_next_core:
   sw    t1, 0(t0)
   li    t0, SPM_EXP_MEM_XOR
   sw    zero, 0(t0)
-
-  la    t0, start_flag
-  li    t1, 1
-  sw    t1, 0(t0)
-
-  li    t0, TIMER_ADDR
-  li    t1, 1
-  sw    t1, 0(t0)
 
   li    t0, ROOT_POLL_DELAY
 root_poll_delay:
@@ -261,12 +297,6 @@ root_fail:
   j     do_wfi
 
 launch_local_step:
-  li    t1, 1
-  beq   s0, t1, root_wait_reports
-wait_start:
-  la    t0, start_flag
-  lw    t1, 0(t0)
-  beqz  t1, wait_start
   li    a0, 0
   li    t0, TARGET_STEP_LOCAL
   YIELD1 a0, t0
@@ -471,6 +501,18 @@ fail_recv:
   .align 2
 start_flag:
   .word 0
+
+  .align 5
+ready_flags:
+  .rept NUM_PU - 1
+  .word 0
+  .endr
+
+  .align 5
+seed_words:
+  .rept NUM_PU - 1
+  .word 0
+  .endr
 
   .align 5
 report_xors:

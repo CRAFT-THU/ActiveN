@@ -41,12 +41,14 @@ class Core(implicit val params: CoreParameters) extends Module {
   val exec = Module(new Exec)
   val crossbar = Module(new Crossbar(2))
   val encoder = Module(new Encoder)
+  val extInQueue = Module(new Queue(ext.in.bits.cloneType, 4))
+  val respQueue = Module(new Queue(new MemResp, 4))
 
   exec.cfg <> cfg
 
-  // BIU ext.in connects directly
   // FIXME: deadlock proof
-  exec.ext.in <> ext.in
+  extInQueue.io.enq <> ext.in
+  exec.ext.in <> extInQueue.io.deq
   exec.ext.idlings <> ext.idlings
   exec.ext.working <> ext.working
 
@@ -65,12 +67,15 @@ class Core(implicit val params: CoreParameters) extends Module {
   // Memory response from external -> encoder -> crossbar
   // Broadcast responses (tag=0xFFFF from MemDistributor) go to BIU instead
   val isBroadcast = mem.valid && mem.bits.id === 0xFFFF.U
-  encoder.resp.valid := mem.valid && !isBroadcast
-  encoder.resp.bits  := mem.bits
+  respQueue.io.enq.valid := mem.valid && !isBroadcast
+  respQueue.io.enq.bits := mem.bits
+  assert(!respQueue.io.enq.valid || respQueue.io.enq.ready, "Core memory response queue overflow")
+  encoder.resp := respQueue.io.deq
+  respQueue.io.deq.ready := true.B
   exec.bcast.valid   := isBroadcast
   exec.bcast.data    := mem.bits.data
 
   fetch.decoded <> exec.dec
-  fetch.busy <> exec.busy
+  fetch.busy := exec.busy | ext.idlings
   fetch.ctrl.br <> exec.brs
 }

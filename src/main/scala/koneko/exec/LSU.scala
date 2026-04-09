@@ -80,6 +80,8 @@ class LSU(implicit val param: CoreParameters) extends Module {
 
   val memReqFired = mem.req.fire
   when(memReqFired) { memSent := true.B }
+  // Mem resp valid implies memSent && !memGotResp
+  assert(!mem.resp.valid || (memSent && !memGotResp), "Unexpected LSU memory response")
 
   // Extract word from wide response based on address within the beat
   val wordsPerBeat = param.memBusWidth / 32
@@ -92,14 +94,13 @@ class LSU(implicit val param: CoreParameters) extends Module {
   val memRespWord = respWords(wordInBeat)
 
   // Response may arrive on same cycle as the request (combinational path through crossbar/driver)
-  val memRespCapture = mem.resp.valid && (memSent || memReqFired)
-  when(memRespCapture) {
+  when(mem.resp.fire) {
     memGotResp := true.B
     memRdata := memRespWord
   }
 
-  val globalDone = memGotResp || memRespCapture
-  val globalRdata = Mux(memRespCapture && !memGotResp, memRespWord, memRdata)
+  val globalDone = memGotResp || mem.resp.fire
+  val globalRdata = Mux(mem.resp.fire && !memGotResp, memRespWord, memRdata)
 
   when(req.fire && !isSPM) {
     memSent := false.B

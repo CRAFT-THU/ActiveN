@@ -11,13 +11,13 @@ class Metadata(implicit val params: CoreParameters) extends Bundle {
 }
 
 class ICache(implicit val params: CoreParameters) extends Module {
-  val input = IO(Flipped(DecoupledIO(UInt(32.W))))
+  val input = IO(Flipped(Decoupled(UInt(32.W))))
   val kill = IO(Input(Bool()))
   val mem = IO(new Bundle {
     val req = Decoupled(new MemReq)
     val resp = Flipped(Valid(new MemResp))
   })
-  val output = IO(DecoupledIO(UInt(32.W)))
+  val output = IO(Decoupled(UInt(32.W)))
 
   /*
    * Storages
@@ -158,6 +158,8 @@ class ICache(implicit val params: CoreParameters) extends Module {
   mem.req.bits.write := false.B
   mem.req.bits.wdata := DontCare
   mem.req.valid := needRefill && !s1reqSentForBeat
+  // Asserted that a response implies needRefill
+  assert(!mem.resp.valid || needRefill, "Unexpected ICache memory response")
 
   s1reqSentForBeat := MuxCase(s1reqSentForBeat, Seq(
     s0step -> false.B,
@@ -165,7 +167,7 @@ class ICache(implicit val params: CoreParameters) extends Module {
   ))
 
   // Receive response: latch wide data
-  when(mem.resp.valid && needRefill && s1reqSentForBeat) {
+  when(mem.resp.fire) {
     s1refillBeatData := mem.resp.bits.data
     s1refillWriting := true.B
   }

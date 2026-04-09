@@ -10,3 +10,5 @@
 /work
 /copilot
 /*.fst
+/sim/.cache
+/compile_commands.json

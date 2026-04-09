@@ -357,14 +357,19 @@ struct CoreState {
     }
   }
 
-  optional<Flit> currentOut() const {
-    if (!core->ext_out_ready || !core->ext_out_valid) return {};
+  optional<Flit> pendingOut() const {
+    if (!core->ext_out_valid) return {};
     return Flit{
       .src = static_cast<uint16_t>(core->cfg_hartid),
       .dst = static_cast<uint16_t>(core->ext_out_bits_dst),
       .tag = static_cast<uint16_t>(core->ext_out_bits_tag),
       .data = core->ext_out_bits_data,
     };
+  }
+
+  optional<Flit> currentOut() const {
+    if (!core->ext_out_ready) return {};
+    return pendingOut();
   }
 
   void posedge() {
@@ -424,6 +429,10 @@ struct SoftMemIf {
   int pu_end;
   vector<int> zone_clusters;
   int ingress_rr = 0;
+  int issue_rr = 0;
+  int local_resp_rr = 0;
+  int remote_resp_rr = 0;
+  bool ring_enq_prefer_incoming = true;
 
   array<MemInflightSlot, kMaxInflight> inflight = {};
   multimap<uint64_t, int> ready_events;
@@ -455,6 +464,15 @@ struct SoftMemIf {
     return -1;
   }
 
+  int findIssueSlot() const {
+    for (int offset = 0; offset < kMaxInflight; ++offset) {
+      int slot = (issue_rr + offset) % kMaxInflight;
+      const auto &entry = inflight[slot];
+      if (entry.allocated && entry.ready && !entry.issued) return slot;
+    }
+    return -1;
+  }
+
   void clearSlot(int slot) {
     inflight[slot] = MemInflightSlot{};
   }
@@ -464,7 +482,8 @@ struct SoftMemIf {
   }
 
   int findCompletedLocalSlot() const {
-    for (int slot = 0; slot < kMaxInflight; ++slot) {
+    for (int offset = 0; offset < kMaxInflight; ++offset) {
+      int slot = (local_resp_rr + offset) % kMaxInflight;
       const auto &entry = inflight[slot];
       if (entry.allocated && entry.completed && isLocal(entry.src)) return slot;
     }
@@ -472,7 +491,8 @@ struct SoftMemIf {
   }
 
   int findCompletedRemoteSlot() const {
-    for (int slot = 0; slot < kMaxInflight; ++slot) {
+    for (int offset = 0; offset < kMaxInflight; ++offset) {
+      int slot = (remote_resp_rr + offset) % kMaxInflight;
       const auto &entry = inflight[slot];
       if (entry.allocated && entry.completed && !isLocal(entry.src)) return slot;
     }
@@ -505,6 +525,9 @@ struct SoftPeriphIf {
   multimap<uint64_t, int> free_events;
   multimap<uint64_t, std::pair<int, MemResponse>> completion_events;
   deque<RingResponse> ring_queue;
+  int issue_rr = 0;
+  int completed_rr = 0;
+  bool ring_enq_prefer_incoming = true;
 
   int findCollectSlot(uint16_t src) const {
     for (int slot = 0; slot < kMaxInflight; ++slot) {
@@ -523,12 +546,22 @@ struct SoftPeriphIf {
     return -1;
   }
 
+  int findIssueSlot() const {
+    for (int offset = 0; offset < kMaxInflight; ++offset) {
+      int slot = (issue_rr + offset) % kMaxInflight;
+      const auto &entry = inflight[slot];
+      if (entry.allocated && entry.ready && !entry.issued) return slot;
+    }
+    return -1;
+  }
+
   void clearSlot(int slot) {
     inflight[slot] = PeriphInflightSlot{};
   }
 
   int findCompletedSlot() const {
-    for (int slot = 0; slot < kMaxInflight; ++slot) {
+    for (int offset = 0; offset < kMaxInflight; ++offset) {
+      int slot = (completed_rr + offset) % kMaxInflight;
       const auto &entry = inflight[slot];
       if (entry.allocated && entry.completed) return slot;
     }
@@ -784,6 +817,7 @@ struct SoftSystemSim {
 
       loadClusterBuffer(global_ci, memifs[mc].makeRingResp(slot));
       resp_busy[mc][local_ci] = true;
+      memifs[mc].local_resp_rr = (slot + 1) % SoftMemIf::kMaxInflight;
       memifs[mc].free_events.emplace(cycle + 1, slot);
     }
 
@@ -808,6 +842,10 @@ struct SoftSystemSim {
     };
     auto nodeLocalCluster = [&](const NodeRef &node, uint16_t dst) {
       return memifs[node.index].localCluster(dst);
+    };
+    auto nodeRingEnqPreferIncoming = [&](const NodeRef &node) -> bool & {
+      return node.is_periph ? periph_if.ring_enq_prefer_incoming
+                            : memifs[node.index].ring_enq_prefer_incoming;
     };
 
     vector<optional<RingResponse>> ring_front(ring_nodes.size());
@@ -837,40 +875,69 @@ struct SoftSystemSim {
         }
         continue;
       }
-
-      int available = 2 - (nodeQueueSize(node) - (pop_front[i] ? 1 : 0));
-      if (available > 0 && !ring_enqueue[i]) {
-        ring_enqueue[i] = incoming;
-        pop_front[prev] = true;
-      }
     }
 
     for (size_t i = 0; i < ring_nodes.size(); ++i) {
+      int prev = (static_cast<int>(i) - 1 + static_cast<int>(ring_nodes.size())) %
+                 static_cast<int>(ring_nodes.size());
       const auto &node = ring_nodes[i];
+      int queue_size = nodeQueueSize(node);
+      if (queue_size > 2) {
+        throw runtime_error("SoftSystemSim: ring response queue overflow");
+      }
+
+      RingResponse incoming;
+      bool has_incoming = false;
+      if (ring_front[prev] && !nodeLocal(node, ring_front[prev]->dst)) {
+        incoming = *ring_front[prev];
+        has_incoming = true;
+      }
+
       RingResponse outgoing;
       bool has_completed = false;
+      int completed_slot = -1;
 
       if (node.is_periph) {
         int slot = periph_if.findCompletedSlot();
         if (slot >= 0) {
-          completed_slots[i] = slot;
+          completed_slot = slot;
           outgoing = periph_if.makeRingResp(slot);
           has_completed = true;
         }
       } else {
         int slot = memifs[node.index].findCompletedRemoteSlot();
         if (slot >= 0) {
-          completed_slots[i] = slot;
+          completed_slot = slot;
           outgoing = memifs[node.index].makeRingResp(slot);
           has_completed = true;
         }
       }
 
-      if (!has_completed || ring_enqueue[i]) continue;
+      bool can_enqueue = queue_size < 2;
+      if (!can_enqueue) continue;
+      if (has_incoming && has_completed) {
+        bool &prefer_incoming = nodeRingEnqPreferIncoming(node);
+        if (prefer_incoming) {
+          ring_enqueue[i] = incoming;
+          pop_front[prev] = true;
+        } else {
+          ring_enqueue[i] = outgoing;
+          completed_slots[i] = completed_slot;
+        }
+        prefer_incoming = !prefer_incoming;
+        continue;
+      }
 
-      int available = 2 - (nodeQueueSize(node) - (pop_front[i] ? 1 : 0));
-      if (available <= 0) continue;
-      ring_enqueue[i] = outgoing;
+      if (has_incoming) {
+        ring_enqueue[i] = incoming;
+        pop_front[prev] = true;
+        continue;
+      }
+
+      if (has_completed) {
+        ring_enqueue[i] = outgoing;
+        completed_slots[i] = completed_slot;
+      }
     }
 
     for (size_t i = 0; i < ring_nodes.size(); ++i) {
@@ -887,8 +954,10 @@ struct SoftSystemSim {
       int slot = completed_slots[i];
       if (slot < 0) continue;
       if (ring_nodes[i].is_periph) {
+        periph_if.completed_rr = (slot + 1) % SoftPeriphIf::kMaxInflight;
         periph_if.free_events.emplace(cycle + 1, slot);
       } else {
+        memifs[ring_nodes[i].index].remote_resp_rr = (slot + 1) % SoftMemIf::kMaxInflight;
         memifs[ring_nodes[i].index].free_events.emplace(cycle + 1, slot);
       }
     }
@@ -1051,17 +1120,12 @@ struct SoftSystemSim {
   void updateExtOutReady() {
     for (int pu = 1; pu <= num_pu; ++pu) {
       auto &c = core(pu);
-      if (!c.core->ext_out_valid) {
+      auto out = c.pendingOut();
+      if (!out) {
         c.core->ext_out_ready = 1;
         continue;
       }
-      Flit flit{
-        .src = static_cast<uint16_t>(c.core->cfg_hartid),
-        .dst = static_cast<uint16_t>(c.core->ext_out_bits_dst),
-        .tag = static_cast<uint16_t>(c.core->ext_out_bits_tag),
-        .data = c.core->ext_out_bits_data,
-      };
-      c.core->ext_out_ready = router(pu).canInject(flit) ? 1 : 0;
+      c.core->ext_out_ready = router(pu).canInject(*out) ? 1 : 0;
     }
   }
 
@@ -1141,11 +1205,18 @@ struct SoftSystemSim {
     processResponseNetwork();
 
     routeRouters();
-    updateExtOutReady();
 
     for (auto &c : cores) {
       c->core->reset = 0;
       c->driveInputs();
+      // Resolve the core's current ext.out payload before computing the ready path.
+      c->core->ext_out_ready = 0;
+      c->core->eval();
+    }
+
+    updateExtOutReady();
+
+    for (auto &c : cores) {
       c->core->eval();
     }
 
@@ -1240,14 +1311,7 @@ void SoftMemIf::processDue(uint64_t cycle, SoftSystemSim &sim) {
   }
   completion_events.erase(complete_range.first, complete_range.second);
 
-  int issue_slot = -1;
-  for (int slot = 0; slot < kMaxInflight; ++slot) {
-    const auto &entry = inflight[slot];
-    if (entry.allocated && entry.ready && !entry.issued) {
-      issue_slot = slot;
-      break;
-    }
-  }
+  int issue_slot = findIssueSlot();
 
   if (issue_slot >= 0) {
     auto &entry = inflight[issue_slot];
@@ -1266,6 +1330,7 @@ void SoftMemIf::processDue(uint64_t cycle, SoftSystemSim &sim) {
                                 std::make_pair(issue_slot, resp));
     }
     entry.issued = true;
+    issue_rr = (issue_slot + 1) % kMaxInflight;
     return;
   }
 
@@ -1341,14 +1406,7 @@ void SoftPeriphIf::processDue(uint64_t cycle, SoftSystemSim &sim) {
   }
   completion_events.erase(complete_range.first, complete_range.second);
 
-  int issue_slot = -1;
-  for (int slot = 0; slot < kMaxInflight; ++slot) {
-    const auto &entry = inflight[slot];
-    if (entry.allocated && entry.ready && !entry.issued) {
-      issue_slot = slot;
-      break;
-    }
-  }
+  int issue_slot = findIssueSlot();
   if (issue_slot < 0) return;
 
   auto &entry = inflight[issue_slot];
@@ -1371,10 +1429,13 @@ void SoftPeriphIf::processDue(uint64_t cycle, SoftSystemSim &sim) {
     MemResponse resp;
     resp.id = entry.resp_id;
     memset(resp.data, 0, sizeof(resp.data));
+    resp.data[(entry.addr & ((MEM_BUS_WORDS * sizeof(uint32_t)) - 1)) /
+              sizeof(uint32_t)] = sim.periph.read(entry.addr);
     completion_events.emplace(cycle + sim.periphReadCompleteLatency(),
                               std::make_pair(issue_slot, resp));
   }
   entry.issued = true;
+  issue_rr = (issue_slot + 1) % kMaxInflight;
 }
 
 struct SoftSystemModel::Impl {

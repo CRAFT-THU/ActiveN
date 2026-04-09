@@ -195,6 +195,9 @@ int main() {
   } else {
     cout << "[CoSim] Matched through cycle limit " << system.cycle() << endl;
   }
+  if (system.timerCount() > 0) {
+    cout << "[CoSim] Timer: " << system.timerCount() << " cycles" << endl;
+  }
   cout << "[CoSim] Runtime: " << fixed << setprecision(3) << wall_secs << "s" << endl;
   return 0;
 }

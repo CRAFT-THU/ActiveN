@@ -137,18 +137,24 @@ struct SingleCoreSim {
   void processPeriphRequest() {
     uint32_t addr = collector.addr();
     uint16_t resp_tag = collector.id();
+    uint32_t rdata = 0;
+    size_t word_idx = (addr & ((MEM_BUS_WORDS * sizeof(uint32_t)) - 1)) /
+                      sizeof(uint32_t);
 
     if (collector.isStore()) {
       periph.write(addr, collector.wdata());
       if (LOG) cout << "[Single] Periph write: addr=0x" << hex << addr
                     << " data=0x" << collector.wdata() << dec << endl;
     } else {
-      if (LOG) cout << "[Single] Periph read: addr=0x" << hex << addr << dec << endl;
+      rdata = periph.read(addr);
+      if (LOG) cout << "[Single] Periph read: addr=0x" << hex << addr
+                    << " data=0x" << rdata << dec << endl;
     }
-    // Provide dummy response so the core can complete the request
+
     MemResponse resp;
     resp.id = resp_tag;
     memset(resp.data, 0, sizeof(resp.data));
+    if (!collector.isStore()) resp.data[word_idx] = rdata;
     mem_resps.push_back(resp);
     collector.reset();
   }

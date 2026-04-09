@@ -56,6 +56,23 @@ class MemIf(
   require(numClusters >= 1)
   require(puEnd >= puStart)
 
+  private val slotIdxWidth = log2Ceil(maxInflight max 2)
+
+  private def bump(idx: UInt): UInt =
+    Mux(idx === (maxInflight - 1).U, 0.U(slotIdxWidth.W), idx + 1.U)
+
+  private def rrPick(candidates: Seq[Bool], start: UInt): (Bool, UInt) = {
+    val candBits = VecInit(candidates).asUInt
+    val doubled = Cat(candBits, candBits)
+    val shifted = (doubled >> start)(maxInflight - 1, 0)
+    val hasAny = shifted.orR
+    val relIdx = PriorityEncoder(shifted)
+    val sum = relIdx +& start
+    val slot = Wire(UInt(slotIdxWidth.W))
+    slot := Mux(sum >= maxInflight.U, sum - maxInflight.U, sum)(slotIdxWidth - 1, 0)
+    (hasAny, slot)
+  }
+
   // --- IO ---
   val req = IO(Vec(numClusters, Flipped(Decoupled(new Bundle {
     val src  = UInt(16.W)
@@ -82,6 +99,10 @@ class MemIf(
   val issued         = RegInit(VecInit.fill(maxInflight)(false.B))
   val completed      = RegInit(VecInit.fill(maxInflight)(false.B))
   val data           = Reg(Vec(maxInflight, UInt(256.W)))
+  val issueStart     = RegInit(0.U(slotIdxWidth.W))
+  val localRespStart = RegInit(0.U(slotIdxWidth.W))
+  val remoteRespStart = RegInit(0.U(slotIdxWidth.W))
+  val ringEnqPreferIncoming = RegInit(true.B)
 
   def isLocal(puId: UInt): Bool = puId >= puStart.U && puId <= puEnd.U
   def clusterOf(puId: UInt): UInt = (puId - puStart.U) >> 4
@@ -178,11 +199,10 @@ class MemIf(
   val configRomEntries = configROM.toSeq.sortBy(_._1)
   val hasConfigROM = configRomEntries.nonEmpty
 
-  val readyToIssue = VecInit((0 until maxInflight).map(s =>
+  val readyToIssueSeq = (0 until maxInflight).map(s =>
     allocated(s) && ready(s) && !issued(s)
-  ))
-  val issueValid = readyToIssue.asUInt.orR
-  val issueSlot  = PriorityEncoder(readyToIssue.asUInt)
+  )
+  val (issueValid, issueSlot) = rrPick(readyToIssueSeq, issueStart)
   val issuePend  = pending(issueSlot)
 
   // Config ROM hit: intercept reads to config addresses
@@ -203,6 +223,7 @@ class MemIf(
     data(issueSlot)      := configData
     issued(issueSlot)    := true.B
     completed(issueSlot) := true.B
+    issueStart           := bump(issueSlot)
   }
 
   val scatWantsIssue = scatState === sScatIssue
@@ -224,6 +245,7 @@ class MemIf(
     when(normalIssue) {
       issued(issueSlot) := true.B
       when(issuePend.write) { completed(issueSlot) := true.B }
+      issueStart := bump(issueSlot)
     }.otherwise {
       scatState := sScatWait
     }
@@ -262,11 +284,10 @@ class MemIf(
   ringOut <> ringBuf.io.deq
 
   // Find first completed local entry
-  val localCandidates = VecInit((0 until maxInflight).map(s =>
+  val localCandidatesSeq = (0 until maxInflight).map(s =>
     allocated(s) && completed(s) && isLocal(pending(s).src)
-  ))
-  val hasLocal  = localCandidates.asUInt.orR
-  val localSlot = PriorityEncoder(localCandidates.asUInt)
+  )
+  val (hasLocal, localSlot) = rrPick(localCandidatesSeq, localRespStart)
 
   // Scatter broadcast: deliver to each cluster one at a time.
   // While broadcasting, normal local delivery is paused.
@@ -307,18 +328,38 @@ class MemIf(
         completed(s) := false.B
         ready(s)     := false.B
         issued(s)    := false.B
+        localRespStart := bump(localSlot)
       }
     }
   }
 
   // Find first completed remote entry
-  val remoteCandidates = VecInit((0 until maxInflight).map(s =>
+  val remoteCandidatesSeq = (0 until maxInflight).map(s =>
     allocated(s) && completed(s) && !isLocal(pending(s).src)
-  ))
-  val hasRemote  = remoteCandidates.asUInt.orR
-  val remoteSlot = PriorityEncoder(remoteCandidates.asUInt)
+  )
+  val (hasRemote, remoteSlot) = rrPick(remoteCandidatesSeq, remoteRespStart)
 
-  when(hasRemote && ringBuf.io.enq.ready) {
+  // --- 5. Ring input ---
+  // Local PUs: deliver directly (overrides local completion on same cluster).
+  // Remote: forward to ring output.
+  val ringLocal = isLocal(ringIn.bits.dst)
+  val ringCi    = clusterOf(ringIn.bits.dst)
+  val ringForwardValid = ringIn.valid && !ringLocal
+  val chooseIncomingRing = WireDefault(false.B)
+  val chooseRemoteRing = WireDefault(false.B)
+
+  when(ringBuf.io.enq.ready) {
+    when(ringForwardValid && hasRemote) {
+      chooseIncomingRing := ringEnqPreferIncoming
+      chooseRemoteRing := !ringEnqPreferIncoming
+    }.elsewhen(ringForwardValid) {
+      chooseIncomingRing := true.B
+    }.elsewhen(hasRemote) {
+      chooseRemoteRing := true.B
+    }
+  }
+
+  when(chooseRemoteRing) {
     val s = remoteSlot
     ringBuf.io.enq.valid     := true.B
     ringBuf.io.enq.bits.dst  := pending(s).src
@@ -328,13 +369,8 @@ class MemIf(
     completed(s) := false.B
     ready(s)     := false.B
     issued(s)    := false.B
+    remoteRespStart := bump(remoteSlot)
   }
-
-  // --- 5. Ring input ---
-  // Local PUs: deliver directly (overrides local completion on same cluster).
-  // Remote: forward to ring output.
-  val ringLocal = isLocal(ringIn.bits.dst)
-  val ringCi    = clusterOf(ringIn.bits.dst)
 
   ringIn.ready := false.B
 
@@ -346,11 +382,15 @@ class MemIf(
         ringIn.ready := resp(ringCi).ready
       }
     }.otherwise {
-      when(ringBuf.io.enq.ready) {
+      when(chooseIncomingRing) {
         ringIn.ready             := true.B
         ringBuf.io.enq.valid     := true.B
         ringBuf.io.enq.bits      := ringIn.bits
       }
     }
+  }
+
+  when(ringBuf.io.enq.fire && ringForwardValid && hasRemote) {
+    ringEnqPreferIncoming := !ringEnqPreferIncoming
   }
 }
