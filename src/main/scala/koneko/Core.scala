@@ -42,7 +42,6 @@ class Core(implicit val params: CoreParameters) extends Module {
   val crossbar = Module(new Crossbar(2))
   val encoder = Module(new Encoder)
   val extInQueue = Module(new Queue(ext.in.bits.cloneType, 4))
-  val respQueue = Module(new Queue(new MemResp, 4))
 
   exec.cfg <> cfg
 
@@ -62,17 +61,14 @@ class Core(implicit val params: CoreParameters) extends Module {
   // Crossbar: upstream(0) = ICache, upstream(1) = LSU global memory
   crossbar.upstream(0) <> fetch.mem
   crossbar.upstream(1) <> exec.lsuMem
-  crossbar.downstream <> encoder.mem
+  crossbar.downstream.req <> encoder.req
 
   // Memory response from external -> encoder -> crossbar
   // Broadcast responses (tag=0xFFFF from MemDistributor) go to BIU instead
-  val isBroadcast = mem.valid && mem.bits.id === 0xFFFF.U
-  respQueue.io.enq.valid := mem.valid && !isBroadcast
-  respQueue.io.enq.bits := mem.bits
-  assert(!respQueue.io.enq.valid || respQueue.io.enq.ready, "Core memory response queue overflow")
-  encoder.resp := respQueue.io.deq
-  respQueue.io.deq.ready := true.B
-  exec.bcast.valid   := isBroadcast
+  val isBroadcast = mem.bits.id === 0xFFFF.U
+  crossbar.downstream.resp.valid := mem.valid && !isBroadcast
+  crossbar.downstream.resp.bits := mem.bits
+  exec.bcast.valid   := mem.valid && isBroadcast
   exec.bcast.data    := mem.bits.data
 
   fetch.decoded <> exec.dec

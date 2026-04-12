@@ -198,7 +198,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
   assert(!(valid && uop.isAM && biu.msg.fire) || s0step)
 
   val isWFI = uop.isSystem && uop.funct3 === 0.U && uop.rs2 === 5.U
-  val idlings = RegInit(0.U(param.pipeCnt.W))
+  val idlings = RegInit(((BigInt(1) << param.pipeCnt) - 2).U(param.pipeCnt.W)) // Only pipe 1 is active at boot
   val idlingsMasked: UInt = idlings | Mux(valid && isWFI, uop.smsel, 0.U)
 
   biu.br.ready := s0step && (idlingsMasked.orR || valid && isYield)

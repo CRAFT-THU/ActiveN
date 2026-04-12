@@ -11,10 +11,7 @@ import koneko._
 
 class Encoder(implicit val param: CoreParameters) extends Module {
   // Memory-side port: connects to Crossbar downstream
-  val mem = IO(new Bundle {
-    val req = Flipped(Decoupled(new MemReq))
-    val resp = Valid(new MemResp)
-  })
+  val req = IO(Flipped(Decoupled(new MemReq)))
 
   // Event output: arbitrated externally with BIU ext.out
   val out = IO(Decoupled(new Bundle {
@@ -22,12 +19,6 @@ class Encoder(implicit val param: CoreParameters) extends Module {
     val data = UInt(32.W)
     val tag = UInt(16.W)
   }))
-
-  // Response input: from Core.mem
-  val resp = IO(Flipped(Valid(new MemResp)))
-
-  // --- Response path: forward directly to crossbar ---
-  mem.resp := resp
 
   // --- Request encoding ---
   // Compute destination from address:
@@ -38,15 +29,15 @@ class Encoder(implicit val param: CoreParameters) extends Module {
   val periphDst = 0x8000  // Peripheral MMIO handler
 
   // Peripheral detection
-  val isPeripheral = !mem.req.bits.addr(31) && mem.req.bits.addr(30)
-  val periphAddr = mem.req.bits.addr - 0x40000000L.U
+  val isPeripheral = !req.bits.addr(31) && req.bits.addr(30)
+  val periphAddr = req.bits.addr - 0x40000000L.U
 
   // For hardware lookup: build cumulative boundaries
   // Controller i handles [cumSize(i), cumSize(i+1))
   val cumSizes = memCtrlSizes.scanLeft(BigInt(0))(_ + _) // [0, size0, size0+size1, ...]
   val numCtrls = memCtrlSizes.length
 
-  val globalAddr = mem.req.bits.addr - 0x80000000L.U
+  val globalAddr = req.bits.addr - 0x80000000L.U
   val ctrlDst = Wire(UInt(16.W))
   ctrlDst := (memDstBase + numCtrls - 1).U(16.W) // default: last controller
   for (i <- 0 until numCtrls) {
@@ -80,14 +71,14 @@ class Encoder(implicit val param: CoreParameters) extends Module {
   val reqDst = Reg(UInt(16.W))
 
   // Accept new request only when idle
-  mem.req.ready := state === sIdle
+  req.ready := state === sIdle
 
-  when(mem.req.fire) {
+  when(req.fire) {
     reqAddr := finalAddr
-    reqId := mem.req.bits.id
-    reqSize := mem.req.bits.size
-    reqWdata := mem.req.bits.wdata
-    reqWrite := mem.req.bits.write
+    reqId := req.bits.id
+    reqSize := req.bits.size
+    reqWdata := req.bits.wdata
+    reqWrite := req.bits.write
     reqDst := finalDst
     state := sSendAddr
   }
