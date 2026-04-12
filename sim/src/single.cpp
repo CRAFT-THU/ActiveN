@@ -105,14 +105,14 @@ struct SingleCoreSim {
 
     if (collector.tag == 0xFF00) {
       // Load
-      if (LOG) cout << "[Single] Mem load: addr=0x" << hex << addr
+      if (LOG) cerr << "[Single] Mem load: addr=0x" << hex << addr
                     << " resp_tag=0x" << resp_tag << dec << endl;
       mem_resps.push_back(readBlock(addr, resp_tag));
     } else if (collector.tag == 0xFF01) {
       // Store
       uint16_t size = collector.size();
       uint32_t wdata = collector.wdata();
-      if (LOG) cout << "[Single] Mem store: addr=0x" << hex << addr
+      if (LOG) cerr << "[Single] Mem store: addr=0x" << hex << addr
                     << " size=" << dec << size
                     << " data=0x" << hex << wdata
                     << " resp_tag=0x" << resp_tag << dec << endl;
@@ -143,11 +143,11 @@ struct SingleCoreSim {
 
     if (collector.isStore()) {
       periph.write(addr, collector.wdata());
-      if (LOG) cout << "[Single] Periph write: addr=0x" << hex << addr
+      if (LOG) cerr << "[Single] Periph write: addr=0x" << hex << addr
                     << " data=0x" << collector.wdata() << dec << endl;
     } else {
       rdata = periph.read(addr);
-      if (LOG) cout << "[Single] Periph read: addr=0x" << hex << addr
+      if (LOG) cerr << "[Single] Periph read: addr=0x" << hex << addr
                     << " data=0x" << rdata << dec << endl;
     }
 
@@ -196,7 +196,7 @@ struct SingleCoreSim {
         Event ev = { cycle, dst, data, tag };
         events.push_back(ev);
 
-        if(LOG) cout << "[Single] Event @" << dec << cycle
+        if(LOG) cerr << "[Single] Event @" << dec << cycle
                      << ": dst=" << dst << " data=0x" << hex << data
                      << " tag=" << dec << tag << endl;
       }
@@ -244,13 +244,13 @@ int main(int argc, char **argv) {
   auto trace_cfg = getenv("MEOW_TRACE");
   if(trace_cfg && trace_cfg[0] != '\0') {
     TRACE = true;
-    cout << "[Single] Tracing enabled" << endl;
+    cerr << "[Single] Tracing enabled" << endl;
   }
 
   auto log_cfg = getenv("MEOW_LOG");
   if(log_cfg && log_cfg[0] != '\0') {
     LOG = true;
-    cout << "[Single] Logging enabled" << endl;
+    cerr << "[Single] Logging enabled" << endl;
   }
 
   auto text_path = getenv("MEOW_TEXT");
@@ -282,7 +282,7 @@ int main(int argc, char **argv) {
   text_input.seekg(0);
   text_input.read(text_mem, file_size);
   text_aligned = (uint32_t *)text_mem;
-  cout << "[Single] Loaded " << file_size << " bytes from " << text_path
+  cerr << "[Single] Loaded " << file_size << " bytes from " << text_path
        << " (backing memory: " << MEM_SIZE / 1024 << " KB)" << endl;
 
   // Signal handler
@@ -306,7 +306,7 @@ int main(int argc, char **argv) {
   }
 
   // Run simulation
-  cout << "[Single] Running simulation (max " << max_cycles << " cycles)..." << endl;
+  cerr << "[Single] Running simulation (max " << max_cycles << " cycles)..." << endl;
   auto wall_start = chrono::steady_clock::now();
   while(!sim.periph.finished && sim.cycle < max_cycles && !exiting) {
     sim.step();
@@ -315,18 +315,18 @@ int main(int argc, char **argv) {
   double wall_secs = chrono::duration<double>(wall_end - wall_start).count();
 
   if(sim.periph.finished) {
-    cout << "[Single] Result: " << dec << sim.periph.result
+    cerr << "[Single] Result: " << dec << sim.periph.result
          << " (0x" << hex << sim.periph.result << ")" << dec << endl;
-    cout << "[Single] Cycles: " << dec << sim.cycle << endl;
+    cerr << "[Single] Cycles: " << dec << sim.cycle << endl;
   } else {
-    cout << "[Single] " << (exiting ? "Interrupted" : "Timed out") << " at cycle " << sim.cycle << endl;
+    cerr << "[Single] " << (exiting ? "Interrupted" : "Timed out") << " at cycle " << sim.cycle << endl;
   }
-  cout << "[Single] Speed: " << dec << (uint64_t)(sim.cycle / wall_secs) << " cycles/s" << endl;
-  cout << "[Single] Runtime: " << fixed << setprecision(3) << wall_secs << "s" << endl;
+  cerr << "[Single] Speed: " << dec << (uint64_t)(sim.cycle / wall_secs) << " cycles/s" << endl;
+  cerr << "[Single] Runtime: " << fixed << setprecision(3) << wall_secs << "s" << endl;
 
-  cout << "[Single] Total events captured: " << sim.events.size() << endl;
+  cerr << "[Single] Total events captured: " << sim.events.size() << endl;
   for(auto &ev : sim.events) {
-    cout << "[Single]   @" << dec << ev.cycle
+    cerr << "[Single]   @" << dec << ev.cycle
          << " dst=" << ev.dst << " tag=" << ev.tag
          << " data=0x" << hex << ev.data << dec << endl;
   }

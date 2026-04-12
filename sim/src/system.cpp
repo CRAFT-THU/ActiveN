@@ -249,10 +249,10 @@ struct SystemModel::Impl {
           }
         }
       }
-      if (LOG) cout << "[System] Store MC" << mc << " addr=0x" << hex << addr
+      if (LOG) cerr << "[System] Store MC" << mc << " addr=0x" << hex << addr
                     << " id=" << dec << id << endl;
     } else {
-      if (LOG) cout << "[System] Load MC" << mc << " addr=0x" << hex << addr
+      if (LOG) cerr << "[System] Load MC" << mc << " addr=0x" << hex << addr
                     << " id=" << dec << id << endl;
     }
 
@@ -284,11 +284,11 @@ struct SystemModel::Impl {
     if (is_write) {
       assert(((sys->io_periph_req_bits_wbe >> byte_offset) & 0xf) == 0xf);
       periph.write(addr, lane_wdata);
-      if (LOG) cout << "[System] Periph write: addr=0x" << hex << addr
+      if (LOG) cerr << "[System] Periph write: addr=0x" << hex << addr
                     << " data=0x" << lane_wdata << dec << endl;
     } else {
       rdata = periph.read(addr);
-      if (LOG) cout << "[System] Periph read: addr=0x" << hex << addr
+      if (LOG) cerr << "[System] Periph read: addr=0x" << hex << addr
                     << " data=0x" << rdata << dec << endl;
     }
 
@@ -557,7 +557,7 @@ int runSystemModelFromEnv() {
 
   int num_pu = SYSTEM_CONFIG.numPU;
   int num_mc = SYSTEM_CONFIG.numMC;
-  cout << "[System] PUs=" << num_pu << " MCs=" << num_mc << endl;
+  cerr << "[System] PUs=" << num_pu << " MCs=" << num_mc << endl;
 
   auto text_path = getenv("MEOW_TEXT");
   if (!text_path || text_path[0] == '\0') {
@@ -588,9 +588,9 @@ int runSystemModelFromEnv() {
     return 1;
   }
 
-  cout << "[System] Loaded program image" << endl;
+  cerr << "[System] Loaded program image" << endl;
   if (image_cfg.data_path) {
-    cout << "[System] Data loaded at 0x" << hex << image_cfg.data_addr << dec << endl;
+    cerr << "[System] Data loaded at 0x" << hex << image_cfg.data_addr << dec << endl;
   }
 
   struct sigaction sig;
@@ -620,10 +620,10 @@ int runSystemModelFromEnv() {
     auto mem_log = getenv("MEOW_MEM_LOG");
     const char *log_dir = (mem_log && mem_log[0] != '\0') ? mem_log : ".";
     sim.initDram(mem_cfg, log_dir);
-    cout << "[System] DRAMsim3 enabled: " << mem_cfg << endl;
+    cerr << "[System] DRAMsim3 enabled: " << mem_cfg << endl;
   }
 
-  cout << "[System] Running (max " << max_cycles << " cycles)..." << endl;
+  cerr << "[System] Running (max " << max_cycles << " cycles)..." << endl;
   auto wall_start = chrono::steady_clock::now();
   while (!sim.finished() && sim.cycle() < max_cycles && !exiting) {
     sim.step();
@@ -633,16 +633,16 @@ int runSystemModelFromEnv() {
   double wall_secs = chrono::duration<double>(wall_end - wall_start).count();
 
   if (sim.finished()) {
-    cout << "[System] Result: " << dec << sim.result() << " (0x" << hex << sim.result() << ")" << endl;
-    cout << "[System] Cycles: " << dec << sim.cycle() << endl;
+    cerr << "[System] Result: " << dec << sim.result() << " (0x" << hex << sim.result() << ")" << endl;
+    cerr << "[System] Cycles: " << dec << sim.cycle() << endl;
   } else {
-    cout << "[System] " << (exiting ? "Interrupted" : "Timed out") << " at cycle " << sim.cycle() << endl;
+    cerr << "[System] " << (exiting ? "Interrupted" : "Timed out") << " at cycle " << sim.cycle() << endl;
   }
   if (sim.timerCount() > 0) {
-    cout << "[System] Timer: " << dec << sim.timerCount() << " cycles" << endl;
+    cerr << "[System] Timer: " << dec << sim.timerCount() << " cycles" << endl;
   }
-  cout << "[System] Speed: " << dec << (uint64_t)(sim.cycle() / wall_secs) << " cycles/s" << endl;
-  cout << "[System] Runtime: " << fixed << setprecision(3) << wall_secs << "s" << endl;
+  cerr << "[System] Speed: " << dec << (uint64_t)(sim.cycle() / wall_secs) << " cycles/s" << endl;
+  cerr << "[System] Runtime: " << fixed << setprecision(3) << wall_secs << "s" << endl;
 
   sim.printDramStats();
 

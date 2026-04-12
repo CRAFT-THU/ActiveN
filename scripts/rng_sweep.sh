@@ -23,7 +23,7 @@ if [ -z "$FAIL_RESULTS" ]; then
 fi
 
 mkdir -p "$OUT_DIR"
-rm -f "$OUT_DIR"/seed_*.log "$OUT_DIR"/seed_*.status "$OUT_DIR"/seed_*.fst "$OUT_DIR"/summary.txt "$OUT_DIR"/aggregate.txt
+rm -f "$OUT_DIR"/seed_*.log "$OUT_DIR"/seed_*.ascii "$OUT_DIR"/seed_*.status "$OUT_DIR"/seed_*.fst "$OUT_DIR"/summary.txt "$OUT_DIR"/aggregate.txt
 rm -rf "$OUT_DIR"/seed_*.run
 
 export OUT_DIR SIM PAYLOAD MAX_CYCLES TRACE_ENABLED USE_NIX_DEVELOP FAIL_RESULTS
@@ -32,6 +32,7 @@ seq "$START_SEED" "$END_SEED" | xargs -P "$JOBS" -I {} sh -c '
   set -e
   seed="$1"
   log="$OUT_DIR/seed_${seed}.log"
+  ascii="$OUT_DIR/seed_${seed}.ascii"
   status="$OUT_DIR/seed_${seed}.status"
   wave="$OUT_DIR/seed_${seed}.fst"
   run_dir="$OUT_DIR/seed_${seed}.run"
@@ -54,7 +55,7 @@ seq "$START_SEED" "$END_SEED" | xargs -P "$JOBS" -I {} sh -c '
       MEOW_TRACE="$TRACE_ENABLED" \
       "$SIM"
     fi
-  ) > "$log" 2>&1; then
+  ) > "$ascii" 2> "$log"; then
     if [ -f "$run_dir/soft_trace.fst" ]; then
       mv "$run_dir/soft_trace.fst" "$wave"
     elif [ -f "$run_dir/trace.fst" ]; then

@@ -131,7 +131,7 @@ int main() {
 
   int num_pu = SYSTEM_CONFIG.numPU;
   int num_mc = SYSTEM_CONFIG.numMC;
-  cout << "[CoSim] PUs=" << num_pu << " MCs=" << num_mc << endl;
+  cerr << "[CoSim] PUs=" << num_pu << " MCs=" << num_mc << endl;
 
   SystemModel system(num_pu, num_mc);
   SoftSystemModel soft(num_pu, num_mc);
@@ -142,7 +142,7 @@ int main() {
     tracer->open("./cosim_trace.fst");
   }
 
-  cout << "[CoSim] Running lockstep (max " << max_cycles << " cycles)..." << endl;
+  cerr << "[CoSim] Running lockstep (max " << max_cycles << " cycles)..." << endl;
   auto wall_start = chrono::steady_clock::now();
 
   bool matched = true;
@@ -185,19 +185,19 @@ int main() {
   }
 
   if (exiting) {
-    cout << "[CoSim] Interrupted at cycle " << system.cycle() << endl;
+    cerr << "[CoSim] Interrupted at cycle " << system.cycle() << endl;
     return 1;
   }
 
   if (system.finished()) {
-    cout << "[CoSim] Matched through completion: result 0x" << hex << system.result() << dec
+    cerr << "[CoSim] Matched through completion: result 0x" << hex << system.result() << dec
          << " in " << system.cycle() << " cycles" << endl;
   } else {
-    cout << "[CoSim] Matched through cycle limit " << system.cycle() << endl;
+    cerr << "[CoSim] Matched through cycle limit " << system.cycle() << endl;
   }
   if (system.timerCount() > 0) {
-    cout << "[CoSim] Timer: " << system.timerCount() << " cycles" << endl;
+    cerr << "[CoSim] Timer: " << system.timerCount() << " cycles" << endl;
   }
-  cout << "[CoSim] Runtime: " << fixed << setprecision(3) << wall_secs << "s" << endl;
+  cerr << "[CoSim] Runtime: " << fixed << setprecision(3) << wall_secs << "s" << endl;
   return 0;
 }

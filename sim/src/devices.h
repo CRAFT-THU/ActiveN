@@ -53,8 +53,14 @@ struct PeripheralDevice {
     if (addr == 0) {
       finished = true;
       result = data;
-    } else if (addr == 4) {
+    } else if (addr == 0x4) {
       timer_enabled = (data != 0);
+    } else if (addr == 0x8) {
+      // ASCII output
+      std::cout << static_cast<char>(data & 0xFF);
+      std::cout.flush();
+    } else if (addr == 0xC) {
+      std::cerr<<"[Periph] Output: "<<data<<std::endl;
     } else if (addr == 0x10) {
       reseed(data);
     }

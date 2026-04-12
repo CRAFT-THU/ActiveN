@@ -315,16 +315,19 @@ struct CoreState {
     uint8_t saved_valid = core->ext_in_valid;
     uint32_t saved_data = core->ext_in_bits_data;
     uint16_t saved_tag = core->ext_in_bits_tag;
+    uint16_t saved_src = core->ext_in_bits_src;
 
     core->ext_in_valid = 1;
     core->ext_in_bits_data = flit.data;
     core->ext_in_bits_tag = flit.tag;
+    core->ext_in_bits_src = flit.src;
     core->eval();
     bool ready = core->ext_in_ready;
 
     core->ext_in_valid = saved_valid;
     core->ext_in_bits_data = saved_data;
     core->ext_in_bits_tag = saved_tag;
+    core->ext_in_bits_src = saved_src;
     core->eval();
     return ready;
   }
@@ -338,11 +341,13 @@ struct CoreState {
       core->ext_in_valid = 0;
       core->ext_in_bits_data = 0;
       core->ext_in_bits_tag = 0;
+      core->ext_in_bits_src = 0;
     } else {
       const auto &f = *ext_input;
       core->ext_in_valid = 1;
       core->ext_in_bits_data = f.data;
       core->ext_in_bits_tag = f.tag;
+      core->ext_in_bits_src = f.src;
     }
 
     if (mem_inbox.empty()) {
@@ -974,6 +979,18 @@ struct SoftSystemSim {
       auto target = routeOutput(pu_id, q.front());
       if (target && *target == output_idx) return input_idx;
     }
+    // Log when PU1 has a self-addressed flit stuck in inject port
+    if (LOG && pu_id == 1 && output_idx == r.core_output) {
+      const auto &inj = r.input_vcs[r.inject_port][vc];
+      if (!inj.empty() && inj.front().dst == 1) {
+        auto target = routeOutput(1, inj.front());
+        cerr << "[Soft] cycle=" << cycle << " SELF-ROUTE MISS pu=1 vc=" << vc
+             << " inject_port=" << r.inject_port << " core_output=" << r.core_output
+             << " routeOutput=" << (target ? to_string(*target) : "nullopt")
+             << " rr_next=" << start
+             << " tag=0x" << hex << inj.front().tag << dec << endl;
+      }
+    }
     return -1;
   }
 
@@ -1044,11 +1061,21 @@ struct SoftSystemSim {
           case RouterOutput::Core:
               if (core(pu).canAcceptExtInput(flit)) {
               core(pu).driveExtInput(flit);
-              if (LOG && (flit.tag == 0 || pu == 1)) {
-                cout << "[Soft] in pu=" << dec << pu << " src=0x" << hex << flit.src
+              if (LOG && pu == 1) {
+                cerr << "[Soft] cycle=" << cycle << " DELIVER pu=1"
+                     << " src=0x" << hex << flit.src
                      << " tag=0x" << flit.tag << " data=0x" << flit.data << dec << endl;
               }
               fired = true;
+            } else if (LOG && pu == 1 && flit.dst == 1) {
+              cerr << "[Soft] cycle=" << cycle << " EJECT-BLOCKED pu=1"
+                   << " src=0x" << hex << flit.src
+                   << " tag=0x" << flit.tag << " data=0x" << flit.data << dec
+                   << " input=" << chosen_input << "(inj=" << router(pu).inject_port << ")"
+                   << " vc=" << chosen_vc
+                   << " ext_in_ready=" << (int)core(pu).core->ext_in_ready
+                   << " ext_in_valid=" << (int)core(pu).core->ext_in_valid
+                   << " has_ext_input=" << core(pu).ext_input.has_value() << endl;
             }
             break;
           case RouterOutput::MemIf:
@@ -1184,6 +1211,34 @@ struct SoftSystemSim {
     ++cycle;
     reset_cycle = cycle <= RESET_LENGTH;
 
+    // Periodic PU1 state dump for debugging
+    if (LOG && cycle >= 4000 && cycle % 500 == 0) {
+      auto &c = core(1);
+      auto &r = router(1);
+      int inj_vc0 = static_cast<int>(r.input_vcs[r.inject_port][0].size());
+      int inj_vc1 = static_cast<int>(r.input_vcs[r.inject_port][1].size());
+      int total_buf = 0;
+      for (int pu = 1; pu <= num_pu; ++pu)
+        for (size_t i = 0; i < router(pu).input_vcs.size(); ++i)
+          for (int v = 0; v < SoftRouter::kNumVc; ++v)
+            total_buf += static_cast<int>(router(pu).input_vcs[i][v].size());
+      int ext_out_count = 0;
+      for (int pu = 1; pu <= num_pu; ++pu)
+        if (core(pu).core->ext_out_valid) ++ext_out_count;
+      int ext_in_ready_count = 0;
+      for (int pu = 1; pu <= num_pu; ++pu)
+        if (core(pu).core->ext_in_ready) ++ext_in_ready_count;
+      cerr << "[Soft] cycle=" << cycle << " PU1-STATE"
+           << " ext_out_valid=" << (int)c.core->ext_out_valid
+           << " ext_out_ready=" << (int)c.core->ext_out_ready
+           << " ext_in_valid=" << (int)c.core->ext_in_valid
+           << " ext_in_ready=" << (int)c.core->ext_in_ready
+           << " inj_vc0=" << inj_vc0 << " inj_vc1=" << inj_vc1
+           << " GLOBAL_router=" << total_buf
+           << " GLOBAL_ext_out=" << ext_out_count
+           << " GLOBAL_ext_in_rdy=" << ext_in_ready_count << endl;
+    }
+
     if (reset_cycle) {
       for (auto &c : cores) {
         c->core->reset = 1;
@@ -1220,12 +1275,24 @@ struct SoftSystemSim {
       c->core->eval();
     }
 
+    // Verify ext_in_ready didn't flip after updateExtOutReady
+    if (LOG) {
+      auto &c1 = core(1);
+      if (c1.ext_input && !c1.core->ext_in_ready) {
+        auto &f = *c1.ext_input;
+        cerr << "[Soft] cycle=" << cycle << " READY-FLIP pu=1"
+             << " src=0x" << hex << f.src << " tag=0x" << f.tag << dec
+             << " ext_in_valid=" << (int)c1.core->ext_in_valid
+             << " ext_in_ready=" << (int)c1.core->ext_in_ready << endl;
+      }
+    }
+
     pending_injected.clear();
     for (int pu = 1; pu <= num_pu; ++pu) {
       auto out = core(pu).currentOut();
       if (out) {
         if (LOG) {
-          cout << "[Soft] cycle=" << cycle << " pu=" << pu
+          cerr << "[Soft] cycle=" << cycle << " pu=" << pu
                << " out dst=0x" << hex << out->dst << " tag=0x" << out->tag
                << " data=0x" << out->data << dec << endl;
         }
@@ -1236,7 +1303,16 @@ struct SoftSystemSim {
     for (auto &c : cores) {
       c->posedge();
     }
-    for (const auto &[pu, flit] : pending_injected) router(pu).enqueueInject(flit);
+    for (const auto &[pu, flit] : pending_injected) {
+      if (LOG && pu == 1 && flit.dst == 1) {
+        int vc = flitVc(flit);
+        bool ok = router(pu).canAccept(router(pu).inject_port, vc);
+        cerr << "[Soft] cycle=" << cycle << " SELF-INJECT pu=1"
+             << " tag=0x" << hex << flit.tag << " data=0x" << flit.data << dec
+             << " vc=" << vc << " canAccept=" << ok << endl;
+      }
+      router(pu).enqueueInject(flit);
+    }
     periph.tick();
     commitClusterBuffers();
   }
@@ -1421,6 +1497,10 @@ void SoftPeriphIf::processDue(uint64_t cycle, SoftSystemSim &sim) {
   }
   if (entry.is_write) {
     sim.periph.write(entry.addr, entry.wdata);
+    if (LOG) {
+      cerr << "[Soft] cycle=" << cycle << " PERIPH-WRITE src=" << dec << entry.src
+           << " addr=0x" << hex << entry.addr << " wdata=0x" << entry.wdata << dec << endl;
+    }
     MemResponse resp;
     resp.id = entry.resp_id;
     memset(resp.data, 0, sizeof(resp.data));
@@ -1581,7 +1661,7 @@ int runSoftSystemModelFromEnv() {
 
   int num_pu = SYSTEM_CONFIG.numPU;
   int num_mc = SYSTEM_CONFIG.numMC;
-  cout << "[Soft] PUs=" << num_pu << " MCs=" << num_mc << endl;
+  cerr << "[Soft] PUs=" << num_pu << " MCs=" << num_mc << endl;
 
   auto text_path = getenv("MEOW_TEXT");
   if (!text_path || text_path[0] == '\0') {
@@ -1610,9 +1690,9 @@ int runSoftSystemModelFromEnv() {
     return 1;
   }
 
-  cout << "[Soft] Loaded program image" << endl;
+  cerr << "[Soft] Loaded program image" << endl;
   if (image_cfg.data_path) {
-    cout << "[Soft] Data loaded at 0x" << hex << image_cfg.data_addr << dec << endl;
+    cerr << "[Soft] Data loaded at 0x" << hex << image_cfg.data_addr << dec << endl;
   }
 
   if (getenv("MEOW_MEM")) {
@@ -1637,7 +1717,7 @@ int runSoftSystemModelFromEnv() {
     owned_tracer->open("./soft_trace.fst");
   }
 
-  cout << "[Soft] Running (max " << max_cycles << " cycles)..." << endl;
+  cerr << "[Soft] Running (max " << max_cycles << " cycles)..." << endl;
   auto wall_start = chrono::steady_clock::now();
   while (!sim.finished() && sim.cycle() < max_cycles && !exiting) {
     sim.step();
@@ -1646,16 +1726,16 @@ int runSoftSystemModelFromEnv() {
   double wall_secs = chrono::duration<double>(wall_end - wall_start).count();
 
   if (sim.finished()) {
-    cout << "[Soft] Result: " << dec << sim.result() << " (0x" << hex << sim.result() << ")" << endl;
-    cout << "[Soft] Cycles: " << dec << sim.cycle() << endl;
+    cerr << "[Soft] Result: " << dec << sim.result() << " (0x" << hex << sim.result() << ")" << endl;
+    cerr << "[Soft] Cycles: " << dec << sim.cycle() << endl;
   } else {
-    cout << "[Soft] " << (exiting ? "Interrupted" : "Timed out") << " at cycle " << sim.cycle() << endl;
+    cerr << "[Soft] " << (exiting ? "Interrupted" : "Timed out") << " at cycle " << sim.cycle() << endl;
   }
   if (sim.timerCount() > 0) {
-    cout << "[Soft] Timer: " << dec << sim.timerCount() << " cycles" << endl;
+    cerr << "[Soft] Timer: " << dec << sim.timerCount() << " cycles" << endl;
   }
-  cout << "[Soft] Speed: " << dec << static_cast<uint64_t>(sim.cycle() / wall_secs) << " cycles/s" << endl;
-  cout << "[Soft] Runtime: " << fixed << setprecision(3) << wall_secs << "s" << endl;
+  cerr << "[Soft] Speed: " << dec << static_cast<uint64_t>(sim.cycle() / wall_secs) << " cycles/s" << endl;
+  cerr << "[Soft] Runtime: " << fixed << setprecision(3) << wall_secs << "s" << endl;
 
   if (TRACE) owned_tracer->close();
   if (mem_trace) mem_trace->flush();
