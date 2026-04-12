@@ -14,13 +14,17 @@ object JumpType extends Enumeration {
   val Jump, Branch = Value
 }
 
+object MemType extends Enumeration {
+  val Load, Store, Atomic = Value
+}
+
 case class InstrPattern(
   val name: String,
   val opcode: String,
   val ty: InstrType.Value,
   val isOPImm: Option[Boolean] = None,
   val jumpType: Option[JumpType.Value] = None,
-  val memIsWrite: Option[Boolean] = None,
+  val memType: Option[MemType.Value] = None,
 ) extends DecodePattern {
   override def bitPat: BitPat = BitPat("b" + opcode)
 }
@@ -108,7 +112,7 @@ object InstrIsBranch extends BoolDecodeField[InstrPattern] {
 
 object InstrIsMem extends BoolDecodeField[InstrPattern] {
   override def name: String = "Decode is mem"
-  override def genTable(op: InstrPattern): BitPat = (op.memIsWrite match {
+  override def genTable(op: InstrPattern): BitPat = (op.memType match {
     case Some(_) => y
     case _ => n
   })
@@ -124,9 +128,19 @@ object InstrIsSystem extends BoolDecodeField[InstrPattern] {
 
 object InstrMemIsWrite extends BoolDecodeField[InstrPattern] {
   override def name: String = "Decode mem op is write"
-  override def genTable(op: InstrPattern): BitPat = (op.memIsWrite match {
-    case Some(true) => y
-    case Some(false) => n
+  override def genTable(op: InstrPattern): BitPat = (op.memType match {
+    case Some(MemType.Store) => y
+    case Some(_) => n
+    case _ => dc
+  })
+}
+
+object InstrMemIsAtomic extends BoolDecodeField[InstrPattern] {
+  override def name: String = "Decode mem op is atomic"
+  override def genTable(op: InstrPattern): BitPat = (op.memType match {
+    // TODO(LRSC): additionally decode LR/SC here
+    case Some(MemType.Atomic) => y
+    case Some(_) => n
     case _ => dc
   })
 }
@@ -219,20 +233,21 @@ class Decode(implicit val params: CoreParameters) extends Module {
     InstrPattern("JALR", "11001", InstrType.I, jumpType = Some(JumpType.Jump)),
 
     InstrPattern("BRANCH", "11000", InstrType.B, isOPImm = Some(false), jumpType = Some(JumpType.Branch)),
-    InstrPattern("LOAD", "00000", InstrType.I, memIsWrite = Some(false)),
-    InstrPattern("STORE", "01000", InstrType.S, memIsWrite = Some(true)),
+    InstrPattern("LOAD", "00000", InstrType.I, memType = Some(MemType.Load)),
+    InstrPattern("STORE", "01000", InstrType.S, memType = Some(MemType.Store)),
     InstrPattern("OP-IMM", "00100", InstrType.I, isOPImm = Some(true)),
     InstrPattern("OP", "01100", InstrType.R, isOPImm = Some(false)),
     InstrPattern("AM", "00010", InstrType.R, isOPImm = Some(false)), // Custom-0
     InstrPattern("SYSTEM", "11100", InstrType.I), // Doesn't use adder result
     InstrPattern("OP-FP", "10100", InstrType.R),
+    InstrPattern("AMO", "01011", InstrType.R, memType = Some(MemType.Atomic)),
   )
 
   val dectraits = Seq(
     InstrAdder1PC, InstrAdder2Imm, InstrALU2Imm,
     InstrRDALU, InstrRDLUI, InstrRDAUIPC, InstrRDPCLink, InstrRDIgnore,
     InstrIsJump, InstrIsBranch,
-    InstrIsMem, InstrMemIsWrite,
+    InstrIsMem, InstrMemIsWrite, InstrMemIsAtomic,
     InstrIsSystem,
     InstrIsAM,
     InstrIsFP,
@@ -255,6 +270,7 @@ class Decode(implicit val params: CoreParameters) extends Module {
   decoded.isBr := decout(InstrIsBranch)
   decoded.isMem := decout(InstrIsMem)
   decoded.memIsWrite := decout(InstrMemIsWrite)
+  decoded.memIsAtomic := decout(InstrMemIsAtomic)
   decoded.isAM := decout(InstrIsAM)
   decoded.isSystem := decout(InstrIsSystem)
   decoded.isFP := decout(InstrIsFP)

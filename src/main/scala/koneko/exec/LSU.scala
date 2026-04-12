@@ -19,7 +19,13 @@ class LSU(implicit val param: CoreParameters) extends Module {
     val wdata = UInt(32.W)
     val write = Bool()
     val rsext = Bool()
+
+    val atomic = Bool()
+    val funct5 = UInt(5.W) // for atomic operations
   })))
+
+  // Asserts that write and AMO cannot both be asserted
+  assert(!req.valid || !req.bits.write || !req.bits.atomic, "AMO and write cannot both be true")
 
   val resp = IO(Output(UInt(32.W)))
 
@@ -52,14 +58,26 @@ class LSU(implicit val param: CoreParameters) extends Module {
   val spmAlignedAddr = (spmAddr >> 2) ## 0.U(2.W)
   val alignedAddr = (req.bits.addr >> 2) ## 0.U(2.W)
 
-  // --- SPM path (2-cycle reads, 1-cycle writes) ---
-  val spmReadPending = RegInit(false.B)
-  spmReadPending := req.valid && isSPM && !req.bits.write && !spmReadPending
-  val spmReady = Mux(req.bits.write, true.B, spmReadPending)
+  // --- SPM path (2-cycle reads / AMO, 1-cycle writes) ---
+  val spmamoalu = Module(new AMOALU32)
+  spmamoalu.orig := spm.io.data
+  spmamoalu.input := req.bits.wdata
+  spmamoalu.funct5 := req.bits.funct5
+
+  // SPM might be busy: new request, not write (AMO or read)
+  //   RegNext(req.ready || !req.valid) is the "new request" condition.
+  // Actual busy signal should also consider req.valid and isSPM
+  // But for generating req.ready, this is sufficient
+  val spmBusy = RegNext(req.ready || !req.valid) && !req.bits.write
 
   spm.io.addr := spmAlignedAddr
-  spm.io.we := Mux(req.fire && isSPM && req.bits.write, wbe, 0.U)
-  spm.io.wdata := wmapped
+  spm.io.we := MuxCase(0.U(4.W), Seq(
+    (req.valid && isSPM && req.bits.write) -> wbe,
+    RegNext(req.valid && !req.ready && isSPM && req.bits.atomic) -> "b1111".U(4.W)
+  ))
+  // Note: AMO necessarily takes two cycles, so if req.bits.atomic causes timing hazard,
+  // we can RegNext here.
+  spm.io.wdata := Mux(req.bits.atomic, spmamoalu.written, wmapped)
 
   // --- Global memory path ---
   val memSent = RegInit(false.B)
@@ -108,7 +126,7 @@ class LSU(implicit val param: CoreParameters) extends Module {
   }
 
   // --- Ready and response mux ---
-  req.ready := Mux(isSPM, spmReady, globalDone)
+  req.ready := Mux(isSPM, !spmBusy, globalDone)
 
   val rdata = Mux(isSPM, spm.io.data, globalRdata)
 

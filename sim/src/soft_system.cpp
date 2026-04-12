@@ -979,18 +979,6 @@ struct SoftSystemSim {
       auto target = routeOutput(pu_id, q.front());
       if (target && *target == output_idx) return input_idx;
     }
-    // Log when PU1 has a self-addressed flit stuck in inject port
-    if (LOG && pu_id == 1 && output_idx == r.core_output) {
-      const auto &inj = r.input_vcs[r.inject_port][vc];
-      if (!inj.empty() && inj.front().dst == 1) {
-        auto target = routeOutput(1, inj.front());
-        cerr << "[Soft] cycle=" << cycle << " SELF-ROUTE MISS pu=1 vc=" << vc
-             << " inject_port=" << r.inject_port << " core_output=" << r.core_output
-             << " routeOutput=" << (target ? to_string(*target) : "nullopt")
-             << " rr_next=" << start
-             << " tag=0x" << hex << inj.front().tag << dec << endl;
-      }
-    }
     return -1;
   }
 
@@ -1061,21 +1049,7 @@ struct SoftSystemSim {
           case RouterOutput::Core:
               if (core(pu).canAcceptExtInput(flit)) {
               core(pu).driveExtInput(flit);
-              if (LOG && pu == 1) {
-                cerr << "[Soft] cycle=" << cycle << " DELIVER pu=1"
-                     << " src=0x" << hex << flit.src
-                     << " tag=0x" << flit.tag << " data=0x" << flit.data << dec << endl;
-              }
               fired = true;
-            } else if (LOG && pu == 1 && flit.dst == 1) {
-              cerr << "[Soft] cycle=" << cycle << " EJECT-BLOCKED pu=1"
-                   << " src=0x" << hex << flit.src
-                   << " tag=0x" << flit.tag << " data=0x" << flit.data << dec
-                   << " input=" << chosen_input << "(inj=" << router(pu).inject_port << ")"
-                   << " vc=" << chosen_vc
-                   << " ext_in_ready=" << (int)core(pu).core->ext_in_ready
-                   << " ext_in_valid=" << (int)core(pu).core->ext_in_valid
-                   << " has_ext_input=" << core(pu).ext_input.has_value() << endl;
             }
             break;
           case RouterOutput::MemIf:
@@ -1211,34 +1185,6 @@ struct SoftSystemSim {
     ++cycle;
     reset_cycle = cycle <= RESET_LENGTH;
 
-    // Periodic PU1 state dump for debugging
-    if (LOG && cycle >= 4000 && cycle % 500 == 0) {
-      auto &c = core(1);
-      auto &r = router(1);
-      int inj_vc0 = static_cast<int>(r.input_vcs[r.inject_port][0].size());
-      int inj_vc1 = static_cast<int>(r.input_vcs[r.inject_port][1].size());
-      int total_buf = 0;
-      for (int pu = 1; pu <= num_pu; ++pu)
-        for (size_t i = 0; i < router(pu).input_vcs.size(); ++i)
-          for (int v = 0; v < SoftRouter::kNumVc; ++v)
-            total_buf += static_cast<int>(router(pu).input_vcs[i][v].size());
-      int ext_out_count = 0;
-      for (int pu = 1; pu <= num_pu; ++pu)
-        if (core(pu).core->ext_out_valid) ++ext_out_count;
-      int ext_in_ready_count = 0;
-      for (int pu = 1; pu <= num_pu; ++pu)
-        if (core(pu).core->ext_in_ready) ++ext_in_ready_count;
-      cerr << "[Soft] cycle=" << cycle << " PU1-STATE"
-           << " ext_out_valid=" << (int)c.core->ext_out_valid
-           << " ext_out_ready=" << (int)c.core->ext_out_ready
-           << " ext_in_valid=" << (int)c.core->ext_in_valid
-           << " ext_in_ready=" << (int)c.core->ext_in_ready
-           << " inj_vc0=" << inj_vc0 << " inj_vc1=" << inj_vc1
-           << " GLOBAL_router=" << total_buf
-           << " GLOBAL_ext_out=" << ext_out_count
-           << " GLOBAL_ext_in_rdy=" << ext_in_ready_count << endl;
-    }
-
     if (reset_cycle) {
       for (auto &c : cores) {
         c->core->reset = 1;
@@ -1275,18 +1221,6 @@ struct SoftSystemSim {
       c->core->eval();
     }
 
-    // Verify ext_in_ready didn't flip after updateExtOutReady
-    if (LOG) {
-      auto &c1 = core(1);
-      if (c1.ext_input && !c1.core->ext_in_ready) {
-        auto &f = *c1.ext_input;
-        cerr << "[Soft] cycle=" << cycle << " READY-FLIP pu=1"
-             << " src=0x" << hex << f.src << " tag=0x" << f.tag << dec
-             << " ext_in_valid=" << (int)c1.core->ext_in_valid
-             << " ext_in_ready=" << (int)c1.core->ext_in_ready << endl;
-      }
-    }
-
     pending_injected.clear();
     for (int pu = 1; pu <= num_pu; ++pu) {
       auto out = core(pu).currentOut();
@@ -1303,16 +1237,7 @@ struct SoftSystemSim {
     for (auto &c : cores) {
       c->posedge();
     }
-    for (const auto &[pu, flit] : pending_injected) {
-      if (LOG && pu == 1 && flit.dst == 1) {
-        int vc = flitVc(flit);
-        bool ok = router(pu).canAccept(router(pu).inject_port, vc);
-        cerr << "[Soft] cycle=" << cycle << " SELF-INJECT pu=1"
-             << " tag=0x" << hex << flit.tag << " data=0x" << flit.data << dec
-             << " vc=" << vc << " canAccept=" << ok << endl;
-      }
-      router(pu).enqueueInject(flit);
-    }
+    for (const auto &[pu, flit] : pending_injected) router(pu).enqueueInject(flit);
     periph.tick();
     commitClusterBuffers();
   }
@@ -1497,10 +1422,6 @@ void SoftPeriphIf::processDue(uint64_t cycle, SoftSystemSim &sim) {
   }
   if (entry.is_write) {
     sim.periph.write(entry.addr, entry.wdata);
-    if (LOG) {
-      cerr << "[Soft] cycle=" << cycle << " PERIPH-WRITE src=" << dec << entry.src
-           << " addr=0x" << hex << entry.addr << " wdata=0x" << entry.wdata << dec << endl;
-    }
     MemResponse resp;
     resp.id = entry.resp_id;
     memset(resp.data, 0, sizeof(resp.data));

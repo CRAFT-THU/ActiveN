@@ -84,7 +84,7 @@
 #define SPM_STOP_COUNT       (SPM_BASE + SPM_SIZE - 28)
 #define SPM_STOP_XOR         (SPM_BASE + SPM_SIZE - 32)
 
-#define NUM_ITERS            16
+#define NUM_ITERS            1024
 #define LEADER               1
 #define TARGET_CTRL_LEADER   ((2 << 16) | LEADER)
 #define TARGET_WORK_LOCAL    0x00030000
@@ -211,17 +211,16 @@ send_start:
 /* ---- tag 0: test traffic receiver (highest priority) ---- */
 test_handler:
   li    t0, SPM_LOCAL_XOR
-  lw    t1, 0(t0)
-  xor   t1, t1, a0
-  sw    t1, 0(t0)
+  amoxor.w zero, a0, (t0)
   j     do_wfi
 
 /* ---- tag 1: completion receiver ---- */
 completion_handler:
   li    t0, SPM_COMP_COUNT
-  lw    t1, 0(t0)
+  li    t1, 1
+  amoadd.w t1, t1, (t0)
+  /* t1 = old count; new count = t1+1 */
   addi  t1, t1, 1
-  sw    t1, 0(t0)
   li    t2, NUM_PU
   bne   t1, t2, do_wfi
   /* all completions received -> send stop to leader with local XOR */
@@ -234,9 +233,10 @@ completion_handler:
 /* ---- tag 2: start handler (leader, later rebound to stop) ---- */
 start_handler:
   li    t0, SPM_START_COUNT
-  lw    t1, 0(t0)
+  li    t1, 1
+  amoadd.w t1, t1, (t0)
+  /* t1 = old count; new count = t1+1 */
   addi  t1, t1, 1
-  sw    t1, 0(t0)
   li    t2, NUM_PU
   bne   t1, t2, do_wfi
   /* all PUs ready - rebind tag 2, start timer, broadcast work */
@@ -259,13 +259,12 @@ bcast_work:
 /* ---- tag 2 (rebound): stop handler (leader) ---- */
 stop_handler:
   li    t0, SPM_STOP_XOR
-  lw    t1, 0(t0)
-  xor   t1, t1, a0
-  sw    t1, 0(t0)
+  amoxor.w zero, a0, (t0)
   li    t0, SPM_STOP_COUNT
-  lw    t1, 0(t0)
+  li    t1, 1
+  amoadd.w t1, t1, (t0)
+  /* t1 = old count; new count = t1+1 */
   addi  t1, t1, 1
-  sw    t1, 0(t0)
   li    t2, NUM_PU
   bne   t1, t2, do_wfi
   /* all stops received - stop timer, write result */
@@ -280,10 +279,12 @@ stop_handler:
 /* ---- tag 3: work handler ---- */
 work_handler:
   li    t0, SPM_ITER
-  lw    t1, 0(t0)
+  li    t1, 1
+  amoadd.w t1, t1, (t0)
+  /* t1 = old iter count (our claimed slot) */
   li    t2, NUM_ITERS
   bge   t1, t2, work_done
-  /* advance PRNG -> destination */
+  /* advance PRNG -> destination (work_handler is never concurrent) */
   li    t0, SPM_PRNG
   lw    t3, 0(t0)
   XORSHIFT t3, t4
@@ -294,16 +295,10 @@ work_handler:
   sw    t3, 0(t0)
   /* XOR payload into local accumulator */
   li    t0, SPM_LOCAL_XOR
-  lw    t4, 0(t0)
-  xor   t4, t4, t3
-  sw    t4, 0(t0)
+  amoxor.w zero, t3, (t0)
   /* send test message (tag 0) */
   mv    a0, t3
   SEND1 a0, t5
-  /* increment iteration */
-  li    t0, SPM_ITER
-  addi  t1, t1, 1
-  sw    t1, 0(t0)
   /* yield to continue work */
   li    a0, 0
   li    t0, TARGET_WORK_LOCAL
@@ -325,14 +320,15 @@ work_done:
 /* ---- tag 3 (rebound): completion broadcast ---- */
 bcast_handler:
   li    t0, SPM_BCAST_IDX
-  lw    t1, 0(t0)
+  li    t1, 1
+  amoadd.w t1, t1, (t0)
+  /* t1 = old bcast_idx */
   addi  t2, t1, 1
   li    t3, (1 << 16)
   or    t2, t2, t3
   li    a0, 0
   SEND1 a0, t2
   addi  t1, t1, 1
-  sw    t1, 0(t0)
   li    t2, NUM_PU
   bge   t1, t2, do_wfi
   li    a0, 0

@@ -31,6 +31,7 @@ class uOp(implicit val param: CoreParameters) extends Bundle {
 
   val isMem = Bool()
   val memIsWrite = Bool()
+  val memIsAtomic = Bool()
 
   val isAM = Bool()
 

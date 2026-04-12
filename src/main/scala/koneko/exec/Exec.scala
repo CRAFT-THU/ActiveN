@@ -158,13 +158,15 @@ class Exec(implicit val param: CoreParameters) extends Module {
   val lsu = Module(new LSU)
   lsu.mem <> lsuMem
 
-  lsu.req.bits.addr := added
+  lsu.req.bits.addr := Mux(uop.memIsAtomic, rs1val, added)
   lsu.req.bits.len.b := uop.funct3(1, 0) === 0.U
   lsu.req.bits.len.h := uop.funct3(1, 0) === 1.U
   lsu.req.bits.len.w := uop.funct3(1, 0) === 2.U
   lsu.req.bits.rsext := !uop.funct3(2)
   lsu.req.bits.wdata := rs2val
   lsu.req.bits.write := uop.memIsWrite
+  lsu.req.bits.atomic := uop.memIsAtomic
+  lsu.req.bits.funct5 := uop.funct7(6, 2) // AMO funct5 is funct7[6:2]
   lsu.req.valid := valid && uop.isMem
 
   // BIU, target at rs2
