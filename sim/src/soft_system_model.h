@@ -36,6 +36,7 @@ class SoftSystemModel {
 
   const std::vector<MemTraceEvent> &lastMemTrace() const;
   const std::vector<PeriphTraceEvent> &lastPeriphTrace() const;
+  void printFinalStats() const;
 
  private:
   struct Impl;

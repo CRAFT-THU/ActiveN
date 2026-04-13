@@ -675,6 +675,70 @@ struct SoftRouter {
   }
 };
 
+struct PeriodicStat {
+  uint64_t total_hops = 0;
+  uint64_t total_injections = 0;
+  uint64_t total_mem_requests = 0;
+  uint64_t idle_lane_cycles = 0;
+  uint64_t idle_core_cycles = 0;
+  uint64_t blocked_vc_depth = 0;
+  uint64_t blocked_structural = 0;
+  uint64_t inflight_messages_sum = 0;
+  uint64_t inflight_dram_sum = 0;
+  uint64_t inflight_resp_sum = 0;
+
+  // Current inflight snapshots (not subtracted in operator-)
+  uint64_t cur_inflight_messages = 0;
+  uint64_t cur_inflight_dram = 0;
+  uint64_t cur_inflight_resp = 0;
+
+  PeriodicStat operator-(const PeriodicStat &o) const {
+    PeriodicStat r;
+    r.total_hops = total_hops - o.total_hops;
+    r.total_injections = total_injections - o.total_injections;
+    r.total_mem_requests = total_mem_requests - o.total_mem_requests;
+    r.idle_lane_cycles = idle_lane_cycles - o.idle_lane_cycles;
+    r.idle_core_cycles = idle_core_cycles - o.idle_core_cycles;
+    r.blocked_vc_depth = blocked_vc_depth - o.blocked_vc_depth;
+    r.blocked_structural = blocked_structural - o.blocked_structural;
+    r.inflight_messages_sum = inflight_messages_sum - o.inflight_messages_sum;
+    r.inflight_dram_sum = inflight_dram_sum - o.inflight_dram_sum;
+    r.inflight_resp_sum = inflight_resp_sum - o.inflight_resp_sum;
+    r.cur_inflight_messages = cur_inflight_messages;
+    r.cur_inflight_dram = cur_inflight_dram;
+    r.cur_inflight_resp = cur_inflight_resp;
+    return r;
+  }
+
+  void print(size_t cycles) const {
+    auto avg = [cycles](uint64_t val) -> double {
+      return cycles > 0 ? static_cast<double>(val) / cycles : 0;
+    };
+    cerr << "  hops:           " << total_hops
+         << " (avg " << fixed << setprecision(2) << avg(total_hops) << "/cyc)\n";
+    cerr << "  injections:     " << total_injections
+         << " (avg " << avg(total_injections) << "/cyc)\n";
+    cerr << "  mem_requests:   " << total_mem_requests
+         << " (avg " << avg(total_mem_requests) << "/cyc)\n";
+    cerr << "  idle_lanes:     " << idle_lane_cycles
+         << " (avg " << avg(idle_lane_cycles) << "/cyc)\n";
+    cerr << "  idle_cores:     " << idle_core_cycles
+         << " (avg " << avg(idle_core_cycles) << "/cyc)\n";
+    cerr << "  blocked_vc:     " << blocked_vc_depth
+         << " (avg " << avg(blocked_vc_depth) << "/cyc)\n";
+    cerr << "  blocked_hazard: " << blocked_structural
+         << " (avg " << avg(blocked_structural) << "/cyc)\n";
+    cerr << "  inflight_msg:   " << inflight_messages_sum
+         << " (avg " << avg(inflight_messages_sum) << "/cyc, cur " << cur_inflight_messages << ")\n";
+    cerr << "  inflight_dram:  " << inflight_dram_sum
+         << " (avg " << avg(inflight_dram_sum) << "/cyc, cur " << cur_inflight_dram << ")\n";
+    cerr << "  inflight_resp:  " << inflight_resp_sum
+         << " (avg " << avg(inflight_resp_sum) << "/cyc, cur " << cur_inflight_resp << ")\n";
+  }
+};
+
+static constexpr uint64_t STAT_PERIOD = 1000;
+
 struct SoftSystemSim {
   uint64_t cycle = 0;
   int num_pu;
@@ -692,6 +756,10 @@ struct SoftSystemSim {
   vector<uint64_t> mc_base;
   vector<multimap<uint64_t, MemResponse>> core_mem;
   vector<pair<int, Flit>> pending_injected;
+
+  PeriodicStat stats;
+  PeriodicStat last_periodic;
+  int total_mesh_outputs = 0;
 
   SoftSystemSim(int pu, int mc)
       : num_pu(pu), num_mc(mc), topo(buildTopology(pu, mc)), core_mem(pu + 1) {
@@ -717,6 +785,9 @@ struct SoftSystemSim {
       mc_base[i] = cumul;
       if (i < SYSTEM_CONFIG.core.numMemCtrl) cumul += SYSTEM_CONFIG.core.memCtrlSizes[i];
     }
+
+    for (int id = 1; id <= num_pu; ++id)
+      total_mesh_outputs += static_cast<int>(routers[id].mesh_dirs.size());
   }
 
   CoreState &core(int pu_id) { return *cores.at(pu_id - 1); }
@@ -1008,6 +1079,21 @@ struct SoftSystemSim {
     vector<vector<MemIfProposal>> memif_props(num_mc);
     for (int pu = 1; pu <= num_pu; ++pu) core(pu).clearExtInput();
 
+    // Compute demand per output port for blocking stats
+    vector<vector<int>> demand(num_pu + 1);
+    for (int pu = 1; pu <= num_pu; ++pu) {
+      auto &r = router(pu);
+      demand[pu].assign(r.outputs.size(), 0);
+      for (int input_idx = 0; input_idx < static_cast<int>(r.input_vcs.size()); ++input_idx) {
+        for (int vc = 0; vc < SoftRouter::kNumVc; ++vc) {
+          auto &q = r.input_vcs[input_idx][vc];
+          if (q.empty()) continue;
+          auto target = routeOutput(pu, q.front());
+          if (target) demand[pu][*target]++;
+        }
+      }
+    }
+
     for (int pu = 1; pu <= num_pu; ++pu) {
       auto &r = router(pu);
 
@@ -1115,6 +1201,28 @@ struct SoftSystemSim {
 
     for (const auto &transfer : transfers) {
       router(transfer.dst_pu).enqueue(transfer.ingress_port, transfer.flit);
+    }
+
+    // Collect stats: hops, idle lanes, blocking
+    stats.total_hops += transfers.size();
+    stats.idle_lane_cycles += total_mesh_outputs - static_cast<int>(transfers.size());
+
+    vector<vector<bool>> consumed(num_pu + 1);
+    for (int pu = 1; pu <= num_pu; ++pu)
+      consumed[pu].assign(router(pu).outputs.size(), false);
+    for (const auto &pop : deferred_pops)
+      consumed[pop.pu][pop.output_idx] = true;
+
+    for (int pu = 1; pu <= num_pu; ++pu) {
+      auto &r = router(pu);
+      for (int oi = 0; oi < static_cast<int>(r.outputs.size()); ++oi) {
+        int d = demand[pu][oi];
+        int c = consumed[pu][oi] ? 1 : 0;
+        if (d > 0 && c == 0 && r.outputs[oi].kind == RouterOutput::Mesh)
+          stats.blocked_vc_depth++;
+        if (d > c)
+          stats.blocked_structural += d - c;
+      }
     }
   }
 
@@ -1240,6 +1348,70 @@ struct SoftSystemSim {
     for (const auto &[pu, flit] : pending_injected) router(pu).enqueueInject(flit);
     periph.tick();
     commitClusterBuffers();
+
+    // Stat: injections
+    stats.total_injections += pending_injected.size();
+
+    // Stat: idle cores (no inject and no ext_input delivered this cycle)
+    {
+      int active_cores = 0;
+      for (int pu = 1; pu <= num_pu; ++pu) {
+        bool injected = false;
+        for (const auto &[ipu, _] : pending_injected) {
+          if (ipu == pu) { injected = true; break; }
+        }
+        bool received = core(pu).ext_input.has_value();
+        if (injected || received) active_cores++;
+      }
+      stats.idle_core_cycles += num_pu - active_cores;
+    }
+
+    // Stat: inflight messages (flits in router VC buffers)
+    {
+      uint64_t inflight_msg = 0;
+      for (int pu = 1; pu <= num_pu; ++pu) {
+        auto &r = router(pu);
+        for (auto &vcs : r.input_vcs)
+          for (auto &q : vcs) inflight_msg += q.size();
+      }
+      stats.inflight_messages_sum += inflight_msg;
+      stats.cur_inflight_messages = inflight_msg;
+    }
+
+    // Stat: inflight DRAM requests (allocated memif slots)
+    {
+      uint64_t inflight_dram = 0;
+      for (int mc = 0; mc < num_mc; ++mc)
+        for (auto &s : memifs[mc].inflight)
+          if (s.allocated) inflight_dram++;
+      stats.inflight_dram_sum += inflight_dram;
+      stats.cur_inflight_dram = inflight_dram;
+    }
+
+    // Stat: inflight memory responses (ring queues + completed slots + cluster buffers)
+    {
+      uint64_t inflight_resp = 0;
+      for (int mc = 0; mc < num_mc; ++mc) {
+        inflight_resp += memifs[mc].ring_queue.size();
+        for (auto &s : memifs[mc].inflight)
+          if (s.allocated && s.completed) inflight_resp++;
+      }
+      inflight_resp += periph_if.ring_queue.size();
+      for (auto &s : periph_if.inflight)
+        if (s.allocated && s.completed) inflight_resp++;
+      for (auto &buf : cluster_buffers)
+        if (buf.valid || buf.pending_valid) inflight_resp++;
+      stats.inflight_resp_sum += inflight_resp;
+      stats.cur_inflight_resp = inflight_resp;
+    }
+
+    // Periodic stats
+    if (cycle % STAT_PERIOD == 0) {
+      PeriodicStat delta = stats - last_periodic;
+      cerr << "[Soft] Stats @ cycle " << cycle << ":\n";
+      delta.print(STAT_PERIOD);
+      last_periodic = stats;
+    }
   }
 
   void stepNegedge() {
@@ -1317,6 +1489,7 @@ void SoftMemIf::processDue(uint64_t cycle, SoftSystemSim &sim) {
   if (issue_slot >= 0) {
     auto &entry = inflight[issue_slot];
     traceMemReq(cycle, mc_idx, entry.is_write, entry.addr, static_cast<uint16_t>(issue_slot));
+    sim.stats.total_mem_requests++;
     uint32_t global_addr = sim.mcGlobalAddr(mc_idx, entry.addr);
 
     if (entry.is_write) {
@@ -1563,6 +1736,12 @@ const std::vector<PeriphTraceEvent> &SoftSystemModel::lastPeriphTrace() const {
   return impl_->last_periph_trace;
 }
 
+void SoftSystemModel::printFinalStats() const {
+  uint64_t c = impl_->sim.cycle;
+  cerr << "[Soft] Final stats (over " << c << " cycles):\n";
+  impl_->sim.stats.print(c);
+}
+
 int runSoftSystemModelFromEnv() {
   std::unique_ptr<VerilatedFstC> owned_tracer;
 
@@ -1657,6 +1836,8 @@ int runSoftSystemModelFromEnv() {
   }
   cerr << "[Soft] Speed: " << dec << static_cast<uint64_t>(sim.cycle() / wall_secs) << " cycles/s" << endl;
   cerr << "[Soft] Runtime: " << fixed << setprecision(3) << wall_secs << "s" << endl;
+
+  sim.printFinalStats();
 
   if (TRACE) owned_tracer->close();
   if (mem_trace) mem_trace->flush();
