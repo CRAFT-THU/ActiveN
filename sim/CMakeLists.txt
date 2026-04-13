@@ -119,6 +119,8 @@ set(BOLT_SINGLE_CYCLES 5000000)
 set(BOLT_MULTI_CYCLES 100000)
 
 set(VERILATOR_COMMON_ARGS -O3 -Wall -Wno-fatal -Wno-DECLFILENAME --trace-params --trace-structs --top-module Core -I${CVFPU_DIR}/src/common_cells/include -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNSIGNED -Wno-CASEINCOMPLETE -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-UNDRIVEN -Wno-PINMISSING)
+set(VERILATOR_CORE_ARGS ${VERILATOR_COMMON_ARGS} --top-module Core)
+set(VERILATOR_SYSTEM_ARGS ${VERILATOR_COMMON_ARGS} --top-module System)
 
 # Single-core simulation driver (no DRAM dependency)
 add_executable(sim_single
@@ -131,7 +133,7 @@ verilate(
     PREFIX rtl
     TRACE_FST
     DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/verilated
-    VERILATOR_ARGS ${VERILATOR_COMMON_ARGS}
+    VERILATOR_ARGS ${VERILATOR_CORE_ARGS}
 )
 apply_bolt(sim_single ${BOLT_SINGLE_PAYLOAD} ${BOLT_SINGLE_CYCLES})
 
@@ -151,8 +153,6 @@ execute_process(
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/gen_system_header.py
             ${SYSTEM_CONFIG_JSON} ${CMAKE_CURRENT_BINARY_DIR}
 )
-
-set(VERILATOR_SYSTEM_ARGS -O3 -Wall -Wno-fatal -Wno-DECLFILENAME --trace-params --trace-structs --top-module System -I${CVFPU_DIR}/src/common_cells/include -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNSIGNED -Wno-CASEINCOMPLETE -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-UNDRIVEN -Wno-PINMISSING)
 
 add_library(system_model_lib STATIC
     src/system.cpp
@@ -187,7 +187,7 @@ verilate(
     PREFIX soft_rtl
     TRACE_FST
     DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/soft_verilated
-    VERILATOR_ARGS ${VERILATOR_COMMON_ARGS}
+    VERILATOR_ARGS ${VERILATOR_CORE_ARGS}
 )
 
 find_package(OpenMP)

@@ -28,7 +28,7 @@
           cmakeFlags = [ "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" ];
         }; in mkShell {
           buildInputs = [
-            (mill.override { jre = pkgs.jdk8; })
+            (mill.override { jre = pkgs.jdk11; })
             circt cmake ninja verilator espresso
             cargo rustc
             python3 nodejs
