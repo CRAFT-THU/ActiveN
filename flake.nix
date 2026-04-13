@@ -1,6 +1,6 @@
 {
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/24.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     flake-utils.url = "github:numtide/flake-utils";
   };
   outputs = { self, nixpkgs, flake-utils } :
@@ -25,6 +25,7 @@
             sha256 = "sha256-DJZ2QdrWHf7PEKju8Q5huoNBLA+E4JI3wcgaVsdzag0=";
           };
           nativeBuildInputs = [ cmake ninja ];
+          cmakeFlags = [ "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" ];
         }; in mkShell {
           buildInputs = [
             (mill.override { jre = pkgs.jdk8; })
@@ -33,6 +34,11 @@
             python3 nodejs
             dramsim3 zlib
             crossPkgs.buildPackages.gcc
+            llvmPackages.clang
+            llvmPackages.lld
+            llvmPackages.llvm
+            bolt_21
+            linuxPackages.perf
           ];
         };
       }

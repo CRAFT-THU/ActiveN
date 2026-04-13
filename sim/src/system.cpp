@@ -36,7 +36,6 @@
 #include <verilated_fst_c.h>
 #include "sys_verilated/sys_rtl.h"
 #include "sys_verilated/sys_rtl___024root.h"
-#include "sys_verilated/sys_rtl_Core.h"
 
 #include "devices.h"
 #include "system_model.h"
@@ -108,16 +107,6 @@ struct SystemModel::Impl {
   std::vector<std::deque<MemResponse>> mem_resps;
   std::vector<MemPort> mem_ports;
   std::vector<uint64_t> mc_base; // cumulative base address per MC
-
-  sys_rtl_Core* getPuCore(int id) {
-    auto r = sys->rootp;
-    switch(id) {
-#define PU_CASE(N) case N: return r->__PVT__System__DOT__pu_##N
-      SYSTEM_PU_CASE_ENTRIES
-#undef PU_CASE
-      default: return nullptr;
-    }
-  }
 
   // Peripheral
   PeripheralDevice periph;
