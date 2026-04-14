@@ -1,10 +1,10 @@
 #pragma once
 
-#include <concepts>
 #include <optional>
 #include <cstdint>
 #include <vector>
 #include <string_view>
+#include <memory>
 
 // System-level simulators
 
@@ -94,12 +94,26 @@ public:
   virtual bool printStats(uint64_t cycles, bool final) = 0;
 };
 
-template<typename T>
-concept ConcreteSystemBackend = requires(T obj, std::optional<std::string_view> tracePath) {
-  requires std::derived_from<T, SystemBackend>;
+struct DRAMsim3Config {
+  std::string_view configFile;
+  std::string_view workDir;
+};
 
-  // T has a specific constructor shape
-  // Arguments:
-  // - The path to the trace file
-  T(tracePath);
+class System {
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+public:
+  System(
+    std::vector<std::string_view> dramInitFiles,
+    std::optional<DRAMsim3Config> dramTimingModel
+  );
+  ~System();
+
+  // Add a backend.
+  // If multiple backends are added, they will form a cosimulation,
+  // where any discrepancy in the observed behavior (e.g. memory requests) will cause a failure.
+  void addBackend(std::unique_ptr<SystemBackend> backend);
+
+  // Run the simulation until all backends have finished, or it's timed out, or a discrepancy is found.
+  void run(uint64_t maxCycles);
 };

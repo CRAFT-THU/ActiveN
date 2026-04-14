@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "sim_model_common.h"
+#include "system.h"
 
 class VerilatedFstC;
 
@@ -15,20 +16,26 @@ void unloadSoftSystemModelImage();
 bool openSoftSystemModelMemTrace(const std::optional<std::string> &path, std::string *error = nullptr);
 void setSoftSystemModelLogging(bool enabled);
 
-class SoftSystemModel {
+class SoftSystemModel : public SystemBackend {
  public:
   SoftSystemModel(int pu, int mc);
-  ~SoftSystemModel();
+  ~SoftSystemModel() override;
   SoftSystemModel(SoftSystemModel &&) noexcept;
   SoftSystemModel &operator=(SoftSystemModel &&) noexcept;
   SoftSystemModel(const SoftSystemModel &) = delete;
   SoftSystemModel &operator=(const SoftSystemModel &) = delete;
 
   void attachTrace(VerilatedFstC *tracer, int depth);
-  void step();
+
+  // SystemBackend interface
+  SystemConfig config() const override;
+  void step() override;
+  void mem(const MemBusIn *, MemBusOut *) override;
+  bool printStats(uint64_t cycles, bool final) override;
+
+  // Legacy accessors (used by cosim / run helpers)
   void stepPosedge();
   void stepNegedge();
-
   uint64_t cycle() const;
   bool finished() const;
   uint32_t result() const;

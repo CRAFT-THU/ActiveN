@@ -56,6 +56,8 @@ function(apply_bolt TARGET BOLT_MEOW_TEXT BOLT_MEOW_MAX_CYCLES)
   if(NOT USE_BOLT)
     return()
   endif()
+  # Extra positional args become BOLT_EXTRA_ARGS
+  set(BOLT_RUN_ARGS ${ARGN})
   set(FDATA "${CMAKE_BINARY_DIR}/${TARGET}.fdata")
   add_custom_command(TARGET ${TARGET} POST_BUILD
     COMMENT "BOLT: optimizing ${TARGET}"
@@ -64,7 +66,7 @@ function(apply_bolt TARGET BOLT_MEOW_TEXT BOLT_MEOW_MAX_CYCLES)
             --instrument --instrumentation-file=${FDATA}
             -o $<TARGET_FILE:${TARGET}>.inst
     # Profile (ignore non-zero exit from simulation timeout)
-    COMMAND sh -c "MEOW_TEXT=${BOLT_MEOW_TEXT} MEOW_MAX_CYCLES=${BOLT_MEOW_MAX_CYCLES} $<TARGET_FILE:${TARGET}>.inst > /dev/null 2>&1 || true"
+    COMMAND sh -c "MEOW_TEXT=${BOLT_MEOW_TEXT} MEOW_MAX_CYCLES=${BOLT_MEOW_MAX_CYCLES} $<TARGET_FILE:${TARGET}>.inst ${BOLT_RUN_ARGS} > /dev/null 2>&1 || true"
     # Optimize
     COMMAND ${LLVM_BOLT} $<TARGET_FILE:${TARGET}>
             -o $<TARGET_FILE:${TARGET}>.bolted
@@ -154,12 +156,21 @@ execute_process(
             ${SYSTEM_CONFIG_JSON} ${CMAKE_CURRENT_BINARY_DIR}
 )
 
-add_library(system_model_lib STATIC
-    src/system.cpp
+# Unified frontend library (system.cpp → System class)
+add_library(system_frontend_lib STATIC
+    src/system_new.cpp
 )
+target_link_libraries(system_frontend_lib PUBLIC ${DRAMSIM3})
 
+# Hard backend: Verilated System RTL
+# hard_backend.h is generated (header-only adapter), but needs the verilated library.
+# We create a dummy static lib to verilate against, then link it.
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/hard_backend_stub.cpp "// stub for verilator linkage\n")
+add_library(hard_backend_lib STATIC
+    ${CMAKE_CURRENT_BINARY_DIR}/hard_backend_stub.cpp
+)
 verilate(
-  system_model_lib
+  hard_backend_lib
     SOURCES ${CVFPU_SOURCES} ${CMAKE_SOURCE_DIR}/../System.sv ${CMAKE_SOURCE_DIR}/../Aux.sv
     PREFIX sys_rtl
     TRACE_FST
@@ -167,16 +178,7 @@ verilate(
     VERILATOR_ARGS ${VERILATOR_SYSTEM_ARGS}
 )
 
-target_link_libraries(system_model_lib PUBLIC ${DRAMSIM3})
-
-add_executable(sim_system
-  src/system_main.cpp
-)
-
-target_link_libraries(sim_system PRIVATE system_model_lib)
-apply_bolt(sim_system ${BOLT_MULTI_PAYLOAD} ${BOLT_MULTI_CYCLES})
-
-# Software NoC simulator (many Core instances connected in C++)
+# Soft backend: many Core instances + C++ NoC
 add_library(soft_system_model_lib STATIC
     src/soft_system.cpp
 )
@@ -197,16 +199,13 @@ endif()
 
 target_link_libraries(soft_system_model_lib PUBLIC ${DRAMSIM3})
 
-add_executable(sim_soft
-  src/soft_system_main.cpp
+# Unified binary: sim_system --soft / --hard / --soft --hard (cosim)
+add_executable(sim_system
+  src/main.cpp
 )
-
-target_link_libraries(sim_soft PRIVATE soft_system_model_lib)
-apply_bolt(sim_soft ${BOLT_MULTI_PAYLOAD} ${BOLT_MULTI_CYCLES})
-
-add_executable(sim_cosim
-  src/cosim.cpp
+target_link_libraries(sim_system PRIVATE
+  system_frontend_lib
+  soft_system_model_lib
+  hard_backend_lib
 )
-
-target_link_libraries(sim_cosim PRIVATE system_model_lib soft_system_model_lib)
-apply_bolt(sim_cosim ${BOLT_MULTI_PAYLOAD} ${BOLT_MULTI_CYCLES})
+apply_bolt(sim_system "${BOLT_MULTI_PAYLOAD}" "${BOLT_MULTI_CYCLES}" "--soft")

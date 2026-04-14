@@ -28,7 +28,7 @@ class GlobalMemReq extends Bundle {
   val id    = UInt(16.W)
   val addr  = UInt(32.W)
   val wdata = UInt(256.W)
-  val wbe   = UInt(32.W)
+  val size  = UInt(8.W)
   val write = Bool()
 }
 

@@ -47,6 +47,7 @@
 #include "soft_verilated/soft_rtl.h"
 #include "devices.h"
 #include "soft_system_model.h"
+#include "system.h"
 #include "system_config.h"
 
 using namespace std;
@@ -438,6 +439,7 @@ struct SoftMemIf {
   int local_resp_rr = 0;
   int remote_resp_rr = 0;
   bool ring_enq_prefer_incoming = true;
+  SoftSystemSim *sim_ptr = nullptr;  // set during init
 
   array<MemInflightSlot, kMaxInflight> inflight = {};
   multimap<uint64_t, int> ready_events;
@@ -513,8 +515,19 @@ struct SoftMemIf {
     return resp;
   }
 
+  // Pending request for external servicing via mem()
+  int pending_issue_slot = -1;
+
+  // Deferred responses: stored in mem(), applied at start of next step()
+  vector<MemResponse> deferred_responses;
+
   void accept(const Flit &flit, uint64_t cycle);
-  void processDue(uint64_t cycle, SoftSystemSim &sim);
+  void advanceSlots(uint64_t cycle);
+  void processScatter(uint64_t cycle);
+  void findPendingReq(uint64_t cycle, SoftSystemSim &sim);
+  void acceptIssue(uint64_t cycle);
+  void applyDeferredResponses();
+  void deferResponse(const MemResponse &resp);
   int numIngress() const { return static_cast<int>(zone_clusters.size()); }
 
   bool isLocal(uint16_t pu_id) const {
@@ -582,8 +595,18 @@ struct SoftPeriphIf {
     return resp;
   }
 
+  // Pending request for external servicing via mem()
+  int pending_issue_slot = -1;
+
+  // Deferred responses: stored in mem(), applied at start of next step()
+  vector<MemResponse> deferred_responses;
+
   void accept(const Flit &flit, uint64_t cycle);
-  void processDue(uint64_t cycle, SoftSystemSim &sim);
+  void advanceSlots(uint64_t cycle);
+  void findPendingReq(uint64_t cycle, SoftSystemSim &sim);
+  void acceptIssue(uint64_t cycle);
+  void applyDeferredResponses();
+  void deferResponse(const MemResponse &resp);
 };
 
 static int flitVc(const Flit &flit) {
@@ -775,6 +798,7 @@ struct SoftSystemSim {
       int pu_start = mc_idx * clusters_per_mc * 16 + 1;
       int pu_end = (mc_idx + 1) * clusters_per_mc * 16;
       memifs.emplace_back(mc_idx, pu_start, pu_end, topo.mc_zones[mc_idx]);
+      memifs.back().sim_ptr = this;
     }
 
     cluster_buffers.resize(num_pu / 16);
@@ -783,7 +807,7 @@ struct SoftSystemSim {
     uint64_t cumul = 0;
     for (int i = 0; i < num_mc; ++i) {
       mc_base[i] = cumul;
-      if (i < SYSTEM_CONFIG.core.numMemCtrl) cumul += SYSTEM_CONFIG.core.memCtrlSizes[i];
+      if (i < SYSTEM_NUM_MEM_CTRL) cumul += SYSTEM_MC_SIZES[i];
     }
 
     for (int id = 1; id <= num_pu; ++id)
@@ -1307,10 +1331,20 @@ struct SoftSystemSim {
 
     for (auto &c : cores) c->retireInputs();
 
+    // Apply deferred responses from previous cycle's mem() before advanceSlots/processResponseNetwork
+    for (int mc = 0; mc < num_mc; ++mc) memifs[mc].applyDeferredResponses();
+    periph_if.applyDeferredResponses();
+
     presentClusterResponses();
     deliverMemResponses();
-    for (int mc = 0; mc < num_mc; ++mc) memifs[mc].processDue(cycle, *this);
-    periph_if.processDue(cycle, *this);
+    for (int mc = 0; mc < num_mc; ++mc) {
+      memifs[mc].advanceSlots(cycle);
+      memifs[mc].findPendingReq(cycle, *this);
+      // Scatter only runs when no regular issue slot is found (matching old processDue behavior)
+      if (memifs[mc].pending_issue_slot < 0) memifs[mc].processScatter(cycle);
+    }
+    periph_if.advanceSlots(cycle);
+    periph_if.findPendingReq(cycle, *this);
     processResponseNetwork();
 
     routeRouters();
@@ -1417,6 +1451,77 @@ struct SoftSystemSim {
   void stepNegedge() {
     for (auto &c : cores) c->negedge();
   }
+
+  // mem() is called once per cycle by the frontend after step().
+  // bus_in[0] / bus_out[0] = peripheral, bus_in[1..numMC] / bus_out[1..numMC] = MCs
+  void mem(const MemBusIn *bus_in, MemBusOut *bus_out) {
+    // --- Defer responses (applied at start of next step()) ---
+
+    // Peripheral (idx 0)
+    if (bus_in[0].resp) {
+      MemResponse resp;
+      resp.id = bus_in[0].resp->id;
+      memcpy(resp.data, bus_in[0].resp->data, sizeof(resp.data));
+      periph_if.deferResponse(resp);
+    }
+
+    // MCs (idx 1..numMC)
+    for (int mc = 0; mc < num_mc; ++mc) {
+      if (bus_in[mc + 1].resp) {
+        MemResponse resp;
+        resp.id = bus_in[mc + 1].resp->id;
+        memcpy(resp.data, bus_in[mc + 1].resp->data, sizeof(resp.data));
+        memifs[mc].deferResponse(resp);
+      }
+    }
+
+    // --- Report pending requests ---
+
+    // Peripheral (idx 0)
+    if (periph_if.pending_issue_slot >= 0 && bus_in[0].reqAccepting) {
+      auto &entry = periph_if.inflight[periph_if.pending_issue_slot];
+      GlobalMemReq req{};
+      req.id = static_cast<uint16_t>(periph_if.pending_issue_slot);
+      req.addr = entry.addr;
+      req.size = entry.size;
+      req.write = entry.is_write;
+      memset(req.wdata, 0, sizeof(req.wdata));
+      if (entry.is_write) {
+        uint32_t word_idx = (entry.addr & 31) >> 2;
+        memcpy(req.wdata + word_idx * 4, &entry.wdata, 4);
+      }
+      bus_out[0].req = req;
+      periph_if.acceptIssue(cycle);
+    } else {
+      bus_out[0].req = std::nullopt;
+    }
+
+    // MCs (idx 1..numMC)
+    for (int mc = 0; mc < num_mc; ++mc) {
+      int idx = mc + 1;
+      if (memifs[mc].pending_issue_slot >= 0 && bus_in[idx].reqAccepting) {
+        auto &entry = memifs[mc].inflight[memifs[mc].pending_issue_slot];
+        GlobalMemReq req{};
+        req.id = static_cast<uint16_t>(memifs[mc].pending_issue_slot);
+        req.addr = entry.addr;
+        req.size = entry.size;
+        req.write = entry.is_write;
+        memset(req.wdata, 0, sizeof(req.wdata));
+        if (entry.is_write) {
+          uint32_t word_idx = (entry.addr & 31) >> 2;
+          memcpy(req.wdata + word_idx * 4, &entry.wdata, 4);
+          // Keep internal memory in sync (for scatter reads)
+          uint32_t global_addr = mcGlobalAddr(mc, entry.addr);
+          applyScalarStore(global_addr, entry.size, entry.wdata);
+        }
+        bus_out[idx].req = req;
+        memifs[mc].acceptIssue(cycle);
+        stats.total_mem_requests++;
+      } else {
+        bus_out[idx].req = std::nullopt;
+      }
+    }
+  }
 };
 
 void SoftMemIf::accept(const Flit &flit, uint64_t cycle) {
@@ -1464,7 +1569,7 @@ void SoftMemIf::accept(const Flit &flit, uint64_t cycle) {
   }
 }
 
-void SoftMemIf::processDue(uint64_t cycle, SoftSystemSim &sim) {
+void SoftMemIf::advanceSlots(uint64_t cycle) {
   auto free_range = free_events.equal_range(cycle);
   for (auto it = free_range.first; it != free_range.second; ++it) clearSlot(it->second);
   free_events.erase(free_range.first, free_range.second);
@@ -1483,31 +1588,9 @@ void SoftMemIf::processDue(uint64_t cycle, SoftSystemSim &sim) {
     memcpy(inflight[slot].data, it->second.second.data, sizeof(inflight[slot].data));
   }
   completion_events.erase(complete_range.first, complete_range.second);
+}
 
-  int issue_slot = findIssueSlot();
-
-  if (issue_slot >= 0) {
-    auto &entry = inflight[issue_slot];
-    traceMemReq(cycle, mc_idx, entry.is_write, entry.addr, static_cast<uint16_t>(issue_slot));
-    sim.stats.total_mem_requests++;
-    uint32_t global_addr = sim.mcGlobalAddr(mc_idx, entry.addr);
-
-    if (entry.is_write) {
-      sim.applyScalarStore(global_addr, entry.size, entry.wdata);
-      MemResponse resp;
-      resp.id = entry.resp_id;
-      memset(resp.data, 0, sizeof(resp.data));
-      completion_events.emplace(cycle + 1, std::make_pair(issue_slot, resp));
-    } else {
-      MemResponse resp = sim.buildMemResp(entry.resp_id, global_addr);
-      completion_events.emplace(cycle + sim.memReadCompleteLatency(mc_idx),
-                                std::make_pair(issue_slot, resp));
-    }
-    entry.issued = true;
-    issue_rr = (issue_slot + 1) % kMaxInflight;
-    return;
-  }
-
+void SoftMemIf::processScatter(uint64_t cycle) {
   auto range = pending_scatter_ops.equal_range(cycle);
   vector<multimap<uint64_t, PendingMemOp>::iterator> erase_list;
   for (auto it = range.first; it != range.second; ++it) {
@@ -1515,12 +1598,12 @@ void SoftMemIf::processDue(uint64_t cycle, SoftSystemSim &sim) {
     uint64_t beat_issue = cycle;
     for (uint32_t addr = op.addr; addr < op.end; addr += 32) {
       traceMemReq(beat_issue, mc_idx, false, addr, SCATTER_RESP_ID);
-      auto resp = sim.buildMemResp(0xFFFF, sim.mcGlobalAddr(mc_idx, addr));
+      auto resp = sim_ptr->buildMemResp(0xFFFF, sim_ptr->mcGlobalAddr(mc_idx, addr));
       int cluster_pos = 0;
       for (int cluster_idx : zone_clusters) {
         uint64_t at = beat_issue + 3 + cluster_pos;
         for (int pu = cluster_idx * 16 + 1; pu <= cluster_idx * 16 + 16; ++pu) {
-          sim.scheduleMcResp(pu, mc_idx, at, resp);
+          sim_ptr->scheduleMcResp(pu, mc_idx, at, resp);
         }
         cluster_pos++;
       }
@@ -1529,6 +1612,116 @@ void SoftMemIf::processDue(uint64_t cycle, SoftSystemSim &sim) {
     erase_list.push_back(it);
   }
   for (auto it : erase_list) pending_scatter_ops.erase(it);
+}
+
+void SoftMemIf::findPendingReq(uint64_t cycle, SoftSystemSim &sim) {
+  pending_issue_slot = findIssueSlot();
+  (void)cycle;
+  (void)sim;
+}
+
+void SoftMemIf::acceptIssue(uint64_t cycle) {
+  if (pending_issue_slot < 0) return;
+  auto &entry = inflight[pending_issue_slot];
+  traceMemReq(cycle, mc_idx, entry.is_write, entry.addr, static_cast<uint16_t>(pending_issue_slot));
+  entry.issued = true;
+  // Writes complete internally (1-cycle latency), matching RTL MemIf behavior.
+  // The external write response from the frontend will be ignored (slot already completed).
+  if (entry.is_write) {
+    MemResponse resp;
+    resp.id = entry.resp_id;
+    memset(resp.data, 0, sizeof(resp.data));
+    completion_events.emplace(cycle + 1, std::make_pair(pending_issue_slot, resp));
+  }
+  issue_rr = (pending_issue_slot + 1) % kMaxInflight;
+  pending_issue_slot = -1;
+}
+
+void SoftMemIf::deferResponse(const MemResponse &resp) {
+  deferred_responses.push_back(resp);
+}
+
+void SoftMemIf::applyDeferredResponses() {
+  for (auto &resp : deferred_responses) {
+    // resp.id is the slot index (matching RTL MemIf convention)
+    int slot = static_cast<int>(resp.id);
+    if (slot < 0 || slot >= kMaxInflight) continue;
+    auto &entry = inflight[slot];
+    if (entry.allocated && entry.issued && !entry.completed) {
+      entry.completed = true;
+      memcpy(entry.data, resp.data, sizeof(entry.data));
+    }
+  }
+  deferred_responses.clear();
+}
+
+void SoftPeriphIf::advanceSlots(uint64_t cycle) {
+  auto free_range = free_events.equal_range(cycle);
+  for (auto it = free_range.first; it != free_range.second; ++it) clearSlot(it->second);
+  free_events.erase(free_range.first, free_range.second);
+
+  auto ready_range = ready_events.equal_range(cycle);
+  for (auto it = ready_range.first; it != ready_range.second; ++it) {
+    if (inflight[it->second].allocated) inflight[it->second].ready = true;
+  }
+  ready_events.erase(ready_range.first, ready_range.second);
+
+  auto complete_range = completion_events.equal_range(cycle);
+  for (auto it = complete_range.first; it != complete_range.second; ++it) {
+    int slot = it->second.first;
+    if (!inflight[slot].allocated) continue;
+    inflight[slot].completed = true;
+    memcpy(inflight[slot].data, it->second.second.data, sizeof(inflight[slot].data));
+  }
+  completion_events.erase(complete_range.first, complete_range.second);
+}
+
+void SoftPeriphIf::findPendingReq(uint64_t cycle, SoftSystemSim &sim) {
+  pending_issue_slot = findIssueSlot();
+  (void)cycle;
+  (void)sim;
+}
+
+void SoftPeriphIf::acceptIssue(uint64_t cycle) {
+  if (pending_issue_slot < 0) return;
+  auto &entry = inflight[pending_issue_slot];
+  if (current_periph_trace) {
+    current_periph_trace->push_back(PeriphTraceEvent{
+      .cycle = cycle,
+      .id = static_cast<uint16_t>(pending_issue_slot),
+      .addr = entry.addr,
+      .is_write = entry.is_write,
+      .wdata = entry.is_write ? entry.wdata : 0,
+    });
+  }
+  entry.issued = true;
+  // Writes complete internally (1-cycle latency), matching RTL MemIf behavior.
+  if (entry.is_write) {
+    MemResponse resp;
+    resp.id = entry.resp_id;
+    memset(resp.data, 0, sizeof(resp.data));
+    completion_events.emplace(cycle + 1, std::make_pair(pending_issue_slot, resp));
+  }
+  issue_rr = (pending_issue_slot + 1) % kMaxInflight;
+  pending_issue_slot = -1;
+}
+
+void SoftPeriphIf::deferResponse(const MemResponse &resp) {
+  deferred_responses.push_back(resp);
+}
+
+void SoftPeriphIf::applyDeferredResponses() {
+  for (auto &resp : deferred_responses) {
+    // resp.id is the slot index (matching RTL MemIf convention)
+    int slot = static_cast<int>(resp.id);
+    if (slot < 0 || slot >= kMaxInflight) continue;
+    auto &entry = inflight[slot];
+    if (entry.allocated && entry.issued && !entry.completed) {
+      entry.completed = true;
+      memcpy(entry.data, resp.data, sizeof(entry.data));
+    }
+  }
+  deferred_responses.clear();
 }
 
 void SoftPeriphIf::accept(const Flit &flit, uint64_t cycle) {
@@ -1558,58 +1751,6 @@ void SoftPeriphIf::accept(const Flit &flit, uint64_t cycle) {
   entry.addr = flit.data;
   entry.is_write = flit.tag == 0xFF01;
   entry.remaining_flits = entry.is_write ? 2 : 1;
-}
-
-void SoftPeriphIf::processDue(uint64_t cycle, SoftSystemSim &sim) {
-  auto free_range = free_events.equal_range(cycle);
-  for (auto it = free_range.first; it != free_range.second; ++it) clearSlot(it->second);
-  free_events.erase(free_range.first, free_range.second);
-
-  auto ready_range = ready_events.equal_range(cycle);
-  for (auto it = ready_range.first; it != ready_range.second; ++it) {
-    if (inflight[it->second].allocated) inflight[it->second].ready = true;
-  }
-  ready_events.erase(ready_range.first, ready_range.second);
-
-  auto complete_range = completion_events.equal_range(cycle);
-  for (auto it = complete_range.first; it != complete_range.second; ++it) {
-    int slot = it->second.first;
-    if (!inflight[slot].allocated) continue;
-    inflight[slot].completed = true;
-    memcpy(inflight[slot].data, it->second.second.data, sizeof(inflight[slot].data));
-  }
-  completion_events.erase(complete_range.first, complete_range.second);
-
-  int issue_slot = findIssueSlot();
-  if (issue_slot < 0) return;
-
-  auto &entry = inflight[issue_slot];
-  if (current_periph_trace) {
-    current_periph_trace->push_back(PeriphTraceEvent{
-      .cycle = cycle,
-      .id = static_cast<uint16_t>(issue_slot),
-      .addr = entry.addr,
-      .is_write = entry.is_write,
-      .wdata = entry.is_write ? entry.wdata : 0,
-    });
-  }
-  if (entry.is_write) {
-    sim.periph.write(entry.addr, entry.wdata);
-    MemResponse resp;
-    resp.id = entry.resp_id;
-    memset(resp.data, 0, sizeof(resp.data));
-    completion_events.emplace(cycle + 1, std::make_pair(issue_slot, resp));
-  } else {
-    MemResponse resp;
-    resp.id = entry.resp_id;
-    memset(resp.data, 0, sizeof(resp.data));
-    resp.data[(entry.addr & ((MEM_BUS_WORDS * sizeof(uint32_t)) - 1)) /
-              sizeof(uint32_t)] = sim.periph.read(entry.addr);
-    completion_events.emplace(cycle + sim.periphReadCompleteLatency(),
-                              std::make_pair(issue_slot, resp));
-  }
-  entry.issued = true;
-  issue_rr = (issue_slot + 1) % kMaxInflight;
 }
 
 struct SoftSystemModel::Impl {
@@ -1723,6 +1864,27 @@ void SoftSystemModel::step() {
   if (TRACE && tracer) tracer->dump(impl_->sim.cycle * 2 + 1);
 }
 
+SystemConfig SoftSystemModel::config() const {
+  SystemConfig cfg;
+  cfg.numPU = impl_->sim.num_pu;
+  cfg.numMC = impl_->sim.num_mc;
+  for (int i = 0; i < SYSTEM_NUM_MEM_CTRL; ++i)
+    cfg.core.mcSizes.push_back(SYSTEM_MC_SIZES[i]);
+  return cfg;
+}
+
+void SoftSystemModel::mem(const MemBusIn *bus_in, MemBusOut *bus_out) {
+  impl_->sim.mem(bus_in, bus_out);
+}
+
+bool SoftSystemModel::printStats(uint64_t cycles, bool final_print) {
+  if (final_print) {
+    cerr << "[Soft] Final stats (over " << cycles << " cycles):\n";
+    impl_->sim.stats.print(cycles);
+  }
+  return true;
+}
+
 uint64_t SoftSystemModel::cycle() const { return impl_->sim.cycle; }
 bool SoftSystemModel::finished() const { return impl_->sim.periph.finished; }
 uint32_t SoftSystemModel::result() const { return impl_->sim.periph.result; }
@@ -1759,8 +1921,8 @@ int runSoftSystemModelFromEnv() {
     }
   }
 
-  int num_pu = SYSTEM_CONFIG.numPU;
-  int num_mc = SYSTEM_CONFIG.numMC;
+  int num_pu = SYSTEM_NUM_PU;
+  int num_mc = SYSTEM_NUM_MC;
   cerr << "[Soft] PUs=" << num_pu << " MCs=" << num_mc << endl;
 
   auto text_path = getenv("MEOW_TEXT");
