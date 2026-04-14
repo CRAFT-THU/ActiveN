@@ -115,5 +115,6 @@ public:
   void addBackend(std::unique_ptr<SystemBackend> backend);
 
   // Run the simulation until all backends have finished, or it's timed out, or a discrepancy is found.
-  void run(uint64_t maxCycles);
+  // Return true for sucessful finish, false for timeout or failure
+  bool run(uint64_t maxCycles);
 };

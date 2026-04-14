@@ -1,22 +1,23 @@
 #pragma once
 
-#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <random>
 
 // Peripheral device: handles MMIO requests in the 0x40000000 region.
 // Address map (relative to 0x40000000):
-//   0x0: Write → end-of-simulation (data = result value)
+//   0x0: Write → end-of-simulation. Zero = success, any non-zero = failure code
 //   0x4: Write 1 → start timer, Write 0 → stop timer
 //        Timer increments every cycle while enabled.
+//   0x8: Write → ASCII output
+//   0xC: Write -> arbitrary 32-bit output, e.g. additional info / failure output
 //   0x10: Read → next 32-bit RNG value, Write → reseed RNG
 struct PeripheralDevice {
   static constexpr uint32_t kDefaultSeed = 0x19260817u;
 
-  bool finished = false;
-  uint32_t result = 0;
+  std::optional<uint32_t> result = {};
 
   bool timer_enabled = false;
   uint64_t timer_count = 0;
@@ -24,18 +25,15 @@ struct PeripheralDevice {
   uint32_t rng_seed = kDefaultSeed;
   std::mt19937 rng;
 
-  PeripheralDevice() : rng(loadSeed()) {
-    rng_seed = loadSeed();
+  // Global override for RNG seed (set by main before any PeripheralDevice is used).
+  static inline std::optional<uint32_t> global_seed_override;
+
+  PeripheralDevice() : rng(effectiveSeed()) {
+    rng_seed = effectiveSeed();
   }
 
-  static uint32_t loadSeed() {
-    const char *seed_env = std::getenv("MEOW_RNG_SEED");
-    if (!seed_env || seed_env[0] == '\0') return kDefaultSeed;
-
-    char *end = nullptr;
-    unsigned long parsed = std::strtoul(seed_env, &end, 0);
-    if (end == seed_env) return kDefaultSeed;
-    return static_cast<uint32_t>(parsed);
+  static uint32_t effectiveSeed() {
+    return global_seed_override.value_or(kDefaultSeed);
   }
 
   void reseed(uint32_t seed) {
@@ -43,7 +41,7 @@ struct PeripheralDevice {
     rng.seed(seed);
   }
 
-  // Call every cycle (before checking finished).
+  // Call every cycle (before checking result).
   void tick() {
     if (timer_enabled) timer_count++;
   }
@@ -51,8 +49,7 @@ struct PeripheralDevice {
   // Handle a store to a peripheral address (addr relative to 0x40000000).
   void write(uint32_t addr, uint32_t data) {
     if (addr == 0) {
-      finished = true;
-      result = data;
+      result = {data};
     } else if (addr == 0x4) {
       timer_enabled = (data != 0);
     } else if (addr == 0x8) {
@@ -60,7 +57,7 @@ struct PeripheralDevice {
       std::cout << static_cast<char>(data & 0xFF);
       std::cout.flush();
     } else if (addr == 0xC) {
-      std::cerr<<"[Periph] Output: "<<data<<std::endl;
+      std::cerr<<"[Periph] Output: "<<std::hex<<data<<std::dec<<std::endl;
     } else if (addr == 0x10) {
       reseed(data);
     }

@@ -44,16 +44,16 @@ echo "--- Step 2: Running profile workloads ---"
 mkdir -p "$PGO_DIR"
 
 echo "  Profiling sim_single (sha256)..."
-MEOW_TEXT="$PAYLOADS/c/sha256_test.bin" MEOW_MAX_CYCLES=10000000 \
-  "$BUILD/sim_single" >/dev/null 2>&1 || true
+"$BUILD/sim_single" "$PAYLOADS/c/sha256_test.bin" --max-cycles 10000000 \
+  >/dev/null 2>&1 || true
 
 echo "  Profiling sim_soft (random_noc)..."
-MEOW_TEXT="$PAYLOADS/sys/random_noc_test.bin" MEOW_MAX_CYCLES=200000 \
-  "$BUILD/sim_soft" >/dev/null 2>&1 || true
+"$BUILD/sim_soft" "$PAYLOADS/sys/random_noc_test.bin" --max-cycles 200000 \
+  >/dev/null 2>&1 || true
 
 echo "  Profiling sim_system (random_noc)..."
-MEOW_TEXT="$PAYLOADS/sys/random_noc_test.bin" MEOW_MAX_CYCLES=200000 \
-  "$BUILD/sim_system" >/dev/null 2>&1 || true
+"$BUILD/sim_system" "$PAYLOADS/sys/random_noc_test.bin" --soft --max-cycles 200000 \
+  >/dev/null 2>&1 || true
 
 # Step 3: Merge profiles
 echo ""
@@ -86,13 +86,13 @@ if [ "$USE_BOLT" = true ]; then
     # Collect perf data
     if [ "$bin" = "sim_single" ]; then
       perf record -e cycles:u -o "$BUILD/${bin}.perf.data" -- \
-        env MEOW_TEXT="$PAYLOADS/c/sha256_test.bin" MEOW_MAX_CYCLES=5000000 \
-        "$BUILD/${bin}.prebolt" >/dev/null 2>&1 || true
+        "$BUILD/${bin}.prebolt" "$PAYLOADS/c/sha256_test.bin" --max-cycles 5000000 \
+        >/dev/null 2>&1 || true
     else
       PAYLOAD="$PAYLOADS/sys/random_noc_test.bin"
       perf record -e cycles:u -o "$BUILD/${bin}.perf.data" -- \
-        env MEOW_TEXT="$PAYLOAD" MEOW_MAX_CYCLES=100000 \
-        "$BUILD/${bin}.prebolt" >/dev/null 2>&1 || true
+        "$BUILD/${bin}.prebolt" "$PAYLOAD" --soft --max-cycles 100000 \
+        >/dev/null 2>&1 || true
     fi
 
     perf2bolt -p "$BUILD/${bin}.perf.data" -o "$BUILD/${bin}.fdata" \
@@ -119,13 +119,13 @@ fi
 echo ""
 echo "=== Final Benchmarks ==="
 echo "--- sim_single (sha256, 10M cycles) ---"
-MEOW_TEXT="$PAYLOADS/c/sha256_test.bin" MEOW_MAX_CYCLES=10000000 "$BUILD/sim_single" 2>&1 | grep -E "Speed|Runtime"
+"$BUILD/sim_single" "$PAYLOADS/c/sha256_test.bin" --max-cycles 10000000 2>&1 | grep -E "Speed|Runtime"
 
 echo "--- sim_soft (random_noc, 200k cycles) ---"
-MEOW_TEXT="$PAYLOADS/sys/random_noc_test.bin" MEOW_MAX_CYCLES=200000 "$BUILD/sim_soft" 2>&1 | grep -E "Speed|Runtime"
+"$BUILD/sim_soft" "$PAYLOADS/sys/random_noc_test.bin" --max-cycles 200000 2>&1 | grep -E "Speed|Runtime"
 
 echo "--- sim_system (random_noc, 200k cycles) ---"
-MEOW_TEXT="$PAYLOADS/sys/random_noc_test.bin" MEOW_MAX_CYCLES=200000 "$BUILD/sim_system" 2>&1 | grep -E "Speed|Runtime"
+"$BUILD/sim_system" "$PAYLOADS/sys/random_noc_test.bin" --soft --max-cycles 200000 2>&1 | grep -E "Speed|Runtime"
 
 echo ""
 echo "=== Done ==="

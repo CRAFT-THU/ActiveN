@@ -8,16 +8,12 @@
  * - AM events (tag != 0xFF00/0xFF01) are captured and logged.
  * - End-of-simulation: store to peripheral address 0x40000000 (dst 0x8000).
  *
- * Environment variables:
- *   MEOW_TEXT       - Path to the binary memory image
- *   MEOW_TRACE      - If non-empty, enable FST tracing
- *   MEOW_LOG        - If non-empty, enable logging
- *   MEOW_MAX_CYCLES - Maximum cycles before timeout (default: 1000000)
+ * Usage:
+ *   sim_single <text> [--trace] [--log] [--max-cycles N] [--rng-seed N]
  */
 
 #include <iostream>
 #include <fstream>
-#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -29,6 +25,7 @@
 #include <verilated_fst_c.h>
 #include "verilated/rtl.h"
 
+#include "include/argparse.h"
 #include "devices.h"
 
 using namespace std;
@@ -241,27 +238,49 @@ struct SingleCoreSim {
 };
 
 int main(int argc, char **argv) {
-  auto trace_cfg = getenv("MEOW_TRACE");
-  if(trace_cfg && trace_cfg[0] != '\0') {
-    TRACE = true;
-    cerr << "[Single] Tracing enabled" << endl;
-  }
+  argparse::ArgumentParser program("sim_single");
 
-  auto log_cfg = getenv("MEOW_LOG");
-  if(log_cfg && log_cfg[0] != '\0') {
-    LOG = true;
-    cerr << "[Single] Logging enabled" << endl;
-  }
+  program.add_argument("text")
+    .help("Binary memory image");
 
-  auto text_path = getenv("MEOW_TEXT");
-  if(!text_path || text_path[0] == '\0') {
-    cerr << "Error: MEOW_TEXT environment variable not set" << endl;
+  program.add_argument("--trace")
+    .help("Enable FST tracing")
+    .default_value(false)
+    .implicit_value(true);
+
+  program.add_argument("--log")
+    .help("Enable verbose logging")
+    .default_value(false)
+    .implicit_value(true);
+
+  program.add_argument("--max-cycles")
+    .help("Max simulation cycles")
+    .default_value(uint64_t(1000000))
+    .scan<'u', uint64_t>();
+
+  program.add_argument("--rng-seed")
+    .help("RNG seed for peripheral device")
+    .scan<'u', uint32_t>();
+
+  try {
+    program.parse_args(argc, argv);
+  } catch (const std::exception &err) {
+    cerr << err.what() << endl;
+    cerr << program;
     return 1;
   }
 
-  uint64_t max_cycles = 1000000;
-  auto max_cfg = getenv("MEOW_MAX_CYCLES");
-  if(max_cfg && max_cfg[0] != '\0') max_cycles = strtoull(max_cfg, nullptr, 10);
+  TRACE = program.get<bool>("--trace");
+  LOG = program.get<bool>("--log");
+  auto text_path = program.get<string>("text");
+  uint64_t max_cycles = program.get<uint64_t>("--max-cycles");
+
+  if (auto seed = program.present<uint32_t>("--rng-seed")) {
+    PeripheralDevice::global_seed_override = *seed;
+  }
+
+  if (TRACE) cerr << "[Single] Tracing enabled" << endl;
+  if (LOG) cerr << "[Single] Logging enabled" << endl;
 
   // Load binary into a larger backing memory
   ifstream text_input(text_path, ios::binary);
@@ -308,15 +327,15 @@ int main(int argc, char **argv) {
   // Run simulation
   cerr << "[Single] Running simulation (max " << max_cycles << " cycles)..." << endl;
   auto wall_start = chrono::steady_clock::now();
-  while(!sim.periph.finished && sim.cycle < max_cycles && !exiting) {
+  while(!sim.periph.result && sim.cycle < max_cycles && !exiting) {
     sim.step();
   }
   auto wall_end = chrono::steady_clock::now();
   double wall_secs = chrono::duration<double>(wall_end - wall_start).count();
 
-  if(sim.periph.finished) {
-    cerr << "[Single] Result: " << dec << sim.periph.result
-         << " (0x" << hex << sim.periph.result << ")" << dec << endl;
+  if(sim.periph.result) {
+    cerr << "[Single] Result: " << dec << *sim.periph.result
+         << " (0x" << hex << *sim.periph.result << ")" << dec << endl;
     cerr << "[Single] Cycles: " << dec << sim.cycle << endl;
   } else {
     cerr << "[Single] " << (exiting ? "Interrupted" : "Timed out") << " at cycle " << sim.cycle << endl;
@@ -337,5 +356,5 @@ int main(int argc, char **argv) {
   }
 
   ::operator delete[](text_mem, align_val_t(4));
-  return sim.periph.finished ? 0 : 1;
+  return sim.periph.result && *sim.periph.result == 0 ? 0 : 1;
 }

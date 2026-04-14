@@ -1,10 +1,39 @@
 /**
- * Unified system-level simulation frontend.
+ * System-level simulation: frontend + CLI entry point.
  *
- * Drives one or more SystemBackend instances (soft NoC or hard RTL),
- * serving memory requests through the mem() interface with flat or DRAMsim3
- * backing memory.  When multiple backends are attached, they run in lockstep
- * (cosimulation) with discrepancy detection.
+ * Contains the System class (frontend) that drives one or more SystemBackend
+ * instances (soft NoC or hard RTL), serving memory requests through the mem()
+ * interface with flat or DRAMsim3 backing memory.  When multiple backends are
+ * attached, they run in lockstep (cosimulation) with discrepancy detection.
+ *
+ * Also contains main() for the sim_system binary.
+ *
+ * Source layout:
+ *   sim/src/system.h          SystemBackend interface, System class declaration
+ *   sim/src/system.cpp         This file (frontend implementation + main)
+ *   sim/src/soft_backend.h     Soft NoC backend (SoftSystemModel) declaration
+ *   sim/src/soft_backend.cpp   Soft NoC backend implementation
+ *   sim/src/single.cpp         Single-core simulation driver (sim_single)
+ *   sim/src/devices.h          PeripheralDevice
+ *   sim/gen_system_header.py   Generates hard_backend.h + system_config.h
+ *
+ * Usage:
+ *   sim_system <text> --soft|--hard [options]
+ *
+ * Positional:
+ *   text                Binary memory image
+ *
+ * Options:
+ *   --soft              Use soft NoC backend
+ *   --hard              Use hard RTL backend
+ *   --data PATH         Data image to load at --data-addr
+ *   --data-addr ADDR    Address for data image (default: 0x80100000)
+ *   --max-cycles N      Max simulation cycles (default: 10000000)
+ *   --dram-config PATH  DRAMsim3 config file
+ *   --dram-log DIR      DRAMsim3 log directory (default: ".")
+ *   --trace             Enable FST tracing
+ *   --log               Enable verbose logging
+ *   --rng-seed N        RNG seed for peripheral device
  */
 
 #include <algorithm>
@@ -20,12 +49,16 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <signal.h>
 #include <string>
 #include <vector>
 
+#include "include/argparse.h"
 #include "system.h"
 #include "devices.h"
+#include "soft_backend.h"
+#include "hard_backend.h"
 #include "dramsim3/dramsim3.h"
 
 using namespace std;
@@ -50,6 +83,16 @@ static void loadImage(const string &text_path,
   fin.seekg(0, ios::end);
   size_t fsize = fin.tellg();
   if (fsize % 4 != 0) throw runtime_error("Image is not 4-byte aligned");
+  // Expand mem_size if data image requires more
+  if (data_path) {
+    ifstream din(*data_path, ios::binary);
+    if (!din) throw runtime_error("Cannot open " + *data_path);
+    din.seekg(0, ios::end);
+    size_t dsz = din.tellg();
+    size_t off = data_addr - TEXT_BASE;
+    size_t needed = off + dsz;
+    if (needed > mem_size) mem_size = (needed + 3) & ~(size_t)3;
+  }
   text_size = mem_size;
   char *buf = new (align_val_t(4)) char[text_size]();
   fin.seekg(0);
@@ -61,7 +104,6 @@ static void loadImage(const string &text_path,
     din.seekg(0, ios::end);
     size_t dsz = din.tellg();
     size_t off = data_addr - TEXT_BASE;
-    if (off + dsz > text_size) throw runtime_error("Data file too large");
     din.seekg(0);
     din.read(buf + off, dsz);
   }
@@ -357,10 +399,10 @@ void System::addBackend(unique_ptr<SystemBackend> backend) {
   impl_->backends.push_back(move(backend));
 }
 
-void System::run(uint64_t maxCycles) {
+bool System::run(uint64_t maxCycles) {
   if (impl_->backends.empty()) {
     cerr << "[System] Error: no backends added" << endl;
-    return;
+    return false;
   }
 
   // Initialize MC bases from first backend's config
@@ -390,9 +432,7 @@ void System::run(uint64_t maxCycles) {
   auto wall_start = chrono::steady_clock::now();
 
   uint64_t cycle = 0;
-  bool finished = false;
-
-  while (!finished && cycle < maxCycles && !exiting) {
+  while (!impl_->periph.result && cycle < maxCycles && !exiting) {
     ++cycle;
 
     // Step all backends
@@ -403,17 +443,14 @@ void System::run(uint64_t maxCycles) {
 
     // Call all backends' mem() with the same bus_in, verify requests match, serve once
     impl_->memInteractAll();
-
-    // Check if the frontend's peripheral indicates finished
-    finished = impl_->periph.finished;
   }
 
   auto wall_end = chrono::steady_clock::now();
   double wall_secs = chrono::duration<double>(wall_end - wall_start).count();
 
-  if (finished) {
-    cerr << "[System] Result: " << dec << impl_->periph.result
-         << " (0x" << hex << impl_->periph.result << ")" << endl;
+  if (impl_->periph.result) {
+    cerr << "[System] Result: " << dec << *impl_->periph.result
+         << " (0x" << hex << *impl_->periph.result << ")" << endl;
     cerr << "[System] Cycles: " << dec << cycle << endl;
   } else {
     cerr << "[System] " << (exiting ? "Interrupted" : "Timed out")
@@ -438,4 +475,125 @@ void System::run(uint64_t maxCycles) {
   }
 
   unloadImage();
+
+  return impl_->periph.result && *impl_->periph.result == 0 ? 0 : 1;
+}
+
+int main(int argc, char **argv) {
+  argparse::ArgumentParser program("sim_system");
+
+  program.add_argument("text")
+    .help("Binary memory image");
+
+  program.add_argument("--soft")
+    .help("Use soft NoC backend")
+    .default_value(false)
+    .implicit_value(true);
+
+  program.add_argument("--hard")
+    .help("Use hard RTL backend")
+    .default_value(false)
+    .implicit_value(true);
+
+  program.add_argument("--data")
+    .help("Data image path");
+
+  program.add_argument("--data-addr")
+    .help("Address for data image")
+    .default_value(string("0x80100000"));
+
+  program.add_argument("--max-cycles")
+    .help("Max simulation cycles")
+    .default_value(uint64_t(10000000))
+    .scan<'u', uint64_t>();
+
+  program.add_argument("--dram-config")
+    .help("DRAMsim3 config file");
+
+  program.add_argument("--dram-log")
+    .help("DRAMsim3 log directory")
+    .default_value(string("."));
+
+  program.add_argument("--trace")
+    .help("Enable FST tracing")
+    .default_value(false)
+    .implicit_value(true);
+
+  program.add_argument("--log")
+    .help("Enable verbose logging")
+    .default_value(false)
+    .implicit_value(true);
+
+  program.add_argument("--rng-seed")
+    .help("RNG seed for peripheral device")
+    .scan<'u', uint32_t>();
+
+  try {
+    program.parse_args(argc, argv);
+  } catch (const std::exception &err) {
+    cerr << err.what() << endl;
+    cerr << program;
+    return 1;
+  }
+
+  bool use_soft = program.get<bool>("--soft");
+  bool use_hard = program.get<bool>("--hard");
+
+  if (!use_soft && !use_hard) {
+    cerr << "Error: specify at least one of --soft or --hard" << endl;
+    cerr << program;
+    return 1;
+  }
+
+  auto text_path = program.get<string>("text");
+  uint64_t max_cycles = program.get<uint64_t>("--max-cycles");
+
+  // Parse data address (supports hex with 0x prefix)
+  auto data_addr_str = program.get<string>("--data-addr");
+  uint32_t data_addr = strtoul(data_addr_str.c_str(), nullptr, 0);
+
+  // RNG seed
+  if (auto seed = program.present<uint32_t>("--rng-seed")) {
+    PeripheralDevice::global_seed_override = *seed;
+  }
+
+  // Logging
+  if (program.get<bool>("--log")) {
+    setSoftSystemModelLogging(true);
+  }
+
+  // Build init files list: text_path [, data_path, data_addr]
+  vector<string_view> dramInitFiles;
+  dramInitFiles.push_back(text_path);
+  string data_path_str;
+  string data_addr_fmt;
+  if (auto data = program.present<string>("--data")) {
+    data_path_str = *data;
+    dramInitFiles.push_back(data_path_str);
+    data_addr_fmt = to_string(data_addr);
+    dramInitFiles.push_back(data_addr_fmt);
+  }
+
+  // Optional DRAMsim3
+  optional<DRAMsim3Config> dram_cfg;
+  if (auto cfg = program.present<string>("--dram-config")) {
+    auto dram_log = program.get<string>("--dram-log");
+    dram_cfg = DRAMsim3Config{*cfg, dram_log};
+  }
+
+  System system(dramInitFiles, dram_cfg);
+
+  if (use_hard) {
+    auto hard = make_unique<HardSystemBackend>();
+    system.addBackend(move(hard));
+    cerr << "[Main] Hard backend enabled" << endl;
+  }
+
+  if (use_soft) {
+    auto soft = make_unique<SoftSystemModel>(HARD_NUM_PU, HARD_NUM_MC);
+    system.addBackend(move(soft));
+    cerr << "[Main] Soft backend enabled" << endl;
+  }
+
+  return system.run(max_cycles);
 }

@@ -10,15 +10,7 @@
  *   - memory/peripheral requests encoded as 0xFF00/0xFF01 flits
  *   - CSR scatter commands encoded as 0xFF02 flits
  *   - wide memory responses on core.mem, including broadcast responses (id=0xFFFF)
- *   - optional per-cycle memory request trace via MEOW_MEM_TRACE
- *
- * Environment:
- *   MEOW_TEXT        - binary payload
- *   MEOW_DATA        - optional data image loaded at MEOW_DATA_ADDR (default 0x80100000)
- *   MEOW_TRACE       - enable FST tracing
- *   MEOW_LOG         - verbose software-NoC logging
- *   MEOW_MAX_CYCLES  - cycle cap (default 10000000)
- *   MEOW_MEM_TRACE   - optional memory request trace file
+ *   - optional per-cycle memory request trace
  */
 
 #include <algorithm>
@@ -46,7 +38,7 @@
 
 #include "soft_verilated/soft_rtl.h"
 #include "devices.h"
-#include "soft_system_model.h"
+#include "soft_backend.h"
 #include "system.h"
 #include "system_config.h"
 
@@ -63,8 +55,6 @@ static const uint16_t PERIPH_DST = 0x8000;
 static const uint16_t FIRST_MC_DST = 0x8001;
 static const uint16_t SCATTER_RESP_ID = 64;
 
-static uint32_t *text_aligned = nullptr;
-static size_t text_size = 0;
 static VerilatedFstC *tracer = nullptr;
 static std::unique_ptr<std::ofstream> mem_trace;
 static std::vector<MemTraceEvent> *current_mem_trace = nullptr;
@@ -389,12 +379,6 @@ struct CoreState {
   }
 };
 
-struct PendingMemOp {
-  enum Kind { Scatter } kind = Scatter;
-  uint32_t addr = 0;
-  uint32_t end = 0;
-};
-
 struct MemInflightSlot {
   bool allocated = false;
   bool ready = false;
@@ -446,8 +430,15 @@ struct SoftMemIf {
   multimap<uint64_t, int> free_events;
   multimap<uint64_t, std::pair<int, MemResponse>> completion_events;
   unordered_map<uint16_t, uint32_t> scatter_base;
-  multimap<uint64_t, PendingMemOp> pending_scatter_ops;
   deque<RingResponse> ring_queue;
+
+  // Scatter FSM (matches RTL MemIf scatter state machine)
+  enum ScatState { ScatIdle, ScatIssue, ScatWait, ScatBcast };
+  ScatState scat_state = ScatIdle;
+  uint32_t scat_addr = 0;
+  uint32_t scat_end = 0;
+  uint32_t scat_data[MEM_BUS_WORDS] = {};
+  int scat_cluster = 0;
 
   SoftMemIf(int mc, int start, int end, vector<int> clusters)
       : mc_idx(mc), pu_start(start), pu_end(end), zone_clusters(std::move(clusters)) {
@@ -516,6 +507,7 @@ struct SoftMemIf {
   }
 
   // Pending request for external servicing via mem()
+  // -1 = none, 0..63 = normal slot, kMaxInflight = scatter read
   int pending_issue_slot = -1;
 
   // Deferred responses: stored in mem(), applied at start of next step()
@@ -523,7 +515,7 @@ struct SoftMemIf {
 
   void accept(const Flit &flit, uint64_t cycle);
   void advanceSlots(uint64_t cycle);
-  void processScatter(uint64_t cycle);
+  void advanceScatter(uint64_t cycle);
   void findPendingReq(uint64_t cycle, SoftSystemSim &sim);
   void acceptIssue(uint64_t cycle);
   void applyDeferredResponses();
@@ -1262,55 +1254,8 @@ struct SoftSystemSim {
     }
   }
 
-  uint32_t mcGlobalAddr(int mc_idx, uint32_t local_addr) const {
-    return local_addr + TEXT_BASE + static_cast<uint32_t>(mc_base[mc_idx]);
-  }
-
-  MemResponse buildMemResp(uint16_t id, uint32_t addr) const {
-    MemResponse resp;
-    resp.id = id;
-    uint32_t aligned = addr & ~(uint32_t)(MEM_BUS_WORDS * 4 - 1);
-    for (int i = 0; i < MEM_BUS_WORDS; ++i) {
-      uint32_t ba = aligned + i * 4;
-      if (ba >= TEXT_BASE && (ba - TEXT_BASE + 3) < text_size) {
-        resp.data[i] = text_aligned[(ba - TEXT_BASE) / 4];
-      } else {
-        resp.data[i] = 0;
-      }
-    }
-    return resp;
-  }
-
-  void applyScalarStore(uint32_t addr, uint16_t size, uint32_t wdata) {
-    if (!(addr >= TEXT_BASE && (addr - TEXT_BASE) < text_size)) return;
-    uint32_t offset = (addr - TEXT_BASE) / 4;
-    uint32_t old_val = text_aligned[offset];
-    uint32_t byte_off = addr & 3;
-    uint32_t mask = 0;
-    switch (size) {
-      case 0: mask = 0xFFu << (byte_off * 8); break;
-      case 1: mask = 0xFFFFu << (byte_off * 8); break;
-      case 2: mask = 0xFFFFFFFFu; break;
-      default: mask = 0xFFFFFFFFu; break;
-    }
-    text_aligned[offset] = (old_val & ~mask) | (wdata & mask);
-  }
-
   void scheduleMcResp(uint16_t dst, int mc_idx, uint64_t at, const MemResponse &resp) {
     core_mem[dst].emplace(at, resp);
-  }
-
-  void schedulePeriphResp(uint16_t dst, uint64_t at, const MemResponse &resp) {
-    core_mem[dst].emplace(at, resp);
-  }
-
-  int memReadCompleteLatency(int mc_idx) const {
-    (void)mc_idx;
-    return 2;
-  }
-
-  int periphReadCompleteLatency() const {
-    return 2;
   }
 
   void stepPosedge() {
@@ -1339,9 +1284,8 @@ struct SoftSystemSim {
     deliverMemResponses();
     for (int mc = 0; mc < num_mc; ++mc) {
       memifs[mc].advanceSlots(cycle);
+      memifs[mc].advanceScatter(cycle);
       memifs[mc].findPendingReq(cycle, *this);
-      // Scatter only runs when no regular issue slot is found (matching old processDue behavior)
-      if (memifs[mc].pending_issue_slot < 0) memifs[mc].processScatter(cycle);
     }
     periph_if.advanceSlots(cycle);
     periph_if.findPendingReq(cycle, *this);
@@ -1500,21 +1444,29 @@ struct SoftSystemSim {
     for (int mc = 0; mc < num_mc; ++mc) {
       int idx = mc + 1;
       if (memifs[mc].pending_issue_slot >= 0 && bus_in[idx].reqAccepting) {
-        auto &entry = memifs[mc].inflight[memifs[mc].pending_issue_slot];
-        GlobalMemReq req{};
-        req.id = static_cast<uint16_t>(memifs[mc].pending_issue_slot);
-        req.addr = entry.addr;
-        req.size = entry.size;
-        req.write = entry.is_write;
-        memset(req.wdata, 0, sizeof(req.wdata));
-        if (entry.is_write) {
-          uint32_t word_idx = (entry.addr & 31) >> 2;
-          memcpy(req.wdata + word_idx * 4, &entry.wdata, 4);
-          // Keep internal memory in sync (for scatter reads)
-          uint32_t global_addr = mcGlobalAddr(mc, entry.addr);
-          applyScalarStore(global_addr, entry.size, entry.wdata);
+        if (memifs[mc].pending_issue_slot == SoftMemIf::kMaxInflight) {
+          // Scatter read: issue via the same bus as normal reads
+          GlobalMemReq req{};
+          req.id = static_cast<uint16_t>(SoftMemIf::kMaxInflight);
+          req.addr = memifs[mc].scat_addr;
+          req.size = 0;  // full 32-byte line
+          req.write = false;
+          memset(req.wdata, 0, sizeof(req.wdata));
+          bus_out[idx].req = req;
+        } else {
+          auto &entry = memifs[mc].inflight[memifs[mc].pending_issue_slot];
+          GlobalMemReq req{};
+          req.id = static_cast<uint16_t>(memifs[mc].pending_issue_slot);
+          req.addr = entry.addr;
+          req.size = entry.size;
+          req.write = entry.is_write;
+          memset(req.wdata, 0, sizeof(req.wdata));
+          if (entry.is_write) {
+            uint32_t word_idx = (entry.addr & 31) >> 2;
+            memcpy(req.wdata + word_idx * 4, &entry.wdata, 4);
+          }
+          bus_out[idx].req = req;
         }
-        bus_out[idx].req = req;
         memifs[mc].acceptIssue(cycle);
         stats.total_mem_requests++;
       } else {
@@ -1559,11 +1511,11 @@ void SoftMemIf::accept(const Flit &flit, uint64_t cycle) {
     if (it == scatter_base.end()) {
       scatter_base.emplace(flit.src, flit.data);
     } else {
-      pending_scatter_ops.emplace(cycle + 1, PendingMemOp{
-        .kind = PendingMemOp::Scatter,
-        .addr = it->second,
-        .end = flit.data,
-      });
+      // RTL: sScatCollect → sScatIssue on flit 2 arrival
+      // The +1 cycle delay matches ready_events timing for normal requests
+      scat_addr = it->second;
+      scat_end = flit.data;
+      scat_state = ScatIssue;
       scatter_base.erase(it);
     }
   }
@@ -1590,38 +1542,54 @@ void SoftMemIf::advanceSlots(uint64_t cycle) {
   completion_events.erase(complete_range.first, complete_range.second);
 }
 
-void SoftMemIf::processScatter(uint64_t cycle) {
-  auto range = pending_scatter_ops.equal_range(cycle);
-  vector<multimap<uint64_t, PendingMemOp>::iterator> erase_list;
-  for (auto it = range.first; it != range.second; ++it) {
-    const auto &op = it->second;
-    uint64_t beat_issue = cycle;
-    for (uint32_t addr = op.addr; addr < op.end; addr += 32) {
-      traceMemReq(beat_issue, mc_idx, false, addr, SCATTER_RESP_ID);
-      auto resp = sim_ptr->buildMemResp(0xFFFF, sim_ptr->mcGlobalAddr(mc_idx, addr));
-      int cluster_pos = 0;
-      for (int cluster_idx : zone_clusters) {
-        uint64_t at = beat_issue + 3 + cluster_pos;
-        for (int pu = cluster_idx * 16 + 1; pu <= cluster_idx * 16 + 16; ++pu) {
-          sim_ptr->scheduleMcResp(pu, mc_idx, at, resp);
-        }
-        cluster_pos++;
-      }
-      beat_issue += static_cast<uint64_t>(zone_clusters.size()) + 1;
-    }
-    erase_list.push_back(it);
+// Advance scatter broadcast FSM. Called each cycle from stepPosedge.
+// In ScatBcast state: delivers data to one cluster per cycle, then advances
+// to next 32-byte beat (ScatIssue) or finishes (ScatIdle).
+void SoftMemIf::advanceScatter(uint64_t cycle) {
+  if (scat_state != ScatBcast) return;
+
+  int cluster_idx = zone_clusters[scat_cluster];
+  // Broadcast to all 16 PUs in this cluster
+  MemResponse bcast_resp;
+  bcast_resp.id = 0xFFFF;
+  memcpy(bcast_resp.data, scat_data, sizeof(bcast_resp.data));
+  for (int pu = cluster_idx * 16 + 1; pu <= cluster_idx * 16 + 16; ++pu) {
+    sim_ptr->scheduleMcResp(pu, mc_idx, cycle + 1, bcast_resp);
   }
-  for (auto it : erase_list) pending_scatter_ops.erase(it);
+
+  if (scat_cluster == static_cast<int>(zone_clusters.size()) - 1) {
+    // All clusters done for this beat. Advance to next beat or finish.
+    scat_cluster = 0;
+    scat_addr += 32;
+    if (scat_addr >= scat_end) {
+      scat_state = ScatIdle;
+    } else {
+      scat_state = ScatIssue;
+    }
+  } else {
+    scat_cluster++;
+  }
 }
 
 void SoftMemIf::findPendingReq(uint64_t cycle, SoftSystemSim &sim) {
   pending_issue_slot = findIssueSlot();
+  // RTL: normal has priority; scatter only issues when no normal slot ready
+  if (pending_issue_slot < 0 && scat_state == ScatIssue) {
+    pending_issue_slot = kMaxInflight;  // sentinel: scatter read
+  }
   (void)cycle;
   (void)sim;
 }
 
 void SoftMemIf::acceptIssue(uint64_t cycle) {
   if (pending_issue_slot < 0) return;
+  if (pending_issue_slot == kMaxInflight) {
+    // Scatter read accepted by frontend → transition to ScatWait
+    traceMemReq(cycle, mc_idx, false, scat_addr, SCATTER_RESP_ID);
+    scat_state = ScatWait;
+    pending_issue_slot = -1;
+    return;
+  }
   auto &entry = inflight[pending_issue_slot];
   traceMemReq(cycle, mc_idx, entry.is_write, entry.addr, static_cast<uint16_t>(pending_issue_slot));
   entry.issued = true;
@@ -1643,10 +1611,19 @@ void SoftMemIf::deferResponse(const MemResponse &resp) {
 
 void SoftMemIf::applyDeferredResponses() {
   for (auto &resp : deferred_responses) {
-    // resp.id is the slot index (matching RTL MemIf convention)
-    int slot = static_cast<int>(resp.id);
-    if (slot < 0 || slot >= kMaxInflight) continue;
-    auto &entry = inflight[slot];
+    int id = static_cast<int>(resp.id);
+    if (id == kMaxInflight) {
+      // Scatter response: capture data and start broadcast
+      if (scat_state == ScatWait) {
+        memcpy(scat_data, resp.data, sizeof(scat_data));
+        scat_cluster = 0;
+        scat_state = ScatBcast;
+      }
+      continue;
+    }
+    // Normal response: resp.id is the slot index
+    if (id < 0 || id >= kMaxInflight) continue;
+    auto &entry = inflight[id];
     if (entry.allocated && entry.issued && !entry.completed) {
       entry.completed = true;
       memcpy(entry.data, resp.data, sizeof(entry.data));
@@ -1775,57 +1752,6 @@ struct SoftSystemModel::Impl {
   }
 };
 
-bool loadSoftSystemModelImage(const ModelImageConfig &config, std::string *error) {
-  unloadSoftSystemModelImage();
-
-  ifstream text_input(config.text_path, ios::binary);
-  if (!text_input) {
-    if (error) *error = "Error: cannot open " + config.text_path;
-    return false;
-  }
-
-  text_input.seekg(0, ios::end);
-  size_t file_size = text_input.tellg();
-  if (file_size % 4 != 0) {
-    if (error) *error = "Error: input image is not 4-byte aligned";
-    return false;
-  }
-
-  text_size = config.mem_size;
-  char *text_mem = new (align_val_t(4)) char[text_size]();
-  text_input.seekg(0);
-  text_input.read(text_mem, file_size);
-  text_aligned = reinterpret_cast<uint32_t *>(text_mem);
-
-  if (config.data_path) {
-    ifstream data_input(*config.data_path, ios::binary);
-    if (!data_input) {
-      if (error) *error = "Error: cannot open " + *config.data_path;
-      unloadSoftSystemModelImage();
-      return false;
-    }
-    data_input.seekg(0, ios::end);
-    size_t data_size = data_input.tellg();
-    size_t data_off = config.data_addr - TEXT_BASE;
-    if (data_off + data_size > text_size) {
-      if (error) *error = "Error: data file too large";
-      unloadSoftSystemModelImage();
-      return false;
-    }
-    data_input.seekg(0);
-    data_input.read(reinterpret_cast<char *>(text_aligned) + data_off, data_size);
-  }
-
-  return true;
-}
-
-void unloadSoftSystemModelImage() {
-  if (!text_aligned) return;
-  delete[] reinterpret_cast<char *>(text_aligned);
-  text_aligned = nullptr;
-  text_size = 0;
-}
-
 bool openSoftSystemModelMemTrace(const std::optional<std::string> &path, std::string *error) {
   mem_trace.reset();
   if (!path) return true;
@@ -1854,9 +1780,6 @@ void SoftSystemModel::attachTrace(VerilatedFstC *trace_file, int depth) {
   for (auto &core : impl_->sim.cores) core->core->trace(trace_file, depth);
 }
 
-void SoftSystemModel::stepPosedge() { impl_->stepPosedge(); }
-void SoftSystemModel::stepNegedge() { impl_->stepNegedge(); }
-
 void SoftSystemModel::step() {
   impl_->stepPosedge();
   if (TRACE && tracer) tracer->dump(impl_->sim.cycle * 2);
@@ -1883,126 +1806,4 @@ bool SoftSystemModel::printStats(uint64_t cycles, bool final_print) {
     impl_->sim.stats.print(cycles);
   }
   return true;
-}
-
-uint64_t SoftSystemModel::cycle() const { return impl_->sim.cycle; }
-bool SoftSystemModel::finished() const { return impl_->sim.periph.finished; }
-uint32_t SoftSystemModel::result() const { return impl_->sim.periph.result; }
-uint64_t SoftSystemModel::timerCount() const { return impl_->sim.periph.timer_count; }
-
-const std::vector<MemTraceEvent> &SoftSystemModel::lastMemTrace() const {
-  return impl_->last_mem_trace;
-}
-
-const std::vector<PeriphTraceEvent> &SoftSystemModel::lastPeriphTrace() const {
-  return impl_->last_periph_trace;
-}
-
-void SoftSystemModel::printFinalStats() const {
-  uint64_t c = impl_->sim.cycle;
-  cerr << "[Soft] Final stats (over " << c << " cycles):\n";
-  impl_->sim.stats.print(c);
-}
-
-int runSoftSystemModelFromEnv() {
-  std::unique_ptr<VerilatedFstC> owned_tracer;
-
-  auto trace_cfg = getenv("MEOW_TRACE");
-  if (trace_cfg && trace_cfg[0] != '\0') TRACE = true;
-  auto log_cfg = getenv("MEOW_LOG");
-  if (log_cfg && log_cfg[0] != '\0') LOG = true;
-
-  auto mem_trace_path = getenv("MEOW_MEM_TRACE");
-  if (mem_trace_path && mem_trace_path[0] != '\0') {
-    std::string trace_error;
-    if (!openSoftSystemModelMemTrace(std::string(mem_trace_path), &trace_error)) {
-      cerr << trace_error << endl;
-      return 1;
-    }
-  }
-
-  int num_pu = SYSTEM_NUM_PU;
-  int num_mc = SYSTEM_NUM_MC;
-  cerr << "[Soft] PUs=" << num_pu << " MCs=" << num_mc << endl;
-
-  auto text_path = getenv("MEOW_TEXT");
-  if (!text_path || text_path[0] == '\0') {
-    cerr << "Error: MEOW_TEXT not set" << endl;
-    return 1;
-  }
-
-  uint64_t max_cycles = 10000000;
-  auto max_cfg = getenv("MEOW_MAX_CYCLES");
-  if (max_cfg && max_cfg[0] != '\0') max_cycles = strtoull(max_cfg, nullptr, 10);
-
-  uint32_t data_addr = 0x80100000;
-  auto data_path = getenv("MEOW_DATA");
-  auto data_addr_cfg = getenv("MEOW_DATA_ADDR");
-  if (data_addr_cfg && data_addr_cfg[0] != '\0') data_addr = strtoul(data_addr_cfg, nullptr, 0);
-
-  ModelImageConfig image_cfg{
-    .text_path = text_path,
-    .data_path = (data_path && data_path[0] != '\0') ? std::optional<std::string>(data_path)
-                                                      : std::nullopt,
-    .data_addr = data_addr,
-  };
-  std::string image_error;
-  if (!loadSoftSystemModelImage(image_cfg, &image_error)) {
-    cerr << image_error << endl;
-    return 1;
-  }
-
-  cerr << "[Soft] Loaded program image" << endl;
-  if (image_cfg.data_path) {
-    cerr << "[Soft] Data loaded at 0x" << hex << image_cfg.data_addr << dec << endl;
-  }
-
-  if (getenv("MEOW_MEM")) {
-    cerr << "Warning: sim_soft currently ignores MEOW_MEM and uses a flat memory model" << endl;
-  }
-
-  struct sigaction sig;
-  sig.sa_handler = sighandler;
-  sigemptyset(&sig.sa_mask);
-  sig.sa_flags = 0;
-  sigaction(SIGINT, &sig, nullptr);
-
-  if (TRACE) {
-    Verilated::traceEverOn(true);
-    owned_tracer.reset(new VerilatedFstC);
-  }
-
-  SoftSystemModel sim(num_pu, num_mc);
-
-  if (TRACE) {
-    sim.attachTrace(owned_tracer.get(), 64);
-    owned_tracer->open("./soft_trace.fst");
-  }
-
-  cerr << "[Soft] Running (max " << max_cycles << " cycles)..." << endl;
-  auto wall_start = chrono::steady_clock::now();
-  while (!sim.finished() && sim.cycle() < max_cycles && !exiting) {
-    sim.step();
-  }
-  auto wall_end = chrono::steady_clock::now();
-  double wall_secs = chrono::duration<double>(wall_end - wall_start).count();
-
-  if (sim.finished()) {
-    cerr << "[Soft] Result: " << dec << sim.result() << " (0x" << hex << sim.result() << ")" << endl;
-    cerr << "[Soft] Cycles: " << dec << sim.cycle() << endl;
-  } else {
-    cerr << "[Soft] " << (exiting ? "Interrupted" : "Timed out") << " at cycle " << sim.cycle() << endl;
-  }
-  if (sim.timerCount() > 0) {
-    cerr << "[Soft] Timer: " << dec << sim.timerCount() << " cycles" << endl;
-  }
-  cerr << "[Soft] Speed: " << dec << static_cast<uint64_t>(sim.cycle() / wall_secs) << " cycles/s" << endl;
-  cerr << "[Soft] Runtime: " << fixed << setprecision(3) << wall_secs << "s" << endl;
-
-  sim.printFinalStats();
-
-  if (TRACE) owned_tracer->close();
-  if (mem_trace) mem_trace->flush();
-  unloadSoftSystemModelImage();
-  return sim.finished() ? 0 : 1;
 }

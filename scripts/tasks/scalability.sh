@@ -27,10 +27,10 @@ run_with_lock(){
   )&
 }
 
-MEOW_PARALLELISM=${AN_PARALLEL_JOBS:-1}
-echo "Parallelism: $MEOW_PARALLELISM"
+PARALLELISM=${AN_PARALLEL_JOBS:-1}
+echo "Parallelism: $PARALLELISM"
 
-open_sem $MEOW_PARALLELISM
+open_sem $PARALLELISM
 # Run scalability with core counts ranging from 128 to 512, with step size 16
 for task in $(seq 128 16 512); do
   run_with_lock ./scripts/tasks/scalability.single.sh $1 $task

@@ -12,39 +12,36 @@ cd $WORKDIR
 # git lfs pull
 
 function work() {
-  export MEOW_CORE_CNT=${AN_CORE_CNT:-512}
-  export MEOW_MEM_CNT=${AN_MEM_CNT:-2}
+  local CORE_CNT=${AN_CORE_CNT:-512}
+  local MEM_CNT=${AN_MEM_CNT:-2}
 
   cp -r $BASE/sim/payloads $WORKDIR/text
   cd text
-  make CORE_CNT=$MEOW_CORE_CNT
+  make CORE_CNT=$CORE_CNT
   cd ..
 
-  export MEOW_DATA=$WORKDIR/data
-  export MEOW_MEM=$BASE/sim/mem.cfg
-  if [[ "$MEOW_MEM_CNT" == "1" ]]; then
-    export MEOW_TEXT=$WORKDIR/text/test.single.bin
-    export MEOW_MEM_LOG="$WORKDIR/dram"
-  elif [[ "$MEOW_MEM_CNT" == "2" ]]; then
-    export MEOW_TEXT=$WORKDIR/text/test.double.bin
-    export MEOW_MEM_LOG="$WORKDIR/dram"
+  local DATA_DIR=$WORKDIR/data
+  local DRAM_CFG=$BASE/sim/mem.cfg
+  local DRAM_LOG="$WORKDIR/dram"
+  local TEXT_BIN
+  if [[ "$MEM_CNT" == "1" ]]; then
+    TEXT_BIN=$WORKDIR/text/test.single.bin
+  elif [[ "$MEM_CNT" == "2" ]]; then
+    TEXT_BIN=$WORKDIR/text/test.double.bin
   else
-    echo "Invalid memory count: $MEOW_MEM_CNT. Only supports 1 and 2 memories"
+    echo "Invalid memory count: $MEM_CNT. Only supports 1 and 2 memories"
     exit 1
   fi
 
-  export MEOW_LOG=
-  export MEOW_TRACE=
+  mkdir -p $DATA_DIR
+  mkdir -p $DRAM_LOG
 
-  mkdir -p $MEOW_DATA
-  mkdir -p $MEOW_MEM_LOG
-
-  $BASE/work/bin/datagen --core-cnt $MEOW_CORE_CNT --load-nest-nodes $BASE/sim/mvc/nodes.json --load-nest-conns $BASE/sim/mvc/conns.json --nest-randomize --dump $MEOW_DATA --pre-simulate 100
+  $BASE/work/bin/datagen --core-cnt $CORE_CNT --load-nest-nodes $BASE/sim/mvc/nodes.json --load-nest-conns $BASE/sim/mvc/conns.json --nest-randomize --dump $DATA_DIR --pre-simulate 100
   echo "======= Data generator: Ret value: $?"
-  $BASE/work/bin/sim.double
+  $BASE/work/bin/sim_system $TEXT_BIN --soft --data $DATA_DIR --dram-config $DRAM_CFG --dram-log $DRAM_LOG
   echo "======= Simulator: Ret value: $?"
 
-  rm -rf $MEOW_DATA
+  rm -rf $DATA_DIR
 }
 
 work | tee $WORKDIR/log.txt

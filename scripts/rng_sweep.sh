@@ -9,7 +9,7 @@ START_SEED="${START_SEED:-1}"
 END_SEED="${END_SEED:-100}"
 MAX_CYCLES="${MAX_CYCLES:-250000}"
 JOBS="${JOBS:-4}"
-TRACE_ENABLED="${TRACE_ENABLED:-${MEOW_TRACE:-}}"
+TRACE_ENABLED="${TRACE_ENABLED:-}"
 USE_NIX_DEVELOP="${USE_NIX_DEVELOP:-1}"
 FAIL_RESULTS="${FAIL_RESULTS:-}"
 
@@ -40,20 +40,17 @@ seq "$START_SEED" "$END_SEED" | xargs -P "$JOBS" -I {} sh -c '
   rm -rf "$run_dir"
   mkdir -p "$run_dir"
 
+  TRACE_ARGS=""
+  if [ -n "$TRACE_ENABLED" ]; then
+    TRACE_ARGS="--trace"
+  fi
+
   if (
     cd "$run_dir"
     if [ "$USE_NIX_DEVELOP" = "1" ]; then
-      MEOW_RNG_SEED="$seed" \
-      MEOW_TEXT="$PAYLOAD" \
-      MEOW_MAX_CYCLES="$MAX_CYCLES" \
-      MEOW_TRACE="$TRACE_ENABLED" \
-      nix develop -c "$SIM"
+      nix develop -c "$SIM" "$PAYLOAD" --soft --max-cycles "$MAX_CYCLES" --rng-seed "$seed" $TRACE_ARGS
     else
-      MEOW_RNG_SEED="$seed" \
-      MEOW_TEXT="$PAYLOAD" \
-      MEOW_MAX_CYCLES="$MAX_CYCLES" \
-      MEOW_TRACE="$TRACE_ENABLED" \
-      "$SIM"
+      "$SIM" "$PAYLOAD" --soft --max-cycles "$MAX_CYCLES" --rng-seed "$seed" $TRACE_ARGS
     fi
   ) > "$ascii" 2> "$log"; then
     if [ -f "$run_dir/soft_trace.fst" ]; then
