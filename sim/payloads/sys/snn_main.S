@@ -67,6 +67,7 @@
 
 #define STOP_ADDR       0x40000000
 #define TIMER_ADDR      0x40000004
+#define PRINT_PORT      0x4000000C
 
   .section .text
   .globl _start
@@ -264,11 +265,28 @@ runtime_tree_done:
   li    t1, 2
   sw    t1, 0(t0)
 
-  li    t0, 1
-  bne   s9, t0, runtime_start
+  # Debug: print (hartid << 16) | 0 — handlers configured
+  slli  t0, s9, 16
+  li    t1, PRINT_PORT
+  sw    t0, 0(t1)
+
+  li    t2, 1
+  bne   s9, t2, wait_leader_flag
+
+  # PU1: write sentinel flag so other PUs know PU1 is ready
+  la    t0, runtime_ready_flag
+  li    t1, 1
+  sw    t1, 0(t0)
   li    t0, TIMER_ADDR
   li    t1, 1
-  sw    t1, 0(t0)             # start timer after untimed boot is complete
+  sw    t1, 0(t0)             # start timer after all handlers installed
+  j     runtime_start
+
+  # Non-PU1: spin until PU1 has written the flag
+wait_leader_flag:
+  la    t0, runtime_ready_flag
+  lw    t1, 0(t0)
+  beqz  t1, wait_leader_flag
 
 runtime_start:
   li    a0, SPM_BASE
@@ -403,6 +421,12 @@ scatter_done:
   # Done: all neurons processed -> sync tree
   #============================================================
 done:
+  # Debug: print (hartid << 16) | 2 — neuron updates complete
+  slli  t0, s9, 16
+  ori   t0, t0, 2
+  li    t1, PRINT_PORT
+  sw    t0, 0(t1)
+
   li    a0, 1                  # count = 1 (this PU done)
   j     syncinc
 
@@ -475,4 +499,9 @@ xor_match:
   li    t0, STOP_ADDR
   sw    s10, 0(t0)
   j     do_wfi
+
+  .section .data
+  .align 2
+runtime_ready_flag:
+  .word 0
 

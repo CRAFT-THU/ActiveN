@@ -51,6 +51,7 @@
 #define SPM_BASE        0x20000000u
 #define SPM_SIZE        16384u
 #define STOP_ADDR       0x40000000u
+#define PRINT_PORT      0x4000000Cu
 #define SPM_IMAGE_MAGIC 0x53504d49u
 #define SPM_IMAGE_VERSION 1u
 #define SNN_BOOT_COOKIE 0x534e4e31u
@@ -117,6 +118,9 @@ unsigned int snn_init(void) {
     SPM_STATE = 0;
     for (unsigned int i = 0; i < nwords; i++)
         dst[i] = src[i];
+
+    /* Debug: print (hartid << 16) | 1 — shared memory loaded */
+    (*(volatile unsigned int *)PRINT_PORT) = (hartid << 16) | 1u;
 
     SPM_NNCOUNT = desc[2];
     SPM_STRIDE = desc[3];

@@ -152,7 +152,7 @@ class ICache(implicit val params: CoreParameters) extends Module {
   val needRefill = s1valid && !s1hit && !s1refillCompleted && !s1refillWriting
 
   mem.req.bits.addr := beatAddr
-  mem.req.bits.size := 2.U // word
+  mem.req.bits.size := 2.U // FIXME: this is word, need to extend to whole line
   mem.req.bits.id := curBeat
   mem.req.bits.wbe := 0.U
   mem.req.bits.write := false.B

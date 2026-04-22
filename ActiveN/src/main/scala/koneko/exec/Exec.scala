@@ -14,13 +14,13 @@ class Exec(implicit val param: CoreParameters) extends Module {
   val ext = IO(new Bundle {
     val out = Decoupled(new Bundle {
       val dst = UInt(16.W)
-      val data = UInt(32.W)
+      val data = Vec(4, UInt(32.W))
       val tag = UInt(16.W)
     })
 
     val in = Flipped(Decoupled(new Bundle {
       val src = UInt(16.W)
-      val data = UInt(32.W)
+      val data = Vec(4, UInt(32.W))
       val tag = UInt(16.W)
     }))
 
@@ -48,7 +48,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
   //////////////////////////
 
   val handlers = RegInit(VecInit(Seq.fill(16)(0.U(32.W))))
-  val argcnts = RegInit(VecInit(Seq.fill(16)(1.U(5.W))))
+  val argcnts = RegInit(VecInit(Seq.fill(16)(0.U(2.W))))
 
   //////////////////////////
   // Actual configuration

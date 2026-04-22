@@ -55,13 +55,13 @@ class BIU(implicit val param: CoreParameters) extends Module {
     // TODO: last
     val out = Decoupled(new Bundle {
       val dst = UInt(16.W)
-      val data = UInt(32.W)
+      val data = Vec(4, UInt(32.W))
       val tag = UInt(16.W)
     })
 
     val in = Flipped(Decoupled(new Bundle {
       val src = UInt(16.W)
-      val data = UInt(32.W)
+      val data = Vec(4, UInt(32.W))
       val tag = UInt(16.W)
     }))
   })
@@ -69,12 +69,12 @@ class BIU(implicit val param: CoreParameters) extends Module {
   val br = IO(Decoupled(new Bundle {
     val regs = Vec(4, UInt(32.W))
     val target = UInt(32.W)
-    val argcnt = UInt(5.W)
+    val argcnt = UInt(2.W)
   }))
 
   val cfg = IO(Input(Vec(16, new Bundle {
     val handler = UInt(32.W)
-    val argcnt = UInt(5.W)
+    val argcnt = UInt(2.W)
   })))
 
   // CSR broadcast input: 256-bit data from MemDistributor broadcast

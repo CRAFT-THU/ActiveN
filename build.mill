@@ -1,10 +1,12 @@
 // import Mill dependency
 import mill._
 import scalalib._
+import mill.scalalib.scalafmt._
+import mill.api.internal.RootModule
+import os.Path
 
-object Koneko extends SbtModule { m =>
-  override def moduleDir = os.pwd
-  override def scalaVersion = "2.13.8"
+object ActiveN extends ScalaModule with ScalafmtModule { m =>
+  override def scalaVersion = "2.13.18"
   override def scalacOptions = Seq(
     "-language:reflectiveCalls",
     "-deprecation",
@@ -14,9 +16,9 @@ object Koneko extends SbtModule { m =>
     "-P:chiselplugin:genBundleElements"
   )
   override def mvnDeps = Seq(
-    mvn"org.chipsalliance::chisel:6.0.0",
+    mvn"org.chipsalliance::chisel:7.11.0",
   )
   override def scalacPluginMvnDeps = Seq(
-    mvn"org.chipsalliance:::chisel-plugin:6.0.0",
+    mvn"org.chipsalliance:::chisel-plugin:7.11.0",
   )
 }

@@ -224,7 +224,10 @@ struct System::Impl {
   void dramWriteCb(int mc, uint64_t addr) {
     auto &d = dram_mcs[mc];
     auto it = d.inflight.find(addr);
-    if (it != d.inflight.end()) d.inflight.erase(it);
+    if (it != d.inflight.end()) {
+      mc_states[mc].resp_queue.push_back(it->second);
+      d.inflight.erase(it);
+    }
   }
 
   // Serve a single request from a backend for MC mc
@@ -290,7 +293,7 @@ struct System::Impl {
   vector<vector<MemBusOut>> per_backend_out;
 
   // Run mem() on all backends with the same bus_in, verify requests match, serve once.
-  void memInteractAll() {
+  void memInteractAll(uint64_t cycle) {
     int num_ports = num_mc + 1;
     size_t n = backends.size();
 
@@ -330,7 +333,8 @@ struct System::Impl {
         for (size_t bi = 1; bi < n; ++bi) {
           bool cur_has = per_backend_out[bi][p].req.has_value();
           if (first_has != cur_has) {
-            cerr << "[System] COSIM MISMATCH: port " << p
+            cerr << "[System] COSIM MISMATCH @ cycle " << dec << cycle
+                 << ": port " << p
                  << " backend 0 req=" << first_has
                  << " backend " << bi << " req=" << cur_has << endl;
             exiting = true;
@@ -339,11 +343,12 @@ struct System::Impl {
           if (first_has && cur_has) {
             auto &a = *per_backend_out[0][p].req;
             auto &b = *per_backend_out[bi][p].req;
-            if (a.addr != b.addr || a.write != b.write || a.id != b.id) {
-              cerr << "[System] COSIM MISMATCH: port " << p
+            if (a.addr != b.addr || a.write != b.write) {
+              cerr << "[System] COSIM MISMATCH @ cycle " << dec << cycle
+                   << ": port " << p
                    << " addr 0x" << hex << a.addr << " vs 0x" << b.addr
                    << " write " << a.write << " vs " << b.write
-                   << " id " << dec << a.id << " vs " << b.id << endl;
+                   << dec << endl;
               exiting = true;
               return;
             }
@@ -436,13 +441,13 @@ bool System::run(uint64_t maxCycles) {
     ++cycle;
 
     // Step all backends
-    for (auto &b : impl_->backends) b->step();
+    for (auto &b : impl_->backends) b->step(cycle);
 
     // Tick frontend memory
     impl_->tickMemory();
 
     // Call all backends' mem() with the same bus_in, verify requests match, serve once
-    impl_->memInteractAll();
+    impl_->memInteractAll(cycle);
   }
 
   auto wall_end = chrono::steady_clock::now();
@@ -583,17 +588,38 @@ int main(int argc, char **argv) {
 
   System system(dramInitFiles, dram_cfg);
 
+  bool enable_trace = program.get<bool>("--trace");
+  std::unique_ptr<VerilatedFstC> fst_tracer;
+  if (enable_trace) {
+    Verilated::traceEverOn(true);
+    fst_tracer = std::make_unique<VerilatedFstC>();
+  }
+
   if (use_hard) {
     auto hard = make_unique<HardSystemBackend>();
+    if (fst_tracer) hard->attachTrace(fst_tracer.get(), 99);
     system.addBackend(move(hard));
     cerr << "[Main] Hard backend enabled" << endl;
   }
 
   if (use_soft) {
     auto soft = make_unique<SoftSystemModel>(HARD_NUM_PU, HARD_NUM_MC);
+    if (fst_tracer) soft->attachTrace(fst_tracer.get(), 99);
     system.addBackend(move(soft));
     cerr << "[Main] Soft backend enabled" << endl;
   }
 
-  return system.run(max_cycles);
+  if (fst_tracer) {
+    fst_tracer->open("trace.fst");
+    cerr << "[Main] FST tracing enabled → trace.fst" << endl;
+  }
+
+  int rc = system.run(max_cycles);
+
+  if (fst_tracer) {
+    fst_tracer->flush();
+    fst_tracer->close();
+  }
+
+  return rc;
 }

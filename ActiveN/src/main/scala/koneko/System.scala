@@ -36,15 +36,6 @@ case class SystemParameters(
   require(numMC >= 1)
 }
 
-// NoC flit data type
-class Flit extends Bundle with Routable {
-  val src = UInt(16.W)
-  val dst = UInt(16.W)
-  val data = UInt(32.W)
-  val tag = UInt(16.W)
-  def prio = Mux(tag === 0xFF00.U || tag === 0xFF01.U, 0.U(1.W), 1.U(1.W))
-}
-
 // Topology computation — pure Scala, no hardware
 object Topology {
   // Grid dimensions: 1:1 or 2:1
@@ -289,7 +280,7 @@ class System(implicit val params: SystemParameters) extends Module {
   implicit val coreParams: CoreParameters = params.coreParams
 
   val topo = Topology.build(params.numPU, params.numMC)
-  val flitType = new Flit
+  val flitType = new bus.Flit
 
   val numClusters = params.numPU / 16
   val clustersPerMC = numClusters / params.numMC
@@ -320,7 +311,7 @@ class System(implicit val params: SystemParameters) extends Module {
     val numI = numE
     val locals = topo.puLocals(id)
     val table = topo.puTables(id)
-    val router = Module(new Router(flitType, locals, numI, numE, 2, 4, table))
+    val router = Module(new Router(flitType, locals, numI, numE, 1, 2, table))
     router.suggestName(s"router_$id")
     (id, router)
   }.toMap
@@ -359,13 +350,13 @@ class System(implicit val params: SystemParameters) extends Module {
     inject.valid := core.ext.out.valid
     inject.bits.src := id.U
     inject.bits.dst := core.ext.out.bits.dst
-    inject.bits.data := core.ext.out.bits.data
+    for (i <- 0 until 4) inject.bits.data(i) := core.ext.out.bits.data(i)
     inject.bits.tag := core.ext.out.bits.tag
     core.ext.out.ready := inject.ready
 
     core.ext.in.valid := eject.valid
     core.ext.in.bits.src := eject.bits.src
-    core.ext.in.bits.data := eject.bits.data
+    for (i <- 0 until 4) core.ext.in.bits.data(i) := eject.bits.data(i)
     core.ext.in.bits.tag := eject.bits.tag
     eject.ready := core.ext.in.ready
   }
@@ -375,7 +366,7 @@ class System(implicit val params: SystemParameters) extends Module {
   val memIfs = topo.mcIds.zipWithIndex.map { case (mcId, mcIdx) =>
     val puStart = mcIdx * clustersPerMC * 16 + 1
     val puEnd   = (mcIdx + 1) * clustersPerMC * 16
-    val memIf = Module(new MemIf(mcIdx, puStart, puEnd, clustersPerMC, 64))
+    val memIf = Module(new DRAMIf(mcIdx, puStart, puEnd, clustersPerMC, 64, 16))
     memIf.suggestName(s"memif_${mcIdx + 1}")
     io.mem(mcIdx).req <> memIf.mem.req
     memIf.mem.resp := io.mem(mcIdx).resp
@@ -402,12 +393,10 @@ class System(implicit val params: SystemParameters) extends Module {
     BigInt("28000000", 16) -> beat0,
     BigInt("28000020", 16) -> beat1,
   )
-  val periphMemIf = Module(new MemIf(params.numMC, 0, 0, 1, 16, configROM = configROM))
+  val periphMemIf = Module(new PeripheralIf(16, configROM = configROM))
   periphMemIf.suggestName("memif_0")
   io.periph.req <> periphMemIf.mem.req
   periphMemIf.mem.resp := io.periph.resp
-  // Tie off resp(0) — no local PUs in the peripheral MemIf's zone
-  periphMemIf.resp(0).ready := true.B
 
   // --- Connect MC eject ports to MemIf req inputs ---
   for ((mcId, mcIdx) <- topo.mcIds.zipWithIndex) {

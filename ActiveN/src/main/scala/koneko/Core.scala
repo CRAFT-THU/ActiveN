@@ -15,13 +15,13 @@ class Core(implicit val params: CoreParameters) extends Module {
   @public val ext = IO(new Bundle {
     val out = Decoupled(new Bundle {
       val dst = UInt(16.W)
-      val data = UInt(32.W)
+      val data = Vec(4, UInt(32.W))
       val tag = UInt(16.W)
     })
 
     val in = Flipped(Decoupled(new Bundle {
       val src = UInt(16.W)
-      val data = UInt(32.W)
+      val data = Vec(4, UInt(32.W))
       val tag = UInt(16.W)
     }))
 

@@ -62,7 +62,7 @@ class SoftSystemModel : public SystemBackend {
 
   // SystemBackend interface
   SystemConfig config() const override;
-  void step() override;
+  void step(uint64_t cycle) override;
   void mem(const MemBusIn *, MemBusOut *) override;
   bool printStats(uint64_t cycles, bool final) override;
 

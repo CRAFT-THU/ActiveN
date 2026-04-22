@@ -37,7 +37,6 @@
 #include <verilated_fst_c.h>
 
 #include "soft_verilated/soft_rtl.h"
-#include "devices.h"
 #include "soft_backend.h"
 #include "system.h"
 #include "system_config.h"
@@ -597,7 +596,7 @@ struct SoftPeriphIf {
   void advanceSlots(uint64_t cycle);
   void findPendingReq(uint64_t cycle, SoftSystemSim &sim);
   void acceptIssue(uint64_t cycle);
-  void applyDeferredResponses();
+  void applyDeferredResponses(uint64_t cycle);
   void deferResponse(const MemResponse &resp);
 };
 
@@ -765,7 +764,6 @@ struct SoftSystemSim {
   vector<SoftRouter> routers;
   vector<SoftMemIf> memifs;
   SoftPeriphIf periph_if;
-  PeripheralDevice periph;
   vector<ClusterRespBuffer> cluster_buffers;
 
   vector<uint64_t> mc_base;
@@ -1258,8 +1256,8 @@ struct SoftSystemSim {
     core_mem[dst].emplace(at, resp);
   }
 
-  void stepPosedge() {
-    ++cycle;
+  void stepPosedge(uint64_t cy) {
+    cycle = cy;
     reset_cycle = cycle <= RESET_LENGTH;
 
     if (reset_cycle) {
@@ -1278,7 +1276,7 @@ struct SoftSystemSim {
 
     // Apply deferred responses from previous cycle's mem() before advanceSlots/processResponseNetwork
     for (int mc = 0; mc < num_mc; ++mc) memifs[mc].applyDeferredResponses();
-    periph_if.applyDeferredResponses();
+    periph_if.applyDeferredResponses(cycle);
 
     presentClusterResponses();
     deliverMemResponses();
@@ -1324,7 +1322,6 @@ struct SoftSystemSim {
       c->posedge();
     }
     for (const auto &[pu, flit] : pending_injected) router(pu).enqueueInject(flit);
-    periph.tick();
     commitClusterBuffers();
 
     // Stat: injections
@@ -1672,7 +1669,8 @@ void SoftPeriphIf::acceptIssue(uint64_t cycle) {
     });
   }
   entry.issued = true;
-  // Writes complete internally (1-cycle latency), matching RTL MemIf behavior.
+  // Writes complete internally (1-cycle latency); only the side-effect matters.
+  // The response data is all-zeros anyway. Frontend handles the actual write.
   if (entry.is_write) {
     MemResponse resp;
     resp.id = entry.resp_id;
@@ -1687,15 +1685,16 @@ void SoftPeriphIf::deferResponse(const MemResponse &resp) {
   deferred_responses.push_back(resp);
 }
 
-void SoftPeriphIf::applyDeferredResponses() {
+void SoftPeriphIf::applyDeferredResponses(uint64_t cycle) {
   for (auto &resp : deferred_responses) {
-    // resp.id is the slot index (matching RTL MemIf convention)
+    // Stage read responses through completion_events with +2 cycle delay,
+    // adding the same 2-cycle shift as writes to match the hard backend's
+    // frontend round-trip latency.
     int slot = static_cast<int>(resp.id);
     if (slot < 0 || slot >= kMaxInflight) continue;
     auto &entry = inflight[slot];
     if (entry.allocated && entry.issued && !entry.completed) {
-      entry.completed = true;
-      memcpy(entry.data, resp.data, sizeof(entry.data));
+      completion_events.emplace(cycle + 2, std::make_pair(slot, resp));
     }
   }
   deferred_responses.clear();
@@ -1737,12 +1736,12 @@ struct SoftSystemModel::Impl {
 
   Impl(int pu, int mc) : sim(pu, mc) {}
 
-  void stepPosedge() {
+  void stepPosedge(uint64_t cycle) {
     last_mem_trace.clear();
     last_periph_trace.clear();
     current_mem_trace = &last_mem_trace;
     current_periph_trace = &last_periph_trace;
-    sim.stepPosedge();
+    sim.stepPosedge(cycle);
   }
 
   void stepNegedge() {
@@ -1780,11 +1779,11 @@ void SoftSystemModel::attachTrace(VerilatedFstC *trace_file, int depth) {
   for (auto &core : impl_->sim.cores) core->core->trace(trace_file, depth);
 }
 
-void SoftSystemModel::step() {
-  impl_->stepPosedge();
-  if (TRACE && tracer) tracer->dump(impl_->sim.cycle * 2);
+void SoftSystemModel::step(uint64_t cycle) {
+  impl_->stepPosedge(cycle);
+  if (TRACE && tracer) tracer->dump(cycle * 2);
   impl_->stepNegedge();
-  if (TRACE && tracer) tracer->dump(impl_->sim.cycle * 2 + 1);
+  if (TRACE && tracer) tracer->dump(cycle * 2 + 1);
 }
 
 SystemConfig SoftSystemModel::config() const {

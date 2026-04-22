@@ -58,7 +58,7 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
     f.write('#include <iostream>\n')
     f.write('#include <verilated.h>\n')
     f.write('#include <verilated_fst_c.h>\n')
-    f.write('#include "devices.h"\n\n')
+    f.write('\n')
 
     f.write("// Frontend memory (defined in system_new.cpp)\n")
     f.write("extern uint32_t *text_aligned;\n")
@@ -100,10 +100,9 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
     f.write("    // Stored requests: captured in Phase 1, reported in mem()\n")
     f.write(f"    std::optional<GlobalMemReq> stored_mc_req_[{num_mc}];\n")
     f.write("    std::optional<GlobalMemReq> stored_periph_req_;\n\n")
-    f.write("    // Internal response queues (self-served flat memory)\n")
+    f.write("    // Internal response queues (MC: self-served flat memory; periph: fed from frontend)\n")
     f.write(f"    std::deque<GlobalMemResp> mc_resps_[{num_mc}];\n")
     f.write("    std::deque<GlobalMemResp> periph_resps_;\n")
-    f.write("    PeripheralDevice periph_;\n")
     f.write(f"    uint64_t mc_bases_[{num_mc}] = {{}};\n\n")
 
     # Constructor
@@ -145,9 +144,9 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
     f.write("    }\n\n")
 
     # step(): self-serve memory, matching old SystemModel::stepPosedge timing exactly
-    f.write("""    void step() override {
+    f.write("""    void step(uint64_t cycle) override {
         static constexpr int MEM_BUS_WORDS = MEM_BUS_WIDTH / 32;
-        ++cycle_;
+        cycle_ = cycle;
         if (cycle_ <= HARD_RESET_LENGTH) {
             sys->reset = true;
 """)
@@ -215,25 +214,10 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
             req.size = 5;
             std::memcpy(req.wdata, sys->io_periph_req_bits_wdata, MEM_BUS_WORDS * 4);
             stored_periph_req_ = req;
-
-            // Self-serve peripheral via PeripheralDevice
-            GlobalMemResp resp{};
-            resp.id = req.id;
-            std::memset(resp.data, 0, sizeof(resp.data));
-            size_t byte_offset = req.addr & ((MEM_BUS_WORDS * sizeof(uint32_t)) - 1);
-            size_t word_idx = byte_offset / sizeof(uint32_t);
-            if (req.write) {
-                uint32_t wdata;
-                std::memcpy(&wdata, req.wdata + byte_offset, sizeof(uint32_t));
-                periph_.write(req.addr, wdata);
-            } else {
-                uint32_t rdata = periph_.read(req.addr);
-                std::memcpy(resp.data + word_idx * sizeof(uint32_t), &rdata, sizeof(uint32_t));
-            }
-            periph_resps_.push_back(resp);
         } else {
             stored_periph_req_ = std::nullopt;
         }
+        // Pop consumed peripheral response
         if (sys->io_periph_resp_valid && !periph_resps_.empty()) {
             periph_resps_.pop_front();
         }
@@ -244,7 +228,6 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
         Verilated::timeInc(1);
         sys->eval();
         if (tracing_ && tracer_) tracer_->dump(cycle_ * 2);
-        periph_.tick();
 
         // ── Phase 3: Drive signals for next cycle ──
         // req_ready = always 1 (flat memory, no backpressure)
@@ -284,9 +267,16 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
 
     # mem(): just report stored requests for cosim comparison, ignore bus_in
     f.write("""
-    void mem(const MemBusIn * /*bus_in*/, MemBusOut *bus_out) override {
+    void mem(const MemBusIn *bus_in, MemBusOut *bus_out) override {
+        // Accept peripheral response from frontend
+        if (bus_in[0].resp) {
+            GlobalMemResp r{};
+            r.id = bus_in[0].resp->id;
+            std::memcpy(r.data, bus_in[0].resp->data, sizeof(r.data));
+            periph_resps_.push_back(r);
+        }
         // Report stored requests (captured in step()) for cosim comparison.
-        // The hard backend self-serves memory in step(), so bus_in is ignored.
+        // The hard backend self-serves MC memory in step(), so MC bus_in is ignored.
         bus_out[0].req = stored_periph_req_;
         for (int mc = 0; mc < HARD_NUM_MC; ++mc)
             bus_out[mc + 1].req = stored_mc_req_[mc];
@@ -294,9 +284,6 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
 """)
 
     # printStats()
-    f.write("    bool printStats(uint64_t, bool) override { return false; }\n\n")
-
-    # Accessors
-    f.write("    uint64_t cycle() const { return cycle_; }\n")
+    f.write("    bool printStats(uint64_t, bool) override { return false; }\n")
 
     f.write("};\n")

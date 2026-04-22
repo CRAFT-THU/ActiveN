@@ -68,7 +68,8 @@ public:
   // Conceptually, this will trigger a FULL cycle, including a posedge and a negedge
   // It's implementation-defined whether the posedge or negedge happens first, but the backend should
   // guarantee that the dump is reasonable (see the explaination for mem)
-  virtual void step() = 0;
+  // The cycle number is provided by the frontend. Backends must not count cycles internally.
+  virtual void step(uint64_t cycle) = 0;
 
   // The following functions are used by scheduling memory req / resp
   // They are guaranteed to be called exactly once per cycle, conceptually happens at the negedge
