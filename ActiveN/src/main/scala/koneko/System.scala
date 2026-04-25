@@ -450,7 +450,7 @@ class System(implicit val params: SystemParameters) extends Module {
     val ciLocal = ci % clustersPerMC // cluster index within the MC's zone
     val puStart = ci * 16 + 1
 
-    val dist = Module(new MemDistributor(puStart))
+    val dist = Module(new Distributor(puStart))
     dist.suggestName(s"distrib_${ci + 1}")
 
     // MemIf resp -> distributor input

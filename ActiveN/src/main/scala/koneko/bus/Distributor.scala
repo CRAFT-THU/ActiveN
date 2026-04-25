@@ -17,7 +17,7 @@ import chisel3.util._
 
 import koneko._
 
-class MemDistributor(
+class Distributor(
   puStart: Int, // First PU ID in this cluster (1-based)
 )(implicit val param: CoreParameters) extends Module {
   val in = IO(Flipped(Decoupled(new RingResp)))
