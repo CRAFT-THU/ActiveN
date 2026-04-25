@@ -3,11 +3,9 @@
 /.idea
 /.vscode
 
-/Core.sv
-/Core.anno.json
-/Core.config.json
-/System.sv
-/System.config.json
+/*.sv
+/*.anno.json
+/*.config.json
 /work
 /copilot
 /*.fst
@@ -18,3 +16,5 @@
 /.metals
 /project
 /target
+/verification
+/filelist.f

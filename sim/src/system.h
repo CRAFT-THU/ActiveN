@@ -11,7 +11,7 @@
 const size_t MEM_BUS_WIDTH = 256;
 
 struct GlobalMemReq {
-  uint16_t id;
+  uint8_t id;
 
   // Size of the access, 2^size bytes
   uint8_t size;
@@ -26,7 +26,7 @@ struct GlobalMemReq {
 };
 
 struct GlobalMemResp {
-  uint16_t id;
+  uint8_t id;
   // Small endian, lane-aligned response data
   uint8_t data[MEM_BUS_WIDTH / 8];
 };

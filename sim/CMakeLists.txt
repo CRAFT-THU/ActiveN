@@ -124,6 +124,9 @@ set(VERILATOR_COMMON_ARGS -O3 -Wall -Wno-fatal -Wno-DECLFILENAME --trace-params 
 set(VERILATOR_CORE_ARGS ${VERILATOR_COMMON_ARGS} --top-module Core)
 set(VERILATOR_SYSTEM_ARGS ${VERILATOR_COMMON_ARGS} --top-module System)
 
+# Collect all generated SystemVerilog files from Chisel elaboration
+file(GLOB CHISEL_SV_SOURCES ${CMAKE_SOURCE_DIR}/../*.sv)
+
 # Single-core simulation driver (no DRAM dependency)
 add_executable(sim_single
     src/single.cpp
@@ -131,7 +134,7 @@ add_executable(sim_single
 
 verilate(
     sim_single
-  SOURCES ${CVFPU_SOURCES} ${CMAKE_SOURCE_DIR}/../System.sv ${CMAKE_SOURCE_DIR}/../Aux.sv
+  SOURCES ${CVFPU_SOURCES} ${CHISEL_SV_SOURCES}
     PREFIX rtl
     TRACE_FST
     DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/verilated
@@ -165,7 +168,7 @@ add_library(hard_backend_lib STATIC
 )
 verilate(
   hard_backend_lib
-    SOURCES ${CVFPU_SOURCES} ${CMAKE_SOURCE_DIR}/../System.sv ${CMAKE_SOURCE_DIR}/../Aux.sv
+    SOURCES ${CVFPU_SOURCES} ${CHISEL_SV_SOURCES}
     PREFIX sys_rtl
     TRACE_FST
     DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/sys_verilated
@@ -179,7 +182,7 @@ add_library(soft_backend_lib STATIC
 
 verilate(
   soft_backend_lib
-    SOURCES ${CVFPU_SOURCES} ${CMAKE_SOURCE_DIR}/../System.sv ${CMAKE_SOURCE_DIR}/../Aux.sv
+    SOURCES ${CVFPU_SOURCES} ${CHISEL_SV_SOURCES}
     PREFIX soft_rtl
     TRACE_FST
     DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/soft_verilated

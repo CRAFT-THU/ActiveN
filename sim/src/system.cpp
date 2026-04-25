@@ -437,6 +437,8 @@ bool System::run(uint64_t maxCycles) {
   auto wall_start = chrono::steady_clock::now();
 
   uint64_t cycle = 0;
+  uint64_t mc_req_count = 0, periph_req_count = 0;
+
   while (!impl_->periph.result && cycle < maxCycles && !exiting) {
     ++cycle;
 
@@ -448,6 +450,20 @@ bool System::run(uint64_t maxCycles) {
 
     // Call all backends' mem() with the same bus_in, verify requests match, serve once
     impl_->memInteractAll(cycle);
+
+    // Count requests for heartbeat
+    auto &out = impl_->per_backend_out[0];
+    if (out[0].req) periph_req_count++;
+    for (int mc = 0; mc < impl_->num_mc; ++mc)
+      if (out[mc+1].req) mc_req_count++;
+
+    if (cycle % 500000 == 0) {
+      fprintf(stderr, "[HEARTBEAT %lu] mc_reqs=%lu periph_reqs=%lu periph_resps_pending=%zu mc_resps_pending=%zu\n",
+              cycle, mc_req_count, periph_req_count,
+              impl_->periph_resps.size(),
+              impl_->mc_states.empty() ? 0 : impl_->mc_states[0].resp_queue.size());
+    }
+
   }
 
   auto wall_end = chrono::steady_clock::now();

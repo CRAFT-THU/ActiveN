@@ -278,7 +278,7 @@ class DRAMIf(
   require(numClusters >= 1)
   require(puEnd >= puStart)
   require(puEnd - puStart + 1 == numClusters * 16, "PU IDs must map cleanly to clusters")
-  require(puStart == (mcIdx - 1) * 16 + 1, "mcIdx must align with puStart")
+  require(puStart == mcIdx * numClusters * 16 + 1, s"mcIdx ($mcIdx) must align with puStart ($puStart), expected ${mcIdx * numClusters * 16 + 1}")
   require(isPow2(bulkInflight), "bulkInflight must be a power of 2")
 
   val bulkSubIdWidth = log2Ceil(bulkInflight)
@@ -343,7 +343,7 @@ class DRAMIf(
   mem.req <> reqArb.io.out
 
   // Response handling
-  override val scalarResp: ValidIO[GlobalMemResp] = Wire(Valid(new GlobalMemResp))
+  override lazy val scalarResp: ValidIO[GlobalMemResp] = Wire(Valid(new GlobalMemResp))
   scalarResp.valid := mem.resp.valid && mem.resp.bits.id(7) === 0.U
   scalarResp.bits := mem.resp.bits
   val respIsBulk = mem.resp.valid && mem.resp.bits.id(7) === 1.U
@@ -451,7 +451,7 @@ class PeripheralIf(
   externalInflight: Int,
   configROM: Map[BigInt, BigInt] = Map.empty,
 ) extends MemIf(0, externalInflight, 1) {
-  // FIXME: impl
+  override lazy val scalarResp: ValidIO[GlobalMemResp] = Wire(Valid(new GlobalMemResp))
 
   val configHits = configROM.map({ case (addr, data) => ((scalarReq.bits.addr(31, 5) << 5) === addr.U, data.U(256.W)) }).toSeq
   val configHit = VecInit(configHits.map(_._1)).asUInt.orR
@@ -476,6 +476,8 @@ class PeripheralIf(
   assert(!ringRecv.valid)
   scalarRecv.ready := DontCare
   assert(!scalarRecv.valid)
+
+  flit.ready := scalarAcceptFlit
 
   ringSend <> scalarSend
 }

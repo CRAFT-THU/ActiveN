@@ -52,51 +52,68 @@ class BIU(implicit val param: CoreParameters) extends Module {
   // Staging registers: accumulate up to 4 words across msg instructions
   val staged = Reg(Vec(4, UInt(32.W)))
   val stagedCnt = RegInit(0.U(3.W)) // 0..4
-  val sending = RegInit(false.B)
-  val sendTarget = Reg(UInt(16.W))
-  val sendTag = Reg(UInt(16.W))
 
-  // Accept msg when not in sending state
-  msg.ready := !sending
+  // Local send state (YIELD1): independent of remote send path
+  val localSending = RegInit(false.B)
+  val localSendTag = Reg(UInt(16.W))
+  val localSendData = Reg(Vec(4, UInt(32.W)))
 
+  // Combinational staged data including current msg enqueue
+  // Used to capture send data in the same cycle as msg.fire
+  val stagedNext = Wire(Vec(4, UInt(32.W)))
+  stagedNext := staged
+  when(msg.valid) {
+    when(msg.bits.enq >= 1.U) { stagedNext(stagedCnt) := msg.bits.reg(0) }
+    when(msg.bits.enq >= 2.U) { stagedNext(stagedCnt + 1.U) := msg.bits.reg(1) }
+  }
+
+  // Classify current msg instruction
+  val msgIsLocal  = msg.bits.send && msg.bits.target === 0.U
+  val msgIsRemote = msg.bits.send && msg.bits.target =/= 0.U
+
+  // Remote send: enqueue directly to sendQueue on msg.fire (single-cycle)
+  // This decouples the pipeline from NoC backpressure — the pipeline only
+  // stalls when the sendQueue itself is full, not when the inject port is busy.
+  val sendQueue = Module(new Queue(ext.out.bits.cloneType, 4))
+  sendQueue.io.enq.valid := msg.fire && msgIsRemote
+  sendQueue.io.enq.bits.dst := msg.bits.target
+  sendQueue.io.enq.bits.tag := msg.bits.tag
+  sendQueue.io.enq.bits.data := stagedNext
+  ext.out <> sendQueue.io.deq
+
+  // msg.ready depends on instruction type:
+  //   Remote send (SEND1): blocked only when sendQueue is full
+  //   Local send (YIELD1): blocked only when a previous yield is pending
+  //   Enq-only (QUEUE2):   always ready
+  msg.ready := MuxCase(true.B, Seq(
+    msgIsRemote -> sendQueue.io.enq.ready,
+    msgIsLocal  -> !localSending,
+  ))
+
+  // Update staging registers on msg.fire
   when(msg.fire) {
-    // Enqueue registers into staging area
-    when(msg.bits.enq >= 1.U) {
-      staged(stagedCnt) := msg.bits.reg(0)
-    }
-    when(msg.bits.enq >= 2.U) {
-      staged(stagedCnt + 1.U) := msg.bits.reg(1)
-    }
-    stagedCnt := stagedCnt + msg.bits.enq
-
+    when(msg.bits.enq >= 1.U) { staged(stagedCnt) := msg.bits.reg(0) }
+    when(msg.bits.enq >= 2.U) { staged(stagedCnt + 1.U) := msg.bits.reg(1) }
     when(msg.bits.send) {
-      sending := true.B
-      sendTarget := msg.bits.target
-      sendTag := msg.bits.tag
+      stagedCnt := 0.U // Reset after any send
+    }.otherwise {
+      stagedCnt := stagedCnt + msg.bits.enq
     }
   }
 
-  // Local send: dst=0 means dispatch to own handler instead of ext.out
-  val isLocalSend = sending && sendTarget === 0.U
+  // Local send: dst=0 means dispatch to own handler via br arbiter
+  val isLocalSend = localSending
 
-  // Drive ext.out for remote sends
-  ext.out.valid := sending && !isLocalSend
-  ext.out.bits.dst := sendTarget
-  ext.out.bits.tag := sendTag
-  ext.out.bits.data := staged
-
-  // Local send bypasses ext and goes directly to br arbitration
-  // (handled below in the receive section)
-
-  // sendDone is set when the flit is actually consumed:
-  // - Remote send: ext.out.fire
-  // - Local send: br.fire && localWins (deferred, connected after br arbiter)
+  // Local send: capture yield data on msg.fire, cleared when br dispatches it
   val localSendDone = Wire(Bool())
-  localSendDone := false.B // default, overridden after arbiter
-  val sendDone = Mux(isLocalSend, localSendDone, ext.out.fire)
-  when(sendDone && sending) {
-    sending := false.B
-    stagedCnt := 0.U
+  localSendDone := false.B // default, overridden after br arbiter
+  when(msg.fire && msgIsLocal) {
+    localSending := true.B
+    localSendTag := msg.bits.tag
+    localSendData := stagedNext
+  }
+  when(localSendDone) {
+    localSending := false.B
   }
 
   //////////////////////////
@@ -158,18 +175,18 @@ class BIU(implicit val param: CoreParameters) extends Module {
 
   // Priority: ext.in > local send > broadcast
   val extInWins   = ext.in.valid
-  val localWins   = !extInWins && isLocalSend
-  val bcastWins   = !extInWins && !isLocalSend && bcastValid
+  val localWins   = !extInWins && localSending
+  val bcastWins   = !extInWins && !localSending && bcastValid
 
   brValid := extInWins || localWins || bcastWins
   brTag   := MuxCase(0.U, Seq(
     extInWins  -> ext.in.bits.tag,
-    localWins  -> sendTag,
+    localWins  -> localSendTag,
     bcastWins  -> bcastTag,
   ))
-  brRegs := MuxCase(VecInit(0.U, 0.U, 0.U, 0.U), Seq(
+  brRegs := MuxCase(VecInit(0.U(32.W), 0.U(32.W), 0.U(32.W), 0.U(32.W)), Seq(
     extInWins  -> ext.in.bits.data,
-    localWins  -> staged,
+    localWins  -> localSendData,
     bcastWins  -> bcastData,
   ))
 

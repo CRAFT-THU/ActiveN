@@ -84,7 +84,7 @@ struct Flit {
   uint16_t src = 0;
   uint16_t dst = 0;
   uint16_t tag = 0;
-  uint32_t data = 0;
+  uint32_t data[4] = {};
 };
 
 static void traceMemReq(uint64_t cycle, int mc, bool is_write, uint32_t local_addr, uint16_t id) {
@@ -303,19 +303,25 @@ struct CoreState {
 
   bool canAcceptExtInput(const Flit &flit) {
     uint8_t saved_valid = core->ext_in_valid;
-    uint32_t saved_data = core->ext_in_bits_data;
+    uint32_t saved_data[4] = {core->ext_in_bits_data_0, core->ext_in_bits_data_1, core->ext_in_bits_data_2, core->ext_in_bits_data_3};
     uint16_t saved_tag = core->ext_in_bits_tag;
     uint16_t saved_src = core->ext_in_bits_src;
 
     core->ext_in_valid = 1;
-    core->ext_in_bits_data = flit.data;
+    core->ext_in_bits_data_0 = flit.data[0];
+    core->ext_in_bits_data_1 = flit.data[1];
+    core->ext_in_bits_data_2 = flit.data[2];
+    core->ext_in_bits_data_3 = flit.data[3];
     core->ext_in_bits_tag = flit.tag;
     core->ext_in_bits_src = flit.src;
     core->eval();
     bool ready = core->ext_in_ready;
 
     core->ext_in_valid = saved_valid;
-    core->ext_in_bits_data = saved_data;
+    core->ext_in_bits_data_0 = saved_data[0];
+    core->ext_in_bits_data_1 = saved_data[1];
+    core->ext_in_bits_data_2 = saved_data[2];
+    core->ext_in_bits_data_3 = saved_data[3];
     core->ext_in_bits_tag = saved_tag;
     core->ext_in_bits_src = saved_src;
     core->eval();
@@ -329,13 +335,19 @@ struct CoreState {
   void driveInputs() {
     if (!ext_input) {
       core->ext_in_valid = 0;
-      core->ext_in_bits_data = 0;
+      core->ext_in_bits_data_0 = 0;
+      core->ext_in_bits_data_1 = 0;
+      core->ext_in_bits_data_2 = 0;
+      core->ext_in_bits_data_3 = 0;
       core->ext_in_bits_tag = 0;
       core->ext_in_bits_src = 0;
     } else {
       const auto &f = *ext_input;
       core->ext_in_valid = 1;
-      core->ext_in_bits_data = f.data;
+      core->ext_in_bits_data_0 = f.data[0];
+      core->ext_in_bits_data_1 = f.data[1];
+      core->ext_in_bits_data_2 = f.data[2];
+      core->ext_in_bits_data_3 = f.data[3];
       core->ext_in_bits_tag = f.tag;
       core->ext_in_bits_src = f.src;
     }
@@ -358,7 +370,7 @@ struct CoreState {
       .src = static_cast<uint16_t>(core->cfg_hartid),
       .dst = static_cast<uint16_t>(core->ext_out_bits_dst),
       .tag = static_cast<uint16_t>(core->ext_out_bits_tag),
-      .data = core->ext_out_bits_data,
+      .data = {core->ext_out_bits_data_0, core->ext_out_bits_data_1, core->ext_out_bits_data_2, core->ext_out_bits_data_3},
     };
   }
 
@@ -1481,10 +1493,10 @@ void SoftMemIf::accept(const Flit &flit, uint64_t cycle) {
       int total_flits = entry.is_write ? 3 : 2;
       int flit_idx = total_flits - entry.remaining_flits;
       if (flit_idx == 1) {
-        entry.resp_id = static_cast<uint16_t>(flit.data & 0xFFFFu);
-        if (entry.is_write) entry.size = static_cast<uint16_t>((flit.data >> 16) & 0xFFFFu);
+        entry.resp_id = static_cast<uint16_t>(flit.data[0] & 0xFFFFu);
+        if (entry.is_write) entry.size = static_cast<uint16_t>((flit.data[0] >> 16) & 0xFFFFu);
       } else if (flit_idx == 2) {
-        entry.wdata = flit.data;
+        entry.wdata = flit.data[0];
       }
       if (entry.remaining_flits > 0) --entry.remaining_flits;
       if (entry.remaining_flits == 0) {
@@ -1500,18 +1512,18 @@ void SoftMemIf::accept(const Flit &flit, uint64_t cycle) {
     entry = MemInflightSlot{};
     entry.allocated = true;
     entry.src = flit.src;
-    entry.addr = flit.data;
+    entry.addr = flit.data[0];
     entry.is_write = flit.tag == 0xFF01;
     entry.remaining_flits = entry.is_write ? 2 : 1;
   } else if (flit.tag == 0xFF02) {
     auto it = scatter_base.find(flit.src);
     if (it == scatter_base.end()) {
-      scatter_base.emplace(flit.src, flit.data);
+      scatter_base.emplace(flit.src, flit.data[0]);
     } else {
       // RTL: sScatCollect → sScatIssue on flit 2 arrival
       // The +1 cycle delay matches ready_events timing for normal requests
       scat_addr = it->second;
-      scat_end = flit.data;
+      scat_end = flit.data[0];
       scat_state = ScatIssue;
       scatter_base.erase(it);
     }
@@ -1707,10 +1719,10 @@ void SoftPeriphIf::accept(const Flit &flit, uint64_t cycle) {
     int total_flits = entry.is_write ? 3 : 2;
     int flit_idx = total_flits - entry.remaining_flits;
     if (flit_idx == 1) {
-      entry.resp_id = static_cast<uint16_t>(flit.data & 0xFFFFu);
-      if (entry.is_write) entry.size = static_cast<uint16_t>((flit.data >> 16) & 0xFFFFu);
+      entry.resp_id = static_cast<uint16_t>(flit.data[0] & 0xFFFFu);
+      if (entry.is_write) entry.size = static_cast<uint16_t>((flit.data[0] >> 16) & 0xFFFFu);
     } else if (flit_idx == 2) {
-      entry.wdata = flit.data;
+      entry.wdata = flit.data[0];
     }
     if (entry.remaining_flits > 0) --entry.remaining_flits;
     if (entry.remaining_flits == 0) ready_events.emplace(cycle + 1, slot);
@@ -1724,7 +1736,7 @@ void SoftPeriphIf::accept(const Flit &flit, uint64_t cycle) {
   entry = PeriphInflightSlot{};
   entry.allocated = true;
   entry.src = flit.src;
-  entry.addr = flit.data;
+  entry.addr = flit.data[0];
   entry.is_write = flit.tag == 0xFF01;
   entry.remaining_flits = entry.is_write ? 2 : 1;
 }
