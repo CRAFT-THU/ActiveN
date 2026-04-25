@@ -3,9 +3,7 @@
 /.idea
 /.vscode
 
-/*.sv
-/*.anno.json
-/*.config.json
+/generated
 /work
 /copilot
 /*.fst
