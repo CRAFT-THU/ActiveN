@@ -12,29 +12,31 @@ This only matters if the users uses ordinary load/store instructions to access t
 
 We currently allocates the following events Tag for memory requests / responses.
 
-- 0xFF00: Normal load
+- 0x?000: Normal load
   - operand[0]: the address, aligned to size
   - operand[1][31:16]: The size of the access (log2, can be <= 15 for now)
   - operand[1][15:0]: The request ID
-- 0xFF01: Normal store
+- 0x?001: Normal store
   - operand[0]: the address, aligned to size
   - operand[1][31:16]: The size of the access (log2, can be 0, 1, 2 for now)
   - FIXME: multibeat stores so that size can be > 2
   - operand[1][15:0]: The request ID
   - operand[2]: The data to write, replicated to fill 32 bits (e.g. for byte access, the byte is replicated 4 times in operand[2])
-- 0xFF02: AMO
+- 0x?002: AMO
   - operand[0]: the address, aligned to size
   - operand[1][15:0]: The request ID
   - operand[1][31:16]: The AMO operation (with size, to be defined)
   - operand[2]: The AMO operand
-- 0xFF10: CSR access
+- 0x?010: CSR access
   - operand[0]: the start of the row
   - operand[1][31:16]: the length of the access (in 8 bytes) FIXME: change to granularity based on memory beat
   - operand[1][15:0]: the return tag value (which is scattered, locally)
-- 0xFF11: Bulk load
+- 0x?011: Bulk load
   - operand[0]: the start of the row
   - operand[1][31:16]: the length of the access (in 8 bytes)
   - operand[1][15:0]: the return tag value (which is unicasted, potentially remotely)
+
+The high bits of the tag is ignored, and should be assigned based on wanted priority. See deadlock.md for details.
 
 ## Response
 Memory response is sent on the memory response bus, which is separated from the normal AM NoC.
