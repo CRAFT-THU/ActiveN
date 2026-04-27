@@ -25,6 +25,8 @@ A rule of thumb in designing a deadlock-free protocol:
   - Else, make sure that the margin is the number of messages that this handler can send, **plus** $sum_{p \in "(strictly) higher priority"} max_{h \in "handlers of messages of priority p"} sent(h)$, where $sent$ stands for the maximum number of messages that handler $h$ can send during one execution. In this way, higher priority messages can always be consumed after this handler is scheduled once.
 
 TODO: make sure that when the margin check works with SMT. Assume a running thread already consumes it's share of margin.
+TODO: Now every module should no longer assume irrevocable Decoupled interface. Distributor should consume and buffer one beat of **each type of response** (so that broadcast won't block unicasts). Don't rely on incoming Decoupled without accepting them. They might get retracted.
+TODO: can we make sure that unicast memory responses always gets consumed in a single cycle?
 
 ## Memory requests / responses
 
@@ -49,3 +51,13 @@ Then we can relax the handler's sending restriction to allow sending messages of
 A specific useful example of this is the local sending pattern to try to emulate preemptive scheduling, where a handler sends an event to the PU itself to re-trigger the handler.
 
 User should be much more careful with these kind of assumptions, because if it actually locks the NoC, it can potentially cause a deadlock.
+
+## SMT Quota
+
+Since each core can have multiple concurrent threads, we need to make sure that SMT threads will not contend for the same queue space. Each handler will have a **quota** CSR that contains the actual number of messages that this handler wants to send during this execution. This value should always be less than or equal to its margin.
+
+When a handler is scheduled onto a thread, it's quota will be copied into a thread-specific **quota counter**. The scheduability of the handlers will take into account the quota counters of all live threads.
+
+When a thread actually sends a message, its quota counter will decrement. Currently we don't hard error on quota underflow, because we don't have instruction exception.
+
+For handlers that may generate unbounded number of messages, we have dedicated instructions for querying the remaining quota, so that the software can try to avoid sending too much message.
