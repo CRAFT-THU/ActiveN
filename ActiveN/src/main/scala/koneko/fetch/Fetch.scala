@@ -27,8 +27,12 @@ class Fetch(implicit val params: CoreParameters) extends Module {
   }
   val selpc = Mux1H(sel.asBools, pcs)
 
-  // Latch
-  val sentSmsel = RegEnable(sel, step)
+  // Latch last sent SMSel.
+  val sentSmsel = RegInit(0.U)
+  // sentSmsel may be reset during killing, since that specific line may require line fill
+  // so the killed ICache cannot accept new fetch at that specific cycle.
+  val maskedSentSmsel = sentSmsel & ~VecInit(ctrl.br.map(_.valid)).asUInt
+  sentSmsel := Mux(step, sel, maskedSentSmsel)
 
   // Fetch via ICache
   val icache = Module(new ICache)
@@ -36,45 +40,38 @@ class Fetch(implicit val params: CoreParameters) extends Module {
   icache.input.bits := selpc
   icache.input.valid := fetchable.orR
   icache.kill := VecInit(ctrl.br.zip(sentSmsel.asBools).map({ case (b, s) => b.valid && s })).asUInt.orR
-  step := icache.input.fire
+  // We're using icache.input.ready as stepping signal
+  // So even there is no active thread in the frontend, we can still process
+  // fetched instructions.
+  step := icache.input.ready
 
   // Decode
   val decode = Module(new Decode)
   decode.pc := RegEnable(selpc, step)
   decode.smsel := RegEnable(sel, step)
-  decode.instr := icache.output.bits
+  decode.instr := icache.output
 
   val decodedHolding = for(_ <- 0 until params.pipeCnt) yield Reg(new uOp)
   val decodedHoldingValid = for(_ <- 0 until params.pipeCnt) yield RegInit(false.B)
-  val icacheOutputConsumed = Wire(Bool())
-  icacheOutputConsumed := false.B
-
-  // Track when the ICache output gets captured into the holding register
-  // so we can acknowledge it and let the ICache advance
-  val holdingCapture = Wire(Bool())
-  holdingCapture := false.B
 
   for(((d, dec), idx) <- decodedHoldingValid.zip(decoded).zipWithIndex) {
     d := MuxCase(d, Seq(
       ctrl.br(idx).valid -> false.B,
       dec.ready -> false.B,
-      // dec is not ready
-      (sentSmsel(idx) && icache.output.valid) -> true.B,
+      // dec is not ready, write into holding register
+      sentSmsel(idx) -> true.B,
     ))
-    dec.valid := d || (sentSmsel(idx) && icache.output.valid && !VecInit(ctrl.br.zip(sentSmsel.asBools).map({ case (b, s) => b.valid && s })).asUInt.orR)
+    dec.valid := d || (sentSmsel(idx) && !VecInit(ctrl.br.zip(sentSmsel.asBools).map({ case (b, s) => b.valid && s })).asUInt.orR)
     dec.bits := Mux(d, decodedHolding(idx), decode.decoded)
-    when(dec.valid && dec.ready && sentSmsel(idx) && !d) {
-      icacheOutputConsumed := true.B
-    }
-    // Detect when we're capturing ICache output into holding register
-    when(!d && !dec.ready && sentSmsel(idx) && icache.output.valid) {
-      holdingCapture := true.B
+
+    when(sentSmsel(idx)) {
+      assert(!d, "Holding register should be empty when a new decoded uop is presented")
     }
   }
   for((d, h) <- decodedHoldingValid.zip(decodedHolding)) {
-    h := Mux(d, h, decode.decoded)
+    when(!d) {
+      h := decode.decoded
+    }
   }
   fetchable := ~VecInit(decodedHoldingValid.zip(ctrl.br).map({ case (d, b) => d || b.valid })).asUInt & ~busy
-
-  icache.output.ready := icacheOutputConsumed || holdingCapture || VecInit(ctrl.br.zip(sentSmsel.asBools).map({ case (b, s) => b.valid && s })).asUInt.orR
 }

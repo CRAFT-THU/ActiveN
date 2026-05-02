@@ -17,7 +17,7 @@ class ICache(implicit val params: CoreParameters) extends Module {
     val req = Decoupled(new MemReq)
     val resp = Flipped(Valid(new MemResp))
   })
-  val output = IO(Decoupled(UInt(32.W)))
+  val output = IO(Output(UInt(32.W)))
 
   /*
    * Storages
@@ -209,7 +209,7 @@ class ICache(implicit val params: CoreParameters) extends Module {
     kill -> true.B,
   ))
 
-  output.bits := Mux(s1hit, s1datamux, s1refilledCapture)
+  output := Mux(s1hit, s1datamux, s1refilledCapture)
 
   val metadataWriteIdx = Mux(s1reset, s1rstCnt, s1pcidx)
   val metadataWriteMask = Mux(s1reset, VecInit(Seq.fill(params.i$Assoc)(true.B)), s1victimMap)
@@ -235,7 +235,6 @@ class ICache(implicit val params: CoreParameters) extends Module {
   }
 
   // Scheduler
-  s0step := !s1reset && (!s1valid || ((output.ready || kill || killed) && !s1blocked))
+  s0step := !s1reset && (!s1valid || !s1blocked)
   input.ready := s0step
-  output.valid := s1valid && !kill && !killed && !s1blocked
 }
