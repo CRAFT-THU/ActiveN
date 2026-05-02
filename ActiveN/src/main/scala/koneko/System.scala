@@ -454,12 +454,12 @@ class System(implicit val params: SystemParameters) extends Module {
     dist.suggestName(s"distrib_${ci + 1}")
 
     // MemIf resp -> distributor input
-    dist.in <> memIfs(mcIdx).resp(ciLocal)
+    // dist.in <> memIfs(mcIdx).resp(ciLocal)
 
     // Distributor outputs -> core mem ports
     for (j <- 0 until 16) {
       val puId = puStart + j
-      cores(puId).mem := dist.out(j)
+      // cores(puId).mem := dist.out(j)
     }
   }
 }

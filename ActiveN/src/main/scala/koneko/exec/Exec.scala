@@ -4,6 +4,7 @@ import chisel3._
 import chisel3.util._
 
 import koneko._
+import koneko.bus._
 
 class Exec(implicit val param: CoreParameters) extends Module {
   val dec = IO(Flipped(
@@ -38,10 +39,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
   })
 
   // CSR broadcast input from MemDistributor (via Core)
-  val bcast = IO(new Bundle {
-    val valid = Input(Bool())
-    val data  = Input(UInt(param.memBusWidth.W))
-  })
+  val bcast = IO(Flipped(Decoupled(new BcastLine)))
 
   //////////////////////////
   // Cfg CSRS
@@ -178,9 +176,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   biu.ext.in <> ext.in
   biu.ext.out <> ext.out
-  // FIXME: bcast data
-  // biu.bcast.valid := bcast.valid
-  // biu.bcast.data  := bcast.data
+  biu.bcast <> bcast
 
   // Message port connections
   biu.msg.bits.dst := rs1val

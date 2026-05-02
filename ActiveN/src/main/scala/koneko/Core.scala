@@ -10,7 +10,10 @@ import koneko.bus._
 
 @instantiable
 class Core(implicit val params: CoreParameters) extends Module {
-  @public val mem = IO(Flipped(Valid(new MemResp)))
+  @public val mem = IO(new Bundle {
+    val unicast = Flipped(Valid(new MemResp))
+    val broadcast = Flipped(Decoupled(new BcastLine))
+  })
 
   @public val ext = IO(new Bundle {
     val out = Decoupled(new OutgoingFlit)
@@ -56,11 +59,8 @@ class Core(implicit val params: CoreParameters) extends Module {
 
   // Memory response from external -> encoder -> crossbar
   // Broadcast responses (tag=0xFFFF from MemDistributor) go to BIU instead
-  val isBroadcast = mem.bits.id === 0xFFFF.U
-  crossbar.downstream.resp.valid := mem.valid && !isBroadcast
-  crossbar.downstream.resp.bits := mem.bits
-  exec.bcast.valid   := mem.valid && isBroadcast
-  exec.bcast.data    := mem.bits.data
+  crossbar.downstream.resp := mem.unicast
+  exec.bcast               <> mem.broadcast
 
   fetch.decoded <> exec.dec
   fetch.busy := exec.busy | ext.idlings

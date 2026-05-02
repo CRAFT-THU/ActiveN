@@ -79,6 +79,8 @@ class BulkPending extends Bundle {
   val src = UInt(16.W)
   val tag = UInt(16.W)
 
+  val extras = Vec(2, UInt(32.W))
+
   val issueCnt = UInt(16.W) // Counting beats
   val completedCnt = UInt(16.W)
 
@@ -99,6 +101,9 @@ object BulkPending {
     p.base := flit.data(0)
     p.end := flit.data(0) + ((flit.data(1)(31, 16)) << 5) // length in beats
     p.tag := flit.data(1).apply(15, 0)
+
+    p.extras(0) := flit.data(2)
+    p.extras(1) := flit.data(3)
 
     p.issueCnt := 0.U
     p.completedCnt := 0.U
@@ -285,7 +290,8 @@ class DRAMIf(
   require(bulkSubIdWidth + 1 <= 8, "bulk request ID must fit in 8 bits")
 
   // DRAMIf has response egress ports into local clusters
-  val resp = IO(Vec(numClusters, Decoupled(new RingResp)))
+  val unicast = IO(Vec(numClusters, Valid(new RingResp)))
+  val broadcast = IO(Vec(numClusters, Decoupled(new BcastLine)))
 
   // DRAMIf-specific state for scatter/broadcast
   // Scatter: multi-read command (tag=0xFF02) followed by multiple beats of response data,
@@ -382,12 +388,12 @@ class DRAMIf(
   val bcstStep = bcstAcceptedUpdated.andR
   bcstAccepted := Mux(bcstStep, 0.U(numClusters.W), bcstAcceptedUpdated)
   val bcstDists = for (ci <- 0 until numClusters) yield {
-    val bcstDist = Wire(Decoupled(new RingResp))
+    val bcstDist = Wire(Decoupled(new BcastLine))
     bcstDist.suggestName(s"bcstDist_$ci")
     bcstDist.valid := bcstValid && !bcstAccepted(ci)
-    bcstDist.bits.dst := 0xFFFF.U
-    bcstDist.bits.id := bulkPending.tag
-    bcstDist.bits.data := bulkBuffer(bulkPending.completedCnt)
+    bcstDist.bits.tag := bulkPending.tag
+    bcstDist.bits.line := bulkBuffer(bulkPending.completedCnt).asTypeOf(Vec(16, new BcastBeat))
+    bcstDist.bits.carried := bulkPending.extras
     bcstAccept(ci) := bcstDist.fire
     bcstDist
   }
@@ -408,7 +414,7 @@ class DRAMIf(
   // 1. ringRecv (only for local resp)
   // 2. scalarEject
   // 3. bulkUcstEject
-  // 4. bcstEject (only local resp)
+  // Braodcast now has a dedicated port
   def localDist(in: DecoupledIO[RingResp], name: String): Seq[DecoupledIO[RingResp]] = {
     val clusterMask = for (ci <- 0 until numClusters) yield {
       clusterOf(in.bits.dst) === ci.U
@@ -436,13 +442,15 @@ class DRAMIf(
   val bulkUcstDist = localDist(bulkUcstRecv, "bulkUcstDist")
 
   for (ci <- 0 until numClusters) {
-    val arb = Module(new Arbiter(new RingResp, 4)).suggestName(s"distArb_$ci")
+    val arb = Module(new Arbiter(new RingResp, 3)).suggestName(s"distArb_$ci")
     arb.io.in(0) <> ringDist(ci)
     arb.io.in(1) <> scalarDist(ci)
     arb.io.in(2) <> bulkUcstDist(ci)
-    arb.io.in(3) <> bcstDists(ci)
 
-    resp(ci) <> arb.io.out
+    unicast(ci) := arb.io.out
+    arb.io.out.ready := true.B
+
+    broadcast(ci) <> bcstDists(ci)
   }
 }
 

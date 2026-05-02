@@ -17,39 +17,53 @@ import chisel3.util._
 
 import koneko._
 
+class DistributorOutput(implicit val param: CoreParameters) extends Bundle {
+  val unicast = Output(new Bundle {
+    val resp = new MemResp
+    val valids = UInt(16.W)
+  })
+  val broadcast = new Bundle {
+    val resp = Output(new BcastLine)
+    val valids = Output(UInt(16.W))
+    val readies = Input(UInt(16.W))
+  }
+}
+
 class Distributor(
   puStart: Int, // First PU ID in this cluster (1-based)
 )(implicit val param: CoreParameters) extends Module {
-  val in = IO(Flipped(Decoupled(new RingResp)))
+  val in = IO(new Bundle {
+    val unicast = Flipped(Valid(new RingResp))
+    val broadcast = Flipped(Decoupled(new BcastLine))
+  })
 
-  val out = IO(Vec(16, Valid(new MemResp)))
+  val out = IO(new DistributorOutput)
 
-  // Single-entry buffer
-  val bufDst  = Reg(UInt(16.W))
-  val bufId   = Reg(UInt(16.W))
-  val bufData = Reg(UInt(param.memBusWidth.W))
-  val valid   = RegInit(false.B)
+  // Unicast
+  out.unicast.resp.id := in.unicast.bits.id
+  out.unicast.resp.data := in.unicast.bits.data
+  out.unicast.valids := Fill(16, in.unicast.valid) & UIntToOH(in.unicast.bits.dst - puStart.U, 16)
 
-  // Accept when buffer is empty
-  in.ready := !valid
+  // Single slot queue for broadcasts
+  val bcstQueue = Module(new Queue(new BcastLine, 1, pipe = true))
+  bcstQueue.io.enq <> in.broadcast
 
-  when(in.fire) {
-    bufDst  := in.bits.dst
-    bufId   := in.bits.id
-    bufData := in.bits.data
-    valid   := true.B
-  }
-
-  val isBroadcast = bufDst === 0xFFFF.U
-  val puIdx = bufDst - puStart.U
-  for (i <- 0 until 16) {
-    out(i).valid    := valid && (isBroadcast || puIdx === i.U)
-    out(i).bits.id  := bufId
-    out(i).bits.data := bufData
-  }
-
-  // Clear buffer after one cycle of valid output
-  when(valid) {
-    valid := false.B
-  }
+  // Broadcast
+  // Whether this PU already accepted this packet
+  val bcstAccepted = RegInit(0.U(16.W))
+  // Whether each PU is hit with this specific broadcast
+  val bcstValids = bcstQueue.io.deq.bits.line.map(e => {
+    val inRange = e.pu -% puStart.U < 16.U
+    Fill(16, inRange) & UIntToOH(e.pu - puStart.U, 16)
+  }).reduce(_ | _)
+  // Block if there is a PU that: is valid, do not accept, not accepted yet
+  val bcstWait = (~(bcstAccepted | out.broadcast.readies) & bcstValids).orR
+  bcstQueue.io.deq.ready := !bcstWait
+  out.broadcast.valids := Fill(16, bcstQueue.io.deq.valid) & bcstValids
+  out.broadcast.resp := bcstQueue.io.deq.bits
+  bcstAccepted := Mux(
+    bcstQueue.io.deq.fire,
+    0.U,
+    bcstAccepted | (out.broadcast.valids & out.broadcast.readies)
+  )
 }

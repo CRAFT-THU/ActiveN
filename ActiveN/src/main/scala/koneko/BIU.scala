@@ -8,18 +8,6 @@ import koneko.bus._
 import koneko.Main.pipeCnt
 import koneko.Common.DecoupledOps
 
-// Bcast ABI:
-// Reinterpret each 64bits chunk of bcast line
-// Into (16bit of PU index, 16bit of subindex, 32bit of data).
-// a0: subindex (truncated)
-// a1: data
-// a2~a3: carried data
-class BcastLine extends Bundle {
-  val line = UInt(256.W)
-  val tag = UInt(12.W)
-  val carried = Vec(2, UInt(32.W))
-}
-
 class BIU(implicit val param: CoreParameters) extends Module {
   // Messaging interface
   // If ready = false, it means that the send fails
@@ -55,10 +43,7 @@ class BIU(implicit val param: CoreParameters) extends Module {
     Vec(16, UInt(log2Ceil(param.sendQueueDepth + 1).W))
   ))
 
-  val bcast = IO(new Bundle {
-    val valid = Input(Bool())
-    val data  = Input(UInt(param.memBusWidth.W))
-  })
+  val bcast = IO(Flipped(Decoupled(new BcastLine)))
   val hartid = IO(Input(UInt(16.W)))
 
   //////////////////////////
@@ -78,15 +63,11 @@ class BIU(implicit val param: CoreParameters) extends Module {
   )
   val bcastQueue = Module(new Queue(new BcastLine, param.bcastQueueDepth))
 
+  bcastQueue.io.enq <> bcast
+
   // Braodcast reinterpret state machine
-  // Big endian
-  class BcastBeat extends Bundle {
-    val pu = UInt(16.W)
-    val idx = UInt(16.W)
-    val data = UInt(32.W)
-  }
   val BcastBeats = 256 / (32 + 32) // 32 bits of data, 32 bits of index
-  val bcastBeats = bcastQueue.io.deq.bits.line.asTypeOf(Vec(BcastBeats, new BcastBeat))
+  val bcastBeats = bcastQueue.io.deq.bits.line
   val bcastValids: UInt = VecInit(bcastBeats.map(_.pu === hartid)).asUInt
   val bcastSent = RegInit(0.U(BcastBeats.W))
   val bcastAvail = bcastValids & ~bcastSent
