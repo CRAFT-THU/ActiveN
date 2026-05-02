@@ -4,40 +4,56 @@ import chisel3._
 import chisel3.util._
 
 import koneko._
+import koneko.bus._
+import koneko.Main.pipeCnt
+import koneko.Common.DecoupledOps
+
+// Bcast ABI:
+// Reinterpret each 64bits chunk of bcast line
+// Into (16bit of PU index, 16bit of subindex, 32bit of data).
+// a0: subindex (truncated)
+// a1: data
+// a2~a3: carried data
+class BcastLine extends Bundle {
+  val line = UInt(256.W)
+  val tag = UInt(12.W)
+  val carried = Vec(2, UInt(32.W))
+}
 
 class BIU(implicit val param: CoreParameters) extends Module {
-  val msg = IO(Flipped(Decoupled(new Bundle {
-    val reg = Vec(2, UInt(32.W))
-    val enq = UInt(2.W) // 0, 1, 2
-    val send = Bool()
-    val target = UInt(16.W)
-    val tag = UInt(16.W)
+  // Messaging interface
+  // If ready = false, it means that the send fails
+  // For nonblocking instructions, the request will be canceled next cycle
+  // Local sends is handled outside
+  val msg = IO(Flipped(Decoupled(new OutgoingFlit)))
+
+  // Local push
+  val push = IO(Flipped(Decoupled(new Bundle {
+    val handler = UInt(4.W)
+    val regs = Vec(4, UInt(32.W))
   })))
 
+  val liveQuota = IO(Input(UInt(log2Ceil(param.sendQueueDepth + 1).W)))
+
   val ext = IO(new Bundle {
-    val out = Decoupled(new Bundle {
-      val dst = UInt(16.W)
-      val data = Vec(4, UInt(32.W))
-      val tag = UInt(16.W)
-    })
+    val out = Decoupled(new OutgoingFlit)
 
     val in = Flipped(Decoupled(new Bundle {
       val src = UInt(16.W)
       val data = Vec(4, UInt(32.W))
-      val tag = UInt(16.W)
+      val tag = UInt(12.W)
     }))
   })
 
-  val br = IO(Decoupled(new Bundle {
+  // Send out: current schedulable events, or the pushed event at the same cycle (at lower priority)
+  val sched = IO(Decoupled(new Bundle {
+    val handler = UInt(4.W) // We have 16 handlers
     val regs = Vec(4, UInt(32.W))
-    val target = UInt(32.W)
-    val argcnt = UInt(2.W)
   }))
 
-  val cfg = IO(Input(Vec(16, new Bundle {
-    val handler = UInt(32.W)
-    val argcnt = UInt(2.W)
-  })))
+  val margins = IO(Input(
+    Vec(16, UInt(log2Ceil(param.sendQueueDepth + 1).W))
+  ))
 
   val bcast = IO(new Bundle {
     val valid = Input(Bool())
@@ -49,169 +65,77 @@ class BIU(implicit val param: CoreParameters) extends Module {
   // Sending
   //////////////////////////
 
-  // Staging registers: accumulate up to 4 words across msg instructions
-  val staged = Reg(Vec(4, UInt(32.W)))
-  val stagedCnt = RegInit(0.U(3.W)) // 0..4
+  val sendQueue = Module(new FlitQueue(new OutgoingFlit, param.sendQueueDepth, 4))
+  sendQueue.enq <> msg
+  ext.out <> sendQueue.deq
 
-  // Local send state (YIELD1): independent of remote send path
-  val localSending = RegInit(false.B)
-  val localSendTag = Reg(UInt(16.W))
-  val localSendData = Reg(Vec(4, UInt(32.W)))
+  //////////////////////////
+  // Receiving
+  //////////////////////////
 
-  // Combinational staged data including current msg enqueue
-  // Used to capture send data in the same cycle as msg.fire
-  val stagedNext = Wire(Vec(4, UInt(32.W)))
-  stagedNext := staged
-  when(msg.valid) {
-    when(msg.bits.enq >= 1.U) { stagedNext(stagedCnt) := msg.bits.reg(0) }
-    when(msg.bits.enq >= 2.U) { stagedNext(stagedCnt + 1.U) := msg.bits.reg(1) }
+  val evQueues = for (i <- 0 until 16) yield (
+    Module(new Queue(Vec(4, UInt(32.W)), 16)).suggestName(s"evq_$i")
+  )
+  val bcastQueue = Module(new Queue(new BcastLine, param.bcastQueueDepth))
+
+  // Braodcast reinterpret state machine
+  // Big endian
+  class BcastBeat extends Bundle {
+    val pu = UInt(16.W)
+    val idx = UInt(16.W)
+    val data = UInt(32.W)
+  }
+  val BcastBeats = 256 / (32 + 32) // 32 bits of data, 32 bits of index
+  val bcastBeats = bcastQueue.io.deq.bits.line.asTypeOf(Vec(BcastBeats, new BcastBeat))
+  val bcastValids: UInt = VecInit(bcastBeats.map(_.pu === hartid)).asUInt
+  val bcastSent = RegInit(0.U(BcastBeats.W))
+  val bcastAvail = bcastValids & ~bcastSent
+  val bcastSel = PriorityEncoderOH(bcastAvail)
+  val bcastValid = bcastAvail.orR
+  val bcastData = Mux1H(bcastSel, bcastBeats.map(_.data))
+  val bcastIdx = Mux1H(bcastSel, bcastBeats.map(_.idx))
+  val bcastHandler = bcastQueue.io.deq.bits.tag(3, 0)
+  val bcastMapped = Wire(Decoupled(Vec(4, UInt(32.W))))
+  bcastMapped.bits(0) := bcastIdx
+  bcastMapped.bits(1) := bcastData
+  bcastMapped.bits(2) := bcastQueue.io.deq.bits.carried(0)
+  bcastMapped.bits(3) := bcastQueue.io.deq.bits.carried(1)
+  bcastMapped.valid := bcastValid && bcastQueue.io.deq.valid
+  bcastQueue.io.deq.ready := !(bcastAvail.orR) // Everything is sent
+  when(bcastQueue.io.deq.fire) {
+    bcastSent := 0.U
+  }.elsewhen(bcastMapped.fire) {
+    bcastSent := bcastSent | bcastSel
   }
 
-  // Classify current msg instruction
-  val msgIsLocal  = msg.bits.send && msg.bits.target === 0.U
-  val msgIsRemote = msg.bits.send && msg.bits.target =/= 0.U
-
-  // Remote send: enqueue directly to sendQueue on msg.fire (single-cycle)
-  // This decouples the pipeline from NoC backpressure — the pipeline only
-  // stalls when the sendQueue itself is full, not when the inject port is busy.
-  val sendQueue = Module(new Queue(ext.out.bits.cloneType, 4))
-  sendQueue.io.enq.valid := msg.fire && msgIsRemote
-  sendQueue.io.enq.bits.dst := msg.bits.target
-  sendQueue.io.enq.bits.tag := msg.bits.tag
-  sendQueue.io.enq.bits.data := stagedNext
-  ext.out <> sendQueue.io.deq
-
-  // msg.ready depends on instruction type:
-  //   Remote send (SEND1): blocked only when sendQueue is full
-  //   Local send (YIELD1): blocked only when a previous yield is pending
-  //   Enq-only (QUEUE2):   always ready
-  msg.ready := MuxCase(true.B, Seq(
-    msgIsRemote -> sendQueue.io.enq.ready,
-    msgIsLocal  -> !localSending,
-  ))
-
-  // Update staging registers on msg.fire
-  when(msg.fire) {
-    when(msg.bits.enq >= 1.U) { staged(stagedCnt) := msg.bits.reg(0) }
-    when(msg.bits.enq >= 2.U) { staged(stagedCnt + 1.U) := msg.bits.reg(1) }
-    when(msg.bits.send) {
-      stagedCnt := 0.U // Reset after any send
-    }.otherwise {
-      stagedCnt := stagedCnt + msg.bits.enq
-    }
-  }
-
-  // Local send: dst=0 means dispatch to own handler via br arbiter
-  val isLocalSend = localSending
-
-  // Local send: capture yield data on msg.fire, cleared when br dispatches it
-  val localSendDone = Wire(Bool())
-  localSendDone := false.B // default, overridden after br arbiter
-  when(msg.fire && msgIsLocal) {
-    localSending := true.B
-    localSendTag := msg.bits.tag
-    localSendData := stagedNext
-  }
-  when(localSendDone) {
-    localSending := false.B
+  // Arbiter priority:
+  // 1. Local push
+  // 2. Incoming unicast
+  // 3. Incoming broadcast
+  val splittedLocal = push.split(16, b => UIntToOH(b.handler(3, 0))).map(_.map(_.regs))
+  val splittedUnicast = ext.in.split(16, d => UIntToOH(d.tag(3, 0))).map(_.map(_.data))
+  val splittedBcast = bcastMapped.split(16, b => UIntToOH(bcastHandler(3, 0)))
+  for (i <- 0 until 16) {
+    val arb = Module(new Arbiter(Vec(4, UInt(32.W)), 3)).suggestName(s"ingressArb_$i")
+    arb.io.in(0) <> splittedLocal(i)
+    arb.io.in(1) <> splittedUnicast(i)
+    arb.io.in(2) <> splittedBcast(i)
+    evQueues(i).io.enq <> arb.io.out
   }
 
   //////////////////////////
-  // Receiving: single-cycle dispatch
+  // Scheduling
   //////////////////////////
-  // With Vec(4, UInt(32.W)) data, we can write all 4 regs and schedule
-  // the handler in one cycle. No EvQueue needed.
 
-  // Arbitrate between: ext.in (remote), local send, and broadcast
-  // All produce (regs, tag) -> look up handler + argcnt -> br output
-
-  // Broadcast processing
-  val bcastTag = 1.U // SPIKE_TAG
-  val numEntries = param.memBusWidth / 64 // 4 for 256-bit bus
-
-  // Buffer raw broadcast beats
-  val bcastBeatQ = Module(new Queue(UInt(param.memBusWidth.W), 256))
-  bcastBeatQ.io.enq.valid := bcast.valid
-  bcastBeatQ.io.enq.bits  := bcast.data
-  bcastBeatQ.io.deq.ready := false.B
-  assert(!bcast.valid || bcastBeatQ.io.enq.ready, "BIU broadcast beat queue overflow")
-
-  // Broadcast match FSM: extract matching entries from beat
-  val bcastPending = RegInit(VecInit(Seq.fill(numEntries)(false.B)))
-  val bcastRegs    = Reg(Vec(numEntries, Vec(4, UInt(32.W))))
-  val bcastActive  = RegInit(false.B)
-
-  when(!bcastActive && bcastBeatQ.io.deq.valid) {
-    bcastBeatQ.io.deq.ready := true.B
-    bcastActive := false.B
-    for (i <- 0 until numEntries) {
-      val word0 = bcastBeatQ.io.deq.bits(64 * i + 31, 64 * i)
-      val word1 = bcastBeatQ.io.deq.bits(64 * i + 63, 64 * i + 32)
-      val dstCore = word0(31, 16)
-      val neuron  = word0(15, 0)
-      val matches = dstCore === hartid
-      bcastPending(i) := matches
-      // Pack as 4-reg event: [neuron, weight, 0, 0]
-      bcastRegs(i)(0) := neuron
-      bcastRegs(i)(1) := word1
-      bcastRegs(i)(2) := 0.U
-      bcastRegs(i)(3) := 0.U
-      when(matches) { bcastActive := true.B }
-    }
+  val scheduleArb = Module(new Arbiter(Vec(4, UInt(32.W)), 16)).suggestName("scheduleArb")
+  for (i <- 0 until 16) {
+    val schedulable = sendQueue.count + margins(i) + liveQuota <= param.sendQueueDepth.U
+    val gated = evQueues(i).io.deq.gatedBy(schedulable).suggestName(s"gated_$i")
+    scheduleArb.io.in(i) <> gated
   }
-
-  // Pick first pending broadcast entry
-  val bcastWhich = PriorityEncoder(bcastPending.asUInt)
-  val bcastValid = bcastActive
-  val bcastData  = bcastRegs(bcastWhich)
-
-  // 3-way priority arbiter for br output:
-  //   1. ext.in (remote message)
-  //   2. local send
-  //   3. broadcast
-  val brValid = Wire(Bool())
-  val brRegs  = Wire(Vec(4, UInt(32.W)))
-  val brTag   = Wire(UInt(16.W))
-
-  // Priority: ext.in > local send > broadcast
-  val extInWins   = ext.in.valid
-  val localWins   = !extInWins && localSending
-  val bcastWins   = !extInWins && !localSending && bcastValid
-
-  brValid := extInWins || localWins || bcastWins
-  brTag   := MuxCase(0.U, Seq(
-    extInWins  -> ext.in.bits.tag,
-    localWins  -> localSendTag,
-    bcastWins  -> bcastTag,
-  ))
-  brRegs := MuxCase(VecInit(0.U(32.W), 0.U(32.W), 0.U(32.W), 0.U(32.W)), Seq(
-    extInWins  -> ext.in.bits.data,
-    localWins  -> localSendData,
-    bcastWins  -> bcastData,
-  ))
-
-  // Look up handler and argcnt from tag
-  val brHandler = cfg(brTag).handler
-  val brArgcnt  = cfg(brTag).argcnt
-
-  br.valid       := brValid
-  br.bits.regs   := brRegs
-  br.bits.target := brHandler
-  br.bits.argcnt := brArgcnt
-
-  // Backpressure / consumption
-  ext.in.ready := br.ready && extInWins
-
-  // Local send completes only when br actually fires for the local send
-  localSendDone := br.fire && localWins
-
-  // Broadcast: consume pending entry when br fires from broadcast
-  when(bcastWins && br.fire) {
-    bcastPending(bcastWhich) := false.B
-    when(PopCount(bcastPending.asUInt) === 1.U) {
-      bcastActive := false.B
-    }
-  }
+  val scheduled = scheduleArb.io.chosen
+  sched.valid := scheduleArb.io.out.valid
+  scheduleArb.io.out.ready := sched.ready
+  sched.bits.handler := scheduleArb.io.chosen
+  sched.bits.regs := scheduleArb.io.out.bits
 }
-
-// TODO: handles local send

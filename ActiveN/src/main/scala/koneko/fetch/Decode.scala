@@ -148,7 +148,7 @@ object InstrMemIsAtomic extends BoolDecodeField[InstrPattern] {
 object InstrIsAM extends BoolDecodeField[InstrPattern] {
   override def name: String = "Decode is AM"
   override def genTable(op: InstrPattern): BitPat = (op.name match {
-    case "AM" => y
+    case "AM" | "AMI" => y
     case _ => n
   })
 }
@@ -238,6 +238,7 @@ class Decode(implicit val params: CoreParameters) extends Module {
     InstrPattern("OP-IMM", "00100", InstrType.I, isOPImm = Some(true)),
     InstrPattern("OP", "01100", InstrType.R, isOPImm = Some(false)),
     InstrPattern("AM", "00010", InstrType.R, isOPImm = Some(false)), // Custom-0
+    InstrPattern("AMI", "01010", InstrType.I, isOPImm = Some(true)), // Custom-0
     InstrPattern("SYSTEM", "11100", InstrType.I), // Doesn't use adder result
     InstrPattern("OP-FP", "10100", InstrType.R),
     InstrPattern("AMO", "01011", InstrType.R, memType = Some(MemType.Atomic)),

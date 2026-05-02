@@ -15,13 +15,13 @@ class Exec(implicit val param: CoreParameters) extends Module {
     val out = Decoupled(new Bundle {
       val dst = UInt(16.W)
       val data = Vec(4, UInt(32.W))
-      val tag = UInt(16.W)
+      val tag = UInt(12.W)
     })
 
     val in = Flipped(Decoupled(new Bundle {
       val src = UInt(16.W)
       val data = Vec(4, UInt(32.W))
-      val tag = UInt(16.W)
+      val tag = UInt(12.W)
     }))
 
     val idlings = Output(UInt(param.pipeCnt.W))
@@ -48,7 +48,9 @@ class Exec(implicit val param: CoreParameters) extends Module {
   //////////////////////////
 
   val handlers = RegInit(VecInit(Seq.fill(16)(0.U(32.W))))
-  val argcnts = RegInit(VecInit(Seq.fill(16)(0.U(2.W))))
+  val argcnts = RegInit(VecInit(Seq.fill(16)(0.U(3.W))))
+  val margins = RegInit(VecInit(Seq.fill(16)(0.U(log2Ceil(param.sendQueueDepth + 1).W))))
+  val quotas = RegInit(VecInit(Seq.fill(16)(0.U(log2Ceil(param.sendQueueDepth + 1).W))))
 
   //////////////////////////
   // Actual configuration
@@ -86,6 +88,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
   val uop = RegEnable(Mux1H(issueSel, s0uops), s0step)
   val rs1val = RegEnable(Mux1H(issueSel, regfiles.map(_.read(0).value)), s0step)
   val rs2val = RegEnable(Mux1H(issueSel, regfiles.map(_.read(1).value)), s0step)
+  val directval = RegEnable(Mux1H(issueSel, regfiles.map(r => VecInit(r.msgDirect.map(_.rdata)))), s0step)
   val delayed = RegEnable(s0delayed, s0step)
 
   ext.working := valid
@@ -169,60 +172,102 @@ class Exec(implicit val param: CoreParameters) extends Module {
   lsu.req.bits.funct5 := uop.funct7(6, 2) // AMO funct5 is funct7[6:2]
   lsu.req.valid := valid && uop.isMem
 
-  // BIU, target at rs2
+  // BIU & related AM connections
   val biu = Module(new BIU)
-  for((b, (h, a)) <- biu.cfg.zip(handlers.zip(argcnts))) {
-    b.handler := h
-    b.argcnt := a
-  }
-
-  // FIXME(meow): arrange yielding as a side effect
-  // because the target of a fire.yield may not be ourselve
-  // - isWFI & isYield should be equivalent
-  // - Future optimization: Loopback biu.br from biu.msg.fire with target = self
-  val isYield = dontTouch(uop.isAM && uop.funct7(0))
-  val yieldTag = rs2val >> 16
-  val yieldTarget = handlers(yieldTag.asUInt)
-  val yieldAcked = biu.br.valid
+  biu.hartid := cfg.hartid(15, 0)
 
   biu.ext.in <> ext.in
   biu.ext.out <> ext.out
-  biu.bcast.valid := bcast.valid
-  biu.bcast.data  := bcast.data
-  biu.hartid      := cfg.hartid(15, 0)
-  biu.msg.bits.reg(0) := rs1val
-  biu.msg.bits.reg(1) := rs2val
-  biu.msg.bits.enq := uop.funct3(1, 0)
-  biu.msg.bits.send := uop.funct3(2)
-  biu.msg.bits.target := rs2val
-  biu.msg.bits.tag := rs2val >> 16
-  biu.msg.valid := valid && uop.isAM && (!isYield || yieldAcked) // TODO: funct7 arbitration?
-  assert(!(valid && uop.isAM && biu.msg.fire) || s0step)
+  // FIXME: bcast data
+  // biu.bcast.valid := bcast.valid
+  // biu.bcast.data  := bcast.data
 
-  val isWFI = uop.isSystem && uop.funct3 === 0.U && uop.rs2 === 5.U
-  val idlings = RegInit(((BigInt(1) << param.pipeCnt) - 2).U(param.pipeCnt.W)) // Only pipe 1 is active at boot
-  val idlingsMasked: UInt = idlings | Mux(valid && isWFI, uop.smsel, 0.U)
+  // Message port connections
+  biu.msg.bits.dst := rs1val
+  biu.msg.bits.data := directval
+  biu.msg.bits.tag := alu2(11, 0) // Reuse alu2imm for decode
+  val msgIsLocal = rs1val === 0.U
+  biu.push.bits.handler := alu2(3, 0)
+  biu.push.bits.regs := directval
 
-  biu.br.ready := s0step && (idlingsMasked.orR || valid && isYield)
-  val biuSel = Mux(valid && isYield, uop.smsel, PriorityEncoderOH(idlingsMasked)) // Yielding guy takes precidence
-  idlings := idlingsMasked & (~Mux(biu.br.fire, biuSel, 0.U)).asUInt // Yielding guy never transitions to idling
+  // FIXME: quota check. See targetQuotaSufficient below
+  biu.msg.valid := valid && uop.isAM && !msgIsLocal
+  biu.push.valid := valid && uop.isAM && msgIsLocal
+
+  // We use fire here because there is a chance of insufficient quota
+  // so valid is not necessarily true
+  val biuAccepted = Mux(msgIsLocal, biu.push.fire, biu.msg.fire)
+
+  // TODO: optimize local send + yield
+  // If biu.sched does not need to be consumed by the current thread, i.e.
+  // - biu.sched.valid === false.B
+  // - There is already another idling thread
+  // Then we can skip sending anything, just immediately complete this send,
+  // jump to the handler without even writing registers.
+
+  // TODO: what's this?
+  // assert(!(valid && uop.isAM && biu.msg.fire) || s0step)
+
+  // Idling management
+  // Next cycle idlings
+  val idlings = RegInit(0.U(param.pipeCnt.W))
   ext.idlings := idlings
+  assert(!valid || ((idlings.asUInt & uop.smsel) === 0.U)) // Active instruction must come from active thread
 
-  val biuBrs = for(i <- 0 until param.pipeCnt) yield {
-    val biuBr = Wire(Valid(UInt(32.W)))
-    biuBr.valid := (idlingsMasked | Mux(valid && isYield, uop.smsel, 0.U))(i)
-    // FIXME: no initVec here
-    biuBr.bits := MuxCase(param.initVec.U, Seq(
-      biu.br.valid -> biu.br.bits.target,
-      (valid && isYield) -> yieldTarget,
-    ))
-    for ((r, active) <- regfiles.zip(biuSel.asBools)) {
-      r.bankedWrite.en := biu.br.fire && active
-      r.bankedWrite.regs := biu.br.bits.regs
-      r.bankedWrite.offset := 0.U // TODO: allow regs > 4
-      r.bankedWrite.cnt := biu.br.bits.argcnt
+  val liveQuotas = RegInit(VecInit(Seq.fill(param.pipeCnt)(0.U(log2Ceil(param.sendQueueDepth + 1).W))))
+  val liveQuotaSum = liveQuotas.zip(idlings.asBools).map({ case (quota, idle) => Mux(idle, 0.U, quota) }).reduce(_ +& _)
+  assert(liveQuotaSum <= param.sendQueueDepth.U)
+  biu.liveQuota := liveQuotaSum
+
+  biu.margins := margins
+
+  val isYield = valid && uop.isAM && uop.funct3(0)
+  val isWFI = valid && uop.isSystem && uop.funct3 === 0.U && uop.rs2 === 5.U
+  // Effectively schedulable threads **RIGHT NOW**
+  // failed nonblocking yield does not constitute a candidate
+  val effectivelyYield = isYield && biuAccepted || isWFI
+  val eidlings = idlings | (Fill(param.pipeCnt, s0step && (isYield && biuAccepted || isWFI)) & uop.smsel)
+  val wakeup = PriorityEncoderOH(eidlings)
+  assert(!effectivelyYield || s0step, "effectivelyYield -> s0step")
+  assert(s0step || eidlings === idlings, "eidlings can only differ from idlings when s0step")
+
+  // Branches caused by AM
+  val biuBrs = Wire(Vec(param.pipeCnt, Valid(UInt(4.W))))
+  // FIXME: handles blocking
+  // We handle idlings by continously branching to an address
+  // FIXME: nonlocal yield may become idle. Also need to branch. Also: WFI is the same
+  for (i <- 0 until param.pipeCnt) {
+    biuBrs(i).valid := eidlings(i)
+    biuBrs(i).bits := biu.sched.bits.handler
+  }
+
+  // BIU sched is accepted when there is an effectively idling thread
+  biu.sched.ready := eidlings.orR
+
+  // Sending quota decrement
+  val targetQuota = Mux1H(uop.smsel, liveQuotas)
+  val targetQuotaSufficient = targetQuota > 0.U
+  val targetQuotaUpdate = Mux(targetQuotaSufficient, targetQuota - 1.U, targetQuota)
+  for(i <- 0 until param.pipeCnt) {
+    when(valid && uop.isAM && uop.smsel(i) && biuAccepted) {
+      liveQuotas(i) := targetQuotaUpdate
     }
-    biuBr
+  }
+
+  // State transition during actual schedule: regfile, quotas, idlings
+  // only clear wakeup thread when there is something to schedule
+  idlings := eidlings & (~wakeup | Fill(param.pipeCnt, !biu.sched.valid))
+  for (i <- 0 until param.pipeCnt) {
+    val scheduled = biu.sched.valid && wakeup(i)
+    for (j <- 0 until 4) {
+      // Local sends skips writing registers, only handles remote sends here
+      regfiles(i).msgDirect(j).wdata := biu.sched.bits.regs(j)
+      regfiles(i).msgDirect(j).wen := scheduled && argcnts(biu.sched.bits.handler) > j.U
+    }
+
+    when(scheduled) {
+      liveQuotas(i) := quotas(biu.sched.bits.handler)
+    }
   }
 
   // CSR
@@ -232,6 +277,10 @@ class Exec(implicit val param: CoreParameters) extends Module {
     case (h, i) => ((0x700 + i) -> h)
   }) ++ argcnts.zipWithIndex.map({
     case (h, i) => ((0x710 + i) -> h)
+  }) ++ margins.zipWithIndex.map({
+    case (h, i) => ((0x720 + i) -> h)
+  }) ++ quotas.zipWithIndex.map({
+    case (h, i) => ((0x730 + i) -> h)
   })
   val csrwmapping = csrmapping.filter({ e => (e._1 >> 10) != 3 })
   val isCSR = uop.isSystem && uop.funct3(1, 0) =/= 0.U
@@ -267,6 +316,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
     uop.rdlui -> uop.immU,
     uop.rdauipc -> (uop.immU + uop.pc),
     uop.isMem -> lsu.resp,
+    uop.isAM -> Mux(biuAccepted, 1.U, 0.U),
     uop.isSystem -> csrRdata, // Only CSR here
   )
 
@@ -302,7 +352,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   var s1donesrc = Seq(
     uop.isMem -> lsu.req.ready,
-    uop.isAM -> (!biu.msg.valid || biu.msg.ready),
+    uop.isAM -> (biuAccepted && !uop.funct3(1)),
   )
 
   val s1done = MuxCase(true.B, s1donesrc)
@@ -318,7 +368,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
   ))
 
   for(((br, biuBr), idx) <- brs.zip(biuBrs).zipWithIndex) {
-    br.bits := Mux(biuBr.valid, biuBr.bits, (added >> 1) ## 0.U(1.W))
+    br.bits := Mux(biuBr.valid, handlers(biuBr.bits), (added >> 1) ## 0.U(1.W))
     br.valid := biuBr.valid || uop.smsel(idx) && (valid && ((uop.isBr && brfire) || uop.isJump))
   }
 

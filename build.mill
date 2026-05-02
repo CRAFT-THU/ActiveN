@@ -17,6 +17,7 @@ object ActiveN extends ScalaModule with ScalafmtModule { m =>
   )
   override def mvnDeps = Seq(
     mvn"org.chipsalliance::chisel:7.11.0",
+    mvn"com.lihaoyi::upickle:4.1.0",
   )
   override def scalacPluginMvnDeps = Seq(
     mvn"org.chipsalliance:::chisel-plugin:7.11.0",

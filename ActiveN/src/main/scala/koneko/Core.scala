@@ -13,17 +13,8 @@ class Core(implicit val params: CoreParameters) extends Module {
   @public val mem = IO(Flipped(Valid(new MemResp)))
 
   @public val ext = IO(new Bundle {
-    val out = Decoupled(new Bundle {
-      val dst = UInt(16.W)
-      val data = Vec(4, UInt(32.W))
-      val tag = UInt(16.W)
-    })
-
-    val in = Flipped(Decoupled(new Bundle {
-      val src = UInt(16.W)
-      val data = Vec(4, UInt(32.W))
-      val tag = UInt(16.W)
-    }))
+    val out = Decoupled(new OutgoingFlit)
+    val in = Flipped(Decoupled(new IncomingFlit))
 
     val idlings = Output(UInt(params.pipeCnt.W))
     val working = Output(Bool())
@@ -41,13 +32,13 @@ class Core(implicit val params: CoreParameters) extends Module {
   val exec = Module(new Exec)
   val crossbar = Module(new Crossbar(2))
   val encoder = Module(new Encoder)
-  val extInQueue = Module(new Queue(ext.in.bits.cloneType, 4))
+  val msgQueue = Module(new FlitQueue(ext.in.bits.cloneType, params.msgQueueDepth, 4))
 
   exec.cfg <> cfg
 
   // FIXME: deadlock proof
-  extInQueue.io.enq <> ext.in
-  exec.ext.in <> extInQueue.io.deq
+  msgQueue.enq <> ext.in
+  exec.ext.in <> msgQueue.deq
   exec.ext.idlings <> ext.idlings
   exec.ext.working <> ext.working
 

@@ -10,14 +10,16 @@ import chisel3._
 import chisel3.util._
 import chisel3.util.experimental.decode.{TruthTable, decoder}
 
-trait Routable extends Data {
-  // The destination of this message
-  def dst: UInt
-
+trait Prio extends Data {
   // The priority of this message
   // This is the hardware priority, not the protocol priority
   // Will be mapped to VCs
   def prio: UInt
+}
+
+trait Routable extends Data with Prio {
+  // The destination of this message
+  def dst: UInt
 
   // Whether this is a tail flit
   def isTail(isHead: Bool): Bool

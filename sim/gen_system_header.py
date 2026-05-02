@@ -30,8 +30,6 @@ with open(os.path.join(outdir, "system_config.h"), "w") as f:
     f.write(f"inline constexpr int SYSTEM_ICACHE_LINES = {core['iCacheLines']};\n")
     f.write(f"inline constexpr int SYSTEM_ICACHE_BLOCK_SIZE = {core['iCacheBlockSize']};\n")
     f.write(f"inline constexpr int SYSTEM_ICACHE_ASSOC = {core['iCacheAssoc']};\n")
-    f.write(f"inline constexpr int SYSTEM_MEM_DST = {core['memDst']};\n")
-    f.write(f"inline constexpr int SYSTEM_MEM_TAG_BASE = {core['memTagBase']};\n")
     f.write(f"inline constexpr int SYSTEM_MEM_BUS_WIDTH = {core['memBusWidth']};\n")
     f.write(f"inline constexpr int SYSTEM_SCRATCHPAD_SIZE = {core['scratchpadSize']};\n")
     f.write(f"inline constexpr bool SYSTEM_USE_FPU = {'true' if core['useFPU'] else 'false'};\n")

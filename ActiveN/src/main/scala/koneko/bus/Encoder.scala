@@ -22,7 +22,7 @@ class Encoder(implicit val param: CoreParameters) extends Module {
   val out = IO(Decoupled(new Bundle {
     val dst = UInt(16.W)
     val data = Vec(4, UInt(32.W))
-    val tag = UInt(16.W)
+    val tag = UInt(12.W)
   }))
 
   // --- Destination computation ---

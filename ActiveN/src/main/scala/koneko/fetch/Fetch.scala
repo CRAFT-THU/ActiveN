@@ -56,6 +56,7 @@ class Fetch(implicit val params: CoreParameters) extends Module {
 
   for(((d, dec), idx) <- decodedHoldingValid.zip(decoded).zipWithIndex) {
     d := MuxCase(d, Seq(
+      ctrl.br(idx).valid -> false.B,
       dec.ready -> false.B,
       // dec is not ready
       (sentSmsel(idx) && icache.output.valid) -> true.B,

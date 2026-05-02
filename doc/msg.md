@@ -19,11 +19,9 @@ The I-type form statically gives the tag, and only take rs1 (the destination).
 The funct3 field of the instruction encode other special meanings:
 - Bit 0: If set, marks this send as a "yield" send. Semantically, it's equivalent to executing a WFI immediately after **successfully** sending the message. Specifically, if there is a lower-priority message, it will be scheduled, and the outgoing message will be placed in the event queue.
   A special optimization is that if the destination is 0 (this does not include using the local PU ID, only 0), and there is no pending message, then the handler will be immediately scheduled during the same cycle, and the message will not be put into the event queue.
-- Bit 1 & 2: If bit 2 is set, marks this send as a "non-blocking" send. If the send queue is full or if there is not enough quota, the instruction will fail. See the section below.
-  - If bit 1 is not set, this instruction will fail if the send queue is full.
-  - If bit 1 is set, this instruction will fail if the quota is exausted.
+- Bit 1: If bit 1 is set, marks this send as a "non-blocking" send. If if there is not enough quota (live quota === 0), the instruction will fail. See the section below.
 
-Memnomic for the instruction: `send{.yield}{.nb[.quota]} rd, dest, tag` and `sendi{.yield}{.nb[.quota]} rd, dest`.
+Memnomic for the instruction: `send{.yield}{.nb} rd, dest, tag` and `sendi{.yield}{.nb} rd, dest`.
 
 The result of this instruction marks the successfulness of the send. Writes back 1 if the send is successful, and 0 if it fails. Note that with blocking send, this instruction will effectively always succeed. With yield, then the software will also never observe a successful send, although the writeback will be performed.
 

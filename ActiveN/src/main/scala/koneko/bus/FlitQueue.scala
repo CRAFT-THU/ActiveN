@@ -3,7 +3,7 @@ package koneko.bus
 import chisel3._
 import chisel3.util._
 
-class FlitQueue[F <: Routable](
+class FlitQueue[F <: Prio](
   flit: F,
   depth: Int,
   numPrio: Int,
@@ -28,6 +28,8 @@ class FlitQueue[F <: Routable](
 
   val enq = IO(Flipped(Decoupled(flit.cloneType)))
   val deq = IO(Decoupled(flit.cloneType))
+  val count = IO(Output(UInt((log2Ceil(depth) + 1).W)))
+  count := cnt
 
   // Dequeue
   val prioDeqs = (0 until numPrio) map { p => VecInit(prio.map(_(p))) }

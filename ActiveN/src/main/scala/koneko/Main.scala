@@ -10,43 +10,40 @@ object Main extends App {
     i$Lines = 16,
     i$Assoc = 2,
     i$BlockSize = 64,
-    memDst = 0,
-    memTagBase = 0x0,
     memBusWidth = 256, // DDR4
     memCtrlSizes = List(BigInt("100000000", 16)), // 4 GiB
     scratchpadSize = 16384,
     useFPU = true,
     pipeCnt = pipeCnt,
+    sendQueueDepth = 16,
+    evQueueDepth = 16,
   )
 
-  def coreConfigJson(p: CoreParameters): String = {
-    val sizes = p.memCtrlSizes.map(s => s""""0x${s.toString(16)}"""").mkString(", ")
-    s"""{
-       |  "initVec": "0x${p.initVec.toString(16)}",
-       |  "iCacheLines": ${p.i$Lines},
-       |  "iCacheBlockSize": ${p.i$BlockSize},
-       |  "iCacheAssoc": ${p.i$Assoc},
-       |  "memDst": ${p.memDst},
-       |  "memTagBase": ${p.memTagBase},
-       |  "memBusWidth": ${p.memBusWidth},
-       |  "memCtrlSizes": [${sizes}],
-       |  "scratchpadSize": ${p.scratchpadSize},
-       |  "useFPU": ${p.useFPU},
-       |  "pipeCnt": ${p.pipeCnt}
-       |}""".stripMargin
-  }
+  def coreConfigJson(p: CoreParameters): ujson.Value = ujson.Obj(
+    "initVec" -> s"0x${p.initVec.toString(16)}",
+    "iCacheLines" -> p.i$Lines,
+    "iCacheBlockSize" -> p.i$BlockSize,
+    "iCacheAssoc" -> p.i$Assoc,
+    "memBusWidth" -> p.memBusWidth,
+    "memCtrlSizes" -> p.memCtrlSizes.map(s => ujson.Str(s"0x${s.toString(16)}")),
+    "scratchpadSize" -> p.scratchpadSize,
+    "useFPU" -> p.useFPU,
+    "pipeCnt" -> p.pipeCnt,
+    "sendQueueDepth" -> p.sendQueueDepth,
+    "msgQueueDepth" -> p.msgQueueDepth,
+    "evQueueDepth" -> p.evQueueDepth,
+    "bcastQueueDepth" -> p.bcastQueueDepth,
+  )
 
-  def systemConfigJson(p: SystemParameters): String = {
-    s"""{
-       |  "numMC": ${p.numMC},
-       |  "numPU": ${p.numPU},
-       |  "core": ${coreConfigJson(p.coreParams).split("\n").mkString("\n  ")}
-       |}""".stripMargin
-  }
+  def systemConfigJson(p: SystemParameters): ujson.Value = ujson.Obj(
+    "numMC" -> p.numMC,
+    "numPU" -> p.numPU,
+    "core" -> coreConfigJson(p.coreParams),
+  )
 
-  def writeJson(filename: String, content: String): Unit = {
+  def writeJson(filename: String, content: ujson.Value): Unit = {
     val pw = new PrintWriter(new File(filename))
-    try pw.write(content) finally pw.close()
+    try pw.write(ujson.write(content, indent = 2)) finally pw.close()
   }
 
   // Parse arguments
