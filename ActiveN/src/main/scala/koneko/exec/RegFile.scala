@@ -36,9 +36,14 @@ class RegFile(val smtid: Int) extends Module {
   )
 
   // Read ports
-  val rdata = VecInit(regs.map(r => if (r == null) 0.U else r))
+  val rdata = Wire(Vec(32, UInt(32.W)))
+  for (i <- 0 until 32) {
+    if (regs(i) != null) rdata(i) := regs(i) else rdata(i) := DontCare
+  }
   for (r <- read) {
-    r.value := rdata(r.num)
+    r.value := Mux(r.num === 0.U, 0.U,
+      Mux(write.en && r.num === write.num, write.value, rdata(r.num))
+    )
   }
 
   // Write ports

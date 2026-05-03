@@ -55,19 +55,14 @@ class Exec(implicit val param: CoreParameters) extends Module {
   //////////////////////////
 
   val s0uops = dec.map(_.bits)
-  val busyMap = RegInit(0.U(param.pipeCnt.W))
-  val issuable = dec.map(_.valid).zip(busyMap.asBools).map({ case (v, b) => v && !b })
+  val issuable = dec.map(_.valid).zip(busy.asBools).map({ case (v, b) => v && !b })
   val issueSel = PriorityEncoderOH(issuable)
 
   // Output consumed
   val s0step = Wire(Bool())
 
-  // Set busyMap based on delay
-  // Remember to check that issueSel != 0!
   val s0uop = Mux1H(issueSel, s0uops)
   val s0delayed = s0uop.isMul || s0uop.isFP
-  // busymap always unsets (because we have max 2-cycle instrs)
-  busyMap := Mux(s0delayed, VecInit(issueSel).asUInt, 0.U)
 
   for((d, i) <- dec.zip(issueSel)) d.ready := i && s0step
 
@@ -77,13 +72,11 @@ class Exec(implicit val param: CoreParameters) extends Module {
     r.read(1).num := u.rs2
   }
 
-  busy := busyMap
-
   // --- Stage ---
   // TODO: investigate about moving br forward one cycle
 
   val valid = RegEnable(VecInit(issueSel).asUInt.orR, false.B, s0step)
-  val uop = RegEnable(Mux1H(issueSel, s0uops), s0step)
+  val uop = RegEnable(s0uop, s0step)
   val rs1val = RegEnable(Mux1H(issueSel, regfiles.map(_.read(0).value)), s0step)
   val rs2val = RegEnable(Mux1H(issueSel, regfiles.map(_.read(1).value)), s0step)
   val directval = RegEnable(Mux1H(issueSel, regfiles.map(r => VecInit(r.msgDirect.map(_.rdata)))), s0step)
@@ -370,4 +363,5 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   // Scheduling
   s0step := !valid || s1done
+  busy := idlings | (Fill(param.pipeCnt, valid && (!s1done || delayed)) & uop.smsel)
 }

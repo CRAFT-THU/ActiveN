@@ -63,6 +63,6 @@ class Core(implicit val params: CoreParameters) extends Module {
   exec.bcast               <> mem.broadcast
 
   fetch.decoded <> exec.dec
-  fetch.busy := exec.busy | ext.idlings
+  fetch.busy := exec.busy
   fetch.ctrl.br <> exec.brs
 }

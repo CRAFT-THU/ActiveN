@@ -28,7 +28,7 @@ class Fetch(implicit val params: CoreParameters) extends Module {
   val selpc = Mux1H(sel.asBools, pcs)
 
   // Latch last sent SMSel.
-  val sentSmsel = RegInit(0.U)
+  val sentSmsel = RegInit(0.U(params.pipeCnt.W))
   // sentSmsel may be reset during killing, since that specific line may require line fill
   // so the killed ICache cannot accept new fetch at that specific cycle.
   val maskedSentSmsel = sentSmsel & ~VecInit(ctrl.br.map(_.valid)).asUInt
@@ -51,27 +51,36 @@ class Fetch(implicit val params: CoreParameters) extends Module {
   decode.smsel := RegEnable(sel, step)
   decode.instr := icache.output
 
-  val decodedHolding = for(_ <- 0 until params.pipeCnt) yield Reg(new uOp)
-  val decodedHoldingValid = for(_ <- 0 until params.pipeCnt) yield RegInit(false.B)
+  val holding = for(_ <- 0 until params.pipeCnt) yield Reg(new uOp)
+  val held = for(_ <- 0 until params.pipeCnt) yield RegInit(false.B)
 
-  for(((d, dec), idx) <- decodedHoldingValid.zip(decoded).zipWithIndex) {
+  for(((d, dec), idx) <- held.zip(decoded).zipWithIndex) {
     d := MuxCase(d, Seq(
       ctrl.br(idx).valid -> false.B,
       dec.ready -> false.B,
       // dec is not ready, write into holding register
-      sentSmsel(idx) -> true.B,
+      (sentSmsel(idx) && step) -> true.B,
     ))
-    dec.valid := d || (sentSmsel(idx) && !VecInit(ctrl.br.zip(sentSmsel.asBools).map({ case (b, s) => b.valid && s })).asUInt.orR)
-    dec.bits := Mux(d, decodedHolding(idx), decode.decoded)
-
-    when(sentSmsel(idx)) {
-      assert(!d, "Holding register should be empty when a new decoded uop is presented")
-    }
+    dec.valid := d || (sentSmsel(idx) && step && !VecInit(ctrl.br.zip(sentSmsel.asBools).map({ case (b, s) => b.valid && s })).asUInt.orR)
+    dec.bits := Mux(d, holding(idx), decode.decoded)
   }
-  for((d, h) <- decodedHoldingValid.zip(decodedHolding)) {
+  for((d, h) <- held.zip(holding)) {
     when(!d) {
       h := decode.decoded
     }
   }
-  fetchable := ~VecInit(decodedHoldingValid.zip(ctrl.br).map({ case (d, b) => d || b.valid })).asUInt & ~busy
+
+  assert(!((sentSmsel & VecInit(held).asUInt).orR), "Thread that holds a instruction must not have sent a fetch")
+
+  // Fetchable threads do not:
+  // 1. branch at the same cycle
+  // 2. it's holding register is being filled this step
+  // 3. have a held instruction and it's not being vacated this cycle
+  // Since if the thread already holds a instruction, the last cycle must not have
+  // fetched from that thread
+  // 2 + 3 = there is a pending fetched instruction that's not consumed by downstream
+  fetchable := ~VecInit.tabulate(params.pipeCnt)(i =>
+    ctrl.br(i).valid
+    || ((sentSmsel(i) || held(i)) && !decoded(i).ready)
+  ).asUInt
 }
