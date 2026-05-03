@@ -70,38 +70,35 @@ struct PeripheralDevice {
   }
 };
 
-// Collects multi-flit memory/peripheral requests from event flits.
-// 0xFF00 (load): 2 flits — addr, meta(id)
-// 0xFF01 (store): 3 flits — addr, meta(size|id), wdata
-struct FlitCollector {
-  bool active = false;
-  uint16_t tag = 0;       // 0xFF00 or 0xFF01
+// Decodes a single-flit memory/peripheral request from ext_out.
+// New encoding (single flit, 4 words):
+//   tag 0xF00 (load) / 0xF01 (store)
+//   data[0] = address (controller-local)
+//   data[1] = 0(14) ## size(2) ## id(16)
+//   data[2] = wdata (stores only)
+//   data[3] = reserved
+struct MemFlitDecoder {
+  static constexpr uint16_t TAG_LOAD  = 0xF00;
+  static constexpr uint16_t TAG_STORE = 0xF01;
+
+  uint16_t tag = 0;
   uint16_t dst = 0;
-  int flit_count = 0;
-  uint32_t operands[3];   // addr, meta, wdata
+  uint32_t data[4] = {};
 
-  void reset() {
-    active = false;
-    flit_count = 0;
+  void set(uint16_t t, uint16_t d, uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3) {
+    tag = t;
+    dst = d;
+    data[0] = d0;
+    data[1] = d1;
+    data[2] = d2;
+    data[3] = d3;
   }
 
-  // Push a flit. Returns true when a complete request has been assembled.
-  bool push(uint16_t t, uint16_t d, uint32_t data) {
-    if (!active || tag != t || dst != d) {
-      active = true;
-      tag = t;
-      dst = d;
-      flit_count = 0;
-    }
-    operands[flit_count++] = data;
-    int expected = (tag == 0xFF00) ? 2 : 3;
-    return flit_count >= expected;
-  }
+  uint32_t addr()    const { return data[0]; }
+  uint16_t id()      const { return data[1] & 0xFFFF; }
+  uint16_t size()    const { return (data[1] >> 16) & 0x3; }
+  uint32_t wdata()   const { return data[2]; }
+  bool     isStore() const { return tag == TAG_STORE; }
 
-  // Decode collected request fields
-  uint32_t addr()    const { return operands[0]; }
-  uint16_t id()      const { return operands[1] & 0xFFFF; }
-  uint16_t size()    const { return (operands[1] >> 16) & 0xFFFF; }
-  uint32_t wdata()   const { return operands[2]; }
-  bool     isStore() const { return tag == 0xFF01; }
+  static bool isMemTag(uint16_t t) { return t == TAG_LOAD || t == TAG_STORE; }
 };

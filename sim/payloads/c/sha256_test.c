@@ -81,5 +81,5 @@ int main(void) {
     if (hash[6] == 0xb410ff61) pass++;
     if (hash[7] == 0xf20015ad) pass++;
 
-    return pass;  /* Expected: 8 */
+    return 8-pass;  /* Expected: 8 */
 }

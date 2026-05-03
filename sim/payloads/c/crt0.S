@@ -1,12 +1,18 @@
 .section .text
 .globl _start
 _start:
+  bnez x10, .park
   la sp, _stack_top
   call main
 
-  # Send result via AM: x10 = return value from main
-  li x11, 0xFFFF
-  .word 0x00B5500B     # AM send: funct7=0, rs2=x11, rs1=x10, funct3=101, rd=x0
+  # Signal end-of-simulation via peripheral write
+  # a0 (x10) = return value from main (0 = success)
+  li t0, 0x40000000
+  sw a0, 0(t0)
 
 halt:
   j halt
+
+.park:
+  wfi
+  j .park

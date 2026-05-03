@@ -73,6 +73,7 @@
   .globl _start
 
 _start:
+  bnez  x10, .park
   li    sp, SPM_BASE + SPM_SIZE - 64   # Leave room for metadata (36 bytes + stack)
 
   # If runtime is already configured, just wait for events.
@@ -499,6 +500,10 @@ xor_match:
   li    t0, STOP_ADDR
   sw    s10, 0(t0)
   j     do_wfi
+
+.park:
+  wfi
+  j     .park
 
   .section .data
   .align 2

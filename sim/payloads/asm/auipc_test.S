@@ -3,6 +3,7 @@
   .section .text
   .globl _start
 _start:
+  bnez x10, .park
   li x20, 0       # pass count
 
   # Test 1: AUIPC to x2 (sp), funct3 bits = 000
@@ -61,15 +62,19 @@ _start:
   bne x6, x7, fail
   addi x20, x20, 1
 
-  # Done (expected 7)
-  mv x10, x20
-  li x11, 0xFFFF
-  .word 0x00B5500B
+  # Done (expected 7): signal success via peripheral
+  li t0, 0x40000000
+  sw zero, 0(t0)       # result=0 → success
+  j wfi_loop
 
 fail:
-  mv x10, x20
-  li x11, 0xFFFF
-  .word 0x00B5500B
+  li t0, 0x40000000
+  li t1, 1
+  sw t1, 0(t0)         # result=1 → failure
 
 wfi_loop:
   j wfi_loop
+
+.park:
+  wfi
+  j .park

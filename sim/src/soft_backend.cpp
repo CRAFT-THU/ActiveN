@@ -7,9 +7,9 @@
  *
  * Supported features:
  *   - core-to-core AM messages via ext.out/ext.in
- *   - memory/peripheral requests encoded as 0xFF00/0xFF01 flits
- *   - CSR scatter commands encoded as 0xFF02 flits
- *   - wide memory responses on core.mem, including broadcast responses (id=0xFFFF)
+ *   - memory/peripheral requests encoded as 0xF00/0xF01 flits (12-bit tag)
+ *   - CSR scatter commands encoded as 0xF10 flits
+ *   - wide memory responses on core.mem_unicast, broadcast on core.mem_broadcast
  *   - optional per-cycle memory request trace
  */
 
@@ -294,7 +294,7 @@ struct CoreState {
   }
 
   void retireInputs() {
-    if (core->mem_valid && !mem_inbox.empty()) mem_inbox.pop_front();
+    if (core->mem_unicast_valid && !mem_inbox.empty()) mem_inbox.pop_front();
   }
 
   void clearExtInput() {
@@ -353,14 +353,16 @@ struct CoreState {
     }
 
     if (mem_inbox.empty()) {
-      core->mem_valid = 0;
-      core->mem_bits_id = 0;
-      for (int i = 0; i < MEM_BUS_WORDS; ++i) core->mem_bits_data[i] = 0;
+      core->mem_unicast_valid = 0;
+      core->mem_broadcast_valid = 0;
+      core->mem_unicast_bits_id = 0;
+      for (int i = 0; i < MEM_BUS_WORDS; ++i) core->mem_unicast_bits_data[i] = 0;
     } else {
       const auto &r = mem_inbox.front();
-      core->mem_valid = 1;
-      core->mem_bits_id = r.id;
-      for (int i = 0; i < MEM_BUS_WORDS; ++i) core->mem_bits_data[i] = r.data[i];
+      core->mem_unicast_valid = 1;
+      core->mem_broadcast_valid = 0;
+      core->mem_unicast_bits_id = r.id;
+      for (int i = 0; i < MEM_BUS_WORDS; ++i) core->mem_unicast_bits_data[i] = r.data[i];
     }
   }
 
@@ -613,7 +615,7 @@ struct SoftPeriphIf {
 };
 
 static int flitVc(const Flit &flit) {
-  return (flit.tag == 0xFF00 || flit.tag == 0xFF01) ? 0 : 1;
+  return (flit.tag == 0xF00 || flit.tag == 0xF01) ? 0 : 1;
 }
 
 struct RouterOutput {
@@ -1275,7 +1277,8 @@ struct SoftSystemSim {
     if (reset_cycle) {
       for (auto &c : cores) {
         c->core->reset = 1;
-        c->core->mem_valid = 0;
+        c->core->mem_unicast_valid = 0;
+        c->core->mem_broadcast_valid = 0;
         c->core->ext_in_valid = 0;
         c->core->ext_out_ready = 0;
         c->core->clock = 1;
@@ -1486,26 +1489,12 @@ struct SoftSystemSim {
 };
 
 void SoftMemIf::accept(const Flit &flit, uint64_t cycle) {
-  if (flit.tag == 0xFF00 || flit.tag == 0xFF01) {
-    int slot = findCollectSlot(flit.src);
-    if (slot >= 0) {
-      auto &entry = inflight[slot];
-      int total_flits = entry.is_write ? 3 : 2;
-      int flit_idx = total_flits - entry.remaining_flits;
-      if (flit_idx == 1) {
-        entry.resp_id = static_cast<uint16_t>(flit.data[0] & 0xFFFFu);
-        if (entry.is_write) entry.size = static_cast<uint16_t>((flit.data[0] >> 16) & 0xFFFFu);
-      } else if (flit_idx == 2) {
-        entry.wdata = flit.data[0];
-      }
-      if (entry.remaining_flits > 0) --entry.remaining_flits;
-      if (entry.remaining_flits == 0) {
-        ready_events.emplace(cycle + 1, slot);
-      }
-      return;
-    }
-
-    slot = findFreeSlot();
+  if (flit.tag == 0xF00 || flit.tag == 0xF01) {
+    // Single-flit memory request:
+    //   data[0] = address (controller-local)
+    //   data[1] = 0(14) ## size(2) ## id(16)
+    //   data[2] = wdata (stores only)
+    int slot = findFreeSlot();
     if (slot < 0) throw runtime_error("SoftMemIf: no free inflight slot");
 
     auto &entry = inflight[slot];
@@ -1513,15 +1502,17 @@ void SoftMemIf::accept(const Flit &flit, uint64_t cycle) {
     entry.allocated = true;
     entry.src = flit.src;
     entry.addr = flit.data[0];
-    entry.is_write = flit.tag == 0xFF01;
-    entry.remaining_flits = entry.is_write ? 2 : 1;
-  } else if (flit.tag == 0xFF02) {
+    entry.resp_id = static_cast<uint16_t>(flit.data[1] & 0xFFFFu);
+    entry.size = static_cast<uint16_t>((flit.data[1] >> 16) & 0x3u);
+    entry.is_write = flit.tag == 0xF01;
+    entry.wdata = flit.data[2];
+    entry.remaining_flits = 0;
+    ready_events.emplace(cycle + 1, slot);
+  } else if (flit.tag == 0xF10) {
     auto it = scatter_base.find(flit.src);
     if (it == scatter_base.end()) {
       scatter_base.emplace(flit.src, flit.data[0]);
     } else {
-      // RTL: sScatCollect → sScatIssue on flit 2 arrival
-      // The +1 cycle delay matches ready_events timing for normal requests
       scat_addr = it->second;
       scat_end = flit.data[0];
       scat_state = ScatIssue;
@@ -1713,23 +1704,11 @@ void SoftPeriphIf::applyDeferredResponses(uint64_t cycle) {
 }
 
 void SoftPeriphIf::accept(const Flit &flit, uint64_t cycle) {
-  int slot = findCollectSlot(flit.src);
-  if (slot >= 0) {
-    auto &entry = inflight[slot];
-    int total_flits = entry.is_write ? 3 : 2;
-    int flit_idx = total_flits - entry.remaining_flits;
-    if (flit_idx == 1) {
-      entry.resp_id = static_cast<uint16_t>(flit.data[0] & 0xFFFFu);
-      if (entry.is_write) entry.size = static_cast<uint16_t>((flit.data[0] >> 16) & 0xFFFFu);
-    } else if (flit_idx == 2) {
-      entry.wdata = flit.data[0];
-    }
-    if (entry.remaining_flits > 0) --entry.remaining_flits;
-    if (entry.remaining_flits == 0) ready_events.emplace(cycle + 1, slot);
-    return;
-  }
-
-  slot = findFreeSlot();
+  // Single-flit peripheral request:
+  //   data[0] = address (peripheral-local, relative to 0x40000000)
+  //   data[1] = 0(14) ## size(2) ## id(16)
+  //   data[2] = wdata (stores only)
+  int slot = findFreeSlot();
   if (slot < 0) throw runtime_error("SoftPeriphIf: no free inflight slot");
 
   auto &entry = inflight[slot];
@@ -1737,8 +1716,12 @@ void SoftPeriphIf::accept(const Flit &flit, uint64_t cycle) {
   entry.allocated = true;
   entry.src = flit.src;
   entry.addr = flit.data[0];
-  entry.is_write = flit.tag == 0xFF01;
-  entry.remaining_flits = entry.is_write ? 2 : 1;
+  entry.resp_id = static_cast<uint16_t>(flit.data[1] & 0xFFFFu);
+  entry.size = static_cast<uint16_t>((flit.data[1] >> 16) & 0x3u);
+  entry.is_write = flit.tag == 0xF01;
+  entry.wdata = flit.data[2];
+  entry.remaining_flits = 0;
+  ready_events.emplace(cycle + 1, slot);
 }
 
 struct SoftSystemModel::Impl {

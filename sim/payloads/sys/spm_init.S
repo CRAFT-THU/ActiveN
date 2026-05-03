@@ -29,6 +29,7 @@
   .globl _start
 
 _start:
+  bnez x10, .park
   csrr s0, mhartid            # s0 = hartid (1..NUM_PU)
   li   sp, 0x20004000         # Stack at top of SPM
 
@@ -142,3 +143,7 @@ all_init_done:
   li   t0, 0x40000000
   sw   s1, 0(t0)              # result = done count
   wfi                         # Harmless restart (counter persists >= NUM_PU)
+
+.park:
+  wfi
+  j    .park

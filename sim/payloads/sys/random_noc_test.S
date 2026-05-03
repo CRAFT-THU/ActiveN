@@ -40,12 +40,14 @@
  *      the leader stops the timer and writes SPM_STOP_XOR to STOP_ADDR.
  *      Zero means every payload was delivered and XORed correctly.
  *
- * 3. Event target / payload encoding
- *    rs2[15:0] = destination hartid,  rs2[31:16] = tag.
- *      Tag 0  test traffic  :  SEND1 payload, dst           (tag field = 0)
- *      Tag 1  completion    :  SEND1 0, (1<<16)|dst
- *      Tag 2  start / stop  :  SEND1 data, (2<<16)|LEADER
- *      Tag 3  local work    :  YIELD1 0, 0x00030000         (local, tag 3)
+ * 3. New ISA send encoding
+ *    SEND  dst_reg, tag_reg   — rs1=dst, rs2=tag, payload in a0-a3
+ *    YIELD dst_reg, tag_reg   — same but yields after send
+ *    Local send: dst=0 (rs1=zero)
+ *      Tag 0  test traffic  :  a0=payload, SEND dst_reg, tag0_reg
+ *      Tag 1  completion    :  a0=0, SEND dst_reg, tag1_reg
+ *      Tag 2  start / stop  :  a0=data, SEND leader_reg, tag2_reg
+ *      Tag 3  local work    :  a0=0, YIELD zero, tag3_reg
  *
  * 4. Persistent register assignment
  *      s0  - hartid (loaded once from CSR 0xF14)
@@ -86,16 +88,20 @@
 
 #define NUM_ITERS            1024
 #define LEADER               1
-#define TARGET_CTRL_LEADER   ((2 << 16) | LEADER)
-#define TARGET_WORK_LOCAL    0x00030000
 
 /* --- instruction macros ------------------------------------------------- */
-  .macro SEND1 data, target
-  .insn r 0x0B, 0x5, 0x0, x0, \data, \target
+/* New ISA: rs1 = destination (0 = local), rs2 = tag (12-bit),
+ *          payload = a0-a3 (direct register file ports x10-x13).
+ * funct3[0] = yield, funct3[1] = nonblocking.
+ * SEND: blocking send without yield (funct3 = 0b100 = 4)
+ * YIELD: blocking send with yield   (funct3 = 0b101 = 5)
+ */
+  .macro SEND dst_reg, tag_reg
+  .insn r 0x0B, 0x4, 0x0, x0, \dst_reg, \tag_reg
   .endm
 
-  .macro YIELD1 data, target
-  .insn r 0x0B, 0x5, 0x1, x0, \data, \target
+  .macro YIELD dst_reg, tag_reg
+  .insn r 0x0B, 0x5, 0x0, x0, \dst_reg, \tag_reg
   .endm
 
   .macro XORSHIFT reg, tmp
@@ -107,28 +113,14 @@
   xor   \reg, \reg, \tmp
   .endm
 
-  /* Kept for future use (currently unused):
-  .macro QUEUE2 data0, data1
-  .insn r 0x0B, 0x2, 0x0, x0, \data0, \data1
-  .endm
-
-  .macro FIRE0 target
-  .insn r 0x0B, 0x4, 0x0, x0, x0, \target
-  .endm
-
-  .macro ASCII_PUTC reg
-  sw    \reg, 0(s2)
-  .endm
-  */
-
 /* ======================================================================== */
   .section .text
   .globl _start
 
 _start:
+  bnez  x10, .park
   li    sp, SPM_BASE + SPM_SIZE - 128
   csrr  s0, 0xF14
-  /* li    s2, ASCII_ADDR */          /* uncomment for debug output */
 
   /* ---- install handlers ---- */
   /* tag 0 - test traffic (highest priority) */
@@ -186,7 +178,6 @@ _start:
   /* ---- setup barrier: leader signals readiness via global flag ---- */
   li    t0, LEADER
   bne   s0, t0, wait_leader_ready
-  /* Leader: write 1 to setup_ready so workers know handlers are installed */
   la    t0, setup_ready
   li    t1, 1
   sw    t1, 0(t0)
@@ -198,10 +189,11 @@ wait_leader_ready:
   beqz  t1, wait_leader_ready
 
 send_start:
-  /* ---- send start to leader, then sleep ---- */
-  li    a0, 0
-  li    t0, TARGET_CTRL_LEADER
-  SEND1 a0, t0
+  /* ---- send start (tag 2) to leader, then sleep ---- */
+  li    a0, 0             /* payload = 0 */
+  li    t0, LEADER        /* dst = leader */
+  li    t1, 2             /* tag = 2 */
+  SEND  t0, t1
   j     do_wfi
 
 /* ================================================================
@@ -209,6 +201,7 @@ send_start:
  * ================================================================ */
 
 /* ---- tag 0: test traffic receiver (highest priority) ---- */
+/* On entry: a0 = received payload word 0 */
 test_handler:
   li    t0, SPM_LOCAL_XOR
   amoxor.w zero, a0, (t0)
@@ -219,15 +212,15 @@ completion_handler:
   li    t0, SPM_COMP_COUNT
   li    t1, 1
   amoadd.w t1, t1, (t0)
-  /* t1 = old count; new count = t1+1 */
   addi  t1, t1, 1
   li    t2, NUM_PU
   bne   t1, t2, do_wfi
-  /* all completions received -> send stop to leader with local XOR */
+  /* all completions received -> send stop (tag 2) to leader with local XOR */
   li    t0, SPM_LOCAL_XOR
-  lw    a0, 0(t0)
-  li    t0, TARGET_CTRL_LEADER
-  SEND1 a0, t0
+  lw    a0, 0(t0)         /* payload = local XOR */
+  li    t0, LEADER
+  li    t1, 2             /* tag = 2 */
+  SEND  t0, t1
   j     do_wfi
 
 /* ---- tag 2: start handler (leader, later rebound to stop) ---- */
@@ -235,35 +228,34 @@ start_handler:
   li    t0, SPM_START_COUNT
   li    t1, 1
   amoadd.w t1, t1, (t0)
-  /* t1 = old count; new count = t1+1 */
   addi  t1, t1, 1
   li    t2, NUM_PU
   bne   t1, t2, do_wfi
-  /* all PUs ready - rebind tag 2, start timer, broadcast work */
+  /* all PUs ready - rebind tag 2 -> stop_handler, start timer, broadcast work */
   la    a0, stop_handler
   csrw  0x702, a0
   li    t0, TIMER_ADDR
   li    t1, 1
   sw    t1, 0(t0)
-  li    t0, 1
+  /* broadcast work (tag 3) to all PUs */
+  li    s1, 1             /* loop counter (PU id) */
 bcast_work:
-  li    t1, NUM_PU + 1
-  beq   t0, t1, do_wfi
-  li    t2, (3 << 16)
-  or    t2, t2, t0
-  li    a0, 0
-  SEND1 a0, t2
-  addi  t0, t0, 1
+  li    t0, NUM_PU + 1
+  beq   s1, t0, do_wfi
+  li    a0, 0             /* payload = 0 */
+  li    t1, 3             /* tag = 3 */
+  SEND  s1, t1
+  addi  s1, s1, 1
   j     bcast_work
 
 /* ---- tag 2 (rebound): stop handler (leader) ---- */
 stop_handler:
+  /* a0 = stop payload (sender's local XOR) */
   li    t0, SPM_STOP_XOR
   amoxor.w zero, a0, (t0)
   li    t0, SPM_STOP_COUNT
   li    t1, 1
   amoadd.w t1, t1, (t0)
-  /* t1 = old count; new count = t1+1 */
   addi  t1, t1, 1
   li    t2, NUM_PU
   bne   t1, t2, do_wfi
@@ -281,28 +273,29 @@ work_handler:
   li    t0, SPM_ITER
   li    t1, 1
   amoadd.w t1, t1, (t0)
-  /* t1 = old iter count (our claimed slot) */
+  /* t1 = old iter count */
   li    t2, NUM_ITERS
   bge   t1, t2, work_done
-  /* advance PRNG -> destination (work_handler is never concurrent) */
+  /* advance PRNG -> destination */
   li    t0, SPM_PRNG
   lw    t3, 0(t0)
   XORSHIFT t3, t4
   andi  t5, t3, NUM_PU - 1
-  addi  t5, t5, 1
+  addi  t5, t5, 1         /* t5 = destination PU */
   /* advance PRNG -> payload */
   XORSHIFT t3, t4
-  sw    t3, 0(t0)
+  sw    t3, 0(t0)         /* store updated PRNG state */
   /* XOR payload into local accumulator */
   li    t0, SPM_LOCAL_XOR
   amoxor.w zero, t3, (t0)
-  /* send test message (tag 0) */
-  mv    a0, t3
-  SEND1 a0, t5
-  /* yield to continue work */
+  /* send test message: dst=t5, tag=0, payload=t3 (in a0) */
+  mv    a0, t3            /* payload in a0 */
+  li    t1, 0             /* tag = 0 */
+  SEND  t5, t1
+  /* yield locally to continue work: dst=0 (local), tag=3 */
   li    a0, 0
-  li    t0, TARGET_WORK_LOCAL
-  YIELD1 a0, t0
+  li    t1, 3             /* tag = 3 */
+  YIELD zero, t1
   j     do_wfi
 
 work_done:
@@ -311,10 +304,10 @@ work_done:
   csrw  0x703, a0
   li    t0, SPM_BCAST_IDX
   sw    zero, 0(t0)
-  /* yield to start broadcasting */
+  /* yield locally to start broadcasting: dst=0 (local), tag=3 */
   li    a0, 0
-  li    t0, TARGET_WORK_LOCAL
-  YIELD1 a0, t0
+  li    t1, 3
+  YIELD zero, t1
   j     do_wfi
 
 /* ---- tag 3 (rebound): completion broadcast ---- */
@@ -322,18 +315,18 @@ bcast_handler:
   li    t0, SPM_BCAST_IDX
   li    t1, 1
   amoadd.w t1, t1, (t0)
-  /* t1 = old bcast_idx */
-  addi  t2, t1, 1
-  li    t3, (1 << 16)
-  or    t2, t2, t3
-  li    a0, 0
-  SEND1 a0, t2
+  /* t1 = old bcast_idx; destination PU = t1 + 1 */
+  addi  t2, t1, 1         /* t2 = destination PU for completion */
+  li    a0, 0             /* payload = 0 */
+  li    t3, 1             /* tag = 1 (completion) */
+  SEND  t2, t3
   addi  t1, t1, 1
   li    t2, NUM_PU
   bge   t1, t2, do_wfi
+  /* yield locally to continue broadcasting */
   li    a0, 0
-  li    t0, TARGET_WORK_LOCAL
-  YIELD1 a0, t0
+  li    t1, 3
+  YIELD zero, t1
   j     do_wfi
 
 /* ---- tag 2 (workers): noop ---- */
@@ -344,6 +337,10 @@ noop_handler:
 do_wfi:
   wfi
   j     do_wfi
+
+.park:
+  wfi
+  j     .park
 
   .section .data
   .align 2

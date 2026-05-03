@@ -44,6 +44,7 @@
   .globl _start
 
 _start:
+  bnez  x10, .park
   # Read hartid
   csrr  s0, 0xF14          # s0 = hartid (1-based, persistent in s0)
 
@@ -176,6 +177,10 @@ handler_spike:
   li    a1, 1               # dst=PU1, tag=0
   .word 0x00B5500B          # send.1 a0, a1
   j     do_wfi
+
+.park:
+  wfi
+  j     .park
 
   #============================================================
   # CSR data section at offset 0x1000 (32-byte aligned)

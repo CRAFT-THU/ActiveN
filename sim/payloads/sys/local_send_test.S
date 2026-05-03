@@ -13,6 +13,7 @@
   .globl _start
 
 _start:
+  bnez  x10, .park
   csrr  s0, 0xF14          # s0 = hartid
 
   # Check if already initialized
@@ -53,3 +54,7 @@ local_handler:
   li    t0, STOP_ADDR
   sw    a0, 0(t0)
   j     do_wfi
+
+.park:
+  wfi
+  j     .park

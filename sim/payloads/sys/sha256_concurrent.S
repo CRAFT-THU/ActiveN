@@ -16,6 +16,7 @@
   .globl result_buffer
 
 _start:
+  bnez x10, .park
   csrr s0, mhartid          # s0 = hartid (1..NUM_PU)
 
   # Use local SPM for stack (each core has its own 16KB SPM at 0x20000000-0x20003FFF)
@@ -100,3 +101,7 @@ all_done:
   li t0, 0x40000000
   sw a0, 0(t0)
   wfi
+
+.park:
+  wfi
+  j .park

@@ -2,6 +2,9 @@
   # PU1 sends 0 around ring: PU1 -> PU2 -> ... -> PU_N -> PU1
   # PU1 increments on each round trip until value reaches 100.
   # Expected result: 100
+  #
+  # New ISA: SEND dst_reg, tag_reg — payload in a0-a3
+  #          .insn r 0x0B, 0x4, 0x0, x0, dst_reg, tag_reg
 
 #ifndef NUM_PU
 #define NUM_PU 16
@@ -10,6 +13,7 @@
   .section .text
   .globl _start
 _start:
+  bnez x10, .park
   # Register handler for tag 0
   la t0, handler
   csrw 0x700, t0
@@ -29,15 +33,16 @@ _start:
   bne s0, t0, wait
 
   # PU1: send initial value 0 to PU2
+  # payload a0 = 0, dst = s1 (PU2), tag = 0
   li a0, 0
-  mv x2, s1           # x2 = 2 (PU2), tag = 0
-  .word 0x0025500b    # Send a0 to x2
+  li t1, 0            # tag = 0
+  .insn r 0x0B, 0x4, 0x0, x0, s1, t1
 
 wait:
   wfi
 
 handler:
-  # a0 = received value (from AM argument)
+  # a0 = received value (from AM payload word 0)
   # s0 = hartid, s1 = next PU (both preserved)
 
   # PU1 increments, others forward
@@ -50,8 +55,9 @@ handler:
   bge a0, t0, done
 
 forward:
-  mv x2, s1
-  .word 0x0025500b    # Send a0 to next PU
+  # Send a0 to next PU: dst = s1, tag = 0
+  li t1, 0
+  .insn r 0x0B, 0x4, 0x0, x0, s1, t1
   wfi
 
 done:
@@ -59,3 +65,7 @@ done:
   li t0, 0x40000000
   sw a0, 0(t0)
   wfi
+
+.park:
+  wfi
+  j .park

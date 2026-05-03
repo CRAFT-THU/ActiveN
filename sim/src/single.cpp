@@ -3,9 +3,10 @@
  *
  * Simulates a single core with a flat memory image.
  * - Loads a binary file as the initial memory image.
- * - Memory requests arrive as event flits on ext.out (tag 0xFF00 = load, 0xFF01 = store).
- * - Memory responses are sent on the mem bus (tag + 256-bit data).
- * - AM events (tag != 0xFF00/0xFF01) are captured and logged.
+ * - Memory requests arrive as single flits on ext.out (tag 0xF00 = load, 0xF01 = store).
+ *   Flit layout: data[0]=addr, data[1]=size|id, data[2]=wdata, data[3]=reserved
+ * - Memory responses are sent on the mem_unicast bus (id + 256-bit data).
+ * - AM events (tag != 0xF00/0xF01) are captured and logged.
  * - End-of-simulation: store to peripheral address 0x40000000 (dst 0x8000).
  *
  * Usage:
@@ -24,6 +25,7 @@
 #include <iomanip>
 #include <verilated_fst_c.h>
 #include "verilated/rtl.h"
+#include "verilated/rtl___024root.h"
 
 #include "include/argparse.h"
 #include "devices.h"
@@ -58,14 +60,14 @@ struct SingleCoreSim {
   std::unique_ptr<rtl> core;
   uint64_t cycle = 0;
   std::deque<MemResponse> mem_resps;
-  FlitCollector collector;
+  MemFlitDecoder decoder;
   PeripheralDevice periph;
 
   // Captured events
   struct Event {
     uint64_t cycle;
     uint16_t dst;
-    uint32_t data;
+    uint32_t data[4];
     uint16_t tag;
   };
   std::vector<Event> events;
@@ -97,18 +99,18 @@ struct SingleCoreSim {
   }
 
   void processMemRequest() {
-    uint32_t addr = collector.addr() + TEXT_BASE; // local addr -> global addr
-    uint16_t resp_tag = collector.id();
+    uint32_t addr = decoder.addr() + TEXT_BASE; // local addr -> global addr
+    uint16_t resp_tag = decoder.id();
 
-    if (collector.tag == 0xFF00) {
+    if (!decoder.isStore()) {
       // Load
       if (LOG) cerr << "[Single] Mem load: addr=0x" << hex << addr
                     << " resp_tag=0x" << resp_tag << dec << endl;
       mem_resps.push_back(readBlock(addr, resp_tag));
-    } else if (collector.tag == 0xFF01) {
+    } else {
       // Store
-      uint16_t size = collector.size();
-      uint32_t wdata = collector.wdata();
+      uint16_t size = decoder.size();
+      uint32_t wdata = decoder.wdata();
       if (LOG) cerr << "[Single] Mem store: addr=0x" << hex << addr
                     << " size=" << dec << size
                     << " data=0x" << hex << wdata
@@ -128,20 +130,19 @@ struct SingleCoreSim {
       }
       mem_resps.push_back(readBlock(addr, resp_tag));
     }
-    collector.reset();
   }
 
   void processPeriphRequest() {
-    uint32_t addr = collector.addr();
-    uint16_t resp_tag = collector.id();
+    uint32_t addr = decoder.addr();
+    uint16_t resp_tag = decoder.id();
     uint32_t rdata = 0;
     size_t word_idx = (addr & ((MEM_BUS_WORDS * sizeof(uint32_t)) - 1)) /
                       sizeof(uint32_t);
 
-    if (collector.isStore()) {
-      periph.write(addr, collector.wdata());
+    if (decoder.isStore()) {
+      periph.write(addr, decoder.wdata());
       if (LOG) cerr << "[Single] Periph write: addr=0x" << hex << addr
-                    << " data=0x" << collector.wdata() << dec << endl;
+                    << " data=0x" << decoder.wdata() << dec << endl;
     } else {
       rdata = periph.read(addr);
       if (LOG) cerr << "[Single] Periph read: addr=0x" << hex << addr
@@ -151,9 +152,8 @@ struct SingleCoreSim {
     MemResponse resp;
     resp.id = resp_tag;
     memset(resp.data, 0, sizeof(resp.data));
-    if (!collector.isStore()) resp.data[word_idx] = rdata;
+    if (!decoder.isStore()) resp.data[word_idx] = rdata;
     mem_resps.push_back(resp);
-    collector.reset();
   }
 
   void step() {
@@ -161,76 +161,76 @@ struct SingleCoreSim {
 
     if(cycle <= RESET_LENGTH) {
       core->reset = true;
-      core->mem_valid = false;
+      core->mem_unicast_valid = false;
+      core->mem_broadcast_valid = false;
       core->ext_out_ready = false;
       core->ext_in_valid = false;
       core->clock = true;
       core->eval();
+      if(TRACE) tracer->dump(cycle * 2);
       core->clock = false;
       core->eval();
+      if(TRACE) tracer->dump(cycle * 2 + 1);
       return;
     }
 
     core->reset = false;
 
-    // Process ext_out from previous cycle
-    if(core->ext_out_ready && core->ext_out_valid) {
+    // Posedge, update, dump
+    core->clock = true;
+    core->eval();
+    if(TRACE) tracer->dump(cycle * 2);
+
+    // Negedge, first, present memory response
+    // Since we're presenting the memory responses first,
+    // there is not single-cycle request-response loopback
+    core->mem_broadcast_valid = false;
+    if(mem_resps.empty()) {
+      core->mem_unicast_valid = false;
+      core->mem_unicast_bits_id = 0;
+      for (int i = 0; i < MEM_BUS_WORDS; i++) {
+        core->mem_unicast_bits_data[i] = 0;
+      }
+    } else {
+      core->mem_unicast_valid = true;
+      core->mem_unicast_bits_id = mem_resps.front().id;
+      for (int i = 0; i < MEM_BUS_WORDS; i++) {
+        core->mem_unicast_bits_data[i] = mem_resps.front().data[i];
+      }
+      mem_resps.pop_front();
+    }
+
+    // Second, accept outgoing events. They will be formally accepted
+    // on the next posedge
+    core->ext_in_valid = false;
+    core->ext_out_ready = true;
+    if(core->ext_out_valid) {
       uint16_t dst = (uint16_t)core->ext_out_bits_dst;
-      uint32_t data = core->ext_out_bits_data;
+      uint32_t d0 = core->ext_out_bits_data_0;
+      uint32_t d1 = core->ext_out_bits_data_1;
+      uint32_t d2 = core->ext_out_bits_data_2;
+      uint32_t d3 = core->ext_out_bits_data_3;
       uint16_t tag = (uint16_t)core->ext_out_bits_tag;
 
-      // Memory or peripheral request flit
-      if (tag == 0xFF00 || tag == 0xFF01) {
-        if (collector.push(tag, dst, data)) {
-          if (collector.dst == 0x8000) {
-            processPeriphRequest();
-          } else {
-            processMemRequest();
-          }
+      if (MemFlitDecoder::isMemTag(tag)) {
+        decoder.set(tag, dst, d0, d1, d2, d3);
+        if (decoder.dst == 0x8000) {
+          processPeriphRequest();
+        } else {
+          processMemRequest();
         }
       } else {
         // Regular AM event
-        Event ev = { cycle, dst, data, tag };
+        Event ev = { cycle, dst, {d0, d1, d2, d3}, tag };
         events.push_back(ev);
 
         if(LOG) cerr << "[Single] Event @" << dec << cycle
-                     << ": dst=" << dst << " data=0x" << hex << data
-                     << " tag=" << dec << tag << endl;
+                     << ": dst=" << dst << " data={0x" << hex << d0
+                     << ",0x" << d1 << ",0x" << d2 << ",0x" << d3
+                     << "} tag=0x" << tag << dec << endl;
       }
     }
 
-    // Advance mem response queue
-    if(core->mem_valid) mem_resps.pop_front();
-
-    // Set mem response signals
-    if(mem_resps.empty()) {
-      core->mem_valid = false;
-      core->mem_bits_id = 0;
-      for (int i = 0; i < MEM_BUS_WORDS; i++) {
-        core->mem_bits_data[i] = 0;
-      }
-    } else {
-      core->mem_valid = true;
-      core->mem_bits_id = mem_resps.front().id;
-      // Pack 8 x 32-bit words into 256-bit data
-      // Verilator represents wide signals as uint32_t arrays
-      for (int i = 0; i < MEM_BUS_WORDS; i++) {
-        core->mem_bits_data[i] = mem_resps.front().data[i];
-      }
-    }
-
-    core->ext_in_valid = false;
-
-    // Posedge
-    core->clock = true;
-    core->eval();
-
-    if(TRACE) tracer->dump(cycle * 2);
-
-    // Set ext_out_ready for next evaluation
-    core->ext_out_ready = true;
-
-    // Negedge
     core->clock = false;
     core->eval();
     if(TRACE) tracer->dump(cycle * 2 + 1);
@@ -346,8 +346,9 @@ int main(int argc, char **argv) {
   cerr << "[Single] Total events captured: " << sim.events.size() << endl;
   for(auto &ev : sim.events) {
     cerr << "[Single]   @" << dec << ev.cycle
-         << " dst=" << ev.dst << " tag=" << ev.tag
-         << " data=0x" << hex << ev.data << dec << endl;
+         << " dst=" << ev.dst << " tag=0x" << hex << ev.tag
+         << " data={0x" << ev.data[0] << ",0x" << ev.data[1]
+         << ",0x" << ev.data[2] << ",0x" << ev.data[3] << "}" << dec << endl;
   }
 
   if(TRACE) {
