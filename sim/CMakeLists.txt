@@ -171,7 +171,7 @@ verilate(
     TRACE_FST
     DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/sys_verilated
     INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/../generated
-    VERILATOR_ARGS "-f" "${CMAKE_CURRENT_SOURCE_DIR}/../generated/filelist.f" ${VERILATOR_CORE_ARGS}
+    VERILATOR_ARGS "-f" "${CMAKE_CURRENT_SOURCE_DIR}/../generated/filelist.f" ${VERILATOR_SYSTEM_ARGS}
 )
 
 # Soft backend: many Core instances + C++ NoC

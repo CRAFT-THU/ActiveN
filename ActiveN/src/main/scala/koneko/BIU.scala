@@ -33,6 +33,9 @@ class BIU(implicit val param: CoreParameters) extends Module {
     }))
   })
 
+  // Bitmask for enabled handlers
+  val enabled = IO(Input(Vec(16, Bool())))
+
   // Send out: current schedulable events, or the pushed event at the same cycle (at lower priority)
   val sched = IO(Decoupled(new Bundle {
     val handler = UInt(4.W) // We have 16 handlers
@@ -110,7 +113,7 @@ class BIU(implicit val param: CoreParameters) extends Module {
 
   val scheduleArb = Module(new Arbiter(Vec(4, UInt(32.W)), 16)).suggestName("scheduleArb")
   for (i <- 0 until 16) {
-    val schedulable = sendQueue.count + margins(i) + liveQuota <= param.sendQueueDepth.U
+    val schedulable = enabled(i) && (sendQueue.count + margins(i) + liveQuota <= param.sendQueueDepth.U)
     val gated = evQueues(i).io.deq.gatedBy(schedulable).suggestName(s"gated_$i")
     scheduleArb.io.in(i) <> gated
   }

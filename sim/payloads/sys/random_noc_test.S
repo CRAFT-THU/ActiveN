@@ -89,6 +89,20 @@
 #define NUM_ITERS            1024
 #define LEADER               1
 
+/* --- tag encoding: bits 11:10 = network priority, bits 3:0 = handler ---
+ * Priority assignment (lower = higher network priority):
+ *   prio 0: terminal messages (test traffic, stop) — drain first
+ *   prio 1: completion messages — generate stop
+ *   prio 2: work broadcast — generate test traffic
+ *   prio 3: start messages — trigger work (lowest priority)
+ */
+#define TAG_TEST             0x000   /* prio 0, handler 0 */
+#define TAG_COMPLETION       0x401   /* prio 1, handler 1 */
+#define TAG_STOP             0x002   /* prio 0, handler 2 */
+#define TAG_START            0xC02   /* prio 3, handler 2 */
+#define TAG_WORK             0x803   /* prio 2, handler 3 */
+#define TAG_LOCAL_WORK       3       /* local yield to handler 3 (no network) */
+
 /* --- instruction macros ------------------------------------------------- */
 /* New ISA: rs1 = destination (0 = local), rs2 = tag (12-bit),
  *          payload = a0-a3 (direct register file ports x10-x13).
@@ -153,6 +167,26 @@ _start:
   li    a0, 1
   csrw  0x713, a0
 
+  /* ---- set quotas (CSR 0x730+) ---- */
+  /* quota(i) = max sends per handler invocation */
+  csrw  0x730, zero        /* handler 0 (test): 0 sends */
+  li    a0, 1
+  csrw  0x731, a0          /* handler 1 (completion): 1 send (stop) */
+  li    a0, 1
+  csrw  0x732, a0          /* handler 2 (start/stop): 1 */
+  li    a0, 1
+  csrw  0x733, a0          /* handler 3 (work/bcast): 1 send */
+
+  /* ---- set margins (CSR 0x720+) ---- */
+  /* margin(i) = cumulative quotas of handlers 0..i */
+  csrw  0x720, zero        /* handler 0: margin=0 */
+  li    a0, 1
+  csrw  0x721, a0          /* handler 1: margin=1 (quota 0+1) */
+  li    a0, 2
+  csrw  0x722, a0          /* handler 2: margin=2 (quota 0+1+1) */
+  li    a0, 3
+  csrw  0x723, a0          /* handler 3: margin=3 (quota 0+1+1+1) */
+
   /* ---- clear SPM state ---- */
   li    t0, SPM_LOCAL_XOR
   sw    zero, 0(t0)
@@ -175,24 +209,11 @@ _start:
   li    t0, SPM_PRNG
   sw    t1, 0(t0)
 
-  /* ---- setup barrier: leader signals readiness via global flag ---- */
-  li    t0, LEADER
-  bne   s0, t0, wait_leader_ready
-  la    t0, setup_ready
-  li    t1, 1
-  sw    t1, 0(t0)
-  j     send_start
-
-wait_leader_ready:
-  la    t0, setup_ready
-  lw    t1, 0(t0)
-  beqz  t1, wait_leader_ready
-
 send_start:
   /* ---- send start (tag 2) to leader, then sleep ---- */
   li    a0, 0             /* payload = 0 */
   li    t0, LEADER        /* dst = leader */
-  li    t1, 2             /* tag = 2 */
+  li    t1, TAG_START      /* tag = 0xC02 (prio 3, handler 2) */
   SEND  t0, t1
   j     do_wfi
 
@@ -219,7 +240,7 @@ completion_handler:
   li    t0, SPM_LOCAL_XOR
   lw    a0, 0(t0)         /* payload = local XOR */
   li    t0, LEADER
-  li    t1, 2             /* tag = 2 */
+  li    t1, TAG_STOP        /* tag = 0x002 (prio 0, handler 2) */
   SEND  t0, t1
   j     do_wfi
 
@@ -243,7 +264,7 @@ bcast_work:
   li    t0, NUM_PU + 1
   beq   s1, t0, do_wfi
   li    a0, 0             /* payload = 0 */
-  li    t1, 3             /* tag = 3 */
+  li    t1, TAG_WORK       /* tag = 0x803 (prio 2, handler 3) */
   SEND  s1, t1
   addi  s1, s1, 1
   j     bcast_work
@@ -290,11 +311,11 @@ work_handler:
   amoxor.w zero, t3, (t0)
   /* send test message: dst=t5, tag=0, payload=t3 (in a0) */
   mv    a0, t3            /* payload in a0 */
-  li    t1, 0             /* tag = 0 */
+  li    t1, TAG_TEST       /* tag = 0x000 (prio 0, handler 0) */
   SEND  t5, t1
   /* yield locally to continue work: dst=0 (local), tag=3 */
   li    a0, 0
-  li    t1, 3             /* tag = 3 */
+  li    t1, TAG_LOCAL_WORK /* local yield to handler 3 */
   YIELD zero, t1
   j     do_wfi
 
@@ -306,7 +327,7 @@ work_done:
   sw    zero, 0(t0)
   /* yield locally to start broadcasting: dst=0 (local), tag=3 */
   li    a0, 0
-  li    t1, 3
+  li    t1, TAG_LOCAL_WORK /* local yield to handler 3 */
   YIELD zero, t1
   j     do_wfi
 
@@ -318,14 +339,14 @@ bcast_handler:
   /* t1 = old bcast_idx; destination PU = t1 + 1 */
   addi  t2, t1, 1         /* t2 = destination PU for completion */
   li    a0, 0             /* payload = 0 */
-  li    t3, 1             /* tag = 1 (completion) */
+  li    t3, TAG_COMPLETION /* tag = 0x401 (prio 1, handler 1) */
   SEND  t2, t3
   addi  t1, t1, 1
   li    t2, NUM_PU
   bge   t1, t2, do_wfi
   /* yield locally to continue broadcasting */
   li    a0, 0
-  li    t1, 3
+  li    t1, TAG_LOCAL_WORK /* local yield to handler 3 */
   YIELD zero, t1
   j     do_wfi
 
@@ -341,8 +362,3 @@ do_wfi:
 .park:
   wfi
   j     .park
-
-  .section .data
-  .align 2
-setup_ready:
-  .word 0

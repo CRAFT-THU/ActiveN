@@ -5,7 +5,8 @@
 ///   data(1) = 0(14) ## size(2) ## id(16)
 ///   data(2) = wdata (stores only, 0 for loads)
 ///   data(3) = reserved (0)
-/// tag = 0xFF00 (load) or 0xFF01 (store)
+/// tag = 0x000 (load) or 0x001 (store)
+/// Encoded requests uses highest priority (0x0??)
 
 package koneko.bus
 
@@ -60,7 +61,7 @@ class Encoder(implicit val param: CoreParameters) extends Module {
   req.ready := out.ready
 
   out.bits.dst := finalDst
-  out.bits.tag := Mux(req.bits.write, 0xFF01.U, 0xFF00.U)
+  out.bits.tag := Mux(req.bits.write, 0x001.U(12.W), 0x000.U(12.W))
   out.bits.data(0) := finalAddr
   out.bits.data(1) := 0.U(14.W) ## req.bits.size ## req.bits.id
   out.bits.data(2) := req.bits.wdata

@@ -12,6 +12,7 @@ JOBS="${JOBS:-4}"
 TRACE_ENABLED="${TRACE_ENABLED:-}"
 USE_NIX_DEVELOP="${USE_NIX_DEVELOP:-1}"
 FAIL_RESULTS="${FAIL_RESULTS:-}"
+BACKEND="${BACKEND:---soft}"
 
 payload_base="$(basename "$PAYLOAD")"
 if [ -z "$FAIL_RESULTS" ]; then
@@ -26,7 +27,7 @@ mkdir -p "$OUT_DIR"
 rm -f "$OUT_DIR"/seed_*.log "$OUT_DIR"/seed_*.ascii "$OUT_DIR"/seed_*.status "$OUT_DIR"/seed_*.fst "$OUT_DIR"/summary.txt "$OUT_DIR"/aggregate.txt
 rm -rf "$OUT_DIR"/seed_*.run
 
-export OUT_DIR SIM PAYLOAD MAX_CYCLES TRACE_ENABLED USE_NIX_DEVELOP FAIL_RESULTS
+export OUT_DIR SIM PAYLOAD MAX_CYCLES TRACE_ENABLED USE_NIX_DEVELOP FAIL_RESULTS BACKEND
 
 seq "$START_SEED" "$END_SEED" | xargs -P "$JOBS" -I {} sh -c '
   set -e
@@ -48,9 +49,9 @@ seq "$START_SEED" "$END_SEED" | xargs -P "$JOBS" -I {} sh -c '
   if (
     cd "$run_dir"
     if [ "$USE_NIX_DEVELOP" = "1" ]; then
-      nix develop -c "$SIM" "$PAYLOAD" --soft --max-cycles "$MAX_CYCLES" --rng-seed "$seed" $TRACE_ARGS
+      nix develop -c "$SIM" "$PAYLOAD" $BACKEND --max-cycles "$MAX_CYCLES" --rng-seed "$seed" $TRACE_ARGS
     else
-      "$SIM" "$PAYLOAD" --soft --max-cycles "$MAX_CYCLES" --rng-seed "$seed" $TRACE_ARGS
+      "$SIM" "$PAYLOAD" $BACKEND --max-cycles "$MAX_CYCLES" --rng-seed "$seed" $TRACE_ARGS
     fi
   ) > "$ascii" 2> "$log"; then
     if [ -f "$run_dir/soft_trace.fst" ]; then

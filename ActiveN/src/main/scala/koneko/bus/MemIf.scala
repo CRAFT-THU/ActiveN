@@ -22,8 +22,8 @@ object ScalarType extends ChiselEnum {
   def fromTag(tag: UInt): (Bool, ScalarType.Type) = {
     // TODO: impl by decoder
     (
-      tag === 0xFF00.U || tag === 0xFF01.U,
-      Mux(tag === 0xFF00.U, ScalarType.Load, ScalarType.Store)
+      tag(7, 0) === 0x00.U || tag(7, 0) === 0x01.U,
+      Mux(tag(7, 0) === 0x00.U, ScalarType.Load, ScalarType.Store)
     )
   }
 }
@@ -64,8 +64,8 @@ object BulkType extends ChiselEnum {
 
   def fromTag(tag: UInt): (Bool, BulkType.Type) = {
     (
-      tag === 0xFF10.U || tag === 0xFF11.U,
-      Mux(tag === 0xFF10.U, BulkType.Scatter, BulkType.BulkLoad)
+      tag(7, 0) === 0x10.U || tag(7, 0) === 0x11.U,
+      Mux(tag(7, 0) === 0x10.U, BulkType.Scatter, BulkType.BulkLoad)
     )
   }
 
@@ -392,7 +392,7 @@ class DRAMIf(
     bcstDist.suggestName(s"bcstDist_$ci")
     bcstDist.valid := bcstValid && !bcstAccepted(ci)
     bcstDist.bits.tag := bulkPending.tag
-    bcstDist.bits.line := bulkBuffer(bulkPending.completedCnt).asTypeOf(Vec(16, new BcastBeat))
+    bcstDist.bits.line := bulkBuffer(bulkPending.completedCnt).asTypeOf(Vec(4, new BcastBeat))
     bcstDist.bits.carried := bulkPending.extras
     bcstAccept(ci) := bcstDist.fire
     bcstDist

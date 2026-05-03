@@ -1,8 +1,7 @@
-/// A wormhole NoC router with locking arbitration.
-/// Once a head flit wins an output port, the grant is held for subsequent
-/// body/tail flits from the same (input, VC) until isTail is asserted.
-/// For single-flit protocols (where every flit is both head and tail),
-/// the lock is never held and the arbiter degenerates to plain round-robin.
+/// A single-flit NoC router with shared priority queues and
+/// priority-aware arbitration per output port.
+/// Uses FlitQueue for admission control (deadlock avoidance via priority
+/// reservation) and FlitArb for priority-aware round-robin output selection.
 
 package koneko.bus
 
@@ -13,7 +12,7 @@ import chisel3.util.experimental.decode.{TruthTable, decoder}
 trait Prio extends Data {
   // The priority of this message
   // This is the hardware priority, not the protocol priority
-  // Will be mapped to VCs
+  // Lower value = higher priority (0 is highest)
   def prio: UInt
 }
 
@@ -71,7 +70,7 @@ class Router[D <: Routable](
   val locals: Seq[Local],
   val numIngress: Int,
   val numEgress: Int,
-  val numVc: Int,
+  val numPrio: Int,
   val buffer: Int,
   val table: Map[Int, Int], // Routing table: dst -> egress link
 ) extends Module {
@@ -149,139 +148,49 @@ class Router[D <: Routable](
     Routable.assertConsecutive(injects(idx).get, s"inject($idx)")
   }
 
-  // --- Input side: per-input-port VC buffers ---
-  val vcBufs: Seq[Seq[Queue[D]]] = Seq.tabulate(numInputs) { i =>
-    val bufs = Seq.tabulate(numVc) { v =>
-      val q = Module(new Queue(data.cloneType, buffer))
-      q.io.enq.bits := inputPorts(i).bits
-      q.io.enq.valid := inputPorts(i).valid && inputPorts(i).bits.prio === v.U
-      q
-    }
-    // Ready when the VC queue targeted by prio can accept
-    inputPorts(i).ready := MuxLookup(inputPorts(i).bits.prio, false.B)(
-      bufs.zipWithIndex.map { case (q, v) => v.U -> q.io.enq.ready }
-    )
-    bufs
+  // --- Input side: per-input-port shared FlitQueue ---
+  val inputQueues: Seq[FlitQueue[D]] = Seq.tabulate(numInputs) { i =>
+    val q = Module(new FlitQueue(data.cloneType, buffer, numPrio))
+    q.enq <> inputPorts(i)
+    q
   }
 
-  private val allBufs: Seq[Queue[D]] = vcBufs.flatten
-
-  // Decode each buffer head's target output port via truth tables
-  // Result: combined 1-hot UInt over numOutputs (bits 0..numEgress-1 = egress, rest = eject locals)
-  private val bufTargets: Seq[UInt] = allBufs.map { buf =>
-    val dstBits = buf.io.deq.bits.dst(idWidth - 1, 0)
-    val fwd = fwdTT.map(tt => decoder(dstBits, tt)).getOrElse(0.U(0.W))
-    val lcl = localTT.map(tt => decoder(dstBits, tt)).getOrElse(0.U(0.W))
-    Cat(lcl, fwd)
-  }
-
-  // --- Output side: per-output-port locking two-level arbitration ---
+  // --- Output side: per-output-port priority-aware arbitration ---
   //
-  // Per output port j, per VC v: we maintain a lock register.
-  // When a head flit wins and is not also a tail, the winning input index is
-  // latched and subsequent cycles bypass the RRArbiter, granting directly to
-  // the locked input until a tail flit fires. This guarantees wormhole
-  // atomicity: no interleaving of packets from different inputs on the same
-  // output link.
-  //
-  // For single-flit protocols (isTail always true on head), the lock is never
-  // engaged, and every cycle goes through normal RR arbitration.
+  // For each output port, we gather all input queues whose head flit targets
+  // that output, then use FlitArb for priority-aware round-robin selection.
 
-  val deqGrant = Wire(Vec(allBufs.length, Bool()))
-  deqGrant := VecInit(Seq.fill(allBufs.length)(false.B))
+  val deqGrant = Wire(Vec(numInputs, Bool()))
+  deqGrant := VecInit(Seq.fill(numInputs)(false.B))
 
   for (j <- 0 until numOutputs) {
-    // Per-VC locking round-robin arbiter across input ports
-    val vcArbs = Seq.tabulate(numVc) { v =>
-      val arb = Module(new RRArbiter(data.cloneType, numInputs))
+    val arb = Module(new FlitArb(data.cloneType, numInputs))
 
-      // Lock state for this (output j, VC v)
-      val locked    = RegInit(false.B)
-      val lockedIdx = Reg(UInt(log2Ceil(numInputs max 2).W))
+    for (i <- 0 until numInputs) {
+      val q = inputQueues(i)
+      val dstBits = q.deq.bits.dst(idWidth - 1, 0)
+      val fwd = fwdTT.map(tt => decoder(dstBits, tt)).getOrElse(0.U(0.W))
+      val lcl = localTT.map(tt => decoder(dstBits, tt)).getOrElse(0.U(0.W))
+      val target = Cat(lcl, fwd)
 
-      // Flat buffer index for a given input
-      def flat(i: Int) = i * numVc + v
-
-      // Connect RRArbiter inputs (active only when NOT locked)
-      for (i <- 0 until numInputs) {
-        arb.io.in(i).valid := allBufs(flat(i)).io.deq.valid && bufTargets(flat(i))(j) && !locked
-        arb.io.in(i).bits := allBufs(flat(i)).io.deq.bits
-      }
-
-      // When locked, the winning input is forced to lockedIdx
-      val winIdx  = Mux(locked, lockedIdx, arb.io.chosen)
-      val winFlat = Wire(UInt(log2Ceil(allBufs.length max 2).W))
-      winFlat := winIdx * numVc.U + v.U
-
-      val lockedBufValid = allBufs.zipWithIndex.map { case (buf, k) =>
-        (winFlat === k.U) && buf.io.deq.valid && bufTargets(k)(j)
-      }.reduce(_ || _)
-      val winValid = Mux(locked, lockedBufValid, arb.io.out.valid)
-
-      val winBits = MuxLookup(winFlat, allBufs(0).io.deq.bits)(
-        allBufs.zipWithIndex.map { case (buf, k) => k.U -> buf.io.deq.bits }
-      )
-
-      // Expose aggregated valid/bits/ready for VC priority selection
-      val outValid = winValid
-      val outBits  = winBits
-      val outReady = Wire(Bool())
-      outReady := false.B
-
-      // When not locked, pass ready back to the RRArbiter
-      arb.io.out.ready := outReady && !locked
-
-      // Determine if this flit is head/tail
-      val isHead = !locked
-      val isTail = outBits.isTail(isHead)
-
-      // Lock management
-      when(outValid && outReady) {
-        when(isHead && !isTail) {
-          // Multi-flit packet begins: lock to this input
-          locked    := true.B
-          lockedIdx := Mux(locked, lockedIdx, arb.io.chosen)
-        }
-        when(isTail) {
-          locked := false.B
-        }
-      }
-
-      // Grant the correct buffer
-      when(outValid && outReady) {
-        for (i <- 0 until numInputs) {
-          when(winIdx === i.U) {
-            deqGrant(flat(i)) := true.B
-          }
-        }
-      }
-
-      (outValid, outBits, outReady, isTail)
+      arb.io.in(i).valid := q.deq.valid && target(j)
+      arb.io.in(i).bits := q.deq.bits
     }
 
-    // Strict VC priority: highest VC number wins
-    val vcValid = VecInit(vcArbs.map(_._1))
-    val hasReq = vcValid.asUInt.orR
-    val winVc = Wire(UInt(log2Ceil(numVc max 2).W))
-    winVc := 0.U
-    for (v <- 0 until numVc) {
-      when(vcValid(v)) { winVc := v.U }
-    }
+    outputPorts(j).valid := arb.io.out.valid
+    outputPorts(j).bits := arb.io.out.bits
+    arb.io.out.ready := outputPorts(j).ready
 
-    // Drive output port
-    outputPorts(j).valid := hasReq
-    outputPorts(j).bits := MuxLookup(winVc, vcArbs(0)._2)(
-      vcArbs.zipWithIndex.map { case ((_, bits, _, _), v) => v.U -> bits }
-    )
-
-    // Back-propagate ready only to the winning VC
-    for (v <- 0 until numVc) {
-      vcArbs(v)._3 := outputPorts(j).ready && winVc === v.U && hasReq
+    // Grant the winning input queue
+    for (i <- 0 until numInputs) {
+      when(arb.io.in(i).ready && arb.io.in(i).valid) {
+        deqGrant(i) := true.B
+      }
     }
   }
 
   // Connect dequeue ready to grants
-  for (k <- allBufs.indices) {
-    allBufs(k).io.deq.ready := deqGrant(k)
+  for (i <- 0 until numInputs) {
+    inputQueues(i).deq.ready := deqGrant(i)
   }
 }

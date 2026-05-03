@@ -311,7 +311,7 @@ class System(implicit val params: SystemParameters) extends Module {
     val numI = numE
     val locals = topo.puLocals(id)
     val table = topo.puTables(id)
-    val router = Module(new Router(flitType, locals, numI, numE, 1, 2, table))
+    val router = Module(new Router(flitType, locals, numI, numE, 4, 8, table))
     router.suggestName(s"router_$id")
     (id, router)
   }.toMap
@@ -454,12 +454,19 @@ class System(implicit val params: SystemParameters) extends Module {
     dist.suggestName(s"distrib_${ci + 1}")
 
     // MemIf resp -> distributor input
-    // dist.in <> memIfs(mcIdx).resp(ciLocal)
+    dist.in.unicast := memIfs(mcIdx).unicast(ciLocal)
+    dist.in.broadcast <> memIfs(mcIdx).broadcast(ciLocal)
 
     // Distributor outputs -> core mem ports
+    val readies = Wire(Vec(16, Bool()))
     for (j <- 0 until 16) {
       val puId = puStart + j
-      // cores(puId).mem := dist.out(j)
+      cores(puId).mem.unicast.valid := dist.out.unicast.valids(j)
+      cores(puId).mem.unicast.bits := dist.out.unicast.resp
+      cores(puId).mem.broadcast.valid := dist.out.broadcast.valids(j)
+      cores(puId).mem.broadcast.bits := dist.out.broadcast.resp
+      readies(j) := cores(puId).mem.broadcast.ready
     }
+    dist.out.broadcast.readies := readies.asUInt
   }
 }

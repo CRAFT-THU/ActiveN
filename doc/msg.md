@@ -39,3 +39,9 @@ We have additional instruction for querying and manipulating the quota during ru
   - send queue space >= target quota + sum(all **other** live threads' quota) + margin given in the instruction
 
 We explicitly did not include a query instruction for remaining spaces, because during SMT execution, this value is highly suspectible to racing. Software should use quota to protect itself from over-saturating the send queue, and be really careful when dynamically allocating quota.
+
+## Reset state
+
+During reset, all two SMT threads are active. register a0 contains the ID of the SMT thread (0, 1, ...), **not hartid**.
+
+Handlers for each message are all reset to 0. If the handler is 0, then the message will not be scheduled. This is to ensure that no race happens during bootup.

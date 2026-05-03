@@ -31,7 +31,7 @@ class FlitQueue[F <: Prio](
   val count = IO(Output(UInt((log2Ceil(depth) + 1).W)))
   count := cnt
 
-  // Dequeue
+  // Dequeue: priority selection (0 = highest)
   val prioDeqs = (0 until numPrio) map { p => VecInit(prio.map(_(p))) }
   val prioValids = prioDeqs.map(_.asUInt.orR)
   val prioSel = PriorityEncoderOH(prioValids) // 0 is highest prio

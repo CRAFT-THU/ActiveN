@@ -166,6 +166,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
   // BIU & related AM connections
   val biu = Module(new BIU)
   biu.hartid := cfg.hartid(15, 0)
+  for (i <- 0 until 16) biu.enabled(i) := handlers(i) =/= 0.U
 
   biu.ext.in <> ext.in
   biu.ext.out <> ext.out

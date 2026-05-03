@@ -305,7 +305,6 @@ struct CoreState {
     uint8_t saved_valid = core->ext_in_valid;
     uint32_t saved_data[4] = {core->ext_in_bits_data_0, core->ext_in_bits_data_1, core->ext_in_bits_data_2, core->ext_in_bits_data_3};
     uint16_t saved_tag = core->ext_in_bits_tag;
-    uint16_t saved_src = core->ext_in_bits_src;
 
     core->ext_in_valid = 1;
     core->ext_in_bits_data_0 = flit.data[0];
@@ -313,7 +312,6 @@ struct CoreState {
     core->ext_in_bits_data_2 = flit.data[2];
     core->ext_in_bits_data_3 = flit.data[3];
     core->ext_in_bits_tag = flit.tag;
-    core->ext_in_bits_src = flit.src;
     core->eval();
     bool ready = core->ext_in_ready;
 
@@ -323,7 +321,6 @@ struct CoreState {
     core->ext_in_bits_data_2 = saved_data[2];
     core->ext_in_bits_data_3 = saved_data[3];
     core->ext_in_bits_tag = saved_tag;
-    core->ext_in_bits_src = saved_src;
     core->eval();
     return ready;
   }
@@ -340,7 +337,6 @@ struct CoreState {
       core->ext_in_bits_data_2 = 0;
       core->ext_in_bits_data_3 = 0;
       core->ext_in_bits_tag = 0;
-      core->ext_in_bits_src = 0;
     } else {
       const auto &f = *ext_input;
       core->ext_in_valid = 1;
@@ -349,7 +345,6 @@ struct CoreState {
       core->ext_in_bits_data_2 = f.data[2];
       core->ext_in_bits_data_3 = f.data[3];
       core->ext_in_bits_tag = f.tag;
-      core->ext_in_bits_src = f.src;
     }
 
     if (mem_inbox.empty()) {
