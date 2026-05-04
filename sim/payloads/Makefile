@@ -50,16 +50,23 @@ sys/sha256_concurrent.bin: sys/sha256_concurrent.S sys/sha256_lib.c sys/linker_s
 	${PREFIX}objcopy -j .text -j .data -O binary sys/sha256_concurrent.elf $@
 
 sys/spm_init.bin: sys/spm_init.S sys/linker_system.ld
-	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -o sys/spm_init.elf $<
+	${PREFIX}gcc -mabi=ilp32 -march=rv32ia_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -o sys/spm_init.elf $<
 	${PREFIX}objcopy -j .text -j .data -O binary sys/spm_init.elf $@
 
 sys/barrier_test.bin: sys/barrier_test.S sys/linker_system.ld
 	${PREFIX}gcc -mabi=ilp32 -march=rv32ia_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -o sys/barrier_test.elf $<
 	${PREFIX}objcopy -j .text -j .data -O binary sys/barrier_test.elf $@
 
-sys/csr_scatter_test.bin: sys/csr_scatter_test.S sys/linker_system.ld
-	${PREFIX}gcc -mabi=ilp32 -march=rv32imf_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -O1 -o sys/csr_scatter_test.elf sys/csr_scatter_test.S
+sys/csr_scatter_data.S: sys/gen_csr_data.py
+	python3 sys/gen_csr_data.py sys/csr_scatter_data.S
+
+sys/csr_scatter_test.bin: sys/csr_scatter_test.S sys/csr_scatter_data.S sys/linker_system.ld
+	${PREFIX}gcc -mabi=ilp32 -march=rv32ima_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -Isys -O1 -o sys/csr_scatter_test.elf sys/csr_scatter_test.S
 	${PREFIX}objcopy -j .text -j .data -O binary sys/csr_scatter_test.elf $@
+
+sys/csr_scatter_dram1.bin: sys/csr_scatter_dram1.S sys/csr_scatter_data.S sys/linker_system.ld
+	${PREFIX}gcc -mabi=ilp32 -march=rv32im_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -Isys -O1 -o sys/csr_scatter_dram1.elf sys/csr_scatter_dram1.S
+	${PREFIX}objcopy -j .text -j .data -O binary sys/csr_scatter_dram1.elf $@
 
 sys/local_send_test.bin: sys/local_send_test.S sys/linker_system.ld
 	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -o sys/local_send_test.elf sys/local_send_test.S

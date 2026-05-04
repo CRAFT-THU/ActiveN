@@ -61,24 +61,19 @@
 
 using namespace std;
 
-static constexpr uint32_t TEXT_BASE = 0x80000000u;
 static constexpr int MEM_BUS_WORDS = MEM_BUS_WIDTH / 32;
 static constexpr int RESP_QUEUE_DEPTH = 64;
 
 static bool exiting = false;
 static void sighandler(int) { exiting = true; }
 
-// ---- Per-MC memory images (owned by the frontend, exported for hard backend) ----
+// ---- Per-MC memory images (owned by the frontend) ----
 struct McImage {
   uint32_t *data = nullptr;
   size_t size = 0;  // bytes
 };
 
 static vector<McImage> mc_images;
-
-// Legacy global pointers for hard_backend.h compatibility (first MC's image).
-uint32_t *text_aligned = nullptr;
-size_t text_size = 0;
 
 static void loadImages(const vector<string> &paths, size_t default_size) {
   mc_images.resize(paths.size());
@@ -95,11 +90,6 @@ static void loadImages(const vector<string> &paths, size_t default_size) {
     mc_images[i].data = reinterpret_cast<uint32_t *>(buf);
     mc_images[i].size = alloc;
   }
-  // Legacy pointers point to first image
-  if (!mc_images.empty()) {
-    text_aligned = mc_images[0].data;
-    text_size = mc_images[0].size;
-  }
 }
 
 static void unloadImages() {
@@ -111,12 +101,10 @@ static void unloadImages() {
     }
   }
   mc_images.clear();
-  text_aligned = nullptr;
-  text_size = 0;
 }
 
 // Build a 32-byte-aligned read response from a specific MC's image
-void buildMemRespMc(int mc, uint32_t local_addr, uint8_t *data) {
+static void buildMemRespMc(int mc, uint32_t local_addr, uint8_t *data) {
   uint32_t aligned = local_addr & ~(uint32_t)(MEM_BUS_WORDS * 4 - 1);
   auto *out = reinterpret_cast<uint32_t *>(data);
   auto &img = mc_images[mc];
@@ -130,7 +118,7 @@ void buildMemRespMc(int mc, uint32_t local_addr, uint8_t *data) {
 }
 
 // Apply a write to a specific MC's image
-void applyWriteMc(int mc, uint32_t local_addr, uint8_t size, const uint8_t *wdata) {
+static void applyWriteMc(int mc, uint32_t local_addr, uint8_t size, const uint8_t *wdata) {
   uint32_t nbytes = 1u << size;
   uint32_t block_base = local_addr & ~(uint32_t)(MEM_BUS_WORDS * 4 - 1);
   uint32_t byte_off = local_addr - block_base;
@@ -140,18 +128,6 @@ void applyWriteMc(int mc, uint32_t local_addr, uint8_t size, const uint8_t *wdat
     uint32_t pos = block_base + byte_off + b;
     if (pos < img.size) mem_bytes[pos] = wdata[byte_off + b];
   }
-}
-
-// Legacy wrappers for hard_backend.h (operate on first MC image)
-void buildMemResp(uint32_t global_addr, uint8_t *data) {
-  uint32_t local = global_addr - TEXT_BASE;
-  buildMemRespMc(0, local, data);
-}
-
-void applyWrite(uint32_t global_addr, uint8_t size, const uint8_t *wdata) {
-  if (global_addr < TEXT_BASE) return;
-  uint32_t local = global_addr - TEXT_BASE;
-  applyWriteMc(0, local, size, wdata);
 }
 
 // ---- Per-MC state in the frontend ----

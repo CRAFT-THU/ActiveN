@@ -5,7 +5,6 @@ import chisel3.util._
 
 import koneko._
 import koneko.bus._
-import koneko.Main.pipeCnt
 import koneko.Common.DecoupledOps
 
 class BIU(implicit val param: CoreParameters) extends Module {

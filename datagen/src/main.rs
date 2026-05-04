@@ -13,35 +13,9 @@ use std::io::BufReader;
 use std::io::BufWriter;
 use std::io::Write;
 
-const XOR_SCALE: f32 = 1.0;
 const CSR_ROW_ALIGN_WORDS: usize = 8;
-const SPM_IMAGE_MAGIC: u32 = 0x5350_4d49;
-const SPM_IMAGE_VERSION: u32 = 1;
-const SPM_IMAGE_HEADER_WORDS: u32 = 5;
-const SPM_INIT_DESC_WORDS: u32 = 7;
-
-fn round_ties_even_i64(value: f64) -> i64 {
-    let lower = value.floor();
-    let frac = value - lower;
-    let rounded = if frac < 0.5 {
-        lower
-    } else if frac > 0.5 {
-        lower + 1.0
-    } else if (lower as i64) & 1 == 0 {
-        lower
-    } else {
-        lower + 1.0
-    };
-    rounded as i64
-}
-
-fn quantize_xor_word(value: f32) -> u32 {
-    if !value.is_finite() {
-        return value.to_bits();
-    }
-    let scaled = value * XOR_SCALE;
-    round_ties_even_i64(scaled as f64) as u32
-}
+const DRAM_HEADER_BYTES: usize = 16;
+const SPM_INIT_DESC_BYTES: usize = 8;
 
 fn pad_csr_row(words: &mut Vec<u32>) {
     while words.len() % CSR_ROW_ALIGN_WORDS != 0 {
@@ -57,6 +31,9 @@ struct Args {
 
     #[clap(long, default_value = "1")]
     num_mc: usize,
+
+    #[clap(long, default_value = "16384")]
+    spm_size: usize,
 
     #[clap(long)]
     load_nest_nodes: Option<PathBuf>,
@@ -90,11 +67,15 @@ struct Args {
     #[clap(long, default_value = "0.273786")]
     inh_ratio: f64,
 
+    /// The executbale binary to be postpended to the dram.0 image
+    /// If not specified, do not generate the jump instruction at the start of the header
+    #[clap(long)]
+    text: Option<PathBuf>,
+
+    /// The path to output the generated files
+    /// Must be a directory. dram.<idx> files will be placed within
     #[clap(short, long)]
     dump: Option<PathBuf>,
-
-    #[clap(long, default_value = "0x80100000")]
-    dram_base: String,
 
     #[clap(long)]
     dump_genn: Option<PathBuf>,
@@ -126,65 +107,50 @@ struct Core {
     neurons: Vec<Neuron>,
 }
 
-#[derive(Copy, Clone)]
-struct SpmInitDescriptor {
-    init_src: u32,
-    init_bytes: u32,
-    nn_count: u32,
-    stride_bytes: u32,
-    num_mc: u32,
-    num_pu: u32,
-    expected_xor: u32,
-}
-
-fn compute_expected_xor(cores: &[Core], final_round_spike_inputs: &[Vec<f32>]) -> u32 {
-    let mut expected_xor = 0;
-    for (core_idx, c) in cores.iter().enumerate() {
-        for (neuron_idx, n) in c.neurons.iter().enumerate() {
-            expected_xor ^= quantize_xor_word(n.state);
-            expected_xor ^= quantize_xor_word(final_round_spike_inputs[core_idx][neuron_idx]);
-        }
-    }
-    expected_xor
+/// Encode a RISC-V JAL x0, offset instruction (unconditional jump).
+/// Panics if offset is out of range (±1MiB) or not 2-byte aligned.
+fn encode_jal_x0(offset: i32) -> u32 {
+    assert!(offset >= -(1 << 20) && offset < (1 << 20), "JAL offset out of range: {}", offset);
+    assert!(offset & 1 == 0, "JAL offset must be 2-byte aligned: {}", offset);
+    let imm = offset as u32;
+    let bit20 = (imm >> 20) & 1;
+    let bits10_1 = (imm >> 1) & 0x3FF;
+    let bit11 = (imm >> 11) & 1;
+    let bits19_12 = (imm >> 12) & 0xFF;
+    (bit20 << 31) | (bits10_1 << 21) | (bit11 << 20) | (bits19_12 << 12) | 0b1101111
 }
 
 fn dump(
     base: &PathBuf,
     cores: &[Core],
-    dram_base: u32,
     num_mc: usize,
-    expected_xor: u32,
+    spm_size: usize,
+    text: Option<&PathBuf>,
+    decay: f32,
+    threshold: f32,
 ) -> anyhow::Result<()> {
     println!("Dumping to {}", base.display());
 
     let core_cnt = cores.len();
     let pus_per_mc = core_cnt / num_mc;
 
-    // New SPM format: per neuron = state(f32), input(f32), csr_start_mc[0..num_mc-1]
-    // Plus 1 sentinel neuron at the end with past-the-end CSR addresses
-    let words_per_neuron = 2 + num_mc; // state, input, N x csr_start
+    // Per neuron in SPM: state(f32), input(f32), starts[0..num_mc-1]
+    // Plus 1 sentinel neuron at the end with past-the-end CSR offsets
+    let words_per_neuron = 2 + num_mc;
+    let bytes_per_neuron = words_per_neuron * 4;
 
-    // Layout in the combined dram.0 file:
-    //   [0, header_end):      Fixed boot header
-    //   [header_end, desc_end): Per-PU SPM init descriptors
-    //   [desc_end, init_end): Compact per-PU SPM init blobs
-    //   [init_end, ...):      CSR data for each MC (concatenated, each MC's block is separate)
-    let header_size = SPM_IMAGE_HEADER_WORDS * 4;
-    let desc_stride = SPM_INIT_DESC_WORDS * 4;
-    let desc_size = (core_cnt as u32) * desc_stride;
-    let init_sizes: Vec<u32> = cores
-        .iter()
-        .map(|c| ((c.neurons.len() + 1) as u32) * (words_per_neuron as u32) * 4)
-        .collect();
-    let init_total: u32 = init_sizes.iter().sum();
-    let mut init_file_offsets = Vec::with_capacity(core_cnt);
-    let mut csr_file_offset = header_size + desc_size;
-    for init_bytes in &init_sizes {
-        init_file_offsets.push(csr_file_offset);
-        csr_file_offset += *init_bytes;
-    }
+    // SPM tail descriptor (FP32 LIF): decay, threshold, type, stride, count = 5 words = 20 bytes
+    let spm_tail_bytes: usize = 20;
 
-    // Step 1: Partition CSR entries by destination MC
+    // Read text binary if provided
+    let text_data = if let Some(text_path) = text {
+        std::fs::read(text_path)?
+    } else {
+        Vec::new()
+    };
+    let text_len = text_data.len();
+
+    // Step 1: Partition CSR entries by destination MC.
     // csr_per_mc[mc] = Vec<u32> of CSR entries (col, weight pairs) for that MC
     let mut csr_per_mc: Vec<Vec<u32>> = vec![Vec::new(); num_mc];
     // per_neuron_csr_starts[ci][ni][mc] = byte offset within csr_per_mc[mc] where this neuron's row starts
@@ -194,7 +160,7 @@ fn dump(
         let c = &cores[ci];
         let mut neuron_starts: Vec<Vec<u32>> = Vec::new();
         for n in c.neurons.iter() {
-            // Record start offsets for each MC
+            // Record start offsets for each MC (byte offset within that MC's CSR block)
             let starts: Vec<u32> = (0..num_mc).map(|mc| (csr_per_mc[mc].len() * 4) as u32).collect();
             neuron_starts.push(starts);
 
@@ -203,7 +169,7 @@ fn dump(
                 let target_pu = neigh.core as usize; // 0-based core index
                 let target_mc = target_pu / pus_per_mc;
                 debug_assert!(target_mc < num_mc, "target_mc={} >= num_mc={}", target_mc, num_mc);
-                // Core IDs are 1-based in the new system (PU IDs 1..core_cnt)
+                // CSR entry: PU ID (1-based) in upper 16 bits, neuron sub-index in lower 16 bits
                 let col = ((neigh.core as u32 + 1) << 16) | (neigh.neuron as u32);
                 csr_per_mc[target_mc].push(col);
                 csr_per_mc[target_mc].push(neigh.weight.to_bits());
@@ -221,123 +187,164 @@ fn dump(
         per_neuron_csr_starts.push(neuron_starts);
     }
 
-    // Step 2: Compute CSR base addresses per MC
-    // All CSR data goes into the dram.0 file sequentially after SPM data.
-    // Each MC's CSR block is at a known file offset.
-    // The MC-local address = (file_offset_of_mc_csr_block + entry_offset_within_block)
-    //   because the Encoder converts global addresses to MC-local by subtracting MC's base.
-    //   For MC0: global = dram_base + file_offset, local = global - 0x80000000
-    //   For MC1: global = dram_base + file_offset, but MC1's DRAM starts at 0x80000000 + mc_size
-    //   So local = global - (0x80000000 + mc_size) = dram_base - 0x80000000 + file_offset - mc_size
-    //
-    // Since all data is in a flat file loaded at dram_base (0x80100000),
-    // and the simulator adjusts per-MC addressing:
-    //   MC0 local_addr → global = local_addr + 0x80000000
-    //   MC1 local_addr → global = local_addr + 0x80000000 + mc_size
-    //
-    // So for MC0: CSR MC-local addr = (dram_base - 0x80000000) + file_offset
-    // For MC1: CSR MC-local addr = (dram_base - 0x80000000) + file_offset - mc_size
-    // Generalization: MC-local addr = (dram_base - 0x80000000 - mc_cumul_base) + file_offset
+    // Step 2: Compute neuron starts as DRAM-image-local offsets.
+    // Per spec: starts are relative to the START OF THE DRAM IMAGE.
+    // MC0 layout: [header(16B)][text][CSR data...], so CSR base = 16 + text_len
+    // Other MCs:  [header(16B)][CSR data...], so CSR base = 16
+    let csr_local_base_mc0 = (DRAM_HEADER_BYTES + text_len) as u32;
+    let csr_local_base_other = DRAM_HEADER_BYTES as u32;
 
-    let mc_size: u64 = 0x100000000; // 4 GiB per MC (matching memCtrlSizes)
-    let mut csr_mc_file_offsets: Vec<u32> = Vec::new();
-    let mut cur_offset = csr_file_offset;
-    for mc in 0..num_mc {
-        csr_mc_file_offsets.push(cur_offset);
-        cur_offset += (csr_per_mc[mc].len() * 4) as u32;
-    }
-
-    // MC-local base for each MC's CSR block
-    let dram_offset_from_text = dram_base - 0x80000000u32;
-    let csr_mc_local_bases: Vec<u32> = (0..num_mc).map(|mc| {
-        let mc_cumul_base = (mc as u64) * mc_size;
-        // MC-local address of the start of this MC's CSR block
-        ((dram_offset_from_text as u64 + csr_mc_file_offsets[mc] as u64) - mc_cumul_base) as u32
-    }).collect();
-
-    // Step 3: Build compact SPM init data and descriptors.
-    let mut all_spm_init: Vec<Vec<u32>> = Vec::new();
-    let mut init_descs: Vec<SpmInitDescriptor> = Vec::new();
+    // Step 3: Build full SPM images (spm_size bytes each).
+    let mut all_spm_images: Vec<Vec<u8>> = Vec::new();
+    let mut global_xor: u32 = 0;
     for ci in 0..core_cnt {
         let c = &cores[ci];
         let nn_count = c.neurons.len();
-        let mut spm_init: Vec<u32> = Vec::new();
+        let neuron_data_bytes = (nn_count + 1) * bytes_per_neuron; // +1 sentinel
+        let required = neuron_data_bytes + spm_tail_bytes;
+        if required > spm_size {
+            panic!(
+                "PU {} requires {} bytes (neurons={}, tail={}), but spm_size={}",
+                ci + 1, required, neuron_data_bytes, spm_tail_bytes, spm_size
+            );
+        }
 
-        // Regular neurons
+        let mut spm = vec![0u8; spm_size];
+
+        // Write neuron data at offset 0
+        let mut off = 0usize;
         for ni in 0..nn_count {
             let n = &c.neurons[ni];
-            spm_init.push(n.state.to_bits());
-            spm_init.push(n.input.to_bits());
+            spm[off..off+4].copy_from_slice(&n.state.to_bits().to_le_bytes());
+            off += 4;
+            spm[off..off+4].copy_from_slice(&n.input.to_bits().to_le_bytes());
+            off += 4;
             for mc in 0..num_mc {
-                // MC-local start address for this neuron's CSR row in this MC
-                spm_init.push(csr_mc_local_bases[mc] + per_neuron_csr_starts[ci][ni][mc]);
+                let base_offset = if mc == 0 { csr_local_base_mc0 } else { csr_local_base_other };
+                let local_offset = base_offset + per_neuron_csr_starts[ci][ni][mc];
+                spm[off..off+4].copy_from_slice(&local_offset.to_le_bytes());
+                off += 4;
             }
         }
-        // Sentinel neuron (past-the-end CSR addresses)
-        spm_init.push(0); // state placeholder
-        spm_init.push(0); // input placeholder
+        // Sentinel neuron
+        spm[off..off+4].copy_from_slice(&0u32.to_le_bytes()); off += 4; // state=0
+        spm[off..off+4].copy_from_slice(&0u32.to_le_bytes()); off += 4; // input=0
         for mc in 0..num_mc {
-            spm_init.push(csr_mc_local_bases[mc] + per_neuron_csr_starts[ci][nn_count][mc]);
+            let base_offset = if mc == 0 { csr_local_base_mc0 } else { csr_local_base_other };
+            let local_offset = base_offset + per_neuron_csr_starts[ci][nn_count][mc];
+            spm[off..off+4].copy_from_slice(&local_offset.to_le_bytes());
+            off += 4;
         }
 
-        init_descs.push(SpmInitDescriptor {
-            init_src: dram_base + init_file_offsets[ci],
-            init_bytes: init_sizes[ci],
-            nn_count: nn_count as u32,
-            stride_bytes: (words_per_neuron as u32) * 4,
-            num_mc: num_mc as u32,
-            num_pu: core_cnt as u32,
-            expected_xor,
-        });
-        all_spm_init.push(spm_init);
+        // Write tail descriptor at end of SPM
+        // end - 0x14: decay factor (FP32)
+        // end - 0x10: threshold (FP32)
+        // end - 0x0C: type (0x0 = FP32 LIF)
+        // end - 0x08: stride bytes (bytes_per_neuron)
+        // end - 0x04: neuron count
+        let end = spm_size;
+        spm[end-0x14..end-0x10].copy_from_slice(&decay.to_bits().to_le_bytes());
+        spm[end-0x10..end-0x0C].copy_from_slice(&threshold.to_bits().to_le_bytes());
+        spm[end-0x0C..end-0x08].copy_from_slice(&0u32.to_le_bytes()); // type = FP32 LIF
+        spm[end-0x08..end-0x04].copy_from_slice(&(bytes_per_neuron as u32).to_le_bytes());
+        spm[end-0x04..end].copy_from_slice(&(nn_count as u32).to_le_bytes());
+
+        // Accumulate XOR of all words in this SPM image
+        for word_idx in 0..(spm_size / 4) {
+            let w = u32::from_le_bytes(spm[word_idx*4..word_idx*4+4].try_into().unwrap());
+            global_xor ^= w;
+        }
+
+        all_spm_images.push(spm);
     }
 
-    // Step 4: Write combined dram.0 file
+    // Step 4: Compute dram.0 layout (per doc/snn.md):
+    // [0..16): header (jump to after header, spm_init_offset, num_mc, num_pu)
+    // [16..16+text_len): executable text binary
+    // [16+text_len..+csr0_bytes): CSR data for MC 0
+    // [after csr..): SPM init section (descriptors + data)
+    let csr0_bytes = csr_per_mc[0].len() * 4;
+    let spm_init_offset = (DRAM_HEADER_BYTES + text_len + csr0_bytes) as u32;
+    let spm_init_desc_total = core_cnt * SPM_INIT_DESC_BYTES;
+    let spm_init_data_total = core_cnt * spm_size;
+    let spm_init_section_size = spm_init_desc_total + spm_init_data_total;
+
+    // Step 5: Write dram.0
     let mut out_file = base.clone();
     out_file.push("dram.0");
     let mut writer = BufWriter::new(File::create(&out_file)?);
 
-    // 1. Fixed boot header.
-    writer.write_u32::<LittleEndian>(SPM_IMAGE_MAGIC)?;
-    writer.write_u32::<LittleEndian>(SPM_IMAGE_VERSION)?;
+    // Header word 0: jump instruction to right after header (offset +16)
+    if text.is_some() {
+        writer.write_u32::<LittleEndian>(encode_jal_x0(DRAM_HEADER_BYTES as i32))?;
+    } else {
+        writer.write_u32::<LittleEndian>(0)?;
+    }
+    // Header word 1: offset to SPM initializer section
+    writer.write_u32::<LittleEndian>(spm_init_offset)?;
+    // Header word 2: number of memory controllers
+    writer.write_u32::<LittleEndian>(num_mc as u32)?;
+    // Header word 3: number of PUs
     writer.write_u32::<LittleEndian>(core_cnt as u32)?;
-    writer.write_u32::<LittleEndian>(dram_base + header_size)?;
-    writer.write_u32::<LittleEndian>(desc_stride)?;
 
-    // 2. Per-PU SPM init descriptors.
-    for desc in &init_descs {
-        writer.write_u32::<LittleEndian>(desc.init_src)?;
-        writer.write_u32::<LittleEndian>(desc.init_bytes)?;
-        writer.write_u32::<LittleEndian>(desc.nn_count)?;
-        writer.write_u32::<LittleEndian>(desc.stride_bytes)?;
-        writer.write_u32::<LittleEndian>(desc.num_mc)?;
-        writer.write_u32::<LittleEndian>(desc.num_pu)?;
-        writer.write_u32::<LittleEndian>(desc.expected_xor)?;
+    // Text binary (right after header)
+    if !text_data.is_empty() {
+        writer.write_all(&text_data)?;
     }
 
-    // 3. Compact per-PU SPM initializer blobs.
-    for spm in &all_spm_init {
-        for word in spm {
-            writer.write_u32::<LittleEndian>(*word)?;
-        }
+    // CSR data for MC 0
+    for word in &csr_per_mc[0] {
+        writer.write_u32::<LittleEndian>(*word)?;
     }
 
-    // 4. CSR data for each MC.
-    for mc in 0..num_mc {
-        for word in &csr_per_mc[mc] {
-            writer.write_u32::<LittleEndian>(*word)?;
-        }
+    // SPM init section: descriptors first, then data blobs
+    // Each descriptor: offset (relative to spm_init_offset), size (bytes)
+    let data_start_within_section = spm_init_desc_total as u32;
+    for ci in 0..core_cnt {
+        let offset = data_start_within_section + (ci * spm_size) as u32;
+        let size = spm_size as u32;
+        writer.write_u32::<LittleEndian>(offset)?;
+        writer.write_u32::<LittleEndian>(size)?;
+    }
+    // SPM data blobs
+    for spm in &all_spm_images {
+        writer.write_all(spm)?;
     }
 
     writer.flush()?;
-    let total_csr: usize = csr_per_mc.iter().map(|v| v.len() * 4).sum();
-    let total_size = header_size as usize + desc_size as usize + init_total as usize + total_csr;
-    println!("  dram.0: {} bytes (boot={}, desc={}, init={}, csr={})",
-        total_size, header_size, desc_size, init_total, total_csr);
-    for mc in 0..num_mc {
-        println!("    MC{}: csr={} bytes, local_base=0x{:08x}",
-            mc, csr_per_mc[mc].len() * 4, csr_mc_local_bases[mc]);
+    let dram0_size = DRAM_HEADER_BYTES + text_len + csr0_bytes + spm_init_section_size;
+    println!("  dram.0: {} bytes (header={}, text={}, csr={}, init_section={})",
+        dram0_size, DRAM_HEADER_BYTES, text_len, csr0_bytes, spm_init_section_size);
+
+    // Step 6: Write dram.1, dram.2, ... for additional MCs
+    for mc in 1..num_mc {
+        let mut out_file = base.clone();
+        out_file.push(format!("dram.{}", mc));
+        let mut writer = BufWriter::new(File::create(&out_file)?);
+
+        // 16 bytes of zeros (header for non-primary images)
+        for _ in 0..4 {
+            writer.write_u32::<LittleEndian>(0)?;
+        }
+
+        // CSR data for this MC
+        for word in &csr_per_mc[mc] {
+            writer.write_u32::<LittleEndian>(*word)?;
+        }
+
+        writer.flush()?;
+        let mc_size = DRAM_HEADER_BYTES + csr_per_mc[mc].len() * 4;
+        println!("  dram.{}: {} bytes (header={}, csr={})",
+            mc, mc_size, DRAM_HEADER_BYTES, csr_per_mc[mc].len() * 4);
     }
+
+    // Summary
+    for mc in 0..num_mc {
+        println!("    MC{}: csr={} bytes ({} entries)",
+            mc, csr_per_mc[mc].len() * 4, csr_per_mc[mc].len() / 2);
+    }
+
+    println!("Reference XOR: 0x{:08x}", global_xor);
 
     Ok(())
 }
@@ -743,11 +750,6 @@ fn main() -> anyhow::Result<()> {
 
     println!("Gen done, max syn per neuron = {}", max_syn_per_neuron);
 
-    let mut final_round_spike_inputs: Vec<Vec<f32>> = core_nn_cnt
-        .iter()
-        .map(|&nn_count| vec![0.0; nn_count])
-        .collect();
-
     let mut dump_snapshot: Option<Vec<Core>> = None;
 
     // Simulate
@@ -780,10 +782,6 @@ fn main() -> anyhow::Result<()> {
                         let neigh = cores[c].neurons[n].neigh[neigh].clone();
                         cores[neigh.core as usize].neurons[neigh.neuron as usize].input +=
                             neigh.weight;
-                        if i == args.pre_simulate - 1 {
-                            final_round_spike_inputs[neigh.core as usize]
-                                [neigh.neuron as usize] += neigh.weight;
-                        }
                     }
                 } else {
                     cores[c].neurons[n].state *= e_neg_tau;
@@ -799,20 +797,9 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // After all rounds: compute the payload-visible XOR checksum. The payload multiplies
-    // by 1.0e1f in FP32 and then converts to int with RNE, so emulate the same path here.
-    // The PU's init clears input to 0, so the final hardware input is the spike-only
-    // accumulation from the last simulated round.
     if let Some(ref snapshot) = dump_snapshot {
         if let Some(ref p) = args.dump {
-            let expected_xor = compute_expected_xor(&cores, &final_round_spike_inputs);
-            let dram_base = u32::from_str_radix(
-                args.dram_base.trim_start_matches("0x").trim_start_matches("0X"),
-                16,
-            ).expect("Invalid --dram-base hex value");
-
-            println!("Expected XOR: 0x{:08x}", expected_xor);
-            dump(p, snapshot, dram_base, args.num_mc, expected_xor)?;
+            dump(p, snapshot, args.num_mc, args.spm_size, args.text.as_ref(), e_neg_tau, args.threshold)?;
         }
 
         if let Some(ref p) = args.dump_genn {

@@ -52,17 +52,10 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
     f.write('#include "sys_verilated/sys_rtl.h"\n')
     f.write('#include <memory>\n')
     f.write('#include <cstring>\n')
-    f.write('#include <deque>\n')
     f.write('#include <iostream>\n')
     f.write('#include <verilated.h>\n')
     f.write('#include <verilated_fst_c.h>\n')
     f.write('\n')
-
-    f.write("// Frontend memory (defined in system_new.cpp)\n")
-    f.write("extern uint32_t *text_aligned;\n")
-    f.write("extern size_t    text_size;\n")
-    f.write("void buildMemResp(uint32_t global_addr, uint8_t *data);\n")
-    f.write("void applyWrite(uint32_t global_addr, uint8_t size, const uint8_t *wdata);\n\n")
 
     f.write(f"static constexpr int HARD_NUM_PU = {num_pu};\n")
     f.write(f"static constexpr int HARD_NUM_MC = {num_mc};\n")
@@ -71,8 +64,7 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
         for s in core["memCtrlSizes"]
     )
     f.write(f"static constexpr uint64_t HARD_MC_SIZES[] = {{{mc_sizes_list}}};\n")
-    f.write(f"static constexpr uint64_t HARD_RESET_LENGTH = 10;\n")
-    f.write(f"static constexpr uint32_t HARD_TEXT_BASE = 0x80000000u;\n\n")
+    f.write(f"static constexpr uint64_t HARD_RESET_LENGTH = 10;\n\n")
 
     # MemPort struct
     f.write("struct HardMemPort {\n")
@@ -95,21 +87,10 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
     f.write(f"    HardMemPort mem_ports[{num_mc}];\n")
     f.write("    VerilatedFstC *tracer_ = nullptr;\n")
     f.write("    bool tracing_ = false;\n\n")
-    f.write("    // Stored requests: captured in Phase 1, reported in mem()\n")
-    f.write(f"    std::optional<GlobalMemReq> stored_mc_req_[{num_mc}];\n")
-    f.write("    std::optional<GlobalMemReq> stored_periph_req_;\n\n")
-    f.write("    // Internal response queues (MC: self-served flat memory; periph: fed from frontend)\n")
-    f.write(f"    std::deque<GlobalMemResp> mc_resps_[{num_mc}];\n")
-    f.write("    std::deque<GlobalMemResp> periph_resps_;\n")
-    f.write(f"    uint64_t mc_bases_[{num_mc}] = {{}};\n\n")
 
     # Constructor
     f.write("    HardSystemBackend() {\n")
     f.write('        sys.reset(new sys_rtl("system"));\n')
-    # Compute MC base offsets
-    f.write("        { uint64_t cumul = 0;\n")
-    f.write(f"          for (int i = 0; i < {num_mc}; ++i) {{ mc_bases_[i] = cumul; cumul += HARD_MC_SIZES[i]; }}\n")
-    f.write("        }\n")
     for i in range(num_mc):
         f.write(f"        mem_ports[{i}].req_valid = &sys->io_mem_{i}_req_valid;\n")
         f.write(f"        mem_ports[{i}].req_ready = &sys->io_mem_{i}_req_ready;\n")
@@ -141,9 +122,8 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
     f.write("        return cfg;\n")
     f.write("    }\n\n")
 
-    # step(): self-serve memory, matching old SystemModel::stepPosedge timing exactly
+    # step(): just tick the clock
     f.write("""    void step(uint64_t cycle) override {
-        static constexpr int MEM_BUS_WORDS = MEM_BUS_WIDTH / 32;
         cycle_ = cycle;
         if (cycle_ <= HARD_RESET_LENGTH) {
             sys->reset = true;
@@ -153,10 +133,7 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
         f.write(f"            *mem_ports[{i}].resp_valid = 0;\n")
     f.write("""            sys->io_periph_req_ready = 0;
             sys->io_periph_resp_valid = 0;
-            stored_periph_req_ = std::nullopt;
-""")
-    f.write(f"            for (int i = 0; i < {num_mc}; ++i) stored_mc_req_[i] = std::nullopt;\n")
-    f.write("""            sys->clock = true;
+            sys->clock = true;
             Verilated::timeInc(1);
             sys->eval();
             if (tracing_ && tracer_) tracer_->dump(cycle_ * 2);
@@ -167,95 +144,11 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
             return;
         }
 
-        // ── Phase 1: Capture + serve + pop consumed ──
-        // (matches old SystemModel::stepPosedge Phase 1)
-
-        // MC requests
-        for (int mc = 0; mc < HARD_NUM_MC; ++mc) {
-            auto &p = mem_ports[mc];
-            if (*p.req_ready && *p.req_valid) {
-                GlobalMemReq req{};
-                req.id = *p.req_id;
-                req.addr = *p.req_addr;
-                req.write = *p.req_write;
-                req.size = 5;
-                std::memcpy(req.wdata, p.req_wdata, MEM_BUS_WORDS * 4);
-                stored_mc_req_[mc] = req;
-
-                // Self-serve from frontend's flat memory
-                uint32_t global_addr = req.addr + HARD_TEXT_BASE + (uint32_t)mc_bases_[mc];
-                GlobalMemResp resp{};
-                resp.id = req.id;
-                if (req.write) {
-                    applyWrite(global_addr, req.size, req.wdata);
-                    std::memset(resp.data, 0, sizeof(resp.data));
-                } else {
-                    buildMemResp(global_addr, resp.data);
-                }
-                mc_resps_[mc].push_back(resp);
-            } else {
-                stored_mc_req_[mc] = std::nullopt;
-            }
-
-            // Pop consumed response (if resp_valid was set last cycle)
-            if (*p.resp_valid && !mc_resps_[mc].empty()) {
-                mc_resps_[mc].pop_front();
-            }
-        }
-
-        // Peripheral request
-        if (sys->io_periph_req_ready && sys->io_periph_req_valid) {
-            GlobalMemReq req{};
-            req.id = sys->io_periph_req_bits_id;
-            req.addr = sys->io_periph_req_bits_addr;
-            req.write = sys->io_periph_req_bits_write;
-            req.size = 5;
-            std::memcpy(req.wdata, sys->io_periph_req_bits_wdata, MEM_BUS_WORDS * 4);
-            stored_periph_req_ = req;
-        } else {
-            stored_periph_req_ = std::nullopt;
-        }
-        // Pop consumed peripheral response
-        if (sys->io_periph_resp_valid && !periph_resps_.empty()) {
-            periph_resps_.pop_front();
-        }
-
-        // ── Phase 2: Posedge ──
         sys->reset = false;
         sys->clock = true;
         Verilated::timeInc(1);
         sys->eval();
         if (tracing_ && tracer_) tracer_->dump(cycle_ * 2);
-
-        // ── Phase 3: Drive signals for next cycle ──
-        // req_ready = always 1 (flat memory, no backpressure)
-""")
-    for i in range(num_mc):
-        f.write(f"        *mem_ports[{i}].req_ready = 1;\n")
-    f.write("""        sys->io_periph_req_ready = 1;
-
-        // Drive resp from internal queue front
-        for (int mc = 0; mc < HARD_NUM_MC; ++mc) {
-            auto &p = mem_ports[mc];
-            if (!mc_resps_[mc].empty()) {
-                auto &r = mc_resps_[mc].front();
-                *p.resp_valid = 1;
-                *p.resp_id = r.id;
-                std::memcpy(p.resp_rdata, r.data, MEM_BUS_WORDS * 4);
-            } else {
-                *p.resp_valid = 0;
-            }
-        }
-        if (!periph_resps_.empty()) {
-            auto &r = periph_resps_.front();
-            sys->io_periph_resp_valid = 1;
-            sys->io_periph_resp_bits_id = r.id;
-            std::memcpy(sys->io_periph_resp_bits_rdata, r.data, MEM_BUS_WORDS * 4);
-        } else {
-            sys->io_periph_resp_valid = 0;
-        }
-
-        // ── Phase 4: Negedge ──
         sys->clock = false;
         Verilated::timeInc(1);
         sys->eval();
@@ -263,21 +156,67 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
     }
 """)
 
-    # mem(): just report stored requests for cosim comparison, ignore bus_in
+    # mem(): drive responses, eval, capture requests
     f.write("""
     void mem(const MemBusIn *bus_in, MemBusOut *bus_out) override {
-        // Accept peripheral response from frontend
-        if (bus_in[0].resp) {
-            GlobalMemResp r{};
-            r.id = bus_in[0].resp->id;
-            std::memcpy(r.data, bus_in[0].resp->data, sizeof(r.data));
-            periph_resps_.push_back(r);
+        static constexpr int MEM_BUS_WORDS = MEM_BUS_WIDTH / 32;
+
+        // Drive MC response signals
+        for (int mc = 0; mc < HARD_NUM_MC; ++mc) {
+            auto &p = mem_ports[mc];
+            if (bus_in[mc + 1].resp) {
+                auto &r = *bus_in[mc + 1].resp;
+                *p.resp_valid = 1;
+                *p.resp_id = r.id;
+                std::memcpy(p.resp_rdata, r.data, MEM_BUS_WORDS * 4);
+            } else {
+                *p.resp_valid = 0;
+            }
+            *p.req_ready = bus_in[mc + 1].reqAccepting ? 1 : 0;
         }
-        // Report stored requests (captured in step()) for cosim comparison.
-        // The hard backend self-serves MC memory in step(), so MC bus_in is ignored.
-        bus_out[0].req = stored_periph_req_;
-        for (int mc = 0; mc < HARD_NUM_MC; ++mc)
-            bus_out[mc + 1].req = stored_mc_req_[mc];
+
+        // Drive peripheral response signals
+        if (bus_in[0].resp) {
+            auto &r = *bus_in[0].resp;
+            sys->io_periph_resp_valid = 1;
+            sys->io_periph_resp_bits_id = r.id;
+            std::memcpy(sys->io_periph_resp_bits_rdata, r.data, MEM_BUS_WORDS * 4);
+        } else {
+            sys->io_periph_resp_valid = 0;
+        }
+        sys->io_periph_req_ready = bus_in[0].reqAccepting ? 1 : 0;
+
+        // Eval so RTL sees the new response/ready signals
+        sys->eval();
+
+        // Capture MC requests
+        for (int mc = 0; mc < HARD_NUM_MC; ++mc) {
+            auto &p = mem_ports[mc];
+            if (*p.req_valid && *p.req_ready) {
+                GlobalMemReq req{};
+                req.id = *p.req_id;
+                req.addr = *p.req_addr;
+                req.write = *p.req_write;
+                req.size = 5;
+                std::memcpy(req.wdata, p.req_wdata, MEM_BUS_WORDS * 4);
+                bus_out[mc + 1].req = req;
+            } else {
+                bus_out[mc + 1].req = std::nullopt;
+            }
+        }
+
+        // Capture peripheral request
+        if (sys->io_periph_req_valid && sys->io_periph_req_ready) {
+            GlobalMemReq req{};
+            req.id = sys->io_periph_req_bits_id;
+            req.addr = sys->io_periph_req_bits_addr;
+            req.write = sys->io_periph_req_bits_write;
+            req.size = 5;
+            std::memcpy(req.wdata, sys->io_periph_req_bits_wdata, MEM_BUS_WORDS * 4);
+            bus_out[0].req = req;
+        } else {
+            bus_out[0].req = std::nullopt;
+        }
     }
 """)
 

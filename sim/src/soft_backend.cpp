@@ -277,10 +277,19 @@ static TopologyInfo buildTopology(int num_pu, int num_mc) {
   return topo;
 }
 
+struct BcastEntry {
+  uint16_t line_pu[4];
+  uint16_t line_idx[4];
+  uint32_t line_data[4];
+  uint16_t tag;
+  uint32_t carried[2];
+};
+
 struct CoreState {
   std::unique_ptr<soft_rtl> core;
   std::optional<Flit> ext_input;
   std::deque<MemResponse> mem_inbox;
+  std::deque<BcastEntry> bcast_inbox;
 
   explicit CoreState(int hartid) {
     std::string name = "soft_pu_" + std::to_string(hartid);
@@ -295,6 +304,7 @@ struct CoreState {
 
   void retireInputs() {
     if (core->mem_unicast_valid && !mem_inbox.empty()) mem_inbox.pop_front();
+    if (core->mem_broadcast_valid && core->mem_broadcast_ready && !bcast_inbox.empty()) bcast_inbox.pop_front();
   }
 
   void clearExtInput() {
@@ -349,15 +359,35 @@ struct CoreState {
 
     if (mem_inbox.empty()) {
       core->mem_unicast_valid = 0;
-      core->mem_broadcast_valid = 0;
       core->mem_unicast_bits_id = 0;
       for (int i = 0; i < MEM_BUS_WORDS; ++i) core->mem_unicast_bits_data[i] = 0;
     } else {
       const auto &r = mem_inbox.front();
       core->mem_unicast_valid = 1;
-      core->mem_broadcast_valid = 0;
       core->mem_unicast_bits_id = r.id;
       for (int i = 0; i < MEM_BUS_WORDS; ++i) core->mem_unicast_bits_data[i] = r.data[i];
+    }
+
+    if (bcast_inbox.empty()) {
+      core->mem_broadcast_valid = 0;
+    } else {
+      const auto &b = bcast_inbox.front();
+      core->mem_broadcast_valid = 1;
+      core->mem_broadcast_bits_line_0_pu = b.line_pu[0];
+      core->mem_broadcast_bits_line_0_idx = b.line_idx[0];
+      core->mem_broadcast_bits_line_0_data = b.line_data[0];
+      core->mem_broadcast_bits_line_1_pu = b.line_pu[1];
+      core->mem_broadcast_bits_line_1_idx = b.line_idx[1];
+      core->mem_broadcast_bits_line_1_data = b.line_data[1];
+      core->mem_broadcast_bits_line_2_pu = b.line_pu[2];
+      core->mem_broadcast_bits_line_2_idx = b.line_idx[2];
+      core->mem_broadcast_bits_line_2_data = b.line_data[2];
+      core->mem_broadcast_bits_line_3_pu = b.line_pu[3];
+      core->mem_broadcast_bits_line_3_idx = b.line_idx[3];
+      core->mem_broadcast_bits_line_3_data = b.line_data[3];
+      core->mem_broadcast_bits_tag = b.tag;
+      core->mem_broadcast_bits_carried_0 = b.carried[0];
+      core->mem_broadcast_bits_carried_1 = b.carried[1];
     }
   }
 
@@ -437,7 +467,6 @@ struct SoftMemIf {
   multimap<uint64_t, int> ready_events;
   multimap<uint64_t, int> free_events;
   multimap<uint64_t, std::pair<int, MemResponse>> completion_events;
-  unordered_map<uint16_t, uint32_t> scatter_base;
   deque<RingResponse> ring_queue;
 
   // Scatter FSM (matches RTL MemIf scatter state machine)
@@ -446,6 +475,8 @@ struct SoftMemIf {
   uint32_t scat_addr = 0;
   uint32_t scat_end = 0;
   uint32_t scat_data[MEM_BUS_WORDS] = {};
+  uint16_t scat_resp_tag = 0;
+  uint32_t scat_extras[2] = {};
   int scat_cluster = 0;
 
   SoftMemIf(int mc, int start, int end, vector<int> clusters)
@@ -1503,16 +1534,18 @@ void SoftMemIf::accept(const Flit &flit, uint64_t cycle) {
     entry.wdata = flit.data[2];
     entry.remaining_flits = 0;
     ready_events.emplace(cycle + 1, slot);
-  } else if (flit.tag == 0xF10) {
-    auto it = scatter_base.find(flit.src);
-    if (it == scatter_base.end()) {
-      scatter_base.emplace(flit.src, flit.data[0]);
-    } else {
-      scat_addr = it->second;
-      scat_end = flit.data[0];
-      scat_state = ScatIssue;
-      scatter_base.erase(it);
-    }
+  } else if ((flit.tag & 0xFF) == 0x10) {
+    // Single-flit scatter request (matches RTL BulkPending.initFromFlit):
+    //   data[0] = base address (controller-local)
+    //   data[1] = (length_in_beats << 16) | response_tag
+    //   data[2], data[3] = carried data (passed through to handlers)
+    scat_addr = flit.data[0];
+    uint32_t length_in_beats = (flit.data[1] >> 16) & 0xFFFF;
+    scat_end = scat_addr + (length_in_beats << 5);
+    scat_resp_tag = static_cast<uint16_t>(flit.data[1] & 0xFFFF);
+    scat_extras[0] = flit.data[2];
+    scat_extras[1] = flit.data[3];
+    scat_state = ScatIssue;
   }
 }
 
@@ -1544,12 +1577,21 @@ void SoftMemIf::advanceScatter(uint64_t cycle) {
   if (scat_state != ScatBcast) return;
 
   int cluster_idx = zone_clusters[scat_cluster];
-  // Broadcast to all 16 PUs in this cluster
-  MemResponse bcast_resp;
-  bcast_resp.id = 0xFFFF;
-  memcpy(bcast_resp.data, scat_data, sizeof(bcast_resp.data));
+  // Build BcastEntry from raw DRAM data (4 entries x 8 bytes per 32-byte beat)
+  BcastEntry entry;
+  entry.tag = scat_resp_tag;
+  entry.carried[0] = scat_extras[0];
+  entry.carried[1] = scat_extras[1];
+  for (int i = 0; i < 4; i++) {
+    uint32_t word0 = scat_data[i * 2];      // (pu_id << 16) | sub_idx
+    uint32_t word1 = scat_data[i * 2 + 1];  // data (e.g. weight)
+    entry.line_pu[i] = static_cast<uint16_t>((word0 >> 16) & 0xFFFF);
+    entry.line_idx[i] = static_cast<uint16_t>(word0 & 0xFFFF);
+    entry.line_data[i] = word1;
+  }
+  // Deliver to all PUs in this cluster
   for (int pu = cluster_idx * 16 + 1; pu <= cluster_idx * 16 + 16; ++pu) {
-    sim_ptr->scheduleMcResp(pu, mc_idx, cycle + 1, bcast_resp);
+    sim_ptr->core(pu).bcast_inbox.push_back(entry);
   }
 
   if (scat_cluster == static_cast<int>(zone_clusters.size()) - 1) {

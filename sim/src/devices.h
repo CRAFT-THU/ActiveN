@@ -72,14 +72,14 @@ struct PeripheralDevice {
 
 // Decodes a single-flit memory/peripheral request from ext_out.
 // New encoding (single flit, 4 words):
-//   tag 0xF00 (load) / 0xF01 (store)
+//   tag 0x000 (load) / 0x001 (store)
 //   data[0] = address (controller-local)
 //   data[1] = 0(14) ## size(2) ## id(16)
 //   data[2] = wdata (stores only)
 //   data[3] = reserved
 struct MemFlitDecoder {
-  static constexpr uint16_t TAG_LOAD  = 0xF00;
-  static constexpr uint16_t TAG_STORE = 0xF01;
+  static constexpr uint16_t TAG_LOAD  = 0x00;
+  static constexpr uint16_t TAG_STORE = 0x01;
 
   uint16_t tag = 0;
   uint16_t dst = 0;
@@ -100,5 +100,5 @@ struct MemFlitDecoder {
   uint32_t wdata()   const { return data[2]; }
   bool     isStore() const { return tag == TAG_STORE; }
 
-  static bool isMemTag(uint16_t t) { return t == TAG_LOAD || t == TAG_STORE; }
+  static bool isMemTag(uint16_t t) { return (t & 0xFF) == TAG_LOAD || (t & 0xFF) == TAG_STORE; }
 };

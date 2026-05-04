@@ -2,3 +2,5 @@ test.single
 test.double
 *.bin
 *.elf
+
+sys/csr_scatter_data.S

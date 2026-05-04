@@ -4,20 +4,7 @@ import circt.stage.ChiselStage;
 import java.io.{File, PrintWriter}
 
 object Main extends App {
-  val pipeCnt = sys.env.get("AN_PIPE_CNT").flatMap(_.toIntOption).getOrElse(2)
-  val param = CoreParameters(
-    initVec = BigInt("80000000", 16),
-    i$Lines = 16,
-    i$Assoc = 2,
-    i$BlockSize = 64,
-    memBusWidth = 256, // DDR4
-    memCtrlSizes = List(BigInt("100000000", 16)), // 4 GiB
-    scratchpadSize = 16384,
-    useFPU = true,
-    pipeCnt = pipeCnt,
-    sendQueueDepth = 16,
-    evQueueDepth = 16,
-  )
+  val param = CoreParameters()
 
   def coreConfigJson(p: CoreParameters): ujson.Value = ujson.Obj(
     "initVec" -> s"0x${p.initVec.toString(16)}",

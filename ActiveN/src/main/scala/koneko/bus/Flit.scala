@@ -34,11 +34,11 @@ class IncomingFlit extends Bundle with Prio {
   def prio = tag(11, 10)
 }
 
-// Big endian
+// Big endian bundle, see snn.md for encoding
 class BcastBeat extends Bundle {
-  val pu = UInt(16.W)
-  val idx = UInt(16.W)
   val data = UInt(32.W)
+  val idx = UInt(16.W)
+  val pu = UInt(16.W)
 }
 
 // Bcast ABI:

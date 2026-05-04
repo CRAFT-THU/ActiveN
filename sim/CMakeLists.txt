@@ -83,11 +83,7 @@ function(apply_bolt TARGET BOLT_PAYLOAD BOLT_MAX_CYCLES)
   )
 endfunction()
 
-if (DEFINED ENV{AN_PIPE_CNT})
-  add_compile_definitions(AN_PIPE_CNT=$ENV{AN_PIPE_CNT})
-else()
-  add_compile_definitions(AN_PIPE_CNT=2)
-endif()
+
 
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -156,9 +152,18 @@ file(READ ${SYSTEM_CONFIG_JSON} SYSTEM_CONFIG_CONTENT)
 string(JSON SYSTEM_NUM_PU GET ${SYSTEM_CONFIG_CONTENT} "numPU")
 string(JSON SYSTEM_NUM_MC GET ${SYSTEM_CONFIG_CONTENT} "numMC")
 
-execute_process(
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/system_config.h
+           ${CMAKE_CURRENT_BINARY_DIR}/hard_backend.h
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/gen_system_header.py
             ${SYSTEM_CONFIG_JSON} ${CMAKE_CURRENT_BINARY_DIR}
+    DEPENDS ${SYSTEM_CONFIG_JSON}
+            ${CMAKE_CURRENT_SOURCE_DIR}/gen_system_header.py
+    COMMENT "Generating system_config.h and hard_backend.h from System.config.json"
+)
+add_custom_target(gen_system_headers DEPENDS
+    ${CMAKE_CURRENT_BINARY_DIR}/system_config.h
+    ${CMAKE_CURRENT_BINARY_DIR}/hard_backend.h
 )
 
 # Hard backend: Verilated System RTL
@@ -196,6 +201,8 @@ verilate(
 add_executable(sim_system
   src/system.cpp
 )
+add_dependencies(sim_system gen_system_headers)
+add_dependencies(soft_backend_lib gen_system_headers)
 target_link_libraries(sim_system PRIVATE
   soft_backend_lib
   hard_backend_lib
