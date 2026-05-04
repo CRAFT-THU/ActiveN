@@ -51,7 +51,7 @@ object Main extends App {
   var core: Boolean = false
   var pu: Option[Int] = None
   var mc: Option[Int] = None
-  var output: String = "./generated"
+  var output: Option[String] = None
   var spliter = args.indexOf("--")
   val (mainArgs, otherArgs) = if (spliter >= 0) {
     this.args.splitAt(spliter)
@@ -68,7 +68,7 @@ object Main extends App {
         println("  --system         Emit System with default config")
         println("  --pu=<N>         Emit System with N PUs")
         println("  --mc=<N>         Emit System with N MCs")
-        println("  --output=<path>  Set output path for generated files. Default: ./generated")
+        println("  --output=<path>  Set output path for generated files. Default: ./generated/core or ./generated/system")
         sys.exit(0)
       }
       case "--core" => core = true
@@ -88,10 +88,11 @@ object Main extends App {
         }
       }
       case a if a.startsWith("--output=") => {
-        output = a.stripPrefix("--output=")
-        if (output.isEmpty) {
-          println(s"Warning: ignoring empty output path, using './generated'")
-          output = "./generated"
+        val stripped = a.stripPrefix("--output=")
+        if (stripped.isEmpty) {
+          println(s"Warning: ignoring empty output path")
+        } else {
+          output = Some(stripped)
         }
       }
       case _ => {
@@ -106,18 +107,33 @@ object Main extends App {
     sys.exit(1)
   }
 
-  var chiselArgs = Array("--target-dir", output) ++ otherArgs
+  if (system && core) {
+    println("Both --system and --core specified. Please specify only one.")
+    sys.exit(1)
+  }
+
+  val subdir = if (system) "system" else "core"
+  val outputUnwrapped = if (output.isDefined) {
+    output.get
+  } else {
+    println(s"No output path specified. Using default ./generated/$subdir")
+    s"./generated/$subdir"
+  }
+
+  var chiselArgs = Array("--target-dir", outputUnwrapped) ++ otherArgs
 
   if (system) {
     if (pu.isEmpty || mc.isEmpty) {
       println("For system generation, both --pu and --mc must be specified.")
       sys.exit(1)
     }
-    implicit val sysParam = SystemParameters(mc.get, pu.get, param)
+    implicit val sysParam = SystemParameters(mc.get, pu.get, param.copy(
+      memCtrlSizes = List.fill(mc.get)(param.memCtrlSizes.head)
+    ))
     ChiselStage.emitSystemVerilogFile(new System, chiselArgs)
-    writeJson(s"$output/System.config.json", systemConfigJson(sysParam))
+    writeJson(s"$outputUnwrapped/System.config.json", systemConfigJson(sysParam))
   } else {
     ChiselStage.emitSystemVerilogFile(new Core()(param), chiselArgs)
-    writeJson(s"$output/Core.config.json", coreConfigJson(param))
+    writeJson(s"$outputUnwrapped/Core.config.json", coreConfigJson(param))
   }
 }

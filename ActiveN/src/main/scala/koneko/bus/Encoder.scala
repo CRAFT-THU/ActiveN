@@ -40,14 +40,14 @@ class Encoder(implicit val param: CoreParameters) extends Module {
   val globalAddr = req.bits.addr - 0x80000000L.U
   val ctrlDst = Wire(UInt(16.W))
   ctrlDst := (memDstBase + numCtrls - 1).U(16.W)
-  for (i <- 0 until numCtrls) {
+  for (i <- (0 until numCtrls).reverse) {
     when(globalAddr < cumSizes(i + 1).U) {
       ctrlDst := (memDstBase + i).U(16.W)
     }
   }
   val ctrlLocalAddr = Wire(UInt(32.W))
   ctrlLocalAddr := globalAddr
-  for (i <- 0 until numCtrls) {
+  for (i <- (0 until numCtrls).reverse) {
     when(globalAddr < cumSizes(i + 1).U) {
       ctrlLocalAddr := globalAddr - cumSizes(i).U
     }

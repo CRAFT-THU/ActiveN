@@ -18,16 +18,14 @@
  *   sim/gen_system_header.py   Generates hard_backend.h + system_config.h
  *
  * Usage:
- *   sim_system <text> --soft|--hard [options]
+ *   sim_system <image>... --soft|--hard [options]
  *
  * Positional:
- *   text                Binary memory image
+ *   image...            One binary memory image per MC (count must match hardware)
  *
  * Options:
  *   --soft              Use soft NoC backend
  *   --hard              Use hard RTL backend
- *   --data PATH         Data image to load at --data-addr
- *   --data-addr ADDR    Address for data image (default: 0x80100000)
  *   --max-cycles N      Max simulation cycles (default: 10000000)
  *   --dram-config PATH  DRAMsim3 config file
  *   --dram-log DIR      DRAMsim3 log directory (default: ".")
@@ -70,79 +68,90 @@ static constexpr int RESP_QUEUE_DEPTH = 64;
 static bool exiting = false;
 static void sighandler(int) { exiting = true; }
 
-// ---- Memory image (owned by the frontend, exported for hard backend) ----
+// ---- Per-MC memory images (owned by the frontend, exported for hard backend) ----
+struct McImage {
+  uint32_t *data = nullptr;
+  size_t size = 0;  // bytes
+};
+
+static vector<McImage> mc_images;
+
+// Legacy global pointers for hard_backend.h compatibility (first MC's image).
 uint32_t *text_aligned = nullptr;
 size_t text_size = 0;
 
-static void loadImage(const string &text_path,
-                      const optional<string> &data_path,
-                      uint32_t data_addr,
-                      size_t mem_size) {
-  ifstream fin(text_path, ios::binary);
-  if (!fin) throw runtime_error("Cannot open " + text_path);
-  fin.seekg(0, ios::end);
-  size_t fsize = fin.tellg();
-  if (fsize % 4 != 0) throw runtime_error("Image is not 4-byte aligned");
-  // Expand mem_size if data image requires more
-  if (data_path) {
-    ifstream din(*data_path, ios::binary);
-    if (!din) throw runtime_error("Cannot open " + *data_path);
-    din.seekg(0, ios::end);
-    size_t dsz = din.tellg();
-    size_t off = data_addr - TEXT_BASE;
-    size_t needed = off + dsz;
-    if (needed > mem_size) mem_size = (needed + 3) & ~(size_t)3;
+static void loadImages(const vector<string> &paths, size_t default_size) {
+  mc_images.resize(paths.size());
+  for (size_t i = 0; i < paths.size(); ++i) {
+    ifstream fin(paths[i], ios::binary);
+    if (!fin) throw runtime_error("Cannot open " + paths[i]);
+    fin.seekg(0, ios::end);
+    size_t fsize = fin.tellg();
+    if (fsize % 4 != 0) throw runtime_error("Image " + paths[i] + " is not 4-byte aligned");
+    size_t alloc = max(fsize, default_size);
+    char *buf = new (align_val_t(4)) char[alloc]();
+    fin.seekg(0);
+    fin.read(buf, fsize);
+    mc_images[i].data = reinterpret_cast<uint32_t *>(buf);
+    mc_images[i].size = alloc;
   }
-  text_size = mem_size;
-  char *buf = new (align_val_t(4)) char[text_size]();
-  fin.seekg(0);
-  fin.read(buf, fsize);
-  text_aligned = reinterpret_cast<uint32_t *>(buf);
-  if (data_path) {
-    ifstream din(*data_path, ios::binary);
-    if (!din) throw runtime_error("Cannot open " + *data_path);
-    din.seekg(0, ios::end);
-    size_t dsz = din.tellg();
-    size_t off = data_addr - TEXT_BASE;
-    din.seekg(0);
-    din.read(buf + off, dsz);
+  // Legacy pointers point to first image
+  if (!mc_images.empty()) {
+    text_aligned = mc_images[0].data;
+    text_size = mc_images[0].size;
   }
 }
 
-static void unloadImage() {
-  if (text_aligned) {
-    delete[] reinterpret_cast<char *>(text_aligned);
-    text_aligned = nullptr;
-    text_size = 0;
+static void unloadImages() {
+  for (auto &img : mc_images) {
+    if (img.data) {
+      delete[] reinterpret_cast<char *>(img.data);
+      img.data = nullptr;
+      img.size = 0;
+    }
   }
+  mc_images.clear();
+  text_aligned = nullptr;
+  text_size = 0;
 }
 
-// Build a 32-byte-aligned read response from backing memory
-void buildMemResp(uint32_t global_addr, uint8_t *data) {
-  uint32_t aligned = global_addr & ~(uint32_t)(MEM_BUS_WORDS * 4 - 1);
+// Build a 32-byte-aligned read response from a specific MC's image
+void buildMemRespMc(int mc, uint32_t local_addr, uint8_t *data) {
+  uint32_t aligned = local_addr & ~(uint32_t)(MEM_BUS_WORDS * 4 - 1);
   auto *out = reinterpret_cast<uint32_t *>(data);
+  auto &img = mc_images[mc];
   for (int i = 0; i < MEM_BUS_WORDS; ++i) {
     uint32_t ba = aligned + i * 4;
-    if (ba >= TEXT_BASE && (ba - TEXT_BASE + 3) < text_size)
-      out[i] = text_aligned[(ba - TEXT_BASE) / 4];
+    if (ba + 3 < img.size)
+      out[i] = img.data[ba / 4];
     else
       out[i] = 0;
   }
 }
 
-// Apply a write to backing memory using the lane-aligned wdata
-void applyWrite(uint32_t global_addr, uint8_t size, const uint8_t *wdata) {
-  // size: 2^size bytes.  wdata is lane-aligned.
+// Apply a write to a specific MC's image
+void applyWriteMc(int mc, uint32_t local_addr, uint8_t size, const uint8_t *wdata) {
   uint32_t nbytes = 1u << size;
-  uint32_t block_base = global_addr & ~(uint32_t)(MEM_BUS_WORDS * 4 - 1);
-  uint32_t byte_off = global_addr - block_base;
-  if (block_base < TEXT_BASE) return;
-  uint32_t mem_off = block_base - TEXT_BASE;
-  auto *mem_bytes = reinterpret_cast<uint8_t *>(text_aligned);
+  uint32_t block_base = local_addr & ~(uint32_t)(MEM_BUS_WORDS * 4 - 1);
+  uint32_t byte_off = local_addr - block_base;
+  auto &img = mc_images[mc];
+  auto *mem_bytes = reinterpret_cast<uint8_t *>(img.data);
   for (uint32_t b = 0; b < nbytes && b + byte_off < (uint32_t)(MEM_BUS_WORDS * 4); ++b) {
-    uint32_t pos = mem_off + byte_off + b;
-    if (pos < text_size) mem_bytes[pos] = wdata[byte_off + b];
+    uint32_t pos = block_base + byte_off + b;
+    if (pos < img.size) mem_bytes[pos] = wdata[byte_off + b];
   }
+}
+
+// Legacy wrappers for hard_backend.h (operate on first MC image)
+void buildMemResp(uint32_t global_addr, uint8_t *data) {
+  uint32_t local = global_addr - TEXT_BASE;
+  buildMemRespMc(0, local, data);
+}
+
+void applyWrite(uint32_t global_addr, uint8_t size, const uint8_t *wdata) {
+  if (global_addr < TEXT_BASE) return;
+  uint32_t local = global_addr - TEXT_BASE;
+  applyWriteMc(0, local, size, wdata);
 }
 
 // ---- Per-MC state in the frontend ----
@@ -171,11 +180,8 @@ struct System::Impl {
   bool use_dram = false;
   vector<DramMC> dram_mcs;
 
-  // Image
-  string text_path;
-  optional<string> data_path;
-  uint32_t data_addr = 0x80100000u;
-  size_t mem_size = 16 * 1024 * 1024;
+  // Image paths (one per MC)
+  vector<string> image_paths;
 
   // Bus arrays (numMC + 1 entries, index 0 = peripheral)
   vector<MemBusIn> bus_in;
@@ -232,15 +238,14 @@ struct System::Impl {
 
   // Serve a single request from a backend for MC mc
   void serveMemReq(int mc, const GlobalMemReq &req) {
-    uint32_t global_addr = req.addr + TEXT_BASE + (uint32_t)mc_states[mc].mc_base;
     GlobalMemResp resp{};
     resp.id = req.id;
 
     if (req.write) {
-      applyWrite(global_addr, req.size, req.wdata);
+      applyWriteMc(mc, req.addr, req.size, req.wdata);
       memset(resp.data, 0, sizeof(resp.data));
     } else {
-      buildMemResp(global_addr, resp.data);
+      buildMemRespMc(mc, req.addr, resp.data);
     }
 
     if (use_dram) {
@@ -381,14 +386,8 @@ System::System(
   vector<string_view> dramInitFiles,
   optional<DRAMsim3Config> dramTimingModel
 ) : impl_(make_unique<Impl>()) {
-  if (!dramInitFiles.empty()) {
-    impl_->text_path = string(dramInitFiles[0]);
-  }
-  if (dramInitFiles.size() > 1) {
-    impl_->data_path = string(dramInitFiles[1]);
-  }
-  if (dramInitFiles.size() > 2) {
-    impl_->data_addr = strtoul(string(dramInitFiles[2]).c_str(), nullptr, 0);
+  for (auto &f : dramInitFiles) {
+    impl_->image_paths.push_back(string(f));
   }
   if (dramTimingModel) {
     impl_->dram_cfg = Impl::StoredDRAMConfig{
@@ -416,9 +415,9 @@ bool System::run(uint64_t maxCycles) {
 
   cerr << "[System] PUs=" << cfg.numPU << " MCs=" << cfg.numMC << endl;
 
-  // Load image
-  loadImage(impl_->text_path, impl_->data_path, impl_->data_addr, impl_->mem_size);
-  cerr << "[System] Loaded program image" << endl;
+  // Load per-MC images
+  loadImages(impl_->image_paths, 16 * 1024 * 1024);
+  cerr << "[System] Loaded " << mc_images.size() << " memory image(s)" << endl;
 
   // DRAMsim3
   if (impl_->dram_cfg) {
@@ -495,7 +494,7 @@ bool System::run(uint64_t maxCycles) {
       impl_->dram_mcs[i].dram->PrintStats();
   }
 
-  unloadImage();
+  unloadImages();
 
   return impl_->periph.result && *impl_->periph.result == 0 ? 0 : 1;
 }
@@ -503,8 +502,9 @@ bool System::run(uint64_t maxCycles) {
 int main(int argc, char **argv) {
   argparse::ArgumentParser program("sim_system");
 
-  program.add_argument("text")
-    .help("Binary memory image");
+  program.add_argument("images")
+    .help("Binary memory images (one per MC)")
+    .remaining();
 
   program.add_argument("--soft")
     .help("Use soft NoC backend")
@@ -515,13 +515,6 @@ int main(int argc, char **argv) {
     .help("Use hard RTL backend")
     .default_value(false)
     .implicit_value(true);
-
-  program.add_argument("--data")
-    .help("Data image path");
-
-  program.add_argument("--data-addr")
-    .help("Address for data image")
-    .default_value(string("0x80100000"));
 
   program.add_argument("--max-cycles")
     .help("Max simulation cycles")
@@ -566,12 +559,22 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  auto text_path = program.get<string>("text");
-  uint64_t max_cycles = program.get<uint64_t>("--max-cycles");
+  auto image_paths = program.get<vector<string>>("images");
+  if (image_paths.empty()) {
+    cerr << "Error: at least one memory image must be provided" << endl;
+    cerr << program;
+    return 1;
+  }
 
-  // Parse data address (supports hex with 0x prefix)
-  auto data_addr_str = program.get<string>("--data-addr");
-  uint32_t data_addr = strtoul(data_addr_str.c_str(), nullptr, 0);
+  // Validate image count matches hardware MC count
+  int hw_num_mc = HARD_NUM_MC;
+  if ((int)image_paths.size() != hw_num_mc) {
+    cerr << "Error: " << image_paths.size() << " image(s) provided but hardware has "
+         << hw_num_mc << " memory controller(s)" << endl;
+    return 1;
+  }
+
+  uint64_t max_cycles = program.get<uint64_t>("--max-cycles");
 
   // RNG seed
   if (auto seed = program.present<uint32_t>("--rng-seed")) {
@@ -583,17 +586,9 @@ int main(int argc, char **argv) {
     setSoftSystemModelLogging(true);
   }
 
-  // Build init files list: text_path [, data_path, data_addr]
+  // Build init files list
   vector<string_view> dramInitFiles;
-  dramInitFiles.push_back(text_path);
-  string data_path_str;
-  string data_addr_fmt;
-  if (auto data = program.present<string>("--data")) {
-    data_path_str = *data;
-    dramInitFiles.push_back(data_path_str);
-    data_addr_fmt = to_string(data_addr);
-    dramInitFiles.push_back(data_addr_fmt);
-  }
+  for (auto &p : image_paths) dramInitFiles.push_back(p);
 
   // Optional DRAMsim3
   optional<DRAMsim3Config> dram_cfg;

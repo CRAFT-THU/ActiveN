@@ -34,6 +34,7 @@ case class SystemParameters(
   require(isPow2(numMC) && isPow2(numPU))
   require(numPU >= numMC * 16)
   require(numMC >= 1)
+  require(coreParams.memCtrlSizes.size == numMC)
 }
 
 // Topology computation — pure Scala, no hardware

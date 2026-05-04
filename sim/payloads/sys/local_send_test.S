@@ -2,24 +2,26 @@
   #
   # Tests that sending with dst=0 pushes directly to the local EvQueue.
   # PU1 sends itself a message (tag=0, dst=0, data=42).
-  # The handler receives it and writes the result to the stop register.
+  # The handler receives it and checks the result.
   #
-  # All other PUs just WFI forever.
+  # Thread 0: setup + send, then WFI.
+  # Thread 1: init registers, then WFI.
+  # Only one event ever arrives, so both threads idle is safe.
 
-#define STOP_ADDR 0x40000000
-#define SPM_STATE_ADDR 0x20003FF8
+#define STOP_ADDR       0x40000000
+#define RESULT_ADDR     0x4000000C
+#define EXPECTED        42
+
+  .macro SEND dst_reg, tag_reg
+  .insn r 0x0B, 0x4, 0x0, x0, \dst_reg, \tag_reg
+  .endm
 
   .section .text
   .globl _start
 
 _start:
-  bnez  x10, .park
+  bnez  x10, thread1_init
   csrr  s0, 0xF14          # s0 = hartid
-
-  # Check if already initialized
-  li    t0, SPM_STATE_ADDR
-  lw    t1, 0(t0)
-  bnez  t1, do_wfi
 
   # Configure handler 0 (tag=0): local_handler, argcnt=1
   la    a0, local_handler
@@ -27,20 +29,18 @@ _start:
   li    a0, 1
   csrw  0x710, a0
 
-  # Mark initialized
-  li    t1, 1
-  li    t0, SPM_STATE_ADDR
-  sw    t1, 0(t0)
-
   # Only PU1 does the local send test
   li    t0, 1
   bne   s0, t0, do_wfi
 
   # PU1: send to self via local send (dst=0, tag=0)
-  # data = 42 in a0, target = (tag=0 << 16) | dst=0 = 0x00000000 in a1
   li    a0, 42
-  li    a1, 0               # dst=0, tag=0
-  .word 0x00B5500B          # send.1 a0(x10), a1(x11)
+  li    t1, 0               # tag = 0
+  SEND  zero, t1            # dst = x0 (local)
+  j     do_wfi
+
+thread1_init:
+  csrr  s0, 0xF14
 
 do_wfi:
   wfi
@@ -50,11 +50,15 @@ do_wfi:
   #============================================================
 local_handler:
   # a0 should be 42 (the data we sent)
-  # Write it to stop register to end simulation
-  li    t0, STOP_ADDR
+  li    t0, RESULT_ADDR
   sw    a0, 0(t0)
+  # Exit 0 if pass, 1 if fail
+  li    t0, STOP_ADDR
+  li    t1, EXPECTED
+  beq   a0, t1, .pass
+  li    t1, 1
+  sw    t1, 0(t0)
   j     do_wfi
-
-.park:
-  wfi
-  j     .park
+.pass:
+  sw    zero, 0(t0)
+  j     do_wfi

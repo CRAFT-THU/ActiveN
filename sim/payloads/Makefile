@@ -41,35 +41,40 @@ all-tests: $(ASM_BINS) $(C_BINS)
 # System-level tests (multicore, RV32I + custom AM instructions)
 NUM_PU ?= 16
 
-sys/pingpong_test.bin: asm/pingpong_test.S linker.ld
-	${PREFIX}gcc -mabi=ilp32 -march=rv32imf_zicsr -nostdlib -nostartfiles -Wl,-T,linker.ld -DNUM_PU=${NUM_PU} -o sys/pingpong_test.elf $<
+sys/pingpong_test.bin: sys/pingpong_test.S sys/linker_system.ld
+	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -o sys/pingpong_test.elf $<
 	${PREFIX}objcopy -j .text -j .data -O binary sys/pingpong_test.elf $@
 
 sys/sha256_concurrent.bin: sys/sha256_concurrent.S sys/sha256_lib.c sys/linker_system.ld
-	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -O1 -o sys/sha256_concurrent.elf sys/sha256_concurrent.S sys/sha256_lib.c
+	${PREFIX}gcc -mabi=ilp32 -march=rv32imaf_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -o sys/sha256_concurrent.elf sys/sha256_concurrent.S sys/sha256_lib.c
 	${PREFIX}objcopy -j .text -j .data -O binary sys/sha256_concurrent.elf $@
 
 sys/spm_init.bin: sys/spm_init.S sys/linker_system.ld
-	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -O1 -o sys/spm_init.elf sys/spm_init.S
+	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -o sys/spm_init.elf $<
 	${PREFIX}objcopy -j .text -j .data -O binary sys/spm_init.elf $@
+
+sys/barrier_test.bin: sys/barrier_test.S sys/linker_system.ld
+	${PREFIX}gcc -mabi=ilp32 -march=rv32ia_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -o sys/barrier_test.elf $<
+	${PREFIX}objcopy -j .text -j .data -O binary sys/barrier_test.elf $@
 
 sys/csr_scatter_test.bin: sys/csr_scatter_test.S sys/linker_system.ld
 	${PREFIX}gcc -mabi=ilp32 -march=rv32imf_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -O1 -o sys/csr_scatter_test.elf sys/csr_scatter_test.S
 	${PREFIX}objcopy -j .text -j .data -O binary sys/csr_scatter_test.elf $@
 
 sys/local_send_test.bin: sys/local_send_test.S sys/linker_system.ld
-	${PREFIX}gcc -mabi=ilp32 -march=rv32imf_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -O1 -o sys/local_send_test.elf sys/local_send_test.S
+	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -o sys/local_send_test.elf sys/local_send_test.S
 	${PREFIX}objcopy -j .text -j .data -O binary sys/local_send_test.elf $@
 
 sys/random_noc_test.bin: sys/random_noc_test.S sys/linker_system.ld
-	${PREFIX}gcc -mabi=ilp32 -march=rv32imaf_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -O1 -o sys/random_noc_test.elf sys/random_noc_test.S
+	${PREFIX}gcc -mabi=ilp32 -march=rv32imaf_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -o sys/random_noc_test.elf sys/random_noc_test.S
 	${PREFIX}objcopy -j .text -j .data -O binary sys/random_noc_test.elf $@
 
 sys/snn_main.bin: sys/snn_main.S sys/snn_init.c sys/linker_system.ld
 	${PREFIX}gcc -mabi=ilp32 -march=rv32imf_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -O1 -o sys/snn_main.elf sys/snn_main.S sys/snn_init.c
 	${PREFIX}objcopy -j .text -j .data -O binary sys/snn_main.elf $@
 
-sys-tests: sys/pingpong_test.bin sys/sha256_concurrent.bin sys/spm_init.bin sys/csr_scatter_test.bin sys/local_send_test.bin sys/random_noc_test.bin
+sys-tests: sys/pingpong_test.bin sys/sha256_concurrent.bin sys/spm_init.bin sys/barrier_test.bin sys/local_send_test.bin sys/random_noc_test.bin
+	@echo "All system tests built successfully"
 
 clean:
 	rm -f test.single test.double test.single.bin test.double.bin
