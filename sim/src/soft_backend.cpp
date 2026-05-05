@@ -1443,7 +1443,7 @@ struct SoftSystemSim {
     if (bus_in[0].resp) {
       MemResponse resp;
       resp.id = bus_in[0].resp->id;
-      memcpy(resp.data, bus_in[0].resp->data, sizeof(resp.data));
+      memcpy(resp.data, bus_in[0].resp->data.data(), sizeof(resp.data));
       periph_if.deferResponse(resp);
     }
 
@@ -1452,7 +1452,7 @@ struct SoftSystemSim {
       if (bus_in[mc + 1].resp) {
         MemResponse resp;
         resp.id = bus_in[mc + 1].resp->id;
-        memcpy(resp.data, bus_in[mc + 1].resp->data, sizeof(resp.data));
+        memcpy(resp.data, bus_in[mc + 1].resp->data.data(), sizeof(resp.data));
         memifs[mc].deferResponse(resp);
       }
     }
@@ -1467,10 +1467,11 @@ struct SoftSystemSim {
       req.addr = entry.addr;
       req.size = entry.size;
       req.write = entry.is_write;
-      memset(req.wdata, 0, sizeof(req.wdata));
+      req.wbe = entry.is_write ? 0xFFFFFFFF : 0;
+      req.wdata = {};
       if (entry.is_write) {
         uint32_t word_idx = (entry.addr & 31) >> 2;
-        memcpy(req.wdata + word_idx * 4, &entry.wdata, 4);
+        memcpy(req.wdata.data() + word_idx * 4, &entry.wdata, 4);
       }
       bus_out[0].req = req;
       periph_if.acceptIssue(cycle);
@@ -1489,7 +1490,8 @@ struct SoftSystemSim {
           req.addr = memifs[mc].scat_addr;
           req.size = 0;  // full 32-byte line
           req.write = false;
-          memset(req.wdata, 0, sizeof(req.wdata));
+          req.wbe = 0;
+          req.wdata = {};
           bus_out[idx].req = req;
         } else {
           auto &entry = memifs[mc].inflight[memifs[mc].pending_issue_slot];
@@ -1498,10 +1500,11 @@ struct SoftSystemSim {
           req.addr = entry.addr;
           req.size = entry.size;
           req.write = entry.is_write;
-          memset(req.wdata, 0, sizeof(req.wdata));
+          req.wbe = entry.is_write ? 0xFFFFFFFF : 0;
+          req.wdata = {};
           if (entry.is_write) {
             uint32_t word_idx = (entry.addr & 31) >> 2;
-            memcpy(req.wdata + word_idx * 4, &entry.wdata, 4);
+            memcpy(req.wdata.data() + word_idx * 4, &entry.wdata, 4);
           }
           bus_out[idx].req = req;
         }

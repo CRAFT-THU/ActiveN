@@ -50,6 +50,7 @@
 #include <optional>
 #include <signal.h>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "include/argparse.h"
@@ -69,64 +70,75 @@ static void sighandler(int) { exiting = true; }
 
 // ---- Per-MC memory images (owned by the frontend) ----
 struct McImage {
-  uint32_t *data = nullptr;
-  size_t size = 0;  // bytes
+  std::unordered_map<uint32_t, mem_line_t> data;
+  std::size_t size; // This is the total size, according to hardware config, not the image size
+
+  GlobalMemResp handle(const GlobalMemReq &req) {
+    if ((1 << req.size) > MEM_BUS_WIDTH / 8) {
+      throw runtime_error("Memory request size exceeds bus width");
+    }
+
+    uint32_t aligned_addr = req.addr & ~(MEM_BUS_WIDTH / 8 - 1);
+    if (aligned_addr >= size) {
+      throw runtime_error("Memory request address out of bounds");
+    }
+
+    if (aligned_addr % (1 << req.size) != 0) {
+      throw runtime_error("Memory request address not aligned");
+    }
+
+    GlobalMemResp resp;
+    // Readout
+    resp.id = req.id;
+    mem_line_t readout = data.contains(aligned_addr) ? data.at(aligned_addr) : mem_line_t {};
+    resp.data = readout;
+
+    if (req.write) {
+      uint32_t subline_addr = req.addr - aligned_addr;
+      mem_mask_t mask = ((((uint64_t) 1) << (1 << req.size)) - 1) << subline_addr; // Byte-enables
+      mask &= req.wbe;
+
+      for (size_t i = 0; i < MEM_BUS_WIDTH / 8; ++i) {
+        if (mask & (1 << i)) {
+          readout[i] = req.wdata[i];
+        }
+      }
+      data[aligned_addr] = readout;
+    }
+
+    return resp;
+  }
 };
 
 static vector<McImage> mc_images;
 
-static void loadImages(const vector<string> &paths, size_t default_size) {
+static void loadImages(const vector<string> &paths, const vector<uint64_t> &mc_sizes) {
   mc_images.resize(paths.size());
   for (size_t i = 0; i < paths.size(); ++i) {
     ifstream fin(paths[i], ios::binary);
     if (!fin) throw runtime_error("Cannot open " + paths[i]);
     fin.seekg(0, ios::end);
     size_t fsize = fin.tellg();
-    if (fsize % 4 != 0) throw runtime_error("Image " + paths[i] + " is not 4-byte aligned");
-    size_t alloc = max(fsize, default_size);
-    char *buf = new (align_val_t(4)) char[alloc]();
     fin.seekg(0);
-    fin.read(buf, fsize);
-    mc_images[i].data = reinterpret_cast<uint32_t *>(buf);
-    mc_images[i].size = alloc;
-  }
-}
 
-static void unloadImages() {
-  for (auto &img : mc_images) {
-    if (img.data) {
-      delete[] reinterpret_cast<char *>(img.data);
-      img.data = nullptr;
-      img.size = 0;
+    mc_images[i].size = (i < mc_sizes.size()) ? (size_t)mc_sizes[i] : fsize;
+
+    // Read file in 32-byte chunks into the unordered_map
+    constexpr size_t LINE_BYTES = MEM_BUS_WIDTH / 8;
+    mem_line_t line{};
+    for (size_t offset = 0; offset < fsize; offset += LINE_BYTES) {
+      size_t to_read = min(LINE_BYTES, fsize - offset);
+      line = {};
+      fin.read(reinterpret_cast<char *>(line.data()), to_read);
+      // Only store non-zero lines
+      bool all_zero = true;
+      for (size_t b = 0; b < LINE_BYTES; ++b) {
+        if (line[b] != 0) { all_zero = false; break; }
+      }
+      if (!all_zero) {
+        mc_images[i].data[(uint32_t)offset] = line;
+      }
     }
-  }
-  mc_images.clear();
-}
-
-// Build a 32-byte-aligned read response from a specific MC's image
-static void buildMemRespMc(int mc, uint32_t local_addr, uint8_t *data) {
-  uint32_t aligned = local_addr & ~(uint32_t)(MEM_BUS_WORDS * 4 - 1);
-  auto *out = reinterpret_cast<uint32_t *>(data);
-  auto &img = mc_images[mc];
-  for (int i = 0; i < MEM_BUS_WORDS; ++i) {
-    uint32_t ba = aligned + i * 4;
-    if (ba + 3 < img.size)
-      out[i] = img.data[ba / 4];
-    else
-      out[i] = 0;
-  }
-}
-
-// Apply a write to a specific MC's image
-static void applyWriteMc(int mc, uint32_t local_addr, uint8_t size, const uint8_t *wdata) {
-  uint32_t nbytes = 1u << size;
-  uint32_t block_base = local_addr & ~(uint32_t)(MEM_BUS_WORDS * 4 - 1);
-  uint32_t byte_off = local_addr - block_base;
-  auto &img = mc_images[mc];
-  auto *mem_bytes = reinterpret_cast<uint8_t *>(img.data);
-  for (uint32_t b = 0; b < nbytes && b + byte_off < (uint32_t)(MEM_BUS_WORDS * 4); ++b) {
-    uint32_t pos = block_base + byte_off + b;
-    if (pos < img.size) mem_bytes[pos] = wdata[byte_off + b];
   }
 }
 
@@ -214,15 +226,7 @@ struct System::Impl {
 
   // Serve a single request from a backend for MC mc
   void serveMemReq(int mc, const GlobalMemReq &req) {
-    GlobalMemResp resp{};
-    resp.id = req.id;
-
-    if (req.write) {
-      applyWriteMc(mc, req.addr, req.size, req.wdata);
-      memset(resp.data, 0, sizeof(resp.data));
-    } else {
-      buildMemRespMc(mc, req.addr, resp.data);
-    }
+    GlobalMemResp resp = mc_images[mc].handle(req);
 
     if (use_dram) {
       dram_mcs[mc].submit_queue.push_back({(uint64_t)req.addr, req.write, resp});
@@ -234,18 +238,18 @@ struct System::Impl {
   void servePeriphReq(const GlobalMemReq &req) {
     GlobalMemResp resp{};
     resp.id = req.id;
-    memset(resp.data, 0, sizeof(resp.data));
+    resp.data = {};
 
     size_t byte_offset = req.addr & ((MEM_BUS_WORDS * sizeof(uint32_t)) - 1);
     size_t word_idx = byte_offset / sizeof(uint32_t);
 
     if (req.write) {
       uint32_t wdata;
-      memcpy(&wdata, req.wdata + byte_offset, sizeof(uint32_t));
+      memcpy(&wdata, req.wdata.data() + byte_offset, sizeof(uint32_t));
       periph.write(req.addr, wdata);
     } else {
       uint32_t rdata = periph.read(req.addr);
-      memcpy(resp.data + word_idx * sizeof(uint32_t), &rdata, sizeof(uint32_t));
+      memcpy(resp.data.data() + word_idx * sizeof(uint32_t), &rdata, sizeof(uint32_t));
     }
     periph_resps.push_back(resp);
   }
@@ -392,7 +396,7 @@ bool System::run(uint64_t maxCycles) {
   cerr << "[System] PUs=" << cfg.numPU << " MCs=" << cfg.numMC << endl;
 
   // Load per-MC images
-  loadImages(impl_->image_paths, 16 * 1024 * 1024);
+  loadImages(impl_->image_paths, cfg.core.mcSizes);
   cerr << "[System] Loaded " << mc_images.size() << " memory image(s)" << endl;
 
   // DRAMsim3
@@ -470,7 +474,7 @@ bool System::run(uint64_t maxCycles) {
       impl_->dram_mcs[i].dram->PrintStats();
   }
 
-  unloadImages();
+  mc_images.clear();
 
   return impl_->periph.result && *impl_->periph.result == 0 ? 0 : 1;
 }

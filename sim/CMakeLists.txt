@@ -122,7 +122,7 @@ set(BOLT_MULTI_CYCLES 100000)
 
 set(VERILATOR_COMMON_ARGS -O3 -Wall -Wno-fatal -Wno-DECLFILENAME --trace-params --trace-structs -I${CVFPU_DIR}/src/common_cells/include -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNSIGNED -Wno-CASEINCOMPLETE -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-UNDRIVEN -Wno-PINMISSING)
 set(VERILATOR_CORE_ARGS ${VERILATOR_COMMON_ARGS} --top-module Core)
-set(VERILATOR_SYSTEM_ARGS ${VERILATOR_COMMON_ARGS} --top-module System)
+set(VERILATOR_SYSTEM_ARGS ${VERILATOR_COMMON_ARGS} --top-module System --threads 8)
 
 # Single-core simulation driver (no DRAM dependency)
 add_executable(sim_single

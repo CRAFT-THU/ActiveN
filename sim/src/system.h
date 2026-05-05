@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cwchar>
 #include <optional>
 #include <cstdint>
 #include <vector>
@@ -9,6 +10,8 @@
 // System-level simulators
 
 const size_t MEM_BUS_WIDTH = 256;
+typedef std::array<uint8_t, MEM_BUS_WIDTH / 8> mem_line_t;
+typedef uint32_t mem_mask_t;
 
 struct GlobalMemReq {
   uint8_t id;
@@ -21,14 +24,18 @@ struct GlobalMemReq {
   // Small endian, lane-aligned (NOT ADDRESS-ALIGNED) data,
   // so wdata[0] always corresponds to the byte 0 at the 32-byte chunk
   // being written
-  uint8_t wdata[MEM_BUS_WIDTH / 8];
+  mem_line_t wdata;
+
+  // Write byte enable, also lane-aligned
+  mem_mask_t wbe;
+
   bool write;
 };
 
 struct GlobalMemResp {
   uint8_t id;
   // Small endian, lane-aligned response data
-  uint8_t data[MEM_BUS_WIDTH / 8];
+  mem_line_t data;
 };
 
 struct MemBusIn {

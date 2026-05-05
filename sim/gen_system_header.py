@@ -74,6 +74,7 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
     f.write("    uint32_t *req_addr;\n")
     f.write("    uint32_t *req_wdata; // WData[8]\n")
     f.write("    uint32_t *req_wbe;\n")
+    f.write("    uint8_t *req_size;\n")
     f.write("    uint8_t *req_write;\n")
     f.write("    uint8_t *resp_valid;\n")
     f.write("    uint8_t *resp_id;\n")
@@ -98,6 +99,7 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
         f.write(f"        mem_ports[{i}].req_addr = &sys->io_mem_{i}_req_bits_addr;\n")
         f.write(f"        mem_ports[{i}].req_wdata = sys->io_mem_{i}_req_bits_wdata;\n")
         f.write(f"        mem_ports[{i}].req_wbe = &sys->io_mem_{i}_req_bits_wbe;\n")
+        f.write(f"        mem_ports[{i}].req_size = &sys->io_mem_{i}_req_bits_size;\n")
         f.write(f"        mem_ports[{i}].req_write = &sys->io_mem_{i}_req_bits_write;\n")
         f.write(f"        mem_ports[{i}].resp_valid = &sys->io_mem_{i}_resp_valid;\n")
         f.write(f"        mem_ports[{i}].resp_id = &sys->io_mem_{i}_resp_bits_id;\n")
@@ -168,7 +170,7 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
                 auto &r = *bus_in[mc + 1].resp;
                 *p.resp_valid = 1;
                 *p.resp_id = r.id;
-                std::memcpy(p.resp_rdata, r.data, MEM_BUS_WORDS * 4);
+                std::memcpy(p.resp_rdata, r.data.data(), MEM_BUS_WORDS * 4);
             } else {
                 *p.resp_valid = 0;
             }
@@ -180,7 +182,7 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
             auto &r = *bus_in[0].resp;
             sys->io_periph_resp_valid = 1;
             sys->io_periph_resp_bits_id = r.id;
-            std::memcpy(sys->io_periph_resp_bits_rdata, r.data, MEM_BUS_WORDS * 4);
+            std::memcpy(sys->io_periph_resp_bits_rdata, r.data.data(), MEM_BUS_WORDS * 4);
         } else {
             sys->io_periph_resp_valid = 0;
         }
@@ -197,8 +199,9 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
                 req.id = *p.req_id;
                 req.addr = *p.req_addr;
                 req.write = *p.req_write;
-                req.size = 5;
-                std::memcpy(req.wdata, p.req_wdata, MEM_BUS_WORDS * 4);
+                req.size = *p.req_size;
+                req.wbe = *p.req_wbe;
+                std::memcpy(req.wdata.data(), p.req_wdata, MEM_BUS_WORDS * 4);
                 bus_out[mc + 1].req = req;
             } else {
                 bus_out[mc + 1].req = std::nullopt;
@@ -211,8 +214,9 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
             req.id = sys->io_periph_req_bits_id;
             req.addr = sys->io_periph_req_bits_addr;
             req.write = sys->io_periph_req_bits_write;
-            req.size = 5;
-            std::memcpy(req.wdata, sys->io_periph_req_bits_wdata, MEM_BUS_WORDS * 4);
+            req.size = sys->io_periph_req_bits_size;
+            req.wbe = sys->io_periph_req_bits_wbe;
+            std::memcpy(req.wdata.data(), sys->io_periph_req_bits_wdata, MEM_BUS_WORDS * 4);
             bus_out[0].req = req;
         } else {
             bus_out[0].req = std::nullopt;

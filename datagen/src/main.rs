@@ -169,8 +169,9 @@ fn dump(
                 let target_pu = neigh.core as usize; // 0-based core index
                 let target_mc = target_pu / pus_per_mc;
                 debug_assert!(target_mc < num_mc, "target_mc={} >= num_mc={}", target_mc, num_mc);
-                // CSR entry: PU ID (1-based) in upper 16 bits, neuron sub-index in lower 16 bits
-                let col = ((neigh.core as u32 + 1) << 16) | (neigh.neuron as u32);
+                // CSR entry: neuron sub-index in upper 16 bits, PU ID (1-based) in lower 16 bits
+                // Hardware BcastBeat layout: pu=bits[15:0], idx=bits[31:16], data=bits[63:32]
+                let col = ((neigh.neuron as u32) << 16) | (neigh.core as u32 + 1);
                 csr_per_mc[target_mc].push(col);
                 csr_per_mc[target_mc].push(neigh.weight.to_bits());
             }

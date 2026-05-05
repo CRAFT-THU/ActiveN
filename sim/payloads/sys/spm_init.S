@@ -114,10 +114,10 @@ xor_loop:
   csrw  0x700, a0
 
 send_xor:
-  /* ---- send XOR result to PU1 (tag 0, 1 arg) ---- */
+  /* ---- send XOR result to PU1 (tag 0, priority 3 = lowest) ---- */
   mv    a0, t2
   li    t0, LEADER
-  li    t1, 0                  /* tag = 0 */
+  li    t1, 0xC00              /* tag = 0, priority 3 (lowest) */
   SEND  t0, t1
 
   j     do_wfi
