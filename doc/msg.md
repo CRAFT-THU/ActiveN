@@ -2,7 +2,42 @@ The active messaging system primarily contains two ISA extensions: a handler reg
 
 ## Handler registration
 
-This part of code needs revision, document will be updated after the code is stabilized.
+Each handler has five piece of data, that's encoded in three CSRs. In case of the handler for message tag 0:
+
+1. 0x700 + ID: `handler0`: The address of the handler function
+2. 0x710 + ID: `hancfg0`: The configuration of the handler, which includes:
+   - Lowest 3 bits: The number of argument for this handler. Although we use a 3-bit field, at most four registers can be passed.
+   - Higher bits from bit 3: a bitmask indicating which of the SMT threads that this handler can be scheduled onto. So bit 3 is for thread 0, bit 4 is for thread 1. Right now there is only two threads at most.
+3. 0x720 + ID: `hanmargin0`: The quota and margin for this handler.
+  - Low 16 bits: Margin
+  - High 16 bits: Quota
+
+### Reset state
+
+During reset, all two SMT threads are active. register a0 contains the ID of the SMT thread (0, 1, ...), **not hartid**.
+
+Handlers for each message are all reset to 0.
+
+The cfg CSR is reset to 0. Crucially, this means that the handler by default won't be schedulable.
+
+Both quota and margin is reset to 0. User should set then correctly before enabling the handler.
+
+### Setup procedure
+
+User is expected to set up each handler in the following way:
+
+First, set the handler function address, quota and margin. During this time, the handler is not yet enabled.
+
+Then, if the handler can be immediately triggered in the other SMT thread, we can enable it in a single `CSRWI` instruction. Note that we specifically uses 5 bits for the handler index (for 2 SMT threads). So the user can directly writes `(3 << 3) | argcnt` to enable the handler with argument count `argcnt`.
+
+If the handler cannot be enabled for everyone, or is intended to be scheduled onto certain ones, you can use `CSRS` to enable it for individual threads.
+
+A example for this is the SNN case. Each thread needs to setup some persistent registers before being able to receive messages. However, only thread 0 does the SPM initialization. So the startup sequence should be:
+
+1. Thread 0 initializes SPM, while thread 1 register a handler "spm_init_finished" that can only be scheduled onto thread 1. Note that the two threads share CSRs, so it need a dedicated handler index.
+2. Thread 1 enters WFI.
+3. After thread 0 initializes SPM and its own registers, it enables the handlers for external messages, but only enabled for thread 0. It then triggers the "spm_init_finished" handler, then enters jumps to the main work loop.
+4. Meanwhile, thread 1 eventually wakes up to execute "spm_init_finished" handler. It reads the SPM and setup the registers, then `CSRS ..., 1 << tid` to add itself into the schedulable pool onto handlers. Then it WFIs, and waits for external messages.
 
 ## ABI
 
@@ -39,9 +74,3 @@ We have additional instruction for querying and manipulating the quota during ru
   - send queue space >= target quota + sum(all **other** live threads' quota) + margin given in the instruction
 
 We explicitly did not include a query instruction for remaining spaces, because during SMT execution, this value is highly suspectible to racing. Software should use quota to protect itself from over-saturating the send queue, and be really careful when dynamically allocating quota.
-
-## Reset state
-
-During reset, all two SMT threads are active. register a0 contains the ID of the SMT thread (0, 1, ...), **not hartid**.
-
-Handlers for each message are all reset to 0. If the handler is 0, then the message will not be scheduled. This is to ensure that no race happens during bootup.

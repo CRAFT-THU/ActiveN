@@ -81,6 +81,7 @@ class Fetch(implicit val params: CoreParameters) extends Module {
   // 2 + 3 = there is a pending fetched instruction that's not consumed by downstream
   fetchable := ~VecInit.tabulate(params.pipeCnt)(i =>
     ctrl.br(i).valid
+    || busy(i)
     || ((sentSmsel(i) || held(i)) && !decoded(i).ready)
   ).asUInt
 }

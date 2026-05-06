@@ -33,13 +33,15 @@ class BIU(implicit val param: CoreParameters) extends Module {
   })
 
   // Bitmask for enabled handlers
-  val enabled = IO(Input(Vec(16, Bool())))
+  val enmasks = IO(Input(Vec(16, UInt(param.pipeCnt.W))))
+  val accepting = IO(Input(UInt(param.pipeCnt.W)))
 
   // Send out: current schedulable events, or the pushed event at the same cycle (at lower priority)
-  val sched = IO(Decoupled(new Bundle {
+  val sched = IO(new Bundle {
     val handler = UInt(4.W) // We have 16 handlers
     val regs = Vec(4, UInt(32.W))
-  }))
+    val wakeup = UInt(param.pipeCnt.W)
+  })
 
   val margins = IO(Input(
     Vec(16, UInt(log2Ceil(param.sendQueueDepth + 1).W))
@@ -112,13 +114,21 @@ class BIU(implicit val param: CoreParameters) extends Module {
 
   val scheduleArb = Module(new Arbiter(Vec(4, UInt(32.W)), 16)).suggestName("scheduleArb")
   for (i <- 0 until 16) {
-    val schedulable = enabled(i) && (sendQueue.count + margins(i) + liveQuota <= param.sendQueueDepth.U)
+    val enabled = (enmasks(i) & accepting).orR
+    val marginSatisfied = sendQueue.count + margins(i) + liveQuota <= param.sendQueueDepth.U
+    val schedulable = enabled && marginSatisfied
     val gated = evQueues(i).io.deq.gatedBy(schedulable).suggestName(s"gated_$i")
     scheduleArb.io.in(i) <> gated
   }
   val scheduled = scheduleArb.io.chosen
-  sched.valid := scheduleArb.io.out.valid
-  scheduleArb.io.out.ready := sched.ready
-  sched.bits.handler := scheduleArb.io.chosen
-  sched.bits.regs := scheduleArb.io.out.bits
+  sched.handler := scheduleArb.io.chosen
+  sched.regs := scheduleArb.io.out.bits
+  sched.wakeup := Fill(param.pipeCnt, scheduleArb.io.out.valid) & PriorityEncoderOH(accepting & enmasks(scheduleArb.io.chosen))
+
+  // If anything is schedulable, then we schedule them
+  // This is safe because we already gates by accepting
+  // So scheduleArb.io.out.valid implies wakeup
+  // and we have wakeup being a subset of accepting
+  scheduleArb.io.out.ready := true.B
+  assert(!scheduleArb.io.out.valid || sched.wakeup.orR)
 }

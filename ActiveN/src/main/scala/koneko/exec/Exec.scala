@@ -47,8 +47,10 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   val handlers = RegInit(VecInit(Seq.fill(16)(0.U(32.W))))
   val argcnts = RegInit(VecInit(Seq.fill(16)(0.U(3.W))))
+  val enmasks = RegInit(VecInit(Seq.fill(16)(0.U(param.pipeCnt.W))))
   val margins = RegInit(VecInit(Seq.fill(16)(0.U(log2Ceil(param.sendQueueDepth + 1).W))))
   val quotas = RegInit(VecInit(Seq.fill(16)(0.U(log2Ceil(param.sendQueueDepth + 1).W))))
+  require(quotas(0).getWidth <= 16) // Can fit two counters into a CSR
 
   //////////////////////////
   // Actual configuration
@@ -166,7 +168,6 @@ class Exec(implicit val param: CoreParameters) extends Module {
   // BIU & related AM connections
   val biu = Module(new BIU)
   biu.hartid := cfg.hartid(15, 0)
-  for (i <- 0 until 16) biu.enabled(i) := handlers(i) =/= 0.U
 
   biu.ext.in <> ext.in
   biu.ext.out <> ext.out
@@ -217,9 +218,15 @@ class Exec(implicit val param: CoreParameters) extends Module {
   // failed nonblocking yield does not constitute a candidate
   val effectivelyYield = isYield && biuAccepted || isWFI
   val eidlings = idlings | (Fill(param.pipeCnt, s0step && (isYield && biuAccepted || isWFI)) & uop.smsel)
-  val wakeup = PriorityEncoderOH(eidlings)
   assert(!effectivelyYield || s0step, "effectivelyYield -> s0step")
   assert(s0step || eidlings === idlings, "eidlings can only differ from idlings when s0step")
+
+  biu.enmasks := enmasks
+  biu.accepting := eidlings
+  // scheduled mask is a subset of accepting threads
+  assert((biu.sched.wakeup & biu.accepting) === biu.sched.wakeup)
+  // scheduled mask has at most 1 bit set
+  assert(PopCount(biu.sched.wakeup) <= 1.U)
 
   // Branches caused by AM
   val biuBrs = Wire(Vec(param.pipeCnt, Valid(UInt(4.W))))
@@ -227,14 +234,15 @@ class Exec(implicit val param: CoreParameters) extends Module {
   // We handle idlings by continously branching to an address
   // FIXME: nonlocal yield may become idle. Also need to branch. Also: WFI is the same
   for (i <- 0 until param.pipeCnt) {
-    biuBrs(i).valid := eidlings(i)
-    biuBrs(i).bits := biu.sched.bits.handler
+    biuBrs(i).valid := biu.sched.wakeup(i)
+    biuBrs(i).bits := biu.sched.handler
   }
 
-  // BIU sched is accepted when there is an effectively idling thread
-  biu.sched.ready := eidlings.orR
-
   // Sending quota decrement
+  // BE CAREFUL WHEN MOVING THIS BLOCK!
+  // lievQuotas(i) might be updated at the same cycle
+  // if we're yielding.
+  // See the block below for setting live quotas for scheduled events
   val targetQuota = Mux1H(uop.smsel, liveQuotas)
   val targetQuotaSufficient = targetQuota > 0.U
   val targetQuotaUpdate = Mux(targetQuotaSufficient, targetQuota - 1.U, targetQuota)
@@ -246,32 +254,60 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   // State transition during actual schedule: regfile, quotas, idlings
   // only clear wakeup thread when there is something to schedule
-  idlings := eidlings & (~wakeup | Fill(param.pipeCnt, !biu.sched.valid))
+  //
+  // Explicitly using the last-connected-wins semantics of Chisel
+  idlings := eidlings & ~biu.sched.wakeup
   for (i <- 0 until param.pipeCnt) {
-    val scheduled = biu.sched.valid && wakeup(i)
+    val scheduled = biu.sched.wakeup(i)
     for (j <- 0 until 4) {
       // Local sends skips writing registers, only handles remote sends here
-      regfiles(i).msgDirect(j).wdata := biu.sched.bits.regs(j)
-      regfiles(i).msgDirect(j).wen := scheduled && argcnts(biu.sched.bits.handler) > j.U
+      regfiles(i).msgDirect(j).wdata := biu.sched.regs(j)
+      regfiles(i).msgDirect(j).wen := scheduled && argcnts(biu.sched.handler) > j.U
     }
 
     when(scheduled) {
-      liveQuotas(i) := quotas(biu.sched.bits.handler)
+      liveQuotas(i) := quotas(biu.sched.handler)
+    }
+  }
+
+  sealed trait CSR {
+    def read: UInt
+    def write(data: UInt): Unit
+  }
+
+  // Automatically cast a UInt into a CSRWriter
+  case class CSRUInt(data: UInt) extends CSR {
+    def read = data
+    def write(data: UInt) = this.data := data
+  }
+  case class CSRHandlerCfg(i: Int) extends CSR {
+    def read = enmasks(i) ## argcnts(i)(2, 0)
+    def write(data: UInt) = {
+      val argcntNew = data(2, 0)
+      argcnts(i) := Mux(argcntNew > 4.U, 4.U, argcntNew)
+      enmasks(i) := data(3 + param.pipeCnt - 1, 3)
+    }
+  }
+  case class CSRQuotaMargin(i: Int) extends CSR {
+    def read = quotas(i) ## margins(i)
+    def write(data: UInt) = {
+      val quotaNew = data(31, 16)
+      val marginNew = data(15, 0)
+      quotas(i) := Mux(quotaNew > param.sendQueueDepth.U, param.sendQueueDepth.U, quotaNew)
+      margins(i) := Mux(marginNew > param.sendQueueDepth.U, param.sendQueueDepth.U, marginNew)
     }
   }
 
   // CSR
-  val csrmapping = Seq(
-    0xF14 -> cfg.hartid,
-  ) ++ handlers.zipWithIndex.map({
-    case (h, i) => ((0x700 + i) -> h)
-  }) ++ argcnts.zipWithIndex.map({
-    case (h, i) => ((0x710 + i) -> h)
-  }) ++ margins.zipWithIndex.map({
-    case (h, i) => ((0x720 + i) -> h)
-  }) ++ quotas.zipWithIndex.map({
-    case (h, i) => ((0x730 + i) -> h)
-  })
+  val csrmapping: Seq[(Int, CSR)] = Seq(
+    0xF14 -> CSRUInt(cfg.hartid),
+  ) ++ (
+    for (i <- 0 until 16) yield (0x700 + i) -> CSRUInt(handlers(i))
+  ) ++ (
+    for (i <- 0 until 16) yield (0x710 + i) -> CSRHandlerCfg(i)
+  ) ++ (
+    for (i <- 0 until 16) yield (0x720 + i) -> CSRQuotaMargin(i)
+  )
   val csrwmapping = csrmapping.filter({ e => (e._1 >> 10) != 3 })
   val isCSR = uop.isSystem && uop.funct3(1, 0) =/= 0.U
   val csrUimmExt = Wire(UInt(32.W))
@@ -281,14 +317,14 @@ class Exec(implicit val param: CoreParameters) extends Module {
   for((i, c) <- csrwmapping) {
     val csrWdata = Mux1H(Seq(
       (uop.funct3(1, 0) === 1.U) -> csrWraw,
-      (uop.funct3(1, 0) === 2.U) -> (csrWraw | c),
-      (uop.funct3(1, 0) === 3.U) -> (c & (~csrWraw).asUInt),
+      (uop.funct3(1, 0) === 2.U) -> (csrWraw | c.read),
+      (uop.funct3(1, 0) === 3.U) -> (c.read & (~csrWraw).asUInt),
     ))
     when(valid && isCSR && i.U === csrIdx) {
-      c := csrWdata
+      c.write(csrWdata)
     }
   }
-  val csrRdata = Mux1H(csrmapping.map({ case (i, c) => (i.U === csrIdx, c) }))
+  val csrRdata = Mux1H(csrmapping.map({ case (i, c) => (i.U === csrIdx, c.read) }))
 
   // PC + 4, used for JAL / JALR
   val pclink = uop.pc + 4.U
@@ -364,5 +400,5 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   // Scheduling
   s0step := !valid || s1done
-  busy := idlings | (Fill(param.pipeCnt, valid && (!s1done || delayed)) & uop.smsel)
+  busy := eidlings | (Fill(param.pipeCnt, valid && (!s1done || delayed)) & uop.smsel)
 }
