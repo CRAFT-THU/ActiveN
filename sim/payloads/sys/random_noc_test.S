@@ -146,19 +146,22 @@ _start:
   addi  s2, s1, -1          /* s2 = NUM_PU - 1 (mask) */
 
   /* ---- install handlers ---- */
-  /* tag 0 - test traffic (highest priority) */
+  /* tag 0 - test traffic (highest priority, all threads, argcnt=1) */
   la    a0, test_handler
   csrw  0x700, a0
-  li    a0, 1
-  csrw  0x710, a0
+  csrw  0x720, zero              /* hanmargin: quota=0, margin=0 */
+  li    a0, (3 << 3) | 1         /* all threads, argcnt=1 */
+  csrw  0x710, a0                /* hancfg (enables handler) */
 
-  /* tag 1 - completion */
+  /* tag 1 - completion (all threads, argcnt=1, quota=1, margin=1) */
   la    a0, completion_handler
   csrw  0x701, a0
-  li    a0, 1
-  csrw  0x711, a0
+  li    a0, (1 << 16) | 1        /* hanmargin: quota=1, margin=1 */
+  csrw  0x721, a0
+  li    a0, (3 << 3) | 1         /* all threads, argcnt=1 */
+  csrw  0x711, a0                /* hancfg (enables handler) */
 
-  /* tag 2 - start (leader) / noop (workers) */
+  /* tag 2 - start (leader) / noop (workers) (all threads, argcnt=1, quota=1, margin=2) */
   li    t0, LEADER
   bne   s0, t0, 1f
   la    a0, start_handler
@@ -167,34 +170,18 @@ _start:
   la    a0, noop_handler
 2:
   csrw  0x702, a0
-  li    a0, 1
-  csrw  0x712, a0
+  li    a0, (1 << 16) | 2        /* hanmargin: quota=1, margin=2 */
+  csrw  0x722, a0
+  li    a0, (3 << 3) | 1         /* all threads, argcnt=1 */
+  csrw  0x712, a0                /* hancfg (enables handler) */
 
-  /* tag 3 - work (lowest priority) */
+  /* tag 3 - work (lowest priority, all threads, argcnt=1, quota=1, margin=3) */
   la    a0, work_handler
   csrw  0x703, a0
-  li    a0, 1
-  csrw  0x713, a0
-
-  /* ---- set quotas (CSR 0x730+) ---- */
-  /* quota(i) = max sends per handler invocation */
-  csrw  0x730, zero        /* handler 0 (test): 0 sends */
-  li    a0, 1
-  csrw  0x731, a0          /* handler 1 (completion): 1 send (stop) */
-  li    a0, 1
-  csrw  0x732, a0          /* handler 2 (start/stop): 1 */
-  li    a0, 1
-  csrw  0x733, a0          /* handler 3 (work/bcast): 1 send */
-
-  /* ---- set margins (CSR 0x720+) ---- */
-  /* margin(i) = cumulative quotas of handlers 0..i */
-  csrw  0x720, zero        /* handler 0: margin=0 */
-  li    a0, 1
-  csrw  0x721, a0          /* handler 1: margin=1 (quota 0+1) */
-  li    a0, 2
-  csrw  0x722, a0          /* handler 2: margin=2 (quota 0+1+1) */
-  li    a0, 3
-  csrw  0x723, a0          /* handler 3: margin=3 (quota 0+1+1+1) */
+  li    a0, (1 << 16) | 3        /* hanmargin: quota=1, margin=3 */
+  csrw  0x723, a0
+  li    a0, (3 << 3) | 1         /* all threads, argcnt=1 */
+  csrw  0x713, a0                /* hancfg (enables handler) */
 
   /* ---- clear SPM state ---- */
   li    t0, SPM_LOCAL_XOR

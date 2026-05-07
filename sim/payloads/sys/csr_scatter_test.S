@@ -91,21 +91,18 @@ _start:
   sw    zero, 0(t0)
 
   # Handler 0 (tag=0): report handler, argcnt=1
-  # Set PC last so handler is not dispatched with wrong argcnt
-  li    a0, 1
-  csrw  0x710, a0             # argcnt = 1
-  csrw  0x720, zero           # margin = 0
-  csrw  0x730, zero           # quota = 0
   la    a0, handler_report
-  csrw  0x700, a0             # handler PC (arms handler)
+  csrw  0x700, a0             # address
+  csrw  0x720, zero           # hanmargin: quota=0, margin=0
+  li    a0, (3 << 3) | 1      # all threads, argcnt=1
+  csrw  0x710, a0             # hancfg (enables handler)
 
   # Handler 1 (tag=1): spike handler, argcnt=2
-  li    a0, 2
-  csrw  0x711, a0             # argcnt = 2
-  csrw  0x721, zero           # margin = 0
-  csrw  0x731, zero           # quota = 0
   la    a0, handler_spike
-  csrw  0x701, a0             # handler PC (arms handler)
+  csrw  0x701, a0             # address
+  csrw  0x721, zero           # hanmargin: quota=0, margin=0
+  li    a0, (3 << 3) | 2      # all threads, argcnt=2
+  csrw  0x711, a0             # hancfg (enables handler)
 
   li    a0, 1
   bne   s0, a0, do_wfi       # workers: just WFI after arming handlers

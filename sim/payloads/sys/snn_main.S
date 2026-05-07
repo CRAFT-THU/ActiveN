@@ -79,7 +79,7 @@
   .globl _start
 
 _start:
-  bnez  x10, thread1_park
+  bnez  x10, thread1_start
   csrr  s0, 0xF14             # s0 = hartid
 
   # Stack in global memory: sp = 0xF8000000 - 1024*(hartid-1)
@@ -92,20 +92,19 @@ _start:
   call  snn_init
   jal   ra, load_sregisters
 
-  # Install boot handler: tag0 = boot_go (argcnt=1)
-  # Handler PC stays 0 until we install it (no dispatch yet)
-  li    a0, 1
-  csrw  0x710, a0             # tag0 argcnt=1
-  csrw  0x720, zero
-  csrw  0x730, zero
+  # Install boot handler: tag0 = boot_go (thread 0 only, argcnt=1).
+  # hanmargin=0 (no sends). Handler armed by writing hancfg last.
+  csrw  0x720, zero           # hanmargin: quota=0, margin=0
 
-  # PU1 (leader): init counters, install handler, then include self in count
+  # PU1 (leader): init counters first, then install handler
   li    t0, 1
   beq   s0, t0, leader_boot
 
   # Non-leader: install handler, send "ready" to PU1, wfi
   la    a0, boot_go
-  csrw  0x700, a0
+  csrw  0x700, a0             # address
+  li    a0, (1 << 3) | 1      # thread 0 only, argcnt=1
+  csrw  0x710, a0             # hancfg (enables handler)
 
   li    a0, 0                 # ready signal (a0=0)
   li    t0, 1                 # dst = PU1
@@ -122,15 +121,25 @@ leader_boot:
 
   # Install handler now that counters are zeroed
   la    a0, boot_go
-  csrw  0x700, a0
+  csrw  0x700, a0             # address
+  li    a0, (1 << 3) | 1      # thread 0 only, argcnt=1
+  csrw  0x710, a0             # hancfg (enables handler)
 
   # If only 1 PU, go directly
   li    t0, 1
   beq   s6, t0, boot_all_ready
   j     do_wfi
 
-thread1_park:
+thread1_start:
   csrr  s0, 0xF14
+  # Register spm_init_finished handler (tag 4): thread 1 only, argcnt=0.
+  # This handler is triggered by thread 0 after install_runtime to let
+  # thread 1 set up its s-registers before joining the schedulable pool.
+  la    a0, spm_init_finished
+  csrw  0x704, a0           # handler 4 address
+  csrw  0x724, zero         # hanmargin: quota=0, margin=0
+  li    a0, (2 << 3) | 0    # thread 1 only, argcnt=0
+  csrw  0x714, a0           # hancfg (enables handler on thread 1 only)
   wfi
 
   #============================================================
@@ -188,37 +197,38 @@ boot_go_self:
   #============================================================
 install_runtime:
   # Handler 0: done_report (argcnt=1, margin=0, quota=0) — highest priority
-  li    a0, 1
-  csrw  0x710, a0
-  csrw  0x720, zero
-  csrw  0x730, zero
   la    a0, done_report
   csrw  0x700, a0
+  csrw  0x720, zero           # hanmargin: quota=0, margin=0
+  li    a0, (1 << 3) | 1      # thread 0 only, argcnt=1
+  csrw  0x710, a0             # hancfg (thread 0 only for now)
 
   # Handler 1: spike (argcnt=2, margin=0, quota=0) — second highest
-  li    a0, 2
-  csrw  0x711, a0
-  csrw  0x721, zero
-  csrw  0x731, zero
   la    a0, spike
   csrw  0x701, a0
+  csrw  0x721, zero           # hanmargin: quota=0, margin=0
+  li    a0, (1 << 3) | 2      # thread 0 only, argcnt=2
+  csrw  0x711, a0             # hancfg (thread 0 only for now)
 
   # Handler 2: work_drain (argcnt=1, margin=0, quota=0)
-  li    a0, 1
-  csrw  0x712, a0
-  csrw  0x722, zero
-  csrw  0x732, zero
   la    a0, work_drain_tick
   csrw  0x702, a0
+  csrw  0x722, zero           # hanmargin: quota=0, margin=0
+  li    a0, (1 << 3) | 1      # thread 0 only, argcnt=1
+  csrw  0x712, a0             # hancfg (thread 0 only for now)
 
   # Handler 3: work_update (argcnt=1, margin=num_mc+1, quota=0) — lowest priority
-  li    a0, 1
-  csrw  0x713, a0
-  addi  a0, s5, 1
-  csrw  0x723, a0             # margin = num_mc + 1 (scatters + self-yield)
-  csrw  0x733, zero           # quota = 0 (unlimited, rely on priority ordering)
   la    a0, work_update
   csrw  0x703, a0
+  addi  a0, s5, 1
+  csrw  0x723, a0             # hanmargin: quota=0, margin=num_mc+1
+  li    a0, (1 << 3) | 1      # thread 0 only, argcnt=1
+  csrw  0x713, a0             # hancfg (thread 0 only for now)
+
+  # Trigger spm_init_finished for thread 1 (local send, tag=4).
+  # Thread 1 will call load_sregisters and then add itself to handlers 0-3.
+  li    t1, 4
+  SEND  zero, t1              # dst=x0 (local), tag=4
 
   # Reset drain counter
   li    t0, SPM_DRAIN_CNT
@@ -230,6 +240,21 @@ install_runtime:
 
 do_wfi:
   wfi
+
+  #============================================================
+  # spm_init_finished (tag=4, argcnt=0, thread 1 only)
+  # Triggered by thread 0 after install_runtime. Sets up s-registers
+  # from the already-initialized SPM and adds thread 1 to all runtime
+  # handler bitmasks, then enters the idle WFI loop.
+  #============================================================
+spm_init_finished:
+  call  load_sregisters       # set s0-s6 from SPM tail + DRAM header
+  li    a0, (1 << 4)          # bit 4 = thread 1
+  csrs  0x710, a0             # add thread 1 to handler 0 (done_report)
+  csrs  0x711, a0             # add thread 1 to handler 1 (spike)
+  csrs  0x712, a0             # add thread 1 to handler 2 (work_drain)
+  csrs  0x713, a0             # add thread 1 to handler 3 (work_update)
+  j     do_wfi
 
   #============================================================
   # spike (tag=1, argcnt=2: a0=neuron_sub_idx, a1=weight)

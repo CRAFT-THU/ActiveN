@@ -52,8 +52,7 @@ _start:
   li    t0, CONFIG_ROM_ADDR
   lw    s1, 0(t0)             /* s1 = NUM_PU */
 
-  /* ---- quotas/margins (set before handler install) ---- */
-  csrw  0x730, zero
+  /* ---- hanmargin (set before handler install) ---- */
   csrw  0x720, zero
   /* handler PC stays 0 — events not scheduled until we install it */
 
@@ -105,13 +104,12 @@ xor_loop:
   li    t0, XOR_ACCUM
   sw    zero, 0(t0)
 
-  /* Now install the handler — enables dispatch on PU1 */
-  /* Set argcount BEFORE handler PC to avoid race: if handler PC is set
-     first, a message could dispatch before argcount is configured. */
-  li    a0, 1
-  csrw  0x710, a0
+  /* Now install the handler — armed by writing hancfg (0x710) last.
+     Address must be set before hancfg; a non-zero bitmask enables dispatch. */
   la    a0, done_handler
   csrw  0x700, a0
+  li    a0, (3 << 3) | 1         /* all threads, argcnt=1 */
+  csrw  0x710, a0                /* hancfg (enables handler) */
 
 send_xor:
   /* ---- send XOR result to PU1 (tag 0, priority 3 = lowest) ---- */

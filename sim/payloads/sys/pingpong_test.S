@@ -29,9 +29,9 @@ _start:
 
   # Register handler for tag 0
   la    t0, handler
-  csrw  0x700, t0
-  li    t0, 1
-  csrw  0x710, t0           # 1 argument
+  csrw  0x700, t0           # address
+  li    t0, (3 << 3) | 1    # all threads, argcnt=1
+  csrw  0x710, t0           # hancfg (enables handler)
 
   csrr  s0, 0xF14           # s0 = hartid (1..NUM_PU)
 

@@ -25,9 +25,9 @@ _start:
 
   # Configure handler 0 (tag=0): local_handler, argcnt=1
   la    a0, local_handler
-  csrw  0x700, a0
-  li    a0, 1
-  csrw  0x710, a0
+  csrw  0x700, a0           # address
+  li    a0, (3 << 3) | 1    # all threads, argcnt=1
+  csrw  0x710, a0           # hancfg (enables handler)
 
   # Only PU1 does the local send test
   li    t0, 1

@@ -41,15 +41,15 @@ _start:
 
   # Register tag 0 handler (work assignment, 1 arg)
   la    t0, work_handler
-  csrw  0x700, t0
-  li    t0, 1
-  csrw  0x710, t0             # 1 argument
+  csrw  0x700, t0           # address
+  li    t0, (3 << 3) | 1    # all threads, argcnt=1
+  csrw  0x710, t0           # hancfg (enables handler)
 
   # Register tag 1 handler (done signal, 2 args: hash + hartid)
   la    t0, done_handler
-  csrw  0x701, t0
-  li    t0, 2
-  csrw  0x711, t0             # 2 arguments
+  csrw  0x701, t0           # address
+  li    t0, (3 << 3) | 2    # all threads, argcnt=2
+  csrw  0x711, t0           # hancfg (enables handler)
 
   # Clear SPM done counter
   li    t0, SPM_DONE_COUNT

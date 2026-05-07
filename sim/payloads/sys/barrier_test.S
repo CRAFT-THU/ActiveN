@@ -40,21 +40,18 @@ _start:
 1:
   la    a0, noop_handler
 2:
-  csrw  0x702, a0
-  li    a0, 1
-  csrw  0x712, a0
+  csrw  0x702, a0           # address
 
-  # Clear counter (leader only)
+  # Clear counter (leader only) — before enabling handler
   li    t0, LEADER
   bne   s0, t0, 3f
   li    t0, SPM_COUNTER
   sw    zero, 0(t0)
 3:
-  # Quotas / margins for handler 2
-  li    a0, 1
-  csrw  0x732, a0
-  li    a0, 2
+  li    a0, (1 << 16) | 2   # hanmargin: quota=1, margin=2
   csrw  0x722, a0
+  li    a0, (3 << 3) | 1    # all threads, argcnt=1
+  csrw  0x712, a0           # hancfg (enables handler)
 
   # Send start to LEADER
   li    a0, 0
