@@ -10,6 +10,8 @@ There are also two types of test cases: single-core tests, which focus on verify
 
 Previous sessions' transcripts are located inside `copilot/`. `copilot/chat.json` is the full transcript. The most distant instructions are located in `copilot/instruction.md`. Other files are the outputs of individual tasks.
 
-You are inside a NixOS container, with root privileges. You're free to install any packages with nix-env, and run any commands you like.
+You are inside a NixOS container, with root privileges. You're free to install any packages with nix-env, and run any commands you like. Please place your temporary files at `copilot/tmp`. This includes traces, logs, generated scripts and other intermediate artifacts, but do not include artifacts with well-defined destinations (SystemVerilog should be in generated/, built workloads in the same folder of the workloads, simulators in sim/build, etc.).
+
+Don't commit any code. User will commit the code after you finish.
 
 Note that you're encourged to ask user questions if you're unclear about anything. Be really careful about changing logic in the codebase. Ask for explicit permission before making significant changes. Crucially, don't make assumptions about the codebase without getting clarifications. Refer to the documentation, since some code might be buggy and does not reflect the design intention.
