@@ -77,6 +77,10 @@ struct Args {
     #[clap(short, long)]
     dump: Option<PathBuf>,
 
+    /// Whether to shuffle the synapse order during dump
+    #[clap(long, requires = "dump")]
+    dump_shuffle_seed: Option<u64>,
+
     #[clap(long)]
     dump_genn: Option<PathBuf>,
 
@@ -120,7 +124,7 @@ fn encode_jal_x0(offset: i32) -> u32 {
     (bit20 << 31) | (bits10_1 << 21) | (bit11 << 20) | (bits19_12 << 12) | 0b1101111
 }
 
-fn dump(
+fn dump<R: Rng>(
     base: &PathBuf,
     cores: &[Core],
     num_mc: usize,
@@ -128,6 +132,7 @@ fn dump(
     text: Option<&PathBuf>,
     decay: f32,
     threshold: f32,
+    mut dump_shuffle_rng: Option<&mut R>,
 ) -> anyhow::Result<()> {
     println!("Dumping to {}", base.display());
 
@@ -165,7 +170,13 @@ fn dump(
             neuron_starts.push(starts);
 
             // Partition neighbors by target MC
-            for neigh in n.neigh.iter() {
+            let mut indices: Vec<usize> = (0..n.neigh.len()).into_iter().collect();
+            if let Some(ref mut r) = dump_shuffle_rng.as_mut() {
+                // This does not affect simulation result, so we can use our own RNG,
+                indices.shuffle(*r);
+            }
+            for i in indices.iter() {
+                let neigh = &n.neigh[*i];
                 let target_pu = neigh.core as usize; // 0-based core index
                 let target_mc = target_pu / pus_per_mc;
                 debug_assert!(target_mc < num_mc, "target_mc={} >= num_mc={}", target_mc, num_mc);
@@ -800,7 +811,8 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(ref snapshot) = dump_snapshot {
         if let Some(ref p) = args.dump {
-            dump(p, snapshot, args.num_mc, args.spm_size, args.text.as_ref(), e_neg_tau, args.threshold)?;
+            let mut dump_shuffle_rng = args.dump_shuffle_seed.map(|seed| Xoshiro256PlusPlus::seed_from_u64(seed));
+            dump(p, snapshot, args.num_mc, args.spm_size, args.text.as_ref(), e_neg_tau, args.threshold, dump_shuffle_rng.as_mut())?;
         }
 
         if let Some(ref p) = args.dump_genn {
