@@ -87,7 +87,7 @@ class BulkPending extends Bundle {
   // FIXME: parametric beat size
   def isFullyIssued: Bool = issueCnt === ((end >> 5) - (base >> 5))
   def isCompletedNext: Bool = (completedCnt + 1.U) === ((end >> 5) - (base >> 5))
-  def canIssue(maxInflight: Int): Bool = completedCnt - issueCnt < maxInflight.U
+  def canIssue(maxInflight: Int): Bool = issueCnt < completedCnt + maxInflight.U
   def issueAddr = base + (issueCnt << 5)
 }
 
@@ -153,7 +153,7 @@ abstract class MemIf(
     val resp = Flipped(Valid(new GlobalMemResp))
   })
 
-  protected val flitArb = Module(new RRArbiter(req(0).bits.cloneType, numReq))
+  protected val flitArb = Module(new FlitArb(req(0).bits.cloneType, numReq))
   for (ci <- 0 until numReq) flitArb.io.in(ci) <> req(ci)
   protected val flit = flitArb.io.out
 
@@ -340,12 +340,12 @@ class DRAMIf(
     bulkCompleted(bulkPending.issueCnt) := false.B
   }
 
-  // For DRAMIf, bulk req takes unconditional priority over scalar reqs, so we're using a plain Arbiter here
+  // For DRAMIf, unicast req takes unconditional priority over scalar reqs, so we're using a plain Arbiter here
   // TODO: do we also block scalarReq if bulkInflight is saturated?
 
   val reqArb = Module(new Arbiter(new GlobalMemReq, 2))
-  reqArb.io.in(0) <> bulkReq
-  reqArb.io.in(1) <> scalarReq
+  reqArb.io.in(0) <> scalarReq
+  reqArb.io.in(1) <> bulkReq
   mem.req <> reqArb.io.out
 
   // Response handling
@@ -361,7 +361,12 @@ class DRAMIf(
 
   // Bulk completion state machine
   // Each resp port has a decoupled state. The state machine steps if all resp port has accepted the current beat
-  val bulkRespValid = bulkAllocated && bulkCompleted(bulkPending.completedCnt)
+  // Need to check that complete counter did not outrun issue counter
+  val bulkRespValid = (
+    bulkAllocated
+    && bulkCompleted(bulkPending.completedCnt)
+    && bulkPending.completedCnt =/= bulkPending.issueCnt // TODO: we can use a shorter comparison
+  )
   val bulkStep = Wire(Bool())
   when(bulkStep) {
     val bulkCompletedCntNext = bulkPending.completedCnt + 1.U

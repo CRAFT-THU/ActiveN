@@ -513,6 +513,11 @@ int main(int argc, char **argv) {
     .default_value(false)
     .implicit_value(true);
 
+  program.add_argument("--trace-start")
+    .help("First cycle at which tracing is enabled (requires --trace)")
+    .default_value(uint64_t(0))
+    .scan<'u', uint64_t>();
+
   program.add_argument("--log")
     .help("Enable verbose logging")
     .default_value(false)
@@ -580,6 +585,13 @@ int main(int argc, char **argv) {
   System system(dramInitFiles, dram_cfg);
 
   bool enable_trace = program.get<bool>("--trace");
+  uint64_t trace_start = program.get<uint64_t>("--trace-start");
+
+  if (trace_start > 0 && !enable_trace) {
+    cerr << "Error: --trace-start requires --trace" << endl;
+    return 1;
+  }
+
   std::unique_ptr<VerilatedFstC> fst_tracer;
   if (enable_trace) {
     Verilated::traceEverOn(true);
@@ -589,6 +601,7 @@ int main(int argc, char **argv) {
   if (use_hard) {
     auto hard = make_unique<HardSystemBackend>();
     if (fst_tracer) hard->attachTrace(fst_tracer.get(), 99);
+    hard->setTraceStart(trace_start);
     system.addBackend(move(hard));
     cerr << "[Main] Hard backend enabled" << endl;
   }
@@ -596,13 +609,16 @@ int main(int argc, char **argv) {
   if (use_soft) {
     auto soft = make_unique<SoftSystemModel>(HARD_NUM_PU, HARD_NUM_MC);
     if (fst_tracer) soft->attachTrace(fst_tracer.get(), 99);
+    soft->setTraceStart(trace_start);
     system.addBackend(move(soft));
     cerr << "[Main] Soft backend enabled" << endl;
   }
 
   if (fst_tracer) {
     fst_tracer->open("trace.fst");
-    cerr << "[Main] FST tracing enabled → trace.fst" << endl;
+    cerr << "[Main] FST tracing enabled → trace.fst"
+         << (trace_start > 0 ? " (from cycle " + to_string(trace_start) + ")" : "")
+         << endl;
   }
 
   int rc = system.run(max_cycles);

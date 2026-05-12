@@ -64,7 +64,8 @@
 #define PRINT_PORT      0x4000000C
 
 #define MC_DST_BASE     0x8001
-#define SCATTER_TAG     0x010
+#define SCATTER_TAG     0x410  /* prio=1, scatter type=0x10 */
+#define SCATTER_RESP_TAG 0x401 /* prio=1, handler=1 (spike) */
 #define DRAIN_LIMIT     1000
 
   .macro SEND dst_reg, tag_reg
@@ -288,6 +289,15 @@ work_update:
 1:
   beq   a0, s1, work_update_done
 
+  # Debug: print a0 when at neuron 0 (start of each pass)
+  li    t0, SPM_BASE
+  bne   a0, t0, 2f
+  li    t0, PRINT_PORT
+  li    t1, 0xA0000000           # "work pass start" marker
+  or    t1, t1, s0               # | hartid
+  sw    t1, 0(t0)
+2:
+
   lw    t0, 0(a0)             # x5/f5 = state
   flt.s t1, f5, fs3           # t1 = (state < threshold)
   bnez  t1, work_not_fired
@@ -321,7 +331,7 @@ scatter_loop:
   mv    a2, a0
   mv    a0, t5                # a0 = csr_start
   slli  a1, t1, 16
-  ori   a1, a1, 1             # handler_tag = 1 (spike)
+  ori   a1, a1, SCATTER_RESP_TAG # prio=1, handler_tag=1 (spike)
 
   li    t1, SCATTER_TAG
   SEND  t4, t1
@@ -336,9 +346,8 @@ scatter_next:
 scatter_done:
   # Advance to next neuron (after firing)
   add   a0, a0, s2
-  mv    t0, s0
   li    t1, 3                 # tag = 3 (work_update)
-  YIELD t0, t1
+  YIELD zero, t1
   j     do_wfi
 
 work_not_fired:
@@ -348,12 +357,17 @@ work_not_fired:
 
   # Advance
   add   a0, a0, s2
-  mv    t0, s0
   li    t1, 3                 # tag = 3 (work_update)
-  YIELD t0, t1
+  YIELD zero, t1
   j     do_wfi
 
 work_update_done:
+  # Debug: report this PU finished the firing loop
+  li    t0, PRINT_PORT
+  li    t1, 0xF1000000           # "firing done" marker
+  or    t1, t1, s0               # | hartid
+  sw    t1, 0(t0)
+
   # Enter drain phase
   li    t0, SPM_DRAIN_CNT
   sw    zero, 0(t0)
@@ -376,9 +390,8 @@ work_drain_tick:
   bge   t2, t3, work_drain_done
 
   # Yield back to drain
-  mv    t0, s0
   li    t1, 2                 # tag = 2 (work_drain)
-  YIELD t0, t1
+  YIELD zero, t1
   j     do_wfi
 
 work_drain_done:
@@ -393,9 +406,15 @@ drain_sum_loop:
   j     drain_sum_loop
 
 drain_report:
+  # Debug: report this PU finished draining
+  li    t0, PRINT_PORT
+  li    t1, 0xD2000000           # "drain done" marker
+  or    t1, t1, s0               # | hartid
+  sw    t1, 0(t0)
+
   # Send done report to PU1 (tag=0)
   li    t0, 1
-  li    t1, 0                 # tag = 0 (done_report)
+  li    t1, 0x400             # tag = 0x400 (done_report, prio=1)
   YIELD t0, t1
   j     do_wfi
 

@@ -87,7 +87,8 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
     f.write("    uint64_t cycle_ = 0;\n")
     f.write(f"    HardMemPort mem_ports[{num_mc}];\n")
     f.write("    VerilatedFstC *tracer_ = nullptr;\n")
-    f.write("    bool tracing_ = false;\n\n")
+    f.write("    bool tracing_ = false;\n")
+    f.write("    uint64_t trace_start_ = 0;\n\n")
 
     # Constructor
     f.write("    HardSystemBackend() {\n")
@@ -113,6 +114,7 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
     f.write("        tracer_ = t;\n")
     f.write("        if (t) sys->trace(t, depth);\n")
     f.write("    }\n\n")
+    f.write("    void setTraceStart(uint64_t t) { trace_start_ = t; }\n\n")
 
     # config()
     f.write("    SystemConfig config() const override {\n")
@@ -138,11 +140,11 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
             sys->clock = true;
             Verilated::timeInc(1);
             sys->eval();
-            if (tracing_ && tracer_) tracer_->dump(cycle_ * 2);
+            if (tracing_ && tracer_ && cycle_ >= trace_start_) tracer_->dump(cycle_ * 2);
             sys->clock = false;
             Verilated::timeInc(1);
             sys->eval();
-            if (tracing_ && tracer_) tracer_->dump(cycle_ * 2 + 1);
+            if (tracing_ && tracer_ && cycle_ >= trace_start_) tracer_->dump(cycle_ * 2 + 1);
             return;
         }
 
@@ -150,11 +152,11 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
         sys->clock = true;
         Verilated::timeInc(1);
         sys->eval();
-        if (tracing_ && tracer_) tracer_->dump(cycle_ * 2);
+        if (tracing_ && tracer_ && cycle_ >= trace_start_) tracer_->dump(cycle_ * 2);
         sys->clock = false;
         Verilated::timeInc(1);
         sys->eval();
-        if (tracing_ && tracer_) tracer_->dump(cycle_ * 2 + 1);
+        if (tracing_ && tracer_ && cycle_ >= trace_start_) tracer_->dump(cycle_ * 2 + 1);
     }
 """)
 

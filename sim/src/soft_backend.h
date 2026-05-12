@@ -59,6 +59,7 @@ class SoftSystemModel : public SystemBackend {
   SoftSystemModel &operator=(const SoftSystemModel &) = delete;
 
   void attachTrace(VerilatedFstC *tracer, int depth);
+  void setTraceStart(uint64_t) {} // not yet supported; no-op
 
   // SystemBackend interface
   SystemConfig config() const override;

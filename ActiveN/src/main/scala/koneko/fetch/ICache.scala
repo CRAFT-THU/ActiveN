@@ -134,6 +134,7 @@ class ICache(implicit val params: CoreParameters) extends Module {
   val s1refilledCapture = Reg(UInt(32.W))
 
   // Refiller: sends multiple requests per cache line (one per memory bus beat)
+  // TODO: send out multiple beats together
   val wordsPerBeat = params.memBusWidth / 32
   val beatsPerLine = params.i$BlockSize / (params.memBusWidth / 8)
   val wordBits = log2Ceil(wordsPerBeat)

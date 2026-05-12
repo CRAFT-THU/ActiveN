@@ -46,10 +46,10 @@ class Core(implicit val params: CoreParameters) extends Module {
   exec.ext.working <> ext.working
 
   // Arbiter: Encoder out (memory requests) and BIU ext.out (AM messages)
-  // BIU gets priority (port 0) since AM messages are typically latency-sensitive
+  // encoder gets static priority because it only outputs prio = 0 messages
   val extArb = Module(new Arbiter(ext.out.bits.cloneType, 2))
-  extArb.io.in(0) <> exec.ext.out
-  extArb.io.in(1) <> encoder.out
+  extArb.io.in(0) <> encoder.out
+  extArb.io.in(1) <> exec.ext.out
   ext.out <> extArb.io.out
 
   // Crossbar: upstream(0) = ICache, upstream(1) = LSU global memory

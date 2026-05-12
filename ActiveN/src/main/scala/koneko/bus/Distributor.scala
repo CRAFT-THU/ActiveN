@@ -59,7 +59,7 @@ class Distributor(
   // Block if there is a PU that: is valid, do not accept, not accepted yet
   val bcstWait = (~(bcstAccepted | out.broadcast.readies) & bcstValids).orR
   bcstQueue.io.deq.ready := !bcstWait
-  out.broadcast.valids := Fill(16, bcstQueue.io.deq.valid) & bcstValids
+  out.broadcast.valids := Fill(16, bcstQueue.io.deq.valid) & bcstValids & ~bcstAccepted
   out.broadcast.resp := bcstQueue.io.deq.bits
   bcstAccepted := Mux(
     bcstQueue.io.deq.fire,
