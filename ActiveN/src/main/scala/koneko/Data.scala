@@ -47,7 +47,7 @@ class uOp(implicit val param: CoreParameters) extends Bundle {
   // Compressed IMM, either imm[20:0] or imm [31:12]
   val cimm = UInt(21.W)
 
-  // Actually embedded inside imm
+  // TODO: Actually embedded inside imm
   val funct7 = UInt(7.W)
   val funct3 = UInt(3.W)
 
@@ -57,4 +57,7 @@ class uOp(implicit val param: CoreParameters) extends Bundle {
 
   def immExt = VecInit(Seq.fill(11)(cimm(20))).asUInt ## cimm
   def immU = cimm(19, 0) ## 0.U(12.W)
+  def funct5 = funct7(6, 2)
+  def isLR = memIsAtomic && funct5 === "b00010".U(5.W)
+  def isSC = memIsAtomic && funct5 === "b00011".U(5.W)
 }

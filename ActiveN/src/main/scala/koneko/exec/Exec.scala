@@ -160,9 +160,11 @@ class Exec(implicit val param: CoreParameters) extends Module {
   lsu.req.bits.len.w := uop.funct3(1, 0) === 2.U
   lsu.req.bits.rsext := !uop.funct3(2)
   lsu.req.bits.wdata := rs2val
-  lsu.req.bits.write := uop.memIsWrite
-  lsu.req.bits.atomic := uop.memIsAtomic
-  lsu.req.bits.funct5 := uop.funct7(6, 2) // AMO funct5 is funct7[6:2]
+  lsu.req.bits.write := uop.memIsWrite || uop.isSC
+  lsu.req.bits.amo := uop.memIsAtomic && !uop.isLR && !uop.isSC
+  lsu.req.bits.funct5 := uop.funct5
+  lsu.req.bits.lrsc := uop.isLR || uop.isSC
+  lsu.req.bits.smsel := uop.smsel
   lsu.req.valid := valid && uop.isMem
 
   // BIU & related AM connections
@@ -341,7 +343,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
     uop.rdpclink -> pclink,
     uop.rdlui -> uop.immU,
     uop.rdauipc -> (uop.immU + uop.pc),
-    uop.isMem -> lsu.resp,
+    uop.isMem -> Mux(uop.isSC, lsu.scFail, lsu.resp),
     uop.isAM -> Mux(biuAccepted, 1.U, 0.U),
     uop.isSystem -> csrRdata, // Only CSR here
   )
