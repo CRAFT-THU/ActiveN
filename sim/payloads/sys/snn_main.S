@@ -269,9 +269,12 @@ spike:
   mul   a0, a0, s2            # sub_idx * stride
   li    t0, SPM_BASE
   add   a0, a0, t0            # neuron address
-  lw    t0, 4(a0)             # x5/f5 = input
-  fadd.s f5, f5, fa1          # input += weight (fa1 = a1 via shared regs)
-  sw    t0, 4(a0)             # store
+  addi  t2, a0, 4             # t2 = &neuron->input
+spike_lrsc:
+  lr.w  t0, (t2)              # t0/f5 = input (load reserved)
+  fadd.s f5, f5, fa1          # f5 += weight (fa1 = a1 via shared regs)
+  sc.w  t3, t0, (t2)          # try store; t3=0 on success
+  bnez  t3, spike_lrsc        # retry if reservation lost
 
   # Reset drain counter
   li    t0, SPM_DRAIN_CNT
