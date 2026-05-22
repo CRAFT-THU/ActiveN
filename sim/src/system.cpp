@@ -59,6 +59,7 @@
 #include "soft_backend.h"
 #include "hard_backend.h"
 #include "dramsim3/dramsim3.h"
+#include <verilated_fst_c.h>
 
 using namespace std;
 
@@ -168,6 +169,10 @@ struct System::Impl {
   bool use_dram = false;
   vector<DramMC> dram_mcs;
 
+  // FST tracer (single dump per cycle between stage and step).
+  VerilatedFstC *tracer = nullptr;
+  uint64_t trace_start = 0;
+
   // Image paths (one per MC)
   vector<string> image_paths;
 
@@ -276,79 +281,97 @@ struct System::Impl {
 
   // Per-backend bus_out arrays for cosim comparison
   vector<vector<MemBusOut>> per_backend_out;
+  vector<vector<MemBusOut *>> per_backend_out_ptrs;
 
-  // Run mem() on all backends with the same bus_in, verify requests match, serve once.
-  void memInteractAll(uint64_t cycle) {
+  // Phase A: peek all backends and verify cosim. Frontend does NOT consume responses
+  // here; it only reads each backend's presented req for this cycle.
+  void peekAndCompare(uint64_t cycle) {
     int num_ports = num_mc + 1;
     size_t n = backends.size();
 
-    // --- Build bus_in (shared across all backends) ---
-
-    // Peripheral (idx 0)
-    bus_in[0].reqAccepting = periph_resps.size() < RESP_QUEUE_DEPTH;
-    if (!periph_resps.empty()) {
-      bus_in[0].resp = periph_resps.front();
-    } else {
-      bus_in[0].resp = nullopt;
-    }
-
-    // MC ports (idx 1..numMC)
-    for (int mc = 0; mc < num_mc; ++mc) {
-      int idx = mc + 1;
-      auto &ms = mc_states[mc];
-      bus_in[idx].reqAccepting = ms.resp_queue.size() < RESP_QUEUE_DEPTH;
-      if (!ms.resp_queue.empty()) {
-        bus_in[idx].resp = ms.resp_queue.front();
-      } else {
-        bus_in[idx].resp = nullopt;
-      }
-    }
-
-    // --- Call each backend's mem() with the same bus_in ---
-    per_backend_out.resize(n);
+    per_backend_out.assign(n, vector<MemBusOut>(num_ports));
+    per_backend_out_ptrs.assign(n, vector<MemBusOut *>(num_ports));
     for (size_t bi = 0; bi < n; ++bi) {
-      per_backend_out[bi].resize(num_ports);
-      backends[bi]->mem(bus_in.data(), per_backend_out[bi].data());
+      for (int p = 0; p < num_ports; ++p) per_backend_out_ptrs[bi][p] = &per_backend_out[bi][p];
+      backends[bi]->peek(cycle, per_backend_out_ptrs[bi]);
     }
 
-    // --- Cosim: verify all backends agree on requests ---
+    static const bool COSIM_VERBOSE = true;
+    static const bool COSIM_KEEP_GOING = std::getenv("COSIM_KEEP_GOING") != nullptr;
     if (n > 1) {
       for (int p = 0; p < num_ports; ++p) {
         bool first_has = per_backend_out[0][p].req.has_value();
+        if (COSIM_VERBOSE && first_has) {
+          auto &a = *per_backend_out[0][p].req;
+          cerr << "[cosim] cycle=" << dec << cycle << " port=" << p
+               << " hard addr=0x" << hex << a.addr << " id=" << dec << a.id << endl;
+        }
         for (size_t bi = 1; bi < n; ++bi) {
           bool cur_has = per_backend_out[bi][p].req.has_value();
+          if (COSIM_VERBOSE && cur_has) {
+            auto &b = *per_backend_out[bi][p].req;
+            cerr << "[cosim] cycle=" << dec << cycle << " port=" << p
+                 << " soft addr=0x" << hex << b.addr << " id=" << dec << b.id << endl;
+          }
           if (first_has != cur_has) {
             cerr << "[System] COSIM MISMATCH @ cycle " << dec << cycle
                  << ": port " << p
                  << " backend 0 req=" << first_has
                  << " backend " << bi << " req=" << cur_has << endl;
-            exiting = true;
-            return;
+            if (!COSIM_KEEP_GOING) { exiting = true; return; }
+            continue;
           }
           if (first_has && cur_has) {
             auto &a = *per_backend_out[0][p].req;
             auto &b = *per_backend_out[bi][p].req;
-            if (a.addr != b.addr || a.write != b.write) {
+            if (a != b) {
               cerr << "[System] COSIM MISMATCH @ cycle " << dec << cycle
                    << ": port " << p
                    << " addr 0x" << hex << a.addr << " vs 0x" << b.addr
+                   << " id " << dec << (int)a.id << " vs " << (int)b.id
                    << " write " << a.write << " vs " << b.write
-                   << dec << endl;
-              exiting = true;
-              return;
+                   << " size " << (int)a.size << " vs " << (int)b.size
+                   << " wbe 0x" << hex << a.wbe << " vs 0x" << b.wbe;
+              if (a.write) {
+                cerr << " wdata0 0x";
+                for (int i = 7; i >= 0; --i) cerr << hex << (int)a.wdata[i];
+                cerr << " vs 0x";
+                for (int i = 7; i >= 0; --i) cerr << hex << (int)b.wdata[i];
+              }
+              cerr << dec << endl;
+              if (!COSIM_KEEP_GOING) { exiting = true; return; }
+              continue;
             }
           }
         }
       }
     }
+  }
 
-    // --- Pop consumed responses (once, not per-backend) ---
+  // Phase B: build bus_in from current resp queues + serve presented requests.
+  // Pops consumed responses, dispatches new requests to memory. Then returns the
+  // bus_in vector for stage().
+  void buildBusInAndServe(uint64_t cycle) {
+    // Build bus_in
+    bus_in[0].reqAccepting = periph_resps.size() < RESP_QUEUE_DEPTH;
+    if (!periph_resps.empty()) bus_in[0].resp = periph_resps.front();
+    else bus_in[0].resp = nullopt;
+
+    for (int mc = 0; mc < num_mc; ++mc) {
+      int idx = mc + 1;
+      auto &ms = mc_states[mc];
+      bus_in[idx].reqAccepting = ms.resp_queue.size() < RESP_QUEUE_DEPTH;
+      if (!ms.resp_queue.empty()) bus_in[idx].resp = ms.resp_queue.front();
+      else bus_in[idx].resp = nullopt;
+    }
+
+    // Pop consumed responses (responses are unconditionally accepted by backend)
     if (bus_in[0].resp) periph_resps.pop_front();
     for (int mc = 0; mc < num_mc; ++mc) {
       if (bus_in[mc + 1].resp) mc_states[mc].resp_queue.pop_front();
     }
 
-    // --- Serve requests (once, using backend 0's output) ---
+    // Serve requests (use backend 0's output as ground truth; cosim already verified equality).
     auto &out = per_backend_out[0];
     if (out[0].req && bus_in[0].reqAccepting) {
       servePeriphReq(*out[0].req);
@@ -383,6 +406,11 @@ void System::addBackend(unique_ptr<SystemBackend> backend) {
   impl_->backends.push_back(move(backend));
 }
 
+void System::setTracer(VerilatedFstC *tracer, uint64_t trace_start) {
+  impl_->tracer = tracer;
+  impl_->trace_start = trace_start;
+}
+
 bool System::run(uint64_t maxCycles) {
   if (impl_->backends.empty()) {
     cerr << "[System] Error: no backends added" << endl;
@@ -392,6 +420,10 @@ bool System::run(uint64_t maxCycles) {
   // Initialize MC bases from first backend's config
   auto cfg = impl_->backends[0]->config();
   impl_->initMcBases(cfg);
+
+  // Initialize config ROM in peripheral device
+  uint64_t mc0_size = cfg.core.mcSizes.empty() ? 0 : cfg.core.mcSizes[0];
+  impl_->periph.setConfig(cfg.numPU, cfg.numMC, mc0_size);
 
   cerr << "[System] PUs=" << cfg.numPU << " MCs=" << cfg.numMC << endl;
 
@@ -421,14 +453,24 @@ bool System::run(uint64_t maxCycles) {
   while (!impl_->periph.result && cycle < maxCycles && !exiting) {
     ++cycle;
 
-    // Step all backends
-    for (auto &b : impl_->backends) b->step(cycle);
+    // Phase 1: peek all backends + cosim verify.
+    impl_->peekAndCompare(cycle);
+    if (exiting) break;
 
-    // Tick frontend memory
+    // Phase 2: tick frontend memory + build bus_in + serve presented requests.
     impl_->tickMemory();
+    impl_->buildBusInAndServe(cycle);
 
-    // Call all backends' mem() with the same bus_in, verify requests match, serve once
-    impl_->memInteractAll(cycle);
+    // Phase 3: stage all backends with the bus_in we just built.
+    for (auto &b : impl_->backends) b->stage(cycle, impl_->bus_in);
+
+    // Phase 4: dump trace ONCE between stage and step.
+    if (impl_->tracer && cycle >= impl_->trace_start) {
+      impl_->tracer->dump(cycle);
+    }
+
+    // Phase 5: step all backends (commit posedge).
+    for (auto &b : impl_->backends) b->step(cycle);
 
     // Count requests for heartbeat
     auto &out = impl_->per_backend_out[0];
@@ -598,20 +640,38 @@ int main(int argc, char **argv) {
     fst_tracer = std::make_unique<VerilatedFstC>();
   }
 
+  // Construct backends WITHOUT attaching the trace yet. soft_rtl's
+  // constructor registers per-model trace callbacks on the shared Verilated
+  // context; if any model is constructed AFTER trace finalisation, its
+  // signals are silently dropped. So defer attachTrace until all models
+  // exist.
+  HardSystemBackend *hard_raw = nullptr;
+  SoftSystemModel *soft_raw = nullptr;
   if (use_hard) {
     auto hard = make_unique<HardSystemBackend>();
-    if (fst_tracer) hard->attachTrace(fst_tracer.get(), 99);
     hard->setTraceStart(trace_start);
+    hard_raw = hard.get();
     system.addBackend(move(hard));
     cerr << "[Main] Hard backend enabled" << endl;
   }
 
   if (use_soft) {
     auto soft = make_unique<SoftSystemModel>(HARD_NUM_PU, HARD_NUM_MC);
-    if (fst_tracer) soft->attachTrace(fst_tracer.get(), 99);
     soft->setTraceStart(trace_start);
+    soft_raw = soft.get();
     system.addBackend(move(soft));
     cerr << "[Main] Soft backend enabled" << endl;
+  }
+
+  if (fst_tracer) {
+    if (hard_raw) hard_raw->attachTrace(fst_tracer.get(), 99);
+    if (soft_raw) soft_raw->attachTrace(fst_tracer.get(), 99);
+    // Register the shared VerilatedContext with the tracer EXACTLY ONCE.
+    // soft_rtl/sys_rtl share the default thread context; per-model trace()
+    // calls would re-register every model, silently breaking FST dumping
+    // (clock signals stop toggling in the trace).
+    Verilated::threadContextp()->trace(fst_tracer.get(), 99);
+    system.setTracer(fst_tracer.get(), trace_start);
   }
 
   if (fst_tracer) {

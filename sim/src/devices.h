@@ -14,6 +14,12 @@
 //   0x8: Write → ASCII output
 //   0xC: Write -> arbitrary 32-bit output, e.g. additional info / failure output
 //   0x10: Read → next 32-bit RNG value, Write → reseed RNG
+// Config ROM (relative to 0x40000000):
+//   0x28000000: numPU    (word 0 of beat 0)
+//   0x28000008: numMC    (word 2 of beat 0)
+//   0x28000010: pusPerMC (word 4 of beat 0)
+//   0x28000020: mcSize low 32 bits  (word 0 of beat 1)
+//   0x28000024: mcSize high 32 bits (word 1 of beat 1)
 struct PeripheralDevice {
   static constexpr uint32_t kDefaultSeed = 0x19260817u;
 
@@ -25,11 +31,24 @@ struct PeripheralDevice {
   uint32_t rng_seed = kDefaultSeed;
   std::mt19937 rng;
 
+  // Config ROM values (set by setConfig before simulation starts)
+  uint32_t num_pu = 0;
+  uint32_t num_mc = 0;
+  uint32_t pus_per_mc = 0;
+  uint64_t mc_size = 0;
+
   // Global override for RNG seed (set by main before any PeripheralDevice is used).
   static inline std::optional<uint32_t> global_seed_override;
 
   PeripheralDevice() : rng(effectiveSeed()) {
     rng_seed = effectiveSeed();
+  }
+
+  void setConfig(uint32_t npu, uint32_t nmc, uint64_t mcsz) {
+    num_pu    = npu;
+    num_mc    = nmc;
+    pus_per_mc = npu / (nmc ? nmc : 1);
+    mc_size   = mcsz;
   }
 
   static uint32_t effectiveSeed() {
@@ -66,6 +85,16 @@ struct PeripheralDevice {
   // Handle a load from a peripheral address (addr relative to 0x40000000).
   uint32_t read(uint32_t addr) {
     if (addr == 0x10) return rng();
+    // Config ROM at 0x28000000-0x28001000
+    if (addr >= 0x28000000u && addr < 0x28001000u) {
+      uint32_t off = addr - 0x28000000u;
+      if (off == 0x00) return num_pu;
+      if (off == 0x08) return num_mc;
+      if (off == 0x10) return pus_per_mc;
+      if (off == 0x20) return static_cast<uint32_t>(mc_size & 0xFFFFFFFFu);
+      if (off == 0x24) return static_cast<uint32_t>(mc_size >> 32);
+      return 0;
+    }
     return 0;
   }
 };

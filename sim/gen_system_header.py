@@ -52,7 +52,9 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
     f.write('#include "sys_verilated/sys_rtl.h"\n')
     f.write('#include <memory>\n')
     f.write('#include <cstring>\n')
+    f.write('#include <cstdlib>\n')
     f.write('#include <iostream>\n')
+    f.write('#include <vector>\n')
     f.write('#include <verilated.h>\n')
     f.write('#include <verilated_fst_c.h>\n')
     f.write('\n')
@@ -112,7 +114,8 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
     f.write("    void attachTrace(VerilatedFstC *t, int depth) {\n")
     f.write("        tracing_ = t != nullptr;\n")
     f.write("        tracer_ = t;\n")
-    f.write("        if (t) sys->trace(t, depth);\n")
+    f.write("        // Trace registration is done once at top-level via the\n")
+    f.write("        // shared VerilatedContext, so we don't call sys->trace() here.\n")
     f.write("    }\n\n")
     f.write("    void setTraceStart(uint64_t t) { trace_start_ = t; }\n\n")
 
@@ -126,77 +129,24 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
     f.write("        return cfg;\n")
     f.write("    }\n\n")
 
-    # step(): just tick the clock
-    f.write("""    void step(uint64_t cycle) override {
+    # peek(): post-(K-1)-posedge, pre-K-negedge logic; emit current request.
+    f.write("""    void peek(uint64_t cycle, std::vector<MemBusOut *> out) override {
         cycle_ = cycle;
-        if (cycle_ <= HARD_RESET_LENGTH) {
-            sys->reset = true;
-""")
-    for i in range(num_mc):
-        f.write(f"            *mem_ports[{i}].req_ready = 0;\n")
-        f.write(f"            *mem_ports[{i}].resp_valid = 0;\n")
-    f.write("""            sys->io_periph_req_ready = 0;
-            sys->io_periph_resp_valid = 0;
-            sys->clock = true;
-            Verilated::timeInc(1);
-            sys->eval();
-            if (tracing_ && tracer_ && cycle_ >= trace_start_) tracer_->dump(cycle_ * 2);
-            sys->clock = false;
-            Verilated::timeInc(1);
-            sys->eval();
-            if (tracing_ && tracer_ && cycle_ >= trace_start_) tracer_->dump(cycle_ * 2 + 1);
-            return;
-        }
-
-        sys->reset = false;
-        sys->clock = true;
-        Verilated::timeInc(1);
-        sys->eval();
-        if (tracing_ && tracer_ && cycle_ >= trace_start_) tracer_->dump(cycle_ * 2);
-        sys->clock = false;
-        Verilated::timeInc(1);
-        sys->eval();
-        if (tracing_ && tracer_ && cycle_ >= trace_start_) tracer_->dump(cycle_ * 2 + 1);
-    }
-""")
-
-    # mem(): drive responses, eval, capture requests
-    f.write("""
-    void mem(const MemBusIn *bus_in, MemBusOut *bus_out) override {
         static constexpr int MEM_BUS_WORDS = MEM_BUS_WIDTH / 32;
-
-        // Drive MC response signals
-        for (int mc = 0; mc < HARD_NUM_MC; ++mc) {
-            auto &p = mem_ports[mc];
-            if (bus_in[mc + 1].resp) {
-                auto &r = *bus_in[mc + 1].resp;
-                *p.resp_valid = 1;
-                *p.resp_id = r.id;
-                std::memcpy(p.resp_rdata, r.data.data(), MEM_BUS_WORDS * 4);
-            } else {
-                *p.resp_valid = 0;
-            }
-            *p.req_ready = bus_in[mc + 1].reqAccepting ? 1 : 0;
+        if ((int)out.size() != HARD_NUM_MC + 1) {
+            std::cerr << "[Hard] peek: out vector size mismatch" << std::endl;
+            std::abort();
         }
-
-        // Drive peripheral response signals
-        if (bus_in[0].resp) {
-            auto &r = *bus_in[0].resp;
-            sys->io_periph_resp_valid = 1;
-            sys->io_periph_resp_bits_id = r.id;
-            std::memcpy(sys->io_periph_resp_bits_rdata, r.data.data(), MEM_BUS_WORDS * 4);
-        } else {
-            sys->io_periph_resp_valid = 0;
-        }
-        sys->io_periph_req_ready = bus_in[0].reqAccepting ? 1 : 0;
-
-        // Eval so RTL sees the new response/ready signals
+        // Reset deassertion is synchronous: at the start of cycle K (just after
+        // posedge K-1), we set sys->reset to its value for cycle K.
+        sys->reset = (cycle_ <= HARD_RESET_LENGTH);
+        // Eval to propagate reset value into combinational outputs (req signals).
         sys->eval();
 
-        // Capture MC requests
+        // Capture MC requests presented on the bus at cycle K.
         for (int mc = 0; mc < HARD_NUM_MC; ++mc) {
             auto &p = mem_ports[mc];
-            if (*p.req_valid && *p.req_ready) {
+            if (*p.req_valid) {
                 GlobalMemReq req{};
                 req.id = *p.req_id;
                 req.addr = *p.req_addr;
@@ -204,14 +154,12 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
                 req.size = *p.req_size;
                 req.wbe = *p.req_wbe;
                 std::memcpy(req.wdata.data(), p.req_wdata, MEM_BUS_WORDS * 4);
-                bus_out[mc + 1].req = req;
+                out[mc + 1]->req = req;
             } else {
-                bus_out[mc + 1].req = std::nullopt;
+                out[mc + 1]->req = std::nullopt;
             }
         }
-
-        // Capture peripheral request
-        if (sys->io_periph_req_valid && sys->io_periph_req_ready) {
+        if (sys->io_periph_req_valid) {
             GlobalMemReq req{};
             req.id = sys->io_periph_req_bits_id;
             req.addr = sys->io_periph_req_bits_addr;
@@ -219,10 +167,54 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
             req.size = sys->io_periph_req_bits_size;
             req.wbe = sys->io_periph_req_bits_wbe;
             std::memcpy(req.wdata.data(), sys->io_periph_req_bits_wdata, MEM_BUS_WORDS * 4);
-            bus_out[0].req = req;
+            out[0]->req = req;
         } else {
-            bus_out[0].req = std::nullopt;
+            out[0]->req = std::nullopt;
         }
+    }
+
+    void stage(uint64_t cycle, const std::vector<MemBusIn> &in) override {
+        static constexpr int MEM_BUS_WORDS = MEM_BUS_WIDTH / 32;
+        if ((int)in.size() != HARD_NUM_MC + 1) {
+            std::cerr << "[Hard] stage: in vector size mismatch" << std::endl;
+            std::abort();
+        }
+
+        // Drive MC response signals
+        for (int mc = 0; mc < HARD_NUM_MC; ++mc) {
+            auto &p = mem_ports[mc];
+            if (in[mc + 1].resp) {
+                auto &r = *in[mc + 1].resp;
+                *p.resp_valid = 1;
+                *p.resp_id = r.id;
+                std::memcpy(p.resp_rdata, r.data.data(), MEM_BUS_WORDS * 4);
+            } else {
+                *p.resp_valid = 0;
+            }
+            *p.req_ready = in[mc + 1].reqAccepting ? 1 : 0;
+        }
+        // Drive peripheral response signals
+        if (in[0].resp) {
+            auto &r = *in[0].resp;
+            sys->io_periph_resp_valid = 1;
+            sys->io_periph_resp_bits_id = r.id;
+            std::memcpy(sys->io_periph_resp_bits_rdata, r.data.data(), MEM_BUS_WORDS * 4);
+        } else {
+            sys->io_periph_resp_valid = 0;
+        }
+        sys->io_periph_req_ready = in[0].reqAccepting ? 1 : 0;
+
+        // Negedge + eval so RTL settles with new resp / ready inputs.
+        sys->clock = false;
+        Verilated::timeInc(1);
+        sys->eval();
+    }
+
+    void step(uint64_t cycle) override {
+        // Posedge — commit Reg state.
+        sys->clock = true;
+        Verilated::timeInc(1);
+        sys->eval();
     }
 """)
 
