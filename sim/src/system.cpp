@@ -71,7 +71,7 @@ static void sighandler(int) { exiting = true; }
 
 // ---- Per-MC memory images (owned by the frontend) ----
 struct McImage {
-  std::unordered_map<uint32_t, mem_line_t> data;
+  std::unordered_map<uint32_t, MemLine> data;
   std::size_t size; // This is the total size, according to hardware config, not the image size
 
   GlobalMemResp handle(const GlobalMemReq &req) {
@@ -91,7 +91,7 @@ struct McImage {
     GlobalMemResp resp;
     // Readout
     resp.id = req.id;
-    mem_line_t readout = data.contains(aligned_addr) ? data.at(aligned_addr) : mem_line_t {};
+    MemLine readout = data.contains(aligned_addr) ? data.at(aligned_addr) : MemLine {};
     resp.data = readout;
 
     if (req.write) {
@@ -126,7 +126,7 @@ static void loadImages(const vector<string> &paths, const vector<uint64_t> &mc_s
 
     // Read file in 32-byte chunks into the unordered_map
     constexpr size_t LINE_BYTES = MEM_BUS_WIDTH / 8;
-    mem_line_t line{};
+    MemLine line{};
     for (size_t offset = 0; offset < fsize; offset += LINE_BYTES) {
       size_t to_read = min(LINE_BYTES, fsize - offset);
       line = {};

@@ -11,7 +11,7 @@
 // System-level simulators
 
 const size_t MEM_BUS_WIDTH = 256;
-typedef std::array<uint8_t, MEM_BUS_WIDTH / 8> mem_line_t;
+typedef std::array<uint8_t, MEM_BUS_WIDTH / 8> MemLine;
 typedef uint32_t mem_mask_t;
 
 struct GlobalMemReq {
@@ -25,7 +25,7 @@ struct GlobalMemReq {
   // Small endian, lane-aligned (NOT ADDRESS-ALIGNED) data,
   // so wdata[0] always corresponds to the byte 0 at the 32-byte chunk
   // being written
-  mem_line_t wdata;
+  MemLine wdata;
 
   // Write byte enable, also lane-aligned
   mem_mask_t wbe;
@@ -46,7 +46,7 @@ struct GlobalMemReq {
 struct GlobalMemResp {
   uint8_t id;
   // Small endian, lane-aligned response data
-  mem_line_t data;
+  MemLine data;
 };
 
 struct MemBusIn {

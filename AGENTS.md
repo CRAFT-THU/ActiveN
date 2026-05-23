@@ -6,7 +6,7 @@ Your task involves reviewing changes to the RTL, implementing the simulator fron
 
 The project can be roughly divided into two levels: the implementation of individual cores, and the implementation of the system-level interconnect.
 
-Correspondingly, there are two types of simulators: a core-level simulator and a system-level simulator. A core-level simulator simulates a single core, while a system-level simulator simulates the entire system. There are two backends for the system-level simulator: a hardware NoC backend that's fully elaborated from the system-level RTL, and a software NoC backend that uses RTL for simulating individual cores, but uses a software NoC implementation for inter-core communication. Right now, the software mode is unaligned and contains bug.
+Correspondingly, there are two types of simulators: a core-level simulator and a system-level simulator. A core-level simulator simulates a single core, while a system-level simulator simulates the entire system. There are two backends for the system-level simulator: a hardware NoC backend that's fully elaborated from the system-level RTL, and a software NoC backend that uses RTL for simulating individual cores, but uses a software NoC implementation for inter-core communication. The two backends are currently cycle-accurately aligned — any change to uncore RTL may break alignment and require re-aligning the soft NoC model.
 
 There are also two types of test cases: single-core tests, which focus on verifying computation and memory access capabilities of individual cores, and system-level tests, which verifys the inter-core communication and parallel execution scheduling. You can find the tests inside the `tests/` directory. Some of the system-level tests requires running the data generator located in `datagen/`, which generates the DRAM image for SNN-like applications.
 
@@ -102,7 +102,7 @@ Pass (`[Single] Result: 0 (0x0)`) or prints the result value. `pingpong_test` in
 
 ### System-Level Tests
 
-**Always use `--hard` mode.** The `--soft` NoC backend is unaligned with current RTL and produces incorrect results.
+System tests can be run with either `--hard` (HARD RTL NoC), `--soft` (software-modelled NoC + per-PU core RTL), or both flags simultaneously to enable **cosim mode** (lockstep execution with per-port memory-request comparison). The soft NoC model is cycle-accurately aligned with the HARD RTL — both backends produce identical cycle counts on all known tests.
 
 All system tests require **exactly 2 MC images** as positional arguments. Most tests use the same binary for both MCs:
 
@@ -135,88 +135,136 @@ FST traces can be read with tools in `copilot/tmp/` (`read_fst`, `trace_vals`). 
 
 ---
 
-## Expected Results (64 PU, 2 MC, hard NoC)
+## Expected Results (64 PU, 2 MC)
 
-Baseline from May 2026 (post isLR/isSC fix, LR/SC on SPM, shuffled SNN):
+| Test | Result | HARD cycles | Cosim aligned |
+|------|--------|-------------|----------------|
+| barrier_test | 0x0 (PASS) | ~1,158 | yes |
+| local_send_test | 0x0 (PASS) | ~178 | yes |
+| csr_scatter_test | 0x0 (PASS) | ~1,760 | yes |
+| pingpong_test | 0x0 (PASS) | ~86,445 | yes |
+| random_noc_test | 0x0 (PASS) | ~50,816 | yes |
+| sha256_concurrent | 0x68ab49ea (PASS) | ~48,275 | yes |
+| spm_init | 0x0 (PASS) | ~371,276 | yes |
+| SNN | 0x0 (PASS) | ~3,810,711 | yes |
 
-| Test | Result | Cycles |
-|------|--------|--------|
-| barrier_test | 0x0 (PASS) | ~1,157 |
-| local_send_test | 0x0 (PASS) | ~177 |
-| csr_scatter_test | 0x0 (PASS) | ~1,759 |
-| pingpong_test | 0x0 (PASS) | ~86,444 |
-| random_noc_test | 0x0 (PASS) | ~50,815 |
-| sha256_concurrent | 0x68ab49ea (PASS) | ~48,274 |
-| spm_init | 0x0 (PASS) | ~371,275 |
-| SNN | 0x0 (PASS) | ~10,477,824 |
+All system tests are aligned in cosim mode (`--soft --hard`) with identical cycle counts on both backends.
 
 ---
 
 ## Common Pitfalls
 
 - **Simulator not rebuilt after RTL change**: After editing Scala RTL, regenerate SV with `mill`, then rebuild with `ninja`. The simulator binary timestamp must be newer than the generated SV files. Mill may use cached Chisel output; if cycle counts look wrong, verify the SV was actually updated.
-- **Using `--soft` mode**: The soft NoC backend is unaligned with current RTL (missing priority arbitration, flit-level details). Always use `--hard` for system tests.
+- **Uncore RTL changes may break SOFT alignment**: If you change anything in the uncore (NoC, routers, memif, distributor, ring), the SOFT NoC model very likely needs to be re-aligned. Run a cosim (`--soft --hard`) on `csr_scatter_test` after any such change to verify; see the "Soft NoC Alignment" section below.
 - **Wrong number of MC images**: `sim_system` requires exactly `numMC` (currently 2) positional image arguments. Passing the program binary as a third or fourth argument will error.
 - **csr_scatter_test uses different MC images**: MC0 = `csr_scatter_test.bin`, MC1 = `csr_scatter_dram1.bin`. Using the same binary for both will hang.
 - **spm_init and SNN load from DRAM**: These tests must be run with datagen-generated DRAM images, not the raw `.bin` file. The DRAM images embed the program binary followed by network/init data.
 
 ---
 
-# Soft NoC Realignment
+# Soft NoC Alignment
 
-The system-level simulator has two modes: a hard NoC mode, which uses the whole system RTL in a simulation, and a soft NoC mode, which uses a software-implemented NoC + memory controller, plus core RTL, to simulate the system. The intention is for the software NoC model to match the RTL implement **cycle-to-cycle**. Every time we make changes to the uncore RTL, we need to update the soft NoC model to match.
+The system-level simulator has two backends: a hard NoC mode using the whole system RTL, and a soft NoC mode using a software model of the uncore (NoC, memif, distributor) plus core RTL. The soft model is intended to match the RTL **cycle-to-cycle**. Currently the two backends are aligned: all system tests pass in cosim mode (`--soft --hard`) with identical cycle counts.
 
-The agent should not spontaneously perform alignment tasks. We will make bulk changes to the RTL, and then update the soft NoC model in one go.
-
-Currently the software NoC is _unaligned_.
-
-During the alignment task, you can record important information in `copilot/alignment.md`, so that later realignment can reuse them. Please consule that file, and also keep that file up-to-date.
+The agent should not spontaneously perform alignment tasks. Bulk RTL changes will be made first, then alignment work happens in a single dedicated session.
 
 ## Methodology
 
-There are some infrastructures in place to help with alignment tasks.
+There are some infrastructures in place to help with alignment.
 
-There is a "cosim" mode in the system-level simulation driver, which enables both the hard NoC and soft NoC models, and compare the memory requests cycle-to-cycle. Because most unalignment will eventually propagate to externally observable behavior (i.e. memory accesses), you can use this mode to verify that the alignment is working.
+There is a **cosim mode** in the system-level simulation driver (`--soft --hard`), which enables both backends and compares the memory requests cycle-to-cycle per MC/peripheral port. Because most unalignment will eventually propagate to externally observable behavior (i.e. memory accesses), this mode is the primary verification tool.
 
-The system-level simulator also has tracing capability, which will generate a waveform trace of simulated RTL.
+Cosim comparison checks **addr + write flag** only (NOT id, since HARD uses bulkId format natively). Only HARD's requests are actually served. SOFT receives the same responses via shared `bus_in`. A mismatch triggers a `[MISMATCH]` error with cycle, port, and divergent addresses. Set `COSIM_KEEP_GOING=1` to continue past the first mismatch.
 
-Thus, we recommend the following workflow for the aligning process:
+The system-level simulator also has tracing capability, which generates a waveform trace of the simulated RTL.
 
-1. Perform a hard-only test with tracing on. Use the csr_scatter_test workload, as it utilizes most uncore features. Remember to verify that the workload and the simulator binaries are up-to-date. You can use 10k cycle limit for this preliminary run.
-2. Analyze the waveform, log the transaction between ready-valid interfaces in the hardware components, and the cycle they occured on. These data will be used to help implementing the soft uncore components. You may not need to actually produce a separate text log. You just need to remember that you're able to consult the waveform to see the behavior of the RTL, and that's the easiest way to know the RTL behavior. Waveform's cycle count may not strictly equal the core cycle count, because we dump twice per cycle, and you may need to convert between the two.
-3. With the waveform data and transaction logs, go through the soft NoC source code, compare it against the RTL, see if there is any obvious difference.
-4. Run the simulator in cosim mode. If the models are unaligned, eventually an mismatch error will be thrown. You can compare the software model with the waveform trace to find the source of the mismatch. You may add additional logs to the software model to help debugging.
-5. Repeat 4 until the models are aligned, and the whole test completes in cosim mode.
+Recommended workflow for aligning:
 
-You should only modify the soft NoC model source files (sim/src/soft_**.c/.h). Especially, you should **NEVER** modify the RTL during the alignment. Treat them as the ground-truth. If you think RTL is buggy, ask the user.
+1. Perform a hard-only test with tracing on. Use `csr_scatter_test` as the canonical workload — it exercises most uncore features. Verify the workload and simulator binaries are up-to-date. Use 10k cycle limit for preliminary runs.
+2. Analyze the waveform to understand the cycle-by-cycle transactions on the relevant ready-valid interfaces. The waveform is the ground truth for hardware behavior.
+3. Compare with the soft NoC source code; look for obvious differences.
+4. Run cosim. If unaligned, an mismatch error will fire. Compare against the waveform; add `fprintf(stderr, ...)` debug prints in the soft model as needed.
+5. Repeat until the whole test passes in cosim mode.
 
-## Code structure
+You should only modify the soft NoC model source files (`sim/src/soft_*.{cpp,h}`). **NEVER** modify the RTL during alignment — treat it as ground truth. If you believe the RTL is buggy, ask the user.
 
-Like the RTL, the soft NoC model is composed of multiple modules, connected with ready-valid interfaces.
+## Trace dump convention (important)
 
-Ready-valid interfaces in soft NoC model should contain two methods: one for peeking certain operations' feasibility, and one for actually peforming the operation. For example:
-- The presenting side of the ready-valid interface should contain two methods:
-  - `peek`: Read out the data (or relevant state) presenting at this beat.
-  - `step`: Actually perform the operation, transfering the data out of the interface.
-- The accepting side of the ready-valid interface should contain two methods:
-  - `can_enq`: Check if a certain data can be pushed into the interface.
-  - `step`: Actually push the data into the interface.
-Because `step` should be atomic, for components with both accepting and presenting interfaces, or multiple interfaces, the `step` function may take multiple operations as input.
+The FST tracer is registered exactly **once** at the top level (in `system.cpp` `main()`). Each simulated cycle calls `dump(K)` exactly once between `stage(K)` and `step(K)`. Waveform time `t = K` corresponds to cycle K — no half-cycle offset, no double-dump. (A prior trace double-registration bug previously masked alignment problems by making both backends' signals appear shifted; that bug has been fixed and must not be re-introduced.)
 
-Ready signal may combinatorially depend on the data and the valid signal, but never the other way around. We need to be careful about this, and this invariant is kept in the following procedure:
+## Backend interface contract
 
-Each simulated cycle should be separated into two logical parts: one negedge and one posedge.
-- During the negedge, all the compoments (and the RTL model)'s presenting interfaces should be queried, and those data should be buffered. Also, these data should be used to ask the corresponding accepting interface if they can accept the data.
-  With the RTL model, the querying should be simply reading the data and valid signal _before the negedge_(i.e. after the last posedge). The (pseudo-)presenting should be setting the data _before the negedge_, flipping the clock signal, `eval()`, and reading the ready signal.
-- During the posedge, we execute all the pending transactions.
-  With the RTL model, the accepting of a presented data should be done by setting the ready signal _before the posedge_, flipping the clock signal, `eval()`. We should never need to change the presented data, because they should not combinatorially depend on the readiness of the accepting side in the RTL.
+`SystemBackend` exposes three per-cycle methods. The data-flow polarity is carefully constrained to keep peek/stage/step a clean register-transfer model:
 
-Soft NoC model should contain classes that corresponding relatively one-to-one with the RTL model. For example, currently, we have flit_queue, flit_arb and router. During alignment, if you see a RTL module that does not have a corresponding soft NoC model class, you should create one, and extract the relevant logic into it.
+- `peek(cycle, std::vector<MemBusOut*> out)` — produce the memory request presented by the backend at cycle K. Reads only Reg.Q from after the prior posedge (K-1); does not consume any bus input. In HARD: deassert reset (synchronous), `eval()`, snapshot req signals. In SOFT: deassert reset+eval, snapshot ring_outs, run `routeRouters`, output dram/periph `mem_req` from peek.
+- `stage(cycle, const std::vector<MemBusIn>& in)` — consume frontend resp / reqAccepting, drive PU inputs (`mem_unicast`/`mem_broadcast`, `ext_in`, `ext_out_ready`), `eval()`, then settle on the negedge. Does **not** advance any Reg state.
+- `step(cycle)` — commit the posedge for cycle K.
 
-### Debugging Tips
+`MemBusIn` / `MemBusOut` are scalar. `SystemBackend` is non-templated. The system has `numMC + 1` ports — index 0 is the peripheral, indices 1..numMC are MCs.
 
-- Use `--trace --trace-start <cycle>` for HARD-only traces. FST can be read with `copilot/tmp/trace_vals`.
-- Add `fprintf(stderr, ...)` debug prints to soft_backend.cpp for SOFT-side visibility.
-- The `strings` filter is needed when piping simulator output because Verilator binary output may contain non-printable characters.
+The main loop (`system.cpp`):
+```
+++cycle;
+peekAndCompare(cycle);     // both backends peek; cosim verifies
+tickMemory();              // frontend updates resp queues
+buildBusInAndServe(cycle); // build bus_in + dispatch new reqs
+for (b : backends) b->stage(cycle, bus_in);
+if (tracer && cycle >= trace_start) tracer->dump(cycle);  // ONCE
+for (b : backends) b->step(cycle);
+```
+
+## Ready-valid invariants (soft side)
+
+Like the RTL, the soft NoC model is composed of modules connected with ready-valid interfaces. Each module exposes a `peek`/`canEnq`/`step` API:
+
+- The presenting side:
+  - `peek`: read out the data (and validity) presented this beat.
+  - `step`: actually perform the operation, transferring data out.
+- The accepting side:
+  - `canEnq`: check if particular data can be pushed in.
+  - `step`: actually push the data in.
+
+`step` is atomic. For components with multiple interfaces, the single `step` takes all resolved fires together.
+
+`ready` may combinationally depend on the presented data and valid, but **never the other way around**. Each cycle is logically split into negedge + posedge:
+
+- **Negedge**: query all components' presenting interfaces and buffer the data. Ask each accepting side (with the buffered data) whether it can accept.
+- **Posedge**: execute all pending transactions. For RTL components, set the resolved `ready` signal, flip clk, `eval()`. Never modify the presented data here.
+
+In SOFT's `step(K)`, the **critical invariant** is that all `pending_injected` flits are collected from PU `currentOut()` **BEFORE** `cores->posedge()`. The router queue Reg latches the PU's post-(K-1) state at posedge K; reading PU outputs after the posedge would advance the flit pipeline by one cycle and silently break alignment.
+
+## Soft NoC code structure
+
+Soft components live in `sim/src/soft_components.h` and the driver in `sim/src/soft_backend.cpp`. Classes mirror the RTL one-to-one. Current classes include `Flit`, `FlitArb`, `FlitQueue`, `Router`, `Queue`, `RrArbiter`, `PriorityArbiter`, `MemIfBase`, `DramIf`, `MmioIf`, `Distributor`. If you encounter an RTL module without a soft counterpart, create one and extract the relevant logic.
+
+Naming convention: types are `PascalCase`, member functions are `camelCase`, member variables typically end with a trailing underscore (`mc_idx_`, `count_`).
+
+## HARD ↔ SOFT scope mapping (FST waveforms)
+
+Useful when comparing HARD vs SOFT scopes in the same trace:
+
+- HARD `system.System.memif_0` = soft `periph` (MmioIf)
+- HARD `system.System.memif_1` = soft `memif0` = MC 0
+- HARD `system.System.memif_2` = soft `memif1` = MC 1
+- HARD `system.System.pu_<N>.*` = soft `soft_pu_<N>.*`
+- Cosim `port=0` = peripheral; `port=1+i` = MC i (so `port=1` ↔ `memif_1` ↔ SOFT memif0).
+
+## Memory request ID formats (HARD)
+
+- Scalar IDs: `0..63` (bit 7 = 0). Inflight slot index.
+- Scatter/bulk IDs: `0x80 | beat` where `beat = beat_idx % kBulkInflight` (bit 7 = 1).
+- Detection: `id & 0x80` → scatter response; `id & (kBulkInflight - 1)` → beat slot.
+
+## Debug env vars (soft side)
+
+- `COSIM_KEEP_GOING=1` — continue past cosim mismatch (no abort)
+- `SOFT_DBG_MEMIF=1` — print memif ALLOC/ISSUE/RESP/EJECT events
+- `SOFT_DBG_ROUTER`, `SOFT_DBG_MMIO`, `SOFT_DBG_PU1`, etc. — module-specific traces
+
+## Debugging tips
+
+- Use `--trace --trace-start <cycle>` for traces (works with `--hard`, `--soft`, or cosim). FST can be read with `copilot/tmp/trace_vals` (signal info on stderr, value changes on stdout; pipe `2>&1` to capture both).
+- Add `fprintf(stderr, ...)` debug prints to `soft_backend.cpp` / `soft_components.h` for SOFT-side visibility.
+- The `strings` filter is needed when piping simulator stdout, because Verilator binary output may contain non-printable characters.
 - `nix develop --command bash -c "..."` is required for all build/run commands.
 - Incremental rebuild: `cd sim/build && ninja -j$(nproc)` (no cmake needed).
