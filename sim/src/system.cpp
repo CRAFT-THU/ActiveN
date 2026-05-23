@@ -569,6 +569,20 @@ int main(int argc, char **argv) {
     .help("RNG seed for peripheral device")
     .scan<'u', uint32_t>();
 
+  program.add_argument("--pu")
+    .help("Number of PUs in the system")
+    .required()
+    .scan<'u', uint32_t>();
+
+  program.add_argument("--mc")
+    .help("Number of memory controllers in the system")
+    .required()
+    .scan<'u', uint32_t>();
+
+  program.add_argument("--mc-size")
+    .help("Per-MC memory size in bytes (decimal or 0x hex); applied to all MCs")
+    .required();
+
   try {
     program.parse_args(argc, argv);
   } catch (const std::exception &err) {
@@ -586,6 +600,22 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // Build SystemConfig from CLI args
+  SystemConfig cli_cfg;
+  cli_cfg.numPU = program.get<uint32_t>("--pu");
+  cli_cfg.numMC = program.get<uint32_t>("--mc");
+  {
+    auto s = program.get<string>("--mc-size");
+    uint64_t mc_size = 0;
+    try {
+      mc_size = std::stoull(s, nullptr, 0);
+    } catch (const std::exception &e) {
+      cerr << "Error: invalid --mc-size value: " << s << endl;
+      return 1;
+    }
+    cli_cfg.core.mcSizes.assign(cli_cfg.numMC, mc_size);
+  }
+
   auto image_paths = program.get<vector<string>>("images");
   if (image_paths.empty()) {
     cerr << "Error: at least one memory image must be provided" << endl;
@@ -593,11 +623,10 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // Validate image count matches hardware MC count
-  int hw_num_mc = HARD_NUM_MC;
-  if ((int)image_paths.size() != hw_num_mc) {
-    cerr << "Error: " << image_paths.size() << " image(s) provided but hardware has "
-         << hw_num_mc << " memory controller(s)" << endl;
+  // Validate image count matches CLI MC count
+  if (image_paths.size() != cli_cfg.numMC) {
+    cerr << "Error: " << image_paths.size() << " image(s) provided but --mc="
+         << cli_cfg.numMC << endl;
     return 1;
   }
 
@@ -649,6 +678,24 @@ int main(int argc, char **argv) {
   SoftSystemModel *soft_raw = nullptr;
   if (use_hard) {
     auto hard = make_unique<HardSystemBackend>();
+    // Compare hard backend's compiled config against CLI-supplied config.
+    auto hcfg = hard->config();
+    auto cfg_mismatch = [&](const string &what) {
+      cerr << "Error: --hard config mismatch: " << what << endl;
+      cerr << "  CLI:  numPU=" << cli_cfg.numPU << " numMC=" << cli_cfg.numMC;
+      cerr << " mcSizes=[";
+      for (size_t i = 0; i < cli_cfg.core.mcSizes.size(); ++i)
+        cerr << (i ? "," : "") << "0x" << hex << cli_cfg.core.mcSizes[i] << dec;
+      cerr << "]" << endl;
+      cerr << "  Hard: numPU=" << hcfg.numPU << " numMC=" << hcfg.numMC;
+      cerr << " mcSizes=[";
+      for (size_t i = 0; i < hcfg.core.mcSizes.size(); ++i)
+        cerr << (i ? "," : "") << "0x" << hex << hcfg.core.mcSizes[i] << dec;
+      cerr << "]" << endl;
+    };
+    if (hcfg.numPU != cli_cfg.numPU) { cfg_mismatch("numPU"); return 1; }
+    if (hcfg.numMC != cli_cfg.numMC) { cfg_mismatch("numMC"); return 1; }
+    if (hcfg.core.mcSizes != cli_cfg.core.mcSizes) { cfg_mismatch("mcSizes"); return 1; }
     hard->setTraceStart(trace_start);
     hard_raw = hard.get();
     system.addBackend(move(hard));
@@ -656,7 +703,7 @@ int main(int argc, char **argv) {
   }
 
   if (use_soft) {
-    auto soft = make_unique<SoftSystemModel>(HARD_NUM_PU, HARD_NUM_MC);
+    auto soft = make_unique<SoftSystemModel>(cli_cfg);
     soft->setTraceStart(trace_start);
     soft_raw = soft.get();
     system.addBackend(move(soft));

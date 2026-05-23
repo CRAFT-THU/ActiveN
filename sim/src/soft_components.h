@@ -147,6 +147,8 @@ class Router : std::is_invocable_r<size_t, RT, size_t> {
   size_t _num_inputs, _num_outputs;
   std::vector<FlitQueue<Flit, Q_DEPTH>> _input_queues;
   std::vector<FlitArb> _output_arbs;
+  // Scratch for Router::step (pre-allocated to _num_inputs).
+  std::vector<std::optional<size_t>> _input_deqs_scratch;
 
 private:
   std::optional<std::pair<size_t, size_t>> peek_iq_slot(size_t o_port) const {
@@ -178,6 +180,7 @@ public:
 
   Router(RT tbl, size_t num_inputs, size_t num_outputs) : _tbl(tbl), _num_inputs(num_inputs), _num_outputs(num_outputs) {
     _input_queues.resize(num_inputs);
+    _input_deqs_scratch.assign(num_inputs, std::nullopt);
     for (size_t i = 0; i < num_outputs; ++i)
       // There are num_inputs queues
       _output_arbs.emplace_back(num_inputs);
@@ -196,23 +199,25 @@ public:
     return q.canEnq(prio);
   }
 
-  void step(std::vector<std::optional<Flit>> enqs, std::vector<bool> deq_accepts) {
+  void step(const std::vector<std::optional<Flit>> &enqs,
+            const std::vector<bool> &deq_accepts) {
     if (enqs.size() != _num_inputs) throw std::runtime_error("wrong number of enqs");
 
-    // Reverse-tracing the dequeue signal for each input queue
-    std::vector<std::optional<size_t>> input_deqs;
-    input_deqs.resize(_num_inputs);
+    // Reverse-tracing the dequeue signal for each input queue.
+    // Reuse pre-allocated scratch buffer; reset values only.
+    auto &input_deqs = _input_deqs_scratch;
+    std::fill(input_deqs.begin(), input_deqs.end(), std::nullopt);
 
     for (size_t o = 0; o < _num_outputs; ++o)
-      if (deq_accepts.at(o)) {
+      if (deq_accepts[o]) {
         auto selected = peek_iq_slot(o);
         if (!selected.has_value()) throw std::runtime_error("deq_accepts is true but peek_iq_slot returns nullopt");
         auto [iq, slot] = *selected;
-        if (input_deqs.at(iq).has_value()) throw std::runtime_error("one flit routed to multiple output ports");
-        input_deqs.at(iq) = slot;
+        if (input_deqs[iq].has_value()) throw std::runtime_error("one flit routed to multiple output ports");
+        input_deqs[iq] = slot;
 
         // Update arbiter
-        _output_arbs.at(o).commit(iq);
+        _output_arbs[o].commit(iq);
       }
 
     // Update input queues
@@ -831,14 +836,17 @@ class DramIf : public MemIfBase {
     }
   }
 
-  // The full step: takes captured inputs + driver-resolved external fires,
-  // returns this cycle's output snapshot, and atomically advances state.
-  DramIfStepOut step(const MemIfStepIn &in, const DramIfStepFires &fires) {
+  // Internal worker shared by step() and peek(). When `fires == nullptr`,
+  // computes `out` only — does not mutate state (peek mode). When `fires`
+  // is non-null, applies all commit-block mutations using its values.
+  // Outputs (`out`) depend only on Reg.Q + `in`, never on `fires` — so the
+  // returned snapshot is identical in either mode.
+  DramIfStepOut runStep(const MemIfStepIn &in, const DramIfStepFires *fires) {
     DramIfStepOut out;
     out.req_ready.assign(num_req_, false);
     out.unicast.assign(num_clusters_, std::nullopt);
     out.broadcast.assign(num_clusters_, std::nullopt);
-    if (fires.broadcast_ready.size() != num_clusters_)
+    if (fires && fires->broadcast_ready.size() != num_clusters_)
       throw std::runtime_error("DramIf::step: broadcast_ready size mismatch");
 
     // ---- snapshot peeks (combinational on Reg.Q) ----
@@ -975,7 +983,7 @@ class DramIf : public MemIfBase {
 
     // ringOut = ringFwdQueue.deq
     if (ring_fwd_queue_.deqValid()) out.ring_out = ring_fwd_queue_.deq_bits();
-    bool ring_out_fire = out.ring_out && fires.ring_out_ready;
+    bool ring_out_fire = out.ring_out && fires && fires->ring_out_ready;
 
     // ringIn.ready = (local ? ringRecv.ready : ringFwd.ready)
     // ringFwd.ready = ring_fwd_queue_can_enq && in(0) chosen in arb (which is
@@ -1033,7 +1041,7 @@ class DramIf : public MemIfBase {
     for (std::size_t ci = 0; ci < num_clusters_; ++ci) {
       if (bulk_is_bcast && !bcst_accepted_[ci]) {
         out.broadcast[ci] = bcast_line;
-        if (fires.broadcast_ready[ci]) bcst_accept_now[ci] = 1;
+        if (fires && fires->broadcast_ready[ci]) bcst_accept_now[ci] = 1;
       }
     }
     // bcstStep = (bcst_accepted | bcst_accept_now).andR
@@ -1062,6 +1070,7 @@ class DramIf : public MemIfBase {
     }
 
     // ---- COMMIT all state mutations atomically ----
+    if (!fires) return out;
 
     // Flit ingress: alloc / bulk register / arb commit
     if (flit_fire) {
@@ -1139,18 +1148,13 @@ class DramIf : public MemIfBase {
     return out;
   }
 
-  // Non-mutating peek: returns the same `out` snapshot that step() would
-  // produce. Implemented by copying *this and calling step() on the copy.
-  // Outputs do not depend on `fires` (verified — fires only affect commit),
-  // so we pass dummy fires (no acceptance). The driver uses this to resolve
-  // ring chain + broadcast back-pressure before calling step().
+  // Public API: peek returns this cycle's outputs without mutating state.
+  // step computes the same outputs and commits all Reg.D writes.
   DramIfStepOut peek(const MemIfStepIn &in) const {
-    DramIf copy(*this);
-    copy.silent_ = true;
-    DramIfStepFires dummy;
-    dummy.broadcast_ready.assign(num_clusters_, false);
-    dummy.ring_out_ready = false;
-    return copy.step(in, dummy);
+    return const_cast<DramIf*>(this)->runStep(in, nullptr);
+  }
+  DramIfStepOut step(const MemIfStepIn &in, const DramIfStepFires &fires) {
+    return runStep(in, &fires);
   }
 };
 
@@ -1183,7 +1187,7 @@ class MmioIf : public MemIfBase {
     return std::nullopt;
   }
 
-  MemIfStepOut step(const MemIfStepIn &in, const MemIfStepFires &fires) {
+  MemIfStepOut runStep(const MemIfStepIn &in, const MemIfStepFires *fires) {
     MemIfStepOut out;
     out.req_ready.assign(num_req_, false);
 
@@ -1269,9 +1273,13 @@ class MmioIf : public MemIfBase {
     out.ring_in_ready = in.ring_in.has_value() && ring_fwd_fire;
 
     if (ring_fwd_queue_.deqValid()) out.ring_out = ring_fwd_queue_.deq_bits();
-    bool ring_out_fire = out.ring_out.has_value() && fires.ring_out_ready;
+    bool ring_out_fire = out.ring_out.has_value() && fires && fires->ring_out_ready;
 
     // ---- COMMIT ----
+    if (!fires) {
+      (void)mem_req_fire;
+      return out;
+    }
 
     if (flit_fire) {
       applyFlitArbCommit(*fw);
@@ -1318,13 +1326,12 @@ class MmioIf : public MemIfBase {
     return out;
   }
 
-  // Non-mutating peek: same convention as DramIf::peek.
+  // Public API: peek returns this cycle's outputs without mutating state.
   MemIfStepOut peek(const MemIfStepIn &in) const {
-    MmioIf copy(*this);
-    copy.silent_ = true;
-    MemIfStepFires dummy;
-    dummy.ring_out_ready = false;
-    return copy.step(in, dummy);
+    return const_cast<MmioIf*>(this)->runStep(in, nullptr);
+  }
+  MemIfStepOut step(const MemIfStepIn &in, const MemIfStepFires &fires) {
+    return runStep(in, &fires);
   }
 };
 

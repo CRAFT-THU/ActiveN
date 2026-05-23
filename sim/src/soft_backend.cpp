@@ -40,13 +40,21 @@
 #include "soft_components.h"
 #include "soft_backend.h"
 #include "system.h"
-#include "system_config.h"
 
 using namespace std;
 
 static bool TRACE = false;
 static bool LOG = false;
 static bool exiting = false;
+
+// Wall-clock accumulator (ns) for time spent inside soft_rtl Verilator eval()
+// calls, summed across all PUs. Thread-local because Verilated contexts are
+// per-thread; we use this to attribute soft-model runtime between "verilator"
+// (CPU spent inside soft_rtl::eval) and "uncore" (everything else inside
+// peek/stage/step). Incremented at batch granularity by the two per-cycle
+// eval loops in stage()/step(); read/snapshotted by SoftSystemSim in
+// peek/stage/step via PhaseTimer.
+static thread_local uint64_t g_soft_verilator_ns = 0;
 
 static const uint64_t RESET_LENGTH = 10;
 static const uint32_t TEXT_BASE = 0x80000000u;
@@ -274,30 +282,6 @@ struct CoreState {
     ext_input.reset();
   }
 
-  bool canAcceptExtInput(const Flit &flit) {
-    uint8_t saved_valid = core->ext_in_valid;
-    uint32_t saved_data[4] = {core->ext_in_bits_data_0, core->ext_in_bits_data_1, core->ext_in_bits_data_2, core->ext_in_bits_data_3};
-    uint16_t saved_tag = core->ext_in_bits_tag;
-
-    core->ext_in_valid = 1;
-    core->ext_in_bits_data_0 = flit.data[0];
-    core->ext_in_bits_data_1 = flit.data[1];
-    core->ext_in_bits_data_2 = flit.data[2];
-    core->ext_in_bits_data_3 = flit.data[3];
-    core->ext_in_bits_tag = flit.tag;
-    core->eval();
-    bool ready = core->ext_in_ready;
-
-    core->ext_in_valid = saved_valid;
-    core->ext_in_bits_data_0 = saved_data[0];
-    core->ext_in_bits_data_1 = saved_data[1];
-    core->ext_in_bits_data_2 = saved_data[2];
-    core->ext_in_bits_data_3 = saved_data[3];
-    core->ext_in_bits_tag = saved_tag;
-    core->eval();
-    return ready;
-  }
-
   void driveExtInput(const Flit &flit) {
     ext_input = flit;
   }
@@ -315,16 +299,6 @@ struct CoreState {
   optional<Flit> currentOut() const {
     if (!core->ext_out_ready) return {};
     return pendingOut();
-  }
-
-  void posedge() {
-    core->clock = 1;
-    core->eval();
-  }
-
-  void negedge() {
-    core->clock = 0;
-    core->eval();
   }
 };
 
@@ -348,8 +322,45 @@ struct SoftRouter {
   int core_output = -1;
   int periph_output = -1;
 
+  // Routing functor: minimal per-router data; computes XY direction inline
+  // for PU dsts and reads a tiny precomputed table for memif dsts.
+  // (Periph and MC dsts never collide: PERIPH_DST=0x8000, FIRST_MC_DST+mc=0x8001+,
+  // so a single memif_port[] array indexed by (dst - 0x8000) handles both.)
+  static constexpr int MAX_MEMIF = 1 + 8;  // 1 periph + up to 8 MCs
+  struct LookupFn {
+    uint16_t src_pu = 0;
+    uint8_t core_port = 0;
+    std::pair<int8_t, int8_t> local_coord{0, 0};
+    std::array<uint8_t, 4> dir_to_port{0, 0, 0, 0};
+    std::array<uint8_t, MAX_MEMIF> memif_port{};
+    const std::pair<int, int> *pu_pos = nullptr;
+
+    size_t operator()(size_t dst) const {
+      uint16_t d = static_cast<uint16_t>(dst);
+      if (d == 0 || d == src_pu) return core_port;
+      if (d & 0x8000) return memif_port[d - 0x8000];
+      const auto &pos = pu_pos[d];
+      int dir = (local_coord.second != pos.second)
+                  ? ((pos.second > local_coord.second) ? 1 : 3)
+                  : ((pos.first > local_coord.first) ? 2 : 0);
+      return dir_to_port[dir];
+    }
+  };
+
+  // Factory matching the user-suggested API: `decltype(rtFor(nullptr, 0))`
+  // names the functor type for use as Router's RT template parameter.
+  static LookupFn rtFor(const TopologyInfo *topo, int pu) {
+    LookupFn fn;
+    if (!topo) return fn;
+    auto [sr, sc] = topo->pu_pos[pu];
+    fn.src_pu = static_cast<uint16_t>(pu);
+    fn.local_coord = {static_cast<int8_t>(sr), static_cast<int8_t>(sc)};
+    fn.pu_pos = topo->pu_pos.data();
+    return fn;
+  }
+
   // Hardware-aligned router: depth-8 priority queues, single VC, FlitArb round-robin.
-  Router<std::function<size_t(size_t)>, 8> rt;
+  Router<decltype(rtFor(nullptr, 0)), 8> rt;
 
   SoftRouter() = default;
 
@@ -381,27 +392,32 @@ struct SoftRouter {
       outputs.push_back(RouterOutput{.kind = RouterOutput::Periph, .dir = -1, .mc_idx = -1, .mc_input = -1});
     }
 
-    // Build complete dst→output_port routing table (captured by value in lambda for move safety).
-    std::unordered_map<uint16_t, size_t> dst_to_port;
-    dst_to_port[0] = core_output;   // broadcast dst
-    dst_to_port[static_cast<uint16_t>(pu)] = core_output;
-    for (int mc = 0; mc < num_mc; ++mc) {
-      if (local_mc_output[mc] >= 0)
-        dst_to_port[static_cast<uint16_t>(FIRST_MC_DST + mc)] = local_mc_output[mc];
-    }
-    if (periph_output >= 0)
-      dst_to_port[PERIPH_DST] = periph_output;
-    for (auto &[dst, port] : topo.pu_tables[pu])
-      dst_to_port[dst] = port;
+    if (1 + num_mc > MAX_MEMIF) throw std::runtime_error("SoftRouter: too many memifs");
 
-    rt = Router<std::function<size_t(size_t)>, 8>(
-        [m = std::move(dst_to_port)](size_t dst) -> size_t {
-          auto it = m.find(static_cast<uint16_t>(dst));
-          if (it == m.end()) throw std::runtime_error("SoftRouter: unroutable flit dst");
-          return it->second;
-        },
-        inject_port + 1,
-        outputs.size());
+    // Build LookupFn: precompute memif_port[] (local or routed-via-egress);
+    // dir_to_port[] for PU dsts via XY-routing.
+    LookupFn fn = rtFor(&topo, pu);
+    fn.core_port = static_cast<uint8_t>(core_output);
+    for (auto &[dir, port] : topo.pu_dir_to_egress[pu])
+      fn.dir_to_port[dir] = static_cast<uint8_t>(port);
+
+    // Memif lookups: pu_tables[pu] already has direction-resolved egress ports
+    // for non-local memifs; local memifs override with their direct output port.
+    auto it = topo.pu_tables[pu].find(PERIPH_DST);
+    if (it != topo.pu_tables[pu].end())
+      fn.memif_port[PERIPH_DST - 0x8000] = static_cast<uint8_t>(it->second);
+    if (periph_output >= 0)
+      fn.memif_port[PERIPH_DST - 0x8000] = static_cast<uint8_t>(periph_output);
+    for (int mc = 0; mc < num_mc; ++mc) {
+      uint16_t key = static_cast<uint16_t>(FIRST_MC_DST + mc) - 0x8000;
+      auto mit = topo.pu_tables[pu].find(static_cast<uint16_t>(FIRST_MC_DST + mc));
+      if (mit != topo.pu_tables[pu].end())
+        fn.memif_port[key] = static_cast<uint8_t>(mit->second);
+      if (local_mc_output[mc] >= 0)
+        fn.memif_port[key] = static_cast<uint8_t>(local_mc_output[mc]);
+    }
+
+    rt = Router<decltype(rtFor(nullptr, 0)), 8>(fn, inject_port + 1, outputs.size());
   }
 
   bool canInject(const Flit &flit) const {
@@ -481,12 +497,14 @@ static constexpr uint64_t STAT_PERIOD = 1000;
 
 struct SoftSystemSim {
   uint64_t cycle = 0;
+  SystemConfig cfg;
   int num_pu;
   int num_mc;
   int num_clusters;
   int clusters_per_mc;
   TopologyInfo topo;
   bool reset_cycle = false;
+  bool reset_just_exited = false;
 
   vector<unique_ptr<CoreState>> cores;
   vector<SoftRouter> routers;
@@ -532,6 +550,24 @@ struct SoftSystemSim {
   PeriodicStat last_periodic;
   int total_mesh_outputs = 0;
 
+  // Runtime breakdown (ns), summed across all calls to peek/stage/step.
+  // verilator_ns: time inside soft_rtl::eval() (the two per-cycle batch
+  //               eval loops in stage()/step(), plus one-time reset-exit).
+  // uncore_ns:    remaining time inside peek/stage/step (soft NoC model logic).
+  uint64_t verilator_ns = 0;
+  uint64_t uncore_ns = 0;
+
+  // Timed batch eval of all cores. Caller must set core->clock before
+  // calling. Adds elapsed wall time to g_soft_verilator_ns so the outer
+  // PhaseTimer correctly attributes it to "verilator" not "uncore".
+  void evalAllCoresTimed() {
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (auto &c : cores) c->core->eval();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    g_soft_verilator_ns +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+  }
+
   static MemLine makeConfigBeat0(uint32_t num_pu, uint32_t num_mc, uint32_t pus_per_mc) {
     MemLine out{};
     auto put32 = [&](int off, uint32_t v) {
@@ -552,12 +588,13 @@ struct SoftSystemSim {
     return out;
   }
 
-  SoftSystemSim(int pu, int mc)
-      : num_pu(pu), num_mc(mc),
-        num_clusters(pu / 16),
-        clusters_per_mc((pu / 16) / mc),
-        topo(buildTopology(pu, mc)),
-        last_resp(mc + 1) {
+  SoftSystemSim(const SystemConfig &cfg_)
+      : cfg(cfg_),
+        num_pu((int)cfg_.numPU), num_mc((int)cfg_.numMC),
+        num_clusters((int)cfg_.numPU / 16),
+        clusters_per_mc(((int)cfg_.numPU / 16) / (int)cfg_.numMC),
+        topo(buildTopology((int)cfg_.numPU, (int)cfg_.numMC)),
+        last_resp((int)cfg_.numMC + 1) {
     routers.resize(num_pu + 1);
     for (int id = 1; id <= num_pu; ++id) {
       cores.push_back(std::make_unique<CoreState>(id));
@@ -572,7 +609,7 @@ struct SoftSystemSim {
     }
     periph = std::make_unique<MmioIf>(16);
     // Config ROM entries (mirror SoftPeriphIf::isConfigRom + fillConfigRomBeat).
-    uint64_t mc_size = (SYSTEM_NUM_MEM_CTRL > 0) ? SYSTEM_MC_SIZES[0] : 0;
+    uint64_t mc_size = cfg.core.mcSizes.empty() ? 0 : cfg.core.mcSizes[0];
     periph->addConfigRomEntry(0x28000000u,
         makeConfigBeat0((uint32_t)num_pu, (uint32_t)num_mc, (uint32_t)(num_pu/num_mc)));
     periph->addConfigRomEntry(0x28000020u,
@@ -593,6 +630,22 @@ struct SoftSystemSim {
 
     for (int id = 1; id <= num_pu; ++id)
       total_mesh_outputs += static_cast<int>(routers[id].mesh_dirs.size());
+
+    // Pre-size pending router-step buffers to fixed widths per router so per-cycle
+    // routeRouters() only resets values via std::fill (no realloc).
+    for (int id = 1; id <= num_pu; ++id) {
+      auto &r = routers[id];
+      pending_router_steps[id].enqs.assign(r.rt.numInputs(), std::nullopt);
+      pending_router_steps[id].deq_accepts.assign(r.outputs.size(), false);
+    }
+
+    // Pre-size per-cycle scratch buffers (member-allocated, reused each cycle).
+    memif_props_buf_.resize(num_mc);
+    for (auto &v : memif_props_buf_) v.reserve(clusters_per_mc * 16);
+    ring_outs_buf_.assign(ringNodeCount(), std::nullopt);
+    ring_in_per_node_buf_.assign(ringNodeCount(), std::nullopt);
+    dist_out_K_buf_.assign(num_clusters, DistributorStepOut{});
+    core_props_K.reserve(num_pu * 4);
 
     fprintf(stderr, "[Soft] SoftSystemSim init: numPU=%d numMC=%d numClusters=%d cpm=%d\n",
             num_pu, num_mc, num_clusters, clusters_per_mc);
@@ -617,8 +670,7 @@ struct SoftSystemSim {
 
   // Compute ring_out for each node (Reg.Q based; independent of `in`).
   // Uses DramIf/MmioIf peek with empty `in`.
-  vector<optional<RingResp>> snapshotRingOuts() {
-    vector<optional<RingResp>> outs(ringNodeCount());
+  void snapshotRingOuts(vector<optional<RingResp>> &outs) {
     MemIfStepIn dummy_in;
     for (int m = 0; m < num_mc; ++m) {
       dummy_in.req.assign(clusters_per_mc, std::nullopt);
@@ -633,57 +685,37 @@ struct SoftSystemSim {
     dummy_in.mem_req_ready = false;
     dummy_in.mem_resp = std::nullopt;
     outs[num_mc] = periph->peek(dummy_in).ring_out;
-    return outs;
   }
 
   // --- routeRouters: peek DramIf/MmioIf/periph for req_ready decisions,
-  // set router deq_accepts. Defers Core ext_in handling to a later phase so
-  // canAcceptExtInput sees PU's mem_unicast/broadcast for this cycle.
+  // set router deq_accepts. Core ext_in acceptance is deferred to stage()
+  // where it can be checked after PU inputs are driven and the negedge
+  // eval has propagated combinational signals.
   struct CoreProp { int pu; int output_idx; Flit flit; };
+  struct MemIfProp { int pu; int output_idx; int cluster_input; Flit flit; };
+  struct PeriphProp { int pu; int output_idx; Flit flit; };
   vector<CoreProp> core_props_K;
+  // Per-MC scratch list of memif proposals, sized [num_mc] at construction;
+  // inner vectors are clear()-ed each cycle (capacity retained).
+  vector<vector<MemIfProp>> memif_props_buf_;
+  // Scratch buffers for snapshotRingOuts() / peek() / stage().
+  vector<optional<RingResp>> ring_outs_buf_;
+  vector<optional<RingResp>> ring_in_per_node_buf_;
+  vector<DistributorStepOut> dist_out_K_buf_;
 
   void routeRouters(const vector<optional<RingResp>> &ring_in_per_node) {
-    struct MemIfProp { int pu; int output_idx; int cluster_input; Flit flit; };
-    vector<vector<MemIfProp>> memif_props(num_mc);
-    struct PeriphProp { int pu; int output_idx; Flit flit; };
+    auto &memif_props = memif_props_buf_;
+    for (auto &v : memif_props) v.clear();
     optional<PeriphProp> periph_prop;
     core_props_K.clear();
-
-    // Debug: dump PU1 router state.
-    if (getenv("SOFT_DBG_PU1")) {
-      int pu = 1;
-      auto &r = routerAt(pu);
-      fprintf(stderr, "[pu1 cy=%lu] queues:", g_soft_dbg_cycle);
-      for (int i = 0; i < (int)r.rt.numInputs(); ++i) {
-        const auto &q = r.rt.inputQueue(i);
-        if (q.size() == 0) continue;
-        fprintf(stderr, " in%d=[", i);
-        for (size_t s = 0; s < 16; ++s) {
-          if (q.occupiedAt(s)) {
-            const auto &f = q[s];
-            fprintf(stderr, "(s%zu src=%u dst=%u prio=%u)", s, f.src, f.dst, f.prio());
-          }
-        }
-        fprintf(stderr, "]");
-      }
-      fprintf(stderr, " | egress:");
-      for (int o = 0; o < (int)r.outputs.size(); ++o) {
-        auto pk = r.rt.peek(o);
-        if (pk) {
-          int win = r.rt.winningInputPort(o);
-          fprintf(stderr, " o%d=(win=%d src=%u dst=%u)", o, win, pk->src, pk->dst);
-        }
-      }
-      fprintf(stderr, "\n");
-    }
 
     for (int pu = 1; pu <= num_pu; ++pu) core(pu).clearExtInput();
 
     for (int pu = 1; pu <= num_pu; ++pu) {
-      auto &r = routerAt(pu);
       auto &ps = pending_router_steps[pu];
-      ps.enqs.assign(r.rt.numInputs(), std::nullopt);
-      ps.deq_accepts.assign(r.outputs.size(), false);
+      // enqs/deq_accepts are pre-sized in ctor; just reset values.
+      std::fill(ps.enqs.begin(), ps.enqs.end(), std::nullopt);
+      std::fill(ps.deq_accepts.begin(), ps.deq_accepts.end(), false);
     }
 
     size_t num_transfers = 0;
@@ -711,7 +743,7 @@ struct SoftSystemSim {
           }
           case RouterOutput::Core:
             // Defer: requires PU's mem_unicast/broadcast inputs of this cycle
-            // to be driven first before canAcceptExtInput can be queried.
+            // to be driven first before ext_in_ready can be observed.
             core_props_K.push_back({pu, oi, flit});
             break;
           case RouterOutput::MemIf:
@@ -809,27 +841,28 @@ struct SoftSystemSim {
   void peek(uint64_t cy, vector<MemBusOut *> out) {
     cycle = cy;
     g_soft_dbg_cycle = cy;
+    bool was_reset = reset_cycle;
     reset_cycle = cycle <= RESET_LENGTH;
     if (reset_cycle) {
       for (auto &p : out) p->req = std::nullopt;
       return;
     }
+    if (was_reset) reset_just_exited = true;
 
-    // Drop reset BEFORE any peeks. In HARD, synchronous reset releases at
-    // posedge K=RESET_LENGTH+1 with reset already deasserted; combinational
-    // outputs (ext_in_ready, ring_out, etc.) at that posedge reflect Regs
-    // exiting reset. In SOFT we peek the cores BEFORE the actual posedge
-    // eval, so we must mirror by pre-clearing reset and re-evaluating so
-    // any combinational logic that depends on reset reports the post-reset
-    // value during peeks.
-    for (auto &c : cores) {
-      c->core->reset = 0;
-      c->core->eval();
+    // First non-reset cycle: deassert reset and re-evaluate once so that
+    // combinational outputs (ext_in_ready, ring_out, etc.) reflect the
+    // post-reset Reg.Q values during this peek. In HARD, synchronous reset
+    // releases at posedge K=RESET_LENGTH+1 with reset already deasserted.
+    if (reset_just_exited) {
+      for (auto &c : cores) c->core->reset = 0;
+      evalAllCoresTimed();
+      reset_just_exited = false;
     }
 
     // Snapshot ring_out for each node (Reg.Q based).
-    auto ring_outs = snapshotRingOuts();
-    vector<optional<RingResp>> ring_in_per_node(ringNodeCount());
+    auto &ring_outs = ring_outs_buf_;
+    auto &ring_in_per_node = ring_in_per_node_buf_;
+    snapshotRingOuts(ring_outs);
     int N = ringNodeCount();
     for (int i = 0; i < N; ++i) {
       int prev = (i - 1 + N) % N;
@@ -852,7 +885,7 @@ struct SoftSystemSim {
   }
 
   // stage(K, in): consume bus_in (resp + reqAccepting), drive PU inputs,
-  // run all combinational eval, compute fires, cores->negedge.
+  // run a single combinational negedge eval, compute fires.
   // Does NOT advance any Reg state.
   void stage(uint64_t cy, const vector<MemBusIn> &in) {
     if (reset_cycle) {
@@ -866,8 +899,10 @@ struct SoftSystemSim {
         c->core->ext_in_valid = 0;
         c->core->ext_out_ready = 0;
       }
-      // Negedge for cores (idempotent under reset, but mirrors HARD timing).
-      for (auto &c : cores) c->negedge();
+      // SINGLE negedge eval under reset (matches non-reset path so each
+      // cycle gets a clock 1→0→1 transition for the posedge in step()).
+      for (auto &c : cores) c->core->clock = 0;
+      evalAllCoresTimed();
       return;
     }
 
@@ -894,9 +929,11 @@ struct SoftSystemSim {
       dist_out_pre_K[ci] = dists[ci].peek(ci_io_in_K[ci], zero);
     }
 
-    // Drive PU mem_unicast (combinational from dist input) and mem_broadcast
-    // (registered through 1-deep pipe Queue, also presented this cycle).
-    // Both come from dist_out_pre_K — the distributor output for cycle K.
+    // ---- Drive ALL per-PU inputs (no eval yet). ----
+    // mem_unicast / mem_broadcast come from dist_out_pre_K. ext_in defaults
+    // to 0 and is overwritten below for proposals. ext_out_ready is computed
+    // from pendingOut() reading post-step(K-1) Reg.Q values (ext_out_valid
+    // is registered, so reading it before this cycle's eval is correct).
     for (int pu = 1; pu <= num_pu; ++pu) {
       auto &c = core(pu);
       c.core->ext_in_valid = 0;
@@ -943,25 +980,9 @@ struct SoftSystemSim {
       } else {
         c.core->mem_broadcast_valid = 0;
       }
-      c.core->eval();
     }
 
-    static const bool dbg_pu1_ready = std::getenv("SOFT_DBG_PU1_READY") != nullptr;
-    if (dbg_pu1_ready) {
-      bool found = false;
-      for (auto &cp : core_props_K) {
-        if (cp.pu == 1) {
-          bool r = core(1).canAcceptExtInput(cp.flit);
-          fprintf(stderr, "[PU1_READY] cy=%lu prop_src=%d prop_dst=%d ready=%d\n",
-                  cycle, cp.flit.src, cp.flit.dst, r ? 1 : 0);
-          found = true;
-        }
-      }
-      if (!found) {
-        fprintf(stderr, "[PU1_READY] cy=%lu no_prop\n", cycle);
-      }
-    }
-    // Drive ext_in_* for any router CORE-output proposal.
+    // Overwrite ext_in_* for any router CORE-output proposal.
     for (auto &cp : core_props_K) {
       auto &c = core(cp.pu);
       c.core->ext_in_valid = 1;
@@ -970,23 +991,32 @@ struct SoftSystemSim {
       c.core->ext_in_bits_data_2 = cp.flit.data[2];
       c.core->ext_in_bits_data_3 = cp.flit.data[3];
       c.core->ext_in_bits_tag = cp.flit.tag;
-      c.core->eval();
-      if (c.core->ext_in_ready) {
-        c.driveExtInput(cp.flit);
-        pending_router_steps[cp.pu].deq_accepts[cp.output_idx] = true;
-      }
     }
-    static const bool dbg_pu1_out = std::getenv("SOFT_DBG_PU1_OUT") != nullptr;
+
+    // Compute ext_out_ready per PU. pendingOut() reads ext_out_valid which
+    // is registered (Reg.Q-based) and therefore valid from the post-K-1
+    // posedge eval without re-eval this cycle.
     for (int pu = 1; pu <= num_pu; ++pu) {
       auto &c = core(pu);
       auto out = c.pendingOut();
       if (!out) c.core->ext_out_ready = 1;
       else c.core->ext_out_ready = routerAt(pu).canInject(*out) ? 1 : 0;
-      if (dbg_pu1_out && pu == 1 && out) {
-        fprintf(stderr, "[PU1_OUT] cy=%lu out_src=%d out_dst=%d ready=%d\n",
-                cycle, out->src, out->dst, c.core->ext_out_ready ? 1 : 0);
+    }
+
+    // ---- SINGLE negedge eval ----
+    // Flip clock to 0 and eval once per core. Combinational outputs
+    // (mem_broadcast_ready, ext_in_ready, ext_out_valid in response to
+    // new ext_out_ready) are valid after this point.
+    for (auto &c : cores) c->core->clock = 0;
+    evalAllCoresTimed();
+
+    // Resolve ext_in_ready for each proposal → decide acceptance.
+    for (auto &cp : core_props_K) {
+      auto &c = core(cp.pu);
+      if (c.core->ext_in_ready) {
+        c.driveExtInput(cp.flit);
+        pending_router_steps[cp.pu].deq_accepts[cp.output_idx] = true;
       }
-      c.core->eval();
     }
 
     // Read per-PU mem_broadcast_ready → Distributor fires.
@@ -1001,7 +1031,7 @@ struct SoftSystemSim {
     }
 
     // Recompute Distributor peek with real fires to get broadcast_enq_ready.
-    vector<DistributorStepOut> dist_out_K(num_clusters);
+    auto &dist_out_K = dist_out_K_buf_;
     for (int ci = 0; ci < num_clusters; ++ci) {
       dist_out_K[ci] = dists[ci].peek(ci_io_in_K[ci], dist_fires_K[ci]);
     }
@@ -1033,14 +1063,15 @@ struct SoftSystemSim {
       dram_in_K[m].mem_resp = in[m + 1].resp;
     }
 
-    // Cores negedge — half-cycle bookkeeping (mirrors HARD's mid-cycle eval point).
-    for (auto &c : cores) c->negedge();
+    // Note: the negedge eval already happened above in the SINGLE eval block.
   }
 
   // step(K): commit posedge — advance all Reg state to post-K.
   void step(uint64_t cy) {
     if (reset_cycle) {
-      for (auto &c : cores) c->posedge();
+      // SINGLE posedge eval under reset.
+      for (auto &c : cores) c->core->clock = 1;
+      evalAllCoresTimed();
       if (cy <= 3 && std::getenv("SOFT_DBG_RESET")) {
         fprintf(stderr, "[SOFT_RESET] cy=%lu cores[0]->reset=%u\n",
                 (unsigned long)cy, (unsigned)cores[0]->core->reset);
@@ -1068,9 +1099,11 @@ struct SoftSystemSim {
       drams[m]->step(dram_in_K[m], dram_fires_K[m]);
     }
 
-    // Cores posedge.
-    for (auto &c : cores) c->posedge();
-    for (auto &c : cores) c->core->eval();
+    // ---- SINGLE posedge eval ----
+    // Flip clock to 1 and eval once per core. Registers latch their post-K
+    // state; combinational outputs reflect new Reg.Q values.
+    for (auto &c : cores) c->core->clock = 1;
+    evalAllCoresTimed();
 
     applyRouterSteps();
     stats.total_injections += pending_injected.size();
@@ -1089,13 +1122,34 @@ struct SoftSystemModel::Impl {
   std::vector<MemTraceEvent> last_mem_trace;
   std::vector<PeriphTraceEvent> last_periph_trace;
 
-  Impl(int pu, int mc) {
-    sim = std::make_unique<SoftSystemSim>(pu, mc);
+  Impl(const SystemConfig &cfg) {
+    sim = std::make_unique<SoftSystemSim>(cfg);
   }
 
   std::vector<std::unique_ptr<CoreState>> &cores() { return sim->cores; }
 
+  // RAII helper that attributes wall time between verilator eval (tracked
+  // separately via g_soft_verilator_ns) and uncore logic.
+  struct PhaseTimer {
+    SoftSystemSim &sim;
+    std::chrono::high_resolution_clock::time_point t0;
+    uint64_t v_at_entry;
+    PhaseTimer(SoftSystemSim &s)
+      : sim(s),
+        t0(std::chrono::high_resolution_clock::now()),
+        v_at_entry(g_soft_verilator_ns) {}
+    ~PhaseTimer() {
+      auto t1 = std::chrono::high_resolution_clock::now();
+      uint64_t total =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+      uint64_t v = g_soft_verilator_ns - v_at_entry;
+      sim.verilator_ns += v;
+      sim.uncore_ns += (total > v ? total - v : 0);
+    }
+  };
+
   void peek(uint64_t cycle, std::vector<MemBusOut *> out) {
+    PhaseTimer _t(*sim);
     last_mem_trace.clear();
     last_periph_trace.clear();
     current_mem_trace = &last_mem_trace;
@@ -1104,22 +1158,19 @@ struct SoftSystemModel::Impl {
   }
 
   void stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
+    PhaseTimer _t(*sim);
     sim->stage(cycle, in);
   }
 
   void step(uint64_t cycle) {
+    PhaseTimer _t(*sim);
     sim->step(cycle);
     current_mem_trace = nullptr;
     current_periph_trace = nullptr;
   }
 
   SystemConfig config() const {
-    SystemConfig cfg;
-    cfg.numPU = sim->num_pu;
-    cfg.numMC = sim->num_mc;
-    for (int i = 0; i < SYSTEM_NUM_MEM_CTRL; ++i)
-      cfg.core.mcSizes.push_back(SYSTEM_MC_SIZES[i]);
-    return cfg;
+    return sim->cfg;
   }
 
   void printStats(uint64_t cycles) { sim->stats.print(cycles); }
@@ -1141,7 +1192,7 @@ void setSoftSystemModelLogging(bool enabled) {
   LOG = enabled;
 }
 
-SoftSystemModel::SoftSystemModel(int pu, int mc) : impl_(std::make_unique<Impl>(pu, mc)) {}
+SoftSystemModel::SoftSystemModel(SystemConfig cfg) : impl_(std::make_unique<Impl>(cfg)) {}
 SoftSystemModel::~SoftSystemModel() = default;
 SoftSystemModel::SoftSystemModel(SoftSystemModel &&) noexcept = default;
 SoftSystemModel &SoftSystemModel::operator=(SoftSystemModel &&) noexcept = default;
@@ -1177,6 +1228,14 @@ bool SoftSystemModel::printStats(uint64_t cycles, bool final_print) {
   if (final_print) {
     cerr << "[Soft] Final stats (over " << cycles << " cycles):\n";
     impl_->printStats(cycles);
+    double v_ms = impl_->sim->verilator_ns / 1e6;
+    double u_ms = impl_->sim->uncore_ns / 1e6;
+    double tot_ms = v_ms + u_ms;
+    auto pct = [&](double x) { return tot_ms > 0 ? (100.0 * x / tot_ms) : 0.0; };
+    fprintf(stderr,
+            "[Soft] Time breakdown: verilator=%.3fms (%.1f%%) "
+            "uncore=%.3fms (%.1f%%) total=%.3fms\n",
+            v_ms, pct(v_ms), u_ms, pct(u_ms), tot_ms);
   }
   return true;
 }

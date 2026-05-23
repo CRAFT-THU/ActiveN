@@ -51,7 +51,7 @@ void setSoftSystemModelLogging(bool enabled);
 
 class SoftSystemModel : public SystemBackend {
  public:
-  SoftSystemModel(int pu, int mc);
+  SoftSystemModel(SystemConfig);
   ~SoftSystemModel() override;
   SoftSystemModel(SoftSystemModel &&) noexcept;
   SoftSystemModel &operator=(SoftSystemModel &&) noexcept;
