@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <deque>
 #include <cassert>
+#include <span>
 
 namespace soft_mem {
 
@@ -158,18 +159,6 @@ struct RingIntf {
   bool *injected;
 };
 
-struct MemIntf {
-  /* Possible memory response from the external memory bus,
-   * or nullptr if no response is available
-   */
-  GlobalMemResp* resp;
-
-  /*
-   * Whether the presented memory request is accepted
-   */
-  bool reqAccepted;
-};
-
 // Base class for software memory interface
 // contains the common components:
 // - scalar states, arbitration, state machine transitions
@@ -313,6 +302,10 @@ public:
     index = (index + offset) % size;
     return (validness >> index) & 1;
   }
+  RingResp* peekAt(size_t index) __attribute__((always_inline)) {
+    if (validAt(index)) return &operator[](index);
+    else return nullptr;
+  }
 
   RingResp& operator[](size_t index) __attribute__((always_inline)) {
     return buffers.at((index + offset) % size);
@@ -330,16 +323,6 @@ public:
  * The DRAMIf. Including the distributors, so it directly interfaces with PUs
  */
 class DRAMIf : public MemIf {
-  struct PUResp {
-    std::optional<std::pair<uint16_t, MemLine>> unicast;
-    std::optional<BcastLine> bcast;
-  };
-
-  struct PUAccept {
-    bool unicast;
-    bool broadcast;
-  };
-
   /*
    * Bulk state machine
    */
@@ -388,11 +371,21 @@ class DRAMIf : public MemIf {
   }
 
 public:
+  struct PUResp {
+    std::optional<std::pair<uint16_t, MemLine>> unicast;
+    std::optional<BcastLine> bcast;
+  };
+
+  struct PUAccept {
+    bool unicast; // Right now, PU unconditionally accepts unicast. The ringbus impl depends on this. TODO: add a assertion
+    bool broadcast;
+  };
+
   /*
    * PU interfacing
    */
-  void peekPUs(std::vector<PUResp> &pus, const RingResp *ingress) const __attribute__((always_inline)) {
-    pus.resize(puEnd - puStart);
+  void peekPUs(std::span<PUResp> &pus, const RingResp *ingress) const __attribute__((always_inline)) {
+    if (pus.size() != puEnd - puStart) throw std::logic_error("Incorrect peekPUs buffer length");
 
     // Generate the UNIQUE arbitration of unicast response
     auto unicast = unicastRespPeek(ingress);
@@ -436,9 +429,9 @@ public:
    */
   void step(
     RingIntf ring,
-    MemIntf mem,
+    MemBusIn &mem,
     Flit *flit,
-    const std::vector<PUAccept> &puAccepts
+    const std::span<PUAccept> &puAccepts
   ) __attribute__((always_inline)) {
     // Remember allocation slots
     auto scalarAlloc = scalarAllocSlot();
@@ -522,7 +515,7 @@ public:
     // that still used the state from the previous cycle
     //
     // If scalar has memory request, it's given priority
-    if (mem.reqAccepted) {
+    if (mem.reqAccepting) {
       if (auto slot = MemIf::scalarReqSlot())
         scalarReqCommit(*slot);
       else if (bulk)
@@ -532,8 +525,8 @@ public:
     }
 
     GlobalMemResp *bulkMemResp = nullptr;
-    if (mem.resp != nullptr) {
-      if (mem.resp->id & 0x80) bulkMemResp = mem.resp;
+    if (mem.resp) {
+      if (mem.resp->id & 0x80) bulkMemResp = &*mem.resp;
       else MemIf::scalarRespAccept(*mem.resp);
     }
 
@@ -586,7 +579,7 @@ public:
 
   void step(
     RingIntf ring,
-    MemIntf mem,
+    MemBusIn &mem,
     Flit *flit
   ) __attribute__((always_inline)) {
     // Remember alloc slots
@@ -608,7 +601,7 @@ public:
     // This is handled before req, because for peripheral, we need to look at the pending request
     // Grant is given to potentially config ROM is external mem does not give a response
     bool romServed = false;
-    if (mem.resp != nullptr) // Contains resp
+    if (mem.resp) // Contains resp
       scalarRespAccept(*mem.resp);
     else if (auto slot = MemIf::scalarReqSlot()) {
       auto req = MemIf::scalarReq(*slot);
@@ -623,7 +616,7 @@ public:
     }
 
     // External memory request
-    if (mem.reqAccepted || romServed) {
+    if (mem.reqAccepting || romServed) {
       if (auto slot = MemIf::scalarReqSlot())
         scalarReqCommit(*slot);
       else
