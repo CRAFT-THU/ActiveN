@@ -6,11 +6,17 @@
 #include <vector>
 #include <string_view>
 #include <memory>
-#include <bitset>
+#include <array>
 
 // System-level simulators
 
-const size_t MEM_BUS_WIDTH = 256;
+const uint8_t MEM_BUS_WIDTH_SIZE = 5; // Log_2(MEM_BUS_WIDTH / 8)
+const size_t MEM_BUS_WIDTH_B = (((size_t ) 1) << MEM_BUS_WIDTH_SIZE);
+const size_t MEM_BUS_WIDTH = MEM_BUS_WIDTH_B * 8;
+const uint32_t MEM_ADDR_OFFSET_MASK = ((((uint32_t) 1) << MEM_BUS_WIDTH_SIZE) - 1);
+const uint32_t MEM_ADDR_ALIGN_MASK = ~MEM_ADDR_OFFSET_MASK;
+
+// FIXME: alignment
 typedef std::array<uint8_t, MEM_BUS_WIDTH / 8> MemLine;
 typedef uint32_t mem_mask_t;
 

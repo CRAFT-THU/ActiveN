@@ -395,6 +395,7 @@ class DRAMIf(
   val bcstDists = for (ci <- 0 until numClusters) yield {
     val bcstDist = Wire(Decoupled(new BcastLine))
     bcstDist.suggestName(s"bcstDist_$ci")
+    // FIXME: gate by if any data lands in that distributor
     bcstDist.valid := bcstValid && !bcstAccepted(ci)
     bcstDist.bits.tag := bulkPending.tag
     bcstDist.bits.line := bulkBuffer(bulkPending.completedCnt).asTypeOf(Vec(4, new BcastBeat))

@@ -29,7 +29,7 @@ We currently allocates the following events Tag for memory requests / responses.
   - operand[2]: The AMO operand
 - 0x?10: CSR access
   - operand[0]: the start of the row
-  - operand[1][31:16]: the length of the access (in 8 bytes) FIXME: change to granularity based on memory beat
+  - operand[1][31:16]: the length of the access (in MEM_BEATS bytes)
   - operand[1][15:0]: the return tag value (which is scattered, locally)
   - TODO: operand[2] & operand[3]: Carried data, passed to the handler.
 - 0x?11: Bulk load
