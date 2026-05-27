@@ -263,7 +263,7 @@ public:
 
   virtual bool ringIsLocal(const RingResp &resp) const noexcept = 0;
   virtual bool ringCanAccept(const RingResp &resp) const noexcept __attribute__((always_inline)) {
-    return true;
+    return ringIsLocal(resp);
   }
 
   /*
@@ -301,6 +301,16 @@ public:
   bool validAt(size_t index) const __attribute__((always_inline)) {
     index = (index + offset) % size;
     return (validness >> index) & 1;
+  }
+  void updateValidAt(size_t index, bool inject, bool eject) __attribute__((always_inline)) {
+    // If nothing happens, do nothing
+    if (!inject && !eject) return;
+
+    size_t offsetted = (index + offset) % size;
+    // If injected, always set one
+    if (inject) validness |= 1ULL << offsetted;
+    // If not injected, but ejected, clear one
+    else if (eject) validness &= ~(1ULL << offsetted);
   }
   RingResp* peekAt(size_t index) __attribute__((always_inline)) {
     if (validAt(index)) return &operator[](index);
@@ -384,7 +394,7 @@ public:
   /*
    * PU interfacing
    */
-  void peekPUs(std::span<PUResp> &pus, const RingResp *ingress) const __attribute__((always_inline)) {
+  void peekPUs(const std::span<PUResp> &pus, const RingResp *ingress) const __attribute__((always_inline)) {
     if (pus.size() != puEnd - puStart) throw std::logic_error("Incorrect peekPUs buffer length");
 
     // Generate the UNIQUE arbitration of unicast response
@@ -433,6 +443,8 @@ public:
     Flit *flit,
     const std::span<PUAccept> &puAccepts
   ) __attribute__((always_inline)) {
+    *ring.injected = false;
+
     // Remember allocation slots
     auto scalarAlloc = scalarAllocSlot();
 
@@ -582,6 +594,8 @@ public:
     MemBusIn &mem,
     Flit *flit
   ) __attribute__((always_inline)) {
+    *ring.injected = false;
+
     // Remember alloc slots
     auto scalarAlloc = scalarAllocSlot();
 

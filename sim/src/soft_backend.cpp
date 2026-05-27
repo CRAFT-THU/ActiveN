@@ -1003,9 +1003,15 @@ public:
   std::span<T> slice(size_t start, size_t end) {
     return std::span<T>(inner.data() + start - 1, end - start);
   }
+  auto begin() { return inner.begin(); }
+  auto end() { return inner.end(); }
+  auto cbegin() { return inner.cbegin(); }
+  auto cend() { return inner.cend(); }
 };
 
 class SoftSystemBackend : public SystemBackend {
+  static const size_t ROUTER_Q_DEPTH = 8;
+
   // New topology info
   // First coordinate is the East-west coord (X)
   // Second coordinate is the North-south coord (y)
@@ -1032,7 +1038,7 @@ class SoftSystemBackend : public SystemBackend {
   size_t numPU, numMC;
   // The cycle EDGE after which the reset is released. Since cycle increment after step,
   // this should be K - 1 if we want K cycles of reset (0-based).
-  size_t releaseResetOn;
+  size_t releaseResetAfter;
 
   Topology topo;
   soft_mem::PeriphIf periph;
@@ -1051,6 +1057,8 @@ class SoftSystemBackend : public SystemBackend {
     ReadyValidPair<Flit> core_inject;
     ReadyValidPair<Flit> core_eject;
     // Forwards may not be fully utilized.
+    // This stores the **egress** buffer
+    // To read the ingress data, routers need to read from the peer router's buffer
     std::array<ReadyValidPair<Flit>, 4> forwards;
   };
 
@@ -1071,7 +1079,7 @@ class SoftSystemBackend : public SystemBackend {
   struct WrappedRouter {
      LinkStatus links;
      LinkBuffer buf;
-     Router<Flit, 8> rt;
+     Router<Flit, ROUTER_Q_DEPTH> rt;
   };
   // Tightly-coupled router states
   IndexVector<WrappedRouter> routers;
@@ -1079,15 +1087,15 @@ class SoftSystemBackend : public SystemBackend {
   // Directions to links. 0 = North, 1 = east, 2 = south, 3 = west
   typedef std::array<std::optional<size_t>, 4> DirectionToLinkIdx;
 
-  auto routingTableFor(uint16_t idx, const DirectionToLinkIdx &linkIdx) const {
+  auto routingTableFor(uint16_t idx, const DirectionToLinkIdx &linkIdx, std::optional<size_t> memifIdx) const {
     const Topology *topo = &this->topo;
     auto selfCoord = topo->pu_to_coord[idx];
-    return [idx, topo, selfCoord, linkIdx](uint16_t dst) -> size_t {
+    return [idx, topo, selfCoord, linkIdx, memifIdx](uint16_t dst) -> size_t {
       bool isMem = (dst & 0x8000) != 0;
       size_t tgt = 0;
       if (isMem) {
         uint16_t memIdx = dst & 0x7FFF;
-        if (memIdx > topo->memif_to_pu.size()) throw std::runtime_error("Memory index too large in flit");
+        if (memIdx >= topo->memif_to_pu.size()) throw std::runtime_error("Memory index too large in flit");
         tgt = topo->memif_to_pu[memIdx];
       } else {
         tgt = dst;
@@ -1095,7 +1103,11 @@ class SoftSystemBackend : public SystemBackend {
 
       if (tgt == 0 || tgt == idx) {
         // Is sending to local
-        return isMem ? 1 : 0;
+        if (isMem) {
+          if (!memifIdx) throw std::runtime_error("Memory request sent to local but no memifIdx is set");
+          return *memifIdx;
+        }
+        return 0;
       }
 
       // Else, requires routing
@@ -1113,7 +1125,7 @@ class SoftSystemBackend : public SystemBackend {
 
   std::optional<Flit> peekCoreInject(uint16_t puIdx) const {
     const auto &core = cores[puIdx];
-    if (core.ext_out_valid) return std::nullopt;
+    if (!core.ext_out_valid) return std::nullopt;
     return Flit {
       .src = puIdx,
       .dst = core.ext_out_bits_dst,
@@ -1127,24 +1139,61 @@ class SoftSystemBackend : public SystemBackend {
     };
   }
 
-  void presentCoreEject(uint16_t puIdx, std::optional<Flit>) {
-    // FIXME: impl
+  void presentCoreEject(uint16_t puIdx, const std::optional<Flit> &flit) {
+    auto &core = cores[puIdx];
+    core.ext_in_valid = flit.has_value();
+    if (flit) {
+      if (flit->dst != puIdx && !(flit->src == puIdx && flit->dst == 0))
+        throw std::invalid_argument("presentCoreEject: flit presented to wrong PU");
+      core.ext_in_bits_tag = flit->tag;
+      core.ext_in_bits_data_0 = flit->data[0];
+      core.ext_in_bits_data_1 = flit->data[1];
+      core.ext_in_bits_data_2 = flit->data[2];
+      core.ext_in_bits_data_3 = flit->data[3];
+    }
   }
 
   void presentCoreMem(uint16_t puIdx, const soft_mem::DRAMIf::PUResp &resp) {
-    // FIXME: impl
+    auto &core = cores[puIdx];
+    core.mem_unicast_valid = resp.unicast.has_value();
+    if (resp.unicast.has_value()) {
+      core.mem_unicast_bits_id = resp.unicast->first;
+      core.mem_unicast_bits_data = resp.unicast->second;
+    }
+
+    core.mem_broadcast_valid = resp.bcast.has_value();
+    if (resp.bcast.has_value()) {
+      core.mem_broadcast_bits_tag = resp.bcast->tag;
+      core.mem_broadcast_bits_carried_0 = resp.bcast->carried[0];
+      core.mem_broadcast_bits_carried_1 = resp.bcast->carried[1];
+
+      // FIXME: fill in, check endian
+    }
   }
 
 public:
   virtual void peek(uint64_t cycle, std::vector<MemBusOut *> out) override {
-    // FIXME: reset period
-    if (out.size() != numMC) throw std::invalid_argument("peek: out size mismatch");
+    if (out.size() != numMC + 1) throw std::invalid_argument("peek: out size mismatch");
+    if (cycle <= releaseResetAfter) {
+      // Exposes nothing
+      for (auto &o : out)
+        o->req = std::nullopt;
+      return;
+    }
+
     out[0]->req = periph.peekMem();
     for (size_t i = 0; i < numMC; ++i)
       out[i + 1]->req = drams[i].peekMem();
   }
 
   void stage(uint64_t cycle, const std::vector<MemBusIn> &in) override {
+    if (cycle <= releaseResetAfter) {
+      for (const auto &i : in) {
+        if (i.reqAccepting) throw std::runtime_error("Memory request accepted during reset");
+        if (i.resp) throw std::runtime_error("Memory response presented during reset");
+      }
+    }
+
     // Copy external memory response into internal buffer
     memif_ext = in;
 
@@ -1178,8 +1227,8 @@ public:
       local.buf.core_inject.accepting = local.buf.core_inject.presenting && local.rt.canEnq(0, local.buf.core_inject.presenting->prio());
       size_t o = 0;
       for (; o < 4 && local.links.forwards[o]; ++o) {
-        auto [to, port] = *local.links.forwards[o];
-        auto &remote = routers[to];
+        auto [from, port] = *local.links.forwards[o];
+        auto &remote = routers[from];
         auto &remoteBuf = remote.buf.forwards[port];
         remoteBuf.accepting = remoteBuf.presenting && local.rt.canEnq(o + 1, remoteBuf.presenting->prio());
       }
@@ -1189,14 +1238,14 @@ public:
     memif_eject[0].accepting = memif_eject[0].presenting && periph.nocCanAccept(*memif_eject[0].presenting);
     for (size_t m = 0; m < numMC; ++m) {
       memif_ring_accept[m + 1] = ring.peekAt(m + 1) && drams[m].ringCanAccept(*ring.peekAt(m + 1));
-      memif_eject[m + 1].accepting = memif_eject[m + 1].presenting && periph.nocCanAccept(*memif_eject[m + 1].presenting);
+      memif_eject[m + 1].accepting = memif_eject[m + 1].presenting && drams[m].nocCanAccept(*memif_eject[m + 1].presenting);
     }
 
     // For cores, additionally propagate inject accepting, so we can eval only once
     for (uint16_t i = 1; i <= numPU; ++i) {
       presentCoreEject(i, routers[i].buf.core_eject.presenting);
       presentCoreMem(i, core_mem[i]);
-      cores[i].ext_out_ready = routers[i].buf.core_eject.accepting;
+      cores[i].ext_out_ready = routers[i].buf.core_inject.accepting;
       // Negedge
       cores[i].clock = false;
       cores[i].eval();
@@ -1214,37 +1263,40 @@ public:
       cores[i].clock = true; // Posedge
       cores[i].eval();
 
-      if (cycle == releaseResetOn) {
+      if (cycle == releaseResetAfter) {
         cores[i].reset = false;
         cores[i].eval();
       }
     }
 
     // Steps routers
-    for (size_t i = 1; i <= numPU; ++i) {
-      auto &router = routers[i];
+    for (auto &router : routers) {
       const auto &buffer = router.buf;
       const auto &links = router.links;
+      const auto &routers = this->routers;
       bool memif_accepting = false;
       if (links.memif.has_value()) memif_accepting = memif_eject[*links.memif].accepting;
       router.rt.step(
-        [&buffer, &links](size_t i) -> std::optional<Flit> {
+        [&buffer, &links, &routers](size_t i) -> std::optional<Flit> {
           if (i == 0) {
             if (buffer.core_inject.accepting) return buffer.core_inject.presenting;
           } else {
             assert(i < 5 && links.forwards[i - 1]);
-            if (buffer.forwards[i - 1].accepting) return buffer.forwards[i - 1].presenting;
+            auto [from, port] = *links.forwards[i - 1];
+            auto &remote = routers[from];
+            auto &remoteBuf = remote.buf.forwards[port];
+            if (remoteBuf.accepting) return remoteBuf.presenting;
           }
 
           return std::nullopt;
         },
         [&buffer, &links, memif_accepting](size_t i) -> bool {
           if (i == 0) {
-            return buffer.core_inject.accepting;
+            return buffer.core_eject.accepting;
           } else if (i < 5 && links.forwards[i - 1]) {
             return buffer.forwards[i - 1].accepting;
           } else {
-            assert(link.memif);
+            assert(links.memif);
             return memif_accepting;
           }
         }
@@ -1253,31 +1305,37 @@ public:
 
     // Step memifs
     const size_t PU_PER_MC = numPU / numMC;
+    bool injected;
     periph.step(
       soft_mem::RingIntf {
         .buffer = &ring[0],
         .ingress = ring.validAt(0),
-        .eject = memif_eject[0].accepting,
+        .eject = memif_ring_accept[0],
         // TODO: this condition may break in the future
         // This reads as: nothing pushed last cycle (the forward queue is empty)
         // and no forward is pushing into the outgoing queue at this cycle
-        .canInject = !ring.validAt(1) && (!ring.validAt(0) || memif_eject[0].accepting)
+        .canInject = !ring.validAt(1) && (!ring.validAt(0) || memif_eject[0].accepting),
+        .injected = &injected
       },
       memif_ext[0],
       memif_eject[0].accepting ? &*memif_eject[0].presenting : nullptr
     );
+    ring.updateValidAt(0, injected, memif_ring_accept[0]);
     for (size_t m = 0; m < numMC; ++m) {
       drams[m].step(
         soft_mem::RingIntf {
-          .buffer = &ring[m],
-          .ingress = ring.validAt(m),
-          .eject = memif_eject[m].accepting,
-          .canInject = !ring.validAt((m + 1) % (numMC + 1)) && (!ring.validAt(m) || memif_eject[m].accepting)
+          .buffer = &ring[m + 1],
+          .ingress = ring.validAt(m + 1),
+          .eject = memif_ring_accept[m + 1],
+          .canInject = !ring.validAt((m + 2) % (numMC + 1)) && (!ring.validAt(m + 1) || memif_eject[m + 1].accepting),
+          .injected = &injected
         },
-        memif_ext[m],
-        memif_eject[m].accepting ? &*memif_eject[m].presenting : nullptr,
+        memif_ext[m + 1],
+        memif_eject[m + 1].accepting ? &*memif_eject[m + 1].presenting : nullptr,
         core_mem_accept.slice(1 + PU_PER_MC * m, 1 + PU_PER_MC * (m + 1))
       );
+      ring.updateValidAt(m + 1, injected, memif_ring_accept[m + 1]);
     }
+    ring.progress();
   }
 };
