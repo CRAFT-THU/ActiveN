@@ -97,8 +97,10 @@ struct Topology {
       size_t tgt = 0;
       if (isMem) {
         uint16_t memIdx = dst & 0x7FFF;
-        if (memIdx >= memif_to_pu.size())
-          throw std::runtime_error("Memory index too large in flit");
+        if constexpr (ASSERTIONS_ENABLED) {
+          if (memIdx >= memif_to_pu.size())
+            throw std::runtime_error("Memory index too large in flit");
+        }
         tgt = memif_to_pu[memIdx];
       } else {
         tgt = dst;
@@ -107,16 +109,20 @@ struct Topology {
       if (tgt == 0 || tgt == idx) {
         // Local delivery.
         if (isMem) {
-          if (!memifIdx)
-            throw std::runtime_error("Memory request sent to local but no memifIdx is set");
+          if constexpr (ASSERTIONS_ENABLED) {
+            if (!memifIdx)
+              throw std::runtime_error("Memory request sent to local but no memifIdx is set");
+          }
           return *memifIdx;
         }
         return coreEjectPort;
       }
 
       // Else, XY routing: column (first) first, then row (second).
-      if (tgt > pu_to_coord.maxIndex())
-        throw std::runtime_error("Target index too large in flit");
+      if constexpr (ASSERTIONS_ENABLED) {
+        if (tgt > pu_to_coord.maxIndex())
+          throw std::runtime_error("Target index too large in flit");
+      }
       auto tgtCoord = pu_to_coord[tgt];
       size_t dir;
       if (tgtCoord.first != selfCoord.first)
@@ -124,7 +130,9 @@ struct Topology {
       else
         dir = tgtCoord.second < selfCoord.second ? 0 /* NORTH */ : 2 /* SOUTH */;
       auto link = linkIdx[dir];
-      if (!link) throw std::logic_error("Routed to a non-existing link");
+      if constexpr (ASSERTIONS_ENABLED) {
+        if (!link) throw std::logic_error("Routed to a non-existing link");
+      }
       return *link;
     };
   }

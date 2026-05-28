@@ -9,6 +9,8 @@
 #include <memory>
 #include <array>
 
+static const bool ASSERTIONS_ENABLED = false;
+
 // System-level simulators
 
 const uint8_t MEM_BUS_WIDTH_SIZE = 5; // Log_2(MEM_BUS_WIDTH / 8)
@@ -19,6 +21,9 @@ const uint32_t MEM_ADDR_ALIGN_MASK = ~MEM_ADDR_OFFSET_MASK;
 
 // FIXME: alignment
 typedef std::array<uint8_t, MEM_BUS_WIDTH / 8> MemLine;
+struct alignas(MEM_BUS_WIDTH_B) AlignedMemLine {
+  MemLine inner;
+};
 typedef uint32_t mem_mask_t;
 
 struct GlobalMemReq {

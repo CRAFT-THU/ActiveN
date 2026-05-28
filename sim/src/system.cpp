@@ -34,7 +34,6 @@
  *   --rng-seed N        RNG seed for peripheral device
  */
 
-#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
@@ -71,8 +70,18 @@ static void sighandler(int) { exiting = true; }
 
 // ---- Per-MC memory images (owned by the frontend) ----
 struct McImage {
-  std::unordered_map<uint32_t, MemLine> data;
-  std::size_t size; // This is the total size, according to hardware config, not the image size
+  std::unique_ptr<AlignedMemLine[]> dense = nullptr;
+  std::unordered_map<uint32_t, AlignedMemLine> sparse = {};
+  std::size_t dense_size; // This is the size of the dense part of the image
+  std::size_t tot_size; // This is the total size, according to hardware config, not the image size
+
+  AlignedMemLine& access(uint32_t aligned_addr) {
+    if (aligned_addr < dense_size) {
+      return dense[aligned_addr / MEM_BUS_WIDTH_B];
+    } else {
+      return sparse[aligned_addr];
+    }
+  }
 
   GlobalMemResp handle(const GlobalMemReq &req) {
     if ((1 << req.size) > MEM_BUS_WIDTH / 8) {
@@ -80,19 +89,21 @@ struct McImage {
     }
 
     uint32_t aligned_addr = req.addr & ~(MEM_BUS_WIDTH / 8 - 1);
-    if (aligned_addr >= size) {
-      throw runtime_error("Memory request address out of bounds");
-    }
+    if constexpr (ASSERTIONS_ENABLED) {
+      if (aligned_addr >= tot_size) {
+        throw runtime_error("Memory request address out of bounds");
+      }
 
-    if (aligned_addr % (1 << req.size) != 0) {
-      throw runtime_error("Memory request address not aligned");
+      if (aligned_addr % (1 << req.size) != 0) {
+        throw runtime_error("Memory request address not aligned");
+      }
     }
 
     GlobalMemResp resp;
     // Readout
     resp.id = req.id;
-    MemLine readout = data.contains(aligned_addr) ? data.at(aligned_addr) : MemLine {};
-    resp.data = readout;
+    AlignedMemLine &cur = access(aligned_addr);
+    resp.data = cur.inner;
 
     if (req.write) {
       uint32_t subline_addr = req.addr - aligned_addr;
@@ -101,10 +112,9 @@ struct McImage {
 
       for (size_t i = 0; i < MEM_BUS_WIDTH / 8; ++i) {
         if (mask & (1 << i)) {
-          readout[i] = req.wdata[i];
+          cur.inner[i] = req.wdata[i];
         }
       }
-      data[aligned_addr] = readout;
     }
 
     return resp;
@@ -122,24 +132,24 @@ static void loadImages(const vector<string> &paths, const vector<uint64_t> &mc_s
     size_t fsize = fin.tellg();
     fin.seekg(0);
 
-    mc_images[i].size = (i < mc_sizes.size()) ? (size_t)mc_sizes[i] : fsize;
+    // Round file size up to MEM_BUS_WIDTH_B; tail bytes are zero-padded.
+    size_t dense_bytes = (fsize + MEM_ADDR_OFFSET_MASK) & ~MEM_ADDR_OFFSET_MASK;
 
-    // Read file in 32-byte chunks into the unordered_map
-    constexpr size_t LINE_BYTES = MEM_BUS_WIDTH / 8;
-    MemLine line{};
-    for (size_t offset = 0; offset < fsize; offset += LINE_BYTES) {
-      size_t to_read = min(LINE_BYTES, fsize - offset);
-      line = {};
-      fin.read(reinterpret_cast<char *>(line.data()), to_read);
-      // Only store non-zero lines
-      bool all_zero = true;
-      for (size_t b = 0; b < LINE_BYTES; ++b) {
-        if (line[b] != 0) { all_zero = false; break; }
-      }
-      if (!all_zero) {
-        mc_images[i].data[(uint32_t)offset] = line;
-      }
-    }
+    mc_images[i].tot_size = (i < mc_sizes.size()) ? (size_t)mc_sizes[i] : dense_bytes;
+    mc_images[i].dense_size = dense_bytes;
+    if (mc_images[i].tot_size < mc_images[i].dense_size) throw runtime_error("MC size is smaller than file size");
+
+    size_t nlines = dense_bytes / MEM_BUS_WIDTH_B;
+    auto t0 = std::chrono::steady_clock::now();
+    mc_images[i].dense = std::make_unique<AlignedMemLine[]>(nlines);
+    auto t1 = std::chrono::steady_clock::now();
+    fin.read(reinterpret_cast<char *>(mc_images[i].dense.get()), fsize);
+    auto t2 = std::chrono::steady_clock::now();
+    double alloc_s = std::chrono::duration<double>(t1 - t0).count();
+    double read_s  = std::chrono::duration<double>(t2 - t1).count();
+    cerr << "[loadImages] MC " << i << ": " << paths[i]
+         << " fsize=" << fsize << " dense_bytes=" << dense_bytes
+         << " alloc=" << alloc_s << "s read=" << read_s << "s" << endl;
   }
 }
 

@@ -10,6 +10,7 @@
 #include <vector>
 #include <cassert>
 #include <stdexcept>
+#include "system.h"
 
 // Fixed-length 1-based vector.
 //
@@ -215,8 +216,10 @@ public:
 
   // Atomically enqueue a item, and also dequeue the selected item if it's accepted
   void step(std::optional<T> enq, std::optional<size_t> deq) {
-    if (enq.has_value() && !canEnq(enq->prio())) throw std::runtime_error("queue overflow");
-    if (deq.has_value() && !(occupied & (1ull << *deq))) throw std::runtime_error("deq slot is not occupied");
+    if constexpr (ASSERTIONS_ENABLED) {
+      if (enq.has_value() && !canEnq(enq->prio())) throw std::runtime_error("queue overflow");
+      if (deq.has_value() && !(occupied & (1ull << *deq))) throw std::runtime_error("deq slot is not occupied");
+    }
 
     // Select lowest zero, may be undefined if queue is full
     size_t enq_idx = std::countr_one(occupied);
@@ -240,7 +243,7 @@ class Router : std::is_invocable_r<size_t, RT, size_t> {
   std::vector<std::optional<size_t>> _input_deqs_scratch;
 
 private:
-  std::optional<std::pair<size_t, size_t>> peek_iq_slot(size_t o_port) const {
+  std::optional<std::pair<size_t, size_t>> peek_iq_slot(size_t o_port) const __attribute__((always_inline)) {
     const FlitArb &arb = _output_arbs[o_port];
     // Build the input lambda
     auto inputs = [this, o_port](size_t idx) __attribute__((always_inline)) -> std::optional<uint8_t> {
@@ -301,9 +304,13 @@ public:
     for (size_t o = 0; o < _num_outputs; ++o)
       if (deq_accepts(o)) {
         auto selected = peek_iq_slot(o);
-        if (!selected.has_value()) throw std::runtime_error("deq_accepts is true but peek_iq_slot returns nullopt");
+        if constexpr (ASSERTIONS_ENABLED) {
+          if (!selected.has_value()) throw std::runtime_error("deq_accepts is true but peek_iq_slot returns nullopt");
+        }
         auto [iq, slot] = *selected;
-        if (input_deqs[iq].has_value()) throw std::runtime_error("one flit routed to multiple output ports");
+        if constexpr (ASSERTIONS_ENABLED) {
+          if (input_deqs[iq].has_value()) throw std::runtime_error("one flit routed to multiple output ports");
+        }
         input_deqs[iq] = slot;
 
         // Update arbiter
@@ -315,8 +322,6 @@ public:
       _input_queues[i].step(enqs(i), input_deqs[i]);
   }
 
-  size_t numInputs() const { return _num_inputs; }
-  size_t numOutputs() const { return _num_outputs; }
   size_t totalFlits() const {
     size_t n = 0;
     for (auto &q : _input_queues) n += q.size();

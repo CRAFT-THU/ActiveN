@@ -437,8 +437,10 @@ static void presentCoreMem(soft_rtl &core, const soft_mem::DRAMIf::PUResp &resp)
 
 void SoftSystemBackend::peek(uint64_t cycle, std::vector<MemBusOut *> out) {
   PhaseTimer _t(*this);
-  if (out.size() != cfg.numMC + 1)
-    throw std::invalid_argument("peek: out size mismatch");
+  if constexpr (ASSERTIONS_ENABLED) {
+    if (out.size() != cfg.numMC + 1)
+      throw std::invalid_argument("peek: out size mismatch");
+  }
   if (cycle <= releaseResetAfter) {
     for (auto &o : out) o->req = std::nullopt;
     return;
@@ -451,9 +453,11 @@ void SoftSystemBackend::peek(uint64_t cycle, std::vector<MemBusOut *> out) {
 
 void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
   PhaseTimer _t(*this);
-  if (cycle <= releaseResetAfter) {
-    for (const auto &i : in) {
-      if (i.resp) throw std::runtime_error("Memory response presented during reset");
+  if constexpr (ASSERTIONS_ENABLED) {
+    if (cycle <= releaseResetAfter) {
+      for (const auto &i : in) {
+        if (i.resp) throw std::runtime_error("Memory response presented during reset");
+      }
     }
   }
 

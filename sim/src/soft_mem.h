@@ -30,7 +30,9 @@ struct ScalarRequest {
   bool write;
 
   static ScalarRequest fromFlit(const Flit &f) {
-    if ((f.tag & 0xFF) > 1) throw std::invalid_argument("Unknown scalar request type");
+    if constexpr (ASSERTIONS_ENABLED) {
+      if ((f.tag & 0xFF) > 1) throw std::invalid_argument("Unknown scalar request type");
+    }
     bool isWrite = (f.tag & 0xFF) != 0;
 
     std::array<uint32_t, MEM_BUS_WIDTH_B / 4> tmp;
@@ -69,8 +71,10 @@ struct BulkRequest {
   std::array<uint32_t, 2> returnCarried;
 
   static BulkRequest fromFlit(size_t maxInflight, const Flit &f) {
-    if (maxInflight > 64) throw std::invalid_argument("maxInflight too large");
-    if ((f.tag & 0xFF) != 0x10) throw std::invalid_argument("Unknown bulk request type");
+    if constexpr (ASSERTIONS_ENABLED) {
+      if (maxInflight > 64) throw std::invalid_argument("maxInflight too large");
+      if ((f.tag & 0xFF) != 0x10) throw std::invalid_argument("Unknown bulk request type");
+    }
     return {
       .base = f.data[0],
       .cnt = (uint16_t) (f.data[1] >> 16),
@@ -111,8 +115,10 @@ struct BulkRequest {
   void step(bool issued, bool retire, const GlobalMemResp *resp, std::vector<MemLine> &buffer) {
     size_t oldIssueCnt = issueCnt;
     if (issued) {
-      if (issueCnt >= maxInflight + retireCnt || issueCnt >= cnt)
-        throw std::logic_error("issueCnt out of bounds");
+      if constexpr (ASSERTIONS_ENABLED) {
+        if (issueCnt >= maxInflight + retireCnt || issueCnt >= cnt)
+          throw std::logic_error("issueCnt out of bounds");
+      }
 
       size_t issueSlot = issueCnt % maxInflight;
       recentResp &= ~(1ULL << issueSlot);
@@ -120,18 +126,26 @@ struct BulkRequest {
     }
 
     if (retire) {
-      if ((recentResp & (1ULL << (retireCnt % maxInflight))) == 0)
-        throw std::logic_error("retired without response");
+      if constexpr (ASSERTIONS_ENABLED) {
+        if ((recentResp & (1ULL << (retireCnt % maxInflight))) == 0)
+          throw std::logic_error("retired without response");
+      }
       ++retireCnt;
-      if (retireCnt > oldIssueCnt)
-        throw std::logic_error("retireCnt out of bounds");
+      if constexpr (ASSERTIONS_ENABLED) {
+        if (retireCnt > oldIssueCnt)
+          throw std::logic_error("retireCnt out of bounds");
+      }
     }
 
     if (resp != nullptr) {
       size_t respSlot = resp->id & 0x7F;
-      if (respSlot >= maxInflight) throw std::logic_error("respSlot out of bounds");
+      if constexpr (ASSERTIONS_ENABLED) {
+        if (respSlot >= maxInflight) throw std::logic_error("respSlot out of bounds");
+      }
       buffer[respSlot] = resp->data;
-      if (recentResp & (1ULL << respSlot)) throw std::logic_error("double response");
+      if constexpr (ASSERTIONS_ENABLED) {
+        if (recentResp & (1ULL << respSlot)) throw std::logic_error("double response");
+      }
       recentResp |= 1ULL << respSlot;
     }
   }
@@ -238,14 +252,18 @@ public:
   }
 
   void scalarReqCommit(uint8_t slot) __attribute__((always_inline)) {
-    if((scalarAllocated & (1ULL << slot)) == 0) throw std::logic_error("scalarReqCommit: slot not yet allocated");
-    if((scalarSent & (1ULL << slot))) throw std::logic_error("scalarReqCommit: slot already committed");
+    if constexpr (ASSERTIONS_ENABLED) {
+      if((scalarAllocated & (1ULL << slot)) == 0) throw std::logic_error("scalarReqCommit: slot not yet allocated");
+      if((scalarSent & (1ULL << slot))) throw std::logic_error("scalarReqCommit: slot already committed");
+    }
     scalarSent |= (1ULL << slot);
     scalarIssueArb.commit(slot);
   }
 
   void scalarRespAccept(const GlobalMemResp &resp) __attribute__((always_inline)) {
-    if (resp.id >= scalarInflight) throw std::logic_error("scalarRespAccept: invalid id");
+    if constexpr (ASSERTIONS_ENABLED) {
+      if (resp.id >= scalarInflight) throw std::logic_error("scalarRespAccept: invalid id");
+    }
     // TODO: implement AMO
     scalarPendings[resp.id].rwdata = resp.data;
     scalarCompleted |= (1ULL << resp.id);
@@ -293,7 +311,7 @@ public:
   requires(std::is_invocable_r_v<const std::optional<Flit>&, FI, size_t>)
   __attribute__((always_inline)) {
     // Iterate through all request ports
-    auto selected = reqArb.peek([&flits](size_t idx) -> std::optional<uint8_t> {
+    auto selected = reqArb.peek([&flits](size_t idx) __attribute__((always_inline)) -> std::optional<uint8_t> {
       auto &flit = flits(idx);
       if (!flit) return std::nullopt;
       return flit->prio();
@@ -472,7 +490,9 @@ public:
   }
 
   void peekPUs(const std::span<PUResp> &pus, const RingResp *ingress) const __attribute__((always_inline)) {
-    if (pus.size() != puEnd - puStart) throw std::logic_error("Incorrect peekPUs buffer length");
+    if constexpr (ASSERTIONS_ENABLED) {
+      if (pus.size() != puEnd - puStart) throw std::logic_error("Incorrect peekPUs buffer length");
+    }
 
     // Generate the UNIQUE arbitration of unicast response
     auto unicast = unicastRespPeek(ingress);
@@ -550,21 +570,25 @@ public:
     // For unicast responses that's from ringbus forward, we don't need to handle it here.
     // it's automatically overwritten by the ringbus injection logic
     // Check if any PU accepted a unicast
-    for (size_t puDelta = 0; puDelta < puEnd - puStart; ++ puDelta)
-      if (puAccepts[puDelta].unicast) {
-        if (
-          std::make_optional(puDelta) != unicast.ringLocal
-          && std::make_optional(puDelta) != unicast.scalarLocal
-        ) throw std::logic_error("PU accepted a non-existing unicast");
-      }
+    if constexpr (ASSERTIONS_ENABLED) {
+      for (size_t puDelta = 0; puDelta < puEnd - puStart; ++ puDelta)
+        if (puAccepts[puDelta].unicast) {
+          if (
+            std::make_optional(puDelta) != unicast.ringLocal
+            && std::make_optional(puDelta) != unicast.scalarLocal
+          ) throw std::logic_error("PU accepted a non-existing unicast");
+        }
 
-    if (unicast.ringLocal && puAccepts[*unicast.ringLocal].unicast) {
-      if (!ring.eject) throw std::logic_error("PU accepted a ringbus forward, but ringbus does not eject");
+      if (unicast.ringLocal && puAccepts[*unicast.ringLocal].unicast) {
+        if (!ring.eject) throw std::logic_error("PU accepted a ringbus forward, but ringbus does not eject");
+      }
     }
 
     if (unicast.scalarLocal && puAccepts[*unicast.scalarLocal].unicast) {
       auto resp = MemIf::scalarReturn(*scalarRet);
-      if (*unicast.scalarLocal + puStart != resp.dst) throw std::logic_error("locally returning a unicast with wrong dest");
+      if constexpr (ASSERTIONS_ENABLED) {
+        if (*unicast.scalarLocal + puStart != resp.dst) throw std::logic_error("locally returning a unicast with wrong dest");
+      }
       scalarDealloc = true;
     }
 
@@ -586,7 +610,9 @@ public:
       uint16_t &bcstPUMask = bcstPUAccepted[dist];
       for (size_t puDelta = 0; puDelta < CLUSTER_SIZE; ++puDelta) {
         if (puAccepts[dist * CLUSTER_SIZE + puDelta].broadcast) {
-          if (bcstPUMask & (1 << puDelta)) throw std::logic_error("PU accepted a non-existing broadcast");
+          if constexpr (ASSERTIONS_ENABLED) {
+            if (bcstPUMask & (1 << puDelta)) throw std::logic_error("PU accepted a non-existing broadcast");
+          }
           bcstPUMask |= 1 << puDelta;
         }
       }
@@ -599,7 +625,10 @@ public:
         // Pop when every addressed PU has accepted (matches RTL bcstWait==0)
         if ((bcstPUMask & valids) == valids) {
           bcstPUMask = 0;
-          if (!queue.pop()) throw std::logic_error("Broadcast queue is empty when dequeue");
+          bool popped = queue.pop();
+          if constexpr (ASSERTIONS_ENABLED) {
+            if (!popped) throw std::logic_error("Broadcast queue is empty when dequeue");
+          }
         }
       }
     }
@@ -615,8 +644,11 @@ public:
       }
       else if (bulk)
         bulkAcceptOne = true;
-      else
-        throw std::logic_error("External memory accepted a ghost request");
+      else {
+        if constexpr (ASSERTIONS_ENABLED) {
+          throw std::logic_error("External memory accepted a ghost request");
+        }
+      }
     }
 
     GlobalMemResp *bulkMemResp = nullptr;
@@ -632,16 +664,22 @@ public:
       bulk->step(bulkAcceptOne, bulkRetireOne, bulkMemResp, bulkBuffer);
       if (bulk->retireCnt == bulk->cnt) bulk = std::nullopt;
     } else if (bulkAcceptOne || bulkRetireOne || bulkMemResp != nullptr)
-      throw std::logic_error("Bulk state mismatch");
+      if constexpr (ASSERTIONS_ENABLED) {
+        throw std::logic_error("Bulk state mismatch");
+      }
 
     // Finally, allocations
     if (flit) {
       bool isBulk = (flit->first.get().tag & 0x10) != 0;
       if (isBulk) {
-        if (bulk.has_value()) throw std::logic_error("Received a bulk request while another bulk is in-flight");
+        if constexpr (ASSERTIONS_ENABLED) {
+          if (bulk.has_value()) throw std::logic_error("Received a bulk request while another bulk is in-flight");
+        }
         bulk = BulkRequest::fromFlit(bulkMaxInflight, flit->first);
       } else {
-        if (!scalarAlloc) throw std::logic_error("Received a scalar request while no slot is available");
+        if constexpr (ASSERTIONS_ENABLED) {
+          if (!scalarAlloc) throw std::logic_error("Received a scalar request while no slot is available");
+        }
         scalarAllocCommit(*scalarAlloc, ScalarRequest::fromFlit(flit->first));
       }
       nocAcceptCommit(flit->second);
@@ -667,7 +705,9 @@ public:
   PeriphIf(size_t memif_idx, size_t scalarInflight, std::unordered_map<uint32_t, MemLine> configROM) : MemIf(memif_idx, scalarInflight, 1), configROM(std::move(configROM)) {
     // Check configROM
     for (const auto &[addr, line] : configROM)
-      if (addr & MEM_ADDR_OFFSET_MASK) throw std::logic_error("ConfigROM address not aligned");
+      if constexpr (ASSERTIONS_ENABLED) {
+        if (addr & MEM_ADDR_OFFSET_MASK) throw std::logic_error("ConfigROM address not aligned");
+      }
   }
 
   virtual bool ringIsLocal(const RingResp &resp) const noexcept override __attribute__((always_inline)) {
@@ -694,7 +734,9 @@ public:
 
     // Ring state machine
     // We have no local ejection, so always feed into the ring
-    if (ring.eject) throw std::logic_error("ring ejection at PeriphIf should never happen");
+    if constexpr (ASSERTIONS_ENABLED) {
+      if (ring.eject) throw std::logic_error("ring ejection at PeriphIf should never happen");
+    }
     if (ring.canInject) {
       auto slot = MemIf::scalarReturnSlot();
       if (slot) {
@@ -726,12 +768,17 @@ public:
     if (romServed || (mem.reqAccepting && peekMem().has_value())) {
       if (auto slot = MemIf::scalarReqSlot())
         scalarReqCommit(*slot);
-      else
-        throw std::logic_error("External memory accepted a ghost request");
+      else {
+        if constexpr (ASSERTIONS_ENABLED) {
+          throw std::logic_error("External memory accepted a ghost request");
+        }
+      }
     }
 
     if (flit) {
-      if (!scalarAlloc) throw std::logic_error("Received a scalar request while no slot is available");
+      if constexpr (ASSERTIONS_ENABLED) {
+        if (!scalarAlloc) throw std::logic_error("Received a scalar request while no slot is available");
+      }
       MemIf::scalarAllocCommit(*scalarAlloc, ScalarRequest::fromFlit(flit->first));
       nocAcceptCommit(flit->second);
     }
