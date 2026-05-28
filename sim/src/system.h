@@ -1,5 +1,6 @@
 #pragma once
 
+#include "verilated_fst_c.h"
 #include <cwchar>
 #include <optional>
 #include <cstdint>

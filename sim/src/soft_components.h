@@ -1,12 +1,102 @@
 #pragma once
 
 #include <bit>
+#include <concepts>
 #include <cstdint>
+#include <functional>
 #include <type_traits>
 #include <optional>
+#include <span>
 #include <vector>
 #include <cassert>
 #include <stdexcept>
+
+// Fixed-length 1-based vector.
+//
+// Backed by std::vector<T>. For types that are neither movable nor
+// copyable (e.g. Verilator-generated soft_rtl), wrap in std::unique_ptr.
+template<typename T>
+class IndexVector {
+  std::vector<T> inner;
+
+public:
+  IndexVector() = default;
+  IndexVector(size_t size) : inner(size) {}
+
+  template<typename F>
+    requires std::is_invocable_r_v<T, F, size_t>
+  IndexVector(size_t size, F factory) {
+    inner.reserve(size);
+    for (size_t i = 0; i < size; ++i) inner.emplace_back(factory(i + 1));
+  }
+
+  T& operator[](size_t idx) { return inner[idx - 1]; }
+  const T& operator[](size_t idx) const { return inner[idx - 1]; }
+  size_t maxIndex() const { return inner.size(); }
+
+  // Borrowed contiguous span [start, end), 1-based indexing.
+  std::span<T> slice(size_t start, size_t end) {
+    return std::span<T>(inner.data() + start - 1, end - start);
+  }
+
+  auto begin() { return inner.begin(); }
+  auto end() { return inner.end(); }
+  auto cbegin() { return inner.cbegin(); }
+  auto cend() { return inner.cend(); }
+
+  void reserve(size_t n) { inner.reserve(n); }
+
+  template<typename ...Args>
+    requires std::constructible_from<T, Args...>
+  T& emplace_back(Args&&... args) {
+    return inner.emplace_back(std::forward<Args>(args)...);
+  }
+};
+
+template<typename T>
+struct FixedLenQueue {
+  size_t head = 0, tail = 0;
+  size_t capacity;
+  std::vector<T> data;
+  bool maybeFull = false;
+
+  FixedLenQueue(size_t capacity) : capacity(capacity), data(capacity) {}
+
+  // Returns a reference to the front element, or nullopt if empty.
+  std::optional<std::reference_wrapper<const T>> front() const {
+    if (head == tail && !maybeFull) return std::nullopt;
+    return std::cref(data[head]);
+  }
+  std::optional<std::reference_wrapper<T>> front() {
+    if (head == tail && !maybeFull) return std::nullopt;
+    return std::ref(data[head]);
+  }
+  bool pop() {
+    bool canPop = head != tail || maybeFull;
+    if (canPop) head = head + 1 == capacity ? 0 : head + 1;
+    maybeFull = false;
+    return canPop;
+  }
+
+  bool full() const {
+    return head == tail && maybeFull;
+  }
+  bool empty() const {
+    return head == tail && !maybeFull;
+  }
+  bool push(const T &t) {
+    if (full()) return false;
+    data[tail] = t;
+    tail = tail + 1 == capacity ? 0 : tail + 1;
+    maybeFull = true;
+    return true;
+  }
+
+  size_t size() const {
+    if (head == tail) return maybeFull ? capacity : 0;
+    return tail > head ? tail - head : capacity - head + tail;
+  }
+};
 
 struct Flit {
   uint16_t src;
@@ -115,7 +205,6 @@ public:
   bool occupiedAt(size_t idx) const {
     return (occupied & (1ull << idx)) != 0;
   }
-  uint64_t occupied_mask() const { return occupied; }
 
   bool canEnq(uint8_t prio) const {
     size_t cnt = std::popcount(occupied);

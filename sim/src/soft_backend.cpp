@@ -1,106 +1,55 @@
 /**
  * Software NoC system simulator.
  *
- * Instantiates many Core RTLs and models the NoC and memory system in C++.
- * The NoC uses the same Hilbert/mesh/MC-connection topology as System.scala,
- * and routes flits through a software model of the mesh routers.
- *
- * Supported features:
- *   - core-to-core AM messages via ext.out/ext.in
- *   - memory/peripheral requests encoded as 0xF00/0xF01 flits (12-bit tag)
- *   - CSR scatter commands encoded as 0xF10 flits
- *   - wide memory responses on core.mem_unicast, broadcast on core.mem_broadcast
- *   - optional per-cycle memory request trace
+ * Method definitions and topology construction for SoftSystemBackend.
+ * The class declaration lives in soft_backend.h.
  */
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
-#include <map>
-#include <memory>
-#include <optional>
 #include <stdexcept>
-#include <string>
-#include <unordered_map>
 #include <utility>
-#include <vector>
 
-#include <verilated_fst_c.h>
-
-#include "soft_verilated/soft_rtl.h"
-#include "soft_components.h"
 #include "soft_backend.h"
-#include "soft_mem.h"
-#include "system.h"
+#include "soft_components.h"
 
 using namespace std;
 
-static bool TRACE = false;
-static bool LOG = false;
-static bool exiting = false;
-
-// Wall-clock accumulator (ns) for time spent inside soft_rtl Verilator eval()
-// calls, summed across all PUs. Thread-local because Verilated contexts are
-// per-thread; we use this to attribute soft-model runtime between "verilator"
-// (CPU spent inside soft_rtl::eval) and "uncore" (everything else inside
-// peek/stage/step). Incremented at batch granularity by the two per-cycle
-// eval loops in stage()/step(); read/snapshotted by SoftSystemSim in
-// peek/stage/step via PhaseTimer.
+// Wall-clock accumulator (ns) for time spent inside soft_rtl Verilator
+// eval() calls, summed across all PUs. Thread-local because Verilated
+// contexts are per-thread; we use this to attribute soft-model runtime
+// between "verilator" (CPU spent inside soft_rtl::eval) and "uncore"
+// (everything else inside peek/stage/step). Incremented at batch
+// granularity by the per-cycle eval loops in stage()/step();
+// snapshotted by PhaseTimer.
 static thread_local uint64_t g_soft_verilator_ns = 0;
 
-static const uint64_t RESET_LENGTH = 10;
-static const uint32_t TEXT_BASE = 0x80000000u;
-static const int MEM_BUS_WORDS = 256 / 32;
-static const uint16_t PERIPH_DST = 0x8000;
-static const uint16_t FIRST_MC_DST = 0x8001;
+// ===========================================================================
+// Topology
+// ===========================================================================
 
-static VerilatedFstC *tracer = nullptr;
-
-static void sighandler(int) { exiting = true; }
-
-// Per-cycle debug helper, set in peek().
-uint64_t g_soft_dbg_cycle = 0;
-
-static bool isPow2(int n) {
-  return n > 0 && (n & (n - 1)) == 0;
-}
-
-struct TopologyInfo {
-  int grid_w = 0;
-  int grid_h = 0;
-  std::vector<std::pair<int, int>> pu_pos;  // 1-based; index 0 unused
-  std::map<std::pair<int, int>, int> pos_to_pu;
-  std::vector<std::vector<int>> mc_zones;   // mc -> cluster indices
-  std::vector<std::vector<int>> mc_conns;   // mc -> connection PU IDs
-  std::vector<std::vector<int>> pu_mesh_dirs;
-  std::vector<std::map<int, int>> pu_dir_to_egress;
-  std::vector<std::unordered_map<uint16_t, int>> pu_tables;
-  std::vector<std::vector<int>> pu_mc_ejects;
-};
+static bool isPow2(int n) { return n > 0 && (n & (n - 1)) == 0; }
 
 static pair<int, int> gridDims(int num_pu) {
   int s = static_cast<int>(std::sqrt(num_pu));
   if (s * s == num_pu) return {s, s};
   int h = static_cast<int>(std::sqrt(num_pu / 2));
-  if (2 * h * h != num_pu) {
+  if (2 * h * h != num_pu)
     throw runtime_error("Cannot form 1:1 or 2:1 grid for numPU=" + to_string(num_pu));
-  }
   return {2 * h, h};
 }
 
+// Hilbert curve d -> (x, y). Backward C base case (first step east).
+// Mirrors koneko.Topology.hilbertD2xy. We label the returned axes
+// (x → row, y → col) for parity with the RTL comment.
 static pair<int, int> hilbertD2xy(int n, int d) {
-  int rx = 0;
-  int ry = 0;
-  int s = 1;
-  int t = d;
-  int x = 0;
-  int y = 0;
+  int rx = 0, ry = 0, s = 1, t = d, x = 0, y = 0;
   while (s < n) {
     rx = ((t & 2) != 0) ? 1 : 0;
     ry = (((t ^ rx) & 1) != 0) ? 1 : 0;
@@ -116,13 +65,12 @@ static pair<int, int> hilbertD2xy(int n, int d) {
     t >>= 2;
     s <<= 1;
   }
-  return {x, y};
+  return {x, y}; // x → row, y → col (RTL convention)
 }
 
 static vector<pair<int, int>> hilbert(int w, int h) {
-  if (!isPow2(w) || w < 2 || !(w == h || w == 2 * h)) {
+  if (!isPow2(w) || w < 2 || !(w == h || w == 2 * h))
     throw runtime_error("Invalid Hilbert dimensions");
-  }
   vector<pair<int, int>> square;
   square.reserve(w * w);
   for (int d = 0; d < w * w; ++d) square.push_back(hilbertD2xy(w, d));
@@ -130,1212 +78,614 @@ static vector<pair<int, int>> hilbert(int w, int h) {
   return square;
 }
 
-static int meshDist(pair<int, int> a, pair<int, int> b) {
-  return std::abs(a.first - b.first) + std::abs(a.second - b.second);
-}
-
+// Manhattan distance between integer points.
 static int meshDist(int r1, int c1, int r2, int c2) {
   return std::abs(r2 - r1) + std::abs(c2 - c1);
 }
 
-static int xyRouteDir(int sr, int sc, int dr, int dc) {
-  if (sc != dc) return (dc > sc) ? 1 : 3;
-  return (dr > sr) ? 2 : 0;
-}
+Topology::Topology(size_t num_pu, size_t num_mc)
+  : pu_to_coord(num_pu),
+    coord_to_pu(),
+    memif_to_pu(1 + num_mc, 0),
+    pu_mesh_dirs(num_pu),
+    pu_memif(num_pu)
+{
+  auto [grid_w, grid_h] = gridDims(static_cast<int>(num_pu));
+  w = static_cast<uint16_t>(grid_w);
+  h = static_cast<uint16_t>(grid_h);
+  coord_to_pu.assign(static_cast<size_t>(grid_w) * grid_h, {});
 
-static TopologyInfo buildTopology(int num_pu, int num_mc) {
-  auto [grid_w, grid_h] = gridDims(num_pu);
+  // Generate Hilbert curve. Each curve entry is (x=row, y=col) per RTL
+  // convention; store soft pairs as (col, row).
   auto curve = hilbert(grid_w, grid_h);
-  if (static_cast<int>(curve.size()) != num_pu) {
+  if (static_cast<int>(curve.size()) != static_cast<int>(num_pu))
     throw runtime_error("Hilbert curve length mismatch");
+
+  for (uint16_t id = 1; id <= num_pu; ++id) {
+    auto [row, col] = curve[id - 1];
+    pu_to_coord[id] = { static_cast<uint16_t>(col), static_cast<uint16_t>(row) };
+    coord_to_pu[static_cast<size_t>(col) * grid_h + row].push_back(id);
   }
 
-  TopologyInfo topo;
-  topo.grid_w = grid_w;
-  topo.grid_h = grid_h;
-  topo.pu_pos.resize(num_pu + 1);
-  for (int id = 1; id <= num_pu; ++id) {
-    topo.pu_pos[id] = curve[id - 1];
-    topo.pos_to_pu[topo.pu_pos[id]] = id;
+  // Per-PU active mesh directions: N if row > 0, E if col < w-1,
+  // S if row < h-1, W if col > 0. Direction order matches RTL link
+  // ordering used by the router-port-index mapping.
+  for (uint16_t id = 1; id <= num_pu; ++id) {
+    auto [col, row] = pu_to_coord[id];
+    auto &dirs = pu_mesh_dirs[id];
+    if (row > 0)            dirs.push_back(0); // NORTH
+    if (col + 1 < grid_w)   dirs.push_back(1); // EAST
+    if (row + 1 < grid_h)   dirs.push_back(2); // SOUTH
+    if (col > 0)            dirs.push_back(3); // WEST
   }
 
-  int num_clusters = num_pu / 16;
-  int clusters_per_mc = num_clusters / num_mc;
-  topo.mc_zones.resize(num_mc);
-  topo.mc_conns.resize(num_mc);
-  topo.pu_mesh_dirs.resize(num_pu + 1);
-  topo.pu_dir_to_egress.resize(num_pu + 1);
-  topo.pu_tables.resize(num_pu + 1);
-  topo.pu_mc_ejects.resize(num_pu + 1);
+  // MC zones: every 16 consecutive Hilbert IDs form a cluster; clusters
+  // are split into numMC contiguous zones.
+  if (num_pu % CLUSTER_SIZE != 0)
+    throw runtime_error("num_pu must be a multiple of cluster size (16)");
+  size_t num_clusters = num_pu / CLUSTER_SIZE;
+  if (num_clusters % num_mc != 0)
+    throw runtime_error("num_clusters must be divisible by num_mc");
+  size_t clusters_per_mc = num_clusters / num_mc;
 
-  for (int mc = 0; mc < num_mc; ++mc) {
-    for (int ci = mc * clusters_per_mc; ci < (mc + 1) * clusters_per_mc; ++ci) {
-      topo.mc_zones[mc].push_back(ci);
-      int best_pu = ci * 16 + 1;
-      double best_dist = 1e30;
-      for (int pu = ci * 16 + 1; pu <= ci * 16 + 16; ++pu) {
-        auto [r, c] = topo.pu_pos[pu];
-        double dist = std::abs(r - grid_h / 2.0) + std::abs(c - grid_w / 2.0);
-        if (dist < best_dist) {
-          best_dist = dist;
-          best_pu = pu;
-        }
+  // Connection PU per cluster: the one closest to the grid center.
+  // For soft's single-PU-per-MC simplification we further pick, across
+  // all clusters in the zone, the connection PU closest to the grid
+  // center.
+  auto best_conn_in_cluster = [&](size_t cluster_idx) -> uint16_t {
+    uint16_t best_pu = static_cast<uint16_t>(cluster_idx * CLUSTER_SIZE + 1);
+    double best_dist = 1e30;
+    for (size_t pu = cluster_idx * CLUSTER_SIZE + 1;
+         pu <= cluster_idx * CLUSTER_SIZE + CLUSTER_SIZE; ++pu) {
+      auto [col, row] = pu_to_coord[static_cast<uint16_t>(pu)];
+      double d = std::abs(row - grid_h / 2.0) + std::abs(col - grid_w / 2.0);
+      if (d < best_dist) {
+        best_dist = d;
+        best_pu = static_cast<uint16_t>(pu);
       }
-      topo.mc_conns[mc].push_back(best_pu);
     }
+    return best_pu;
+  };
+
+  // memif_to_pu[0] = peripheral connection = PU 1 (matches old impl).
+  memif_to_pu[0] = 1;
+
+  for (size_t mc = 0; mc < num_mc; ++mc) {
+    uint16_t best_pu = 0;
+    double best_dist = 1e30;
+    for (size_t ci = mc * clusters_per_mc; ci < (mc + 1) * clusters_per_mc; ++ci) {
+      uint16_t cpu = best_conn_in_cluster(ci);
+      auto [col, row] = pu_to_coord[cpu];
+      double d = std::abs(row - grid_h / 2.0) + std::abs(col - grid_w / 2.0);
+      if (d < best_dist) { best_dist = d; best_pu = cpu; }
+    }
+    memif_to_pu[1 + mc] = best_pu;
+    pu_memif[best_pu] = static_cast<uint16_t>(1 + mc);
   }
 
-  for (int id = 1; id <= num_pu; ++id) {
-    auto [row, col] = topo.pu_pos[id];
-    auto &dirs = topo.pu_mesh_dirs[id];
-    if (row > 0) dirs.push_back(0);
-    if (col + 1 < grid_w) dirs.push_back(1);
-    if (row + 1 < grid_h) dirs.push_back(2);
-    if (col > 0) dirs.push_back(3);
-    for (size_t i = 0; i < dirs.size(); ++i) {
-      topo.pu_dir_to_egress[id][dirs[i]] = static_cast<int>(i);
-    }
-  }
-
-  for (int mc = 0; mc < num_mc; ++mc) {
-    for (int pu : topo.mc_conns[mc]) topo.pu_mc_ejects[pu].push_back(mc);
-  }
-
-  for (int src = 1; src <= num_pu; ++src) {
-    auto [sr, sc] = topo.pu_pos[src];
-    auto &table = topo.pu_tables[src];
-
-    for (int dst = 1; dst <= num_pu; ++dst) {
-      if (dst == src) continue;
-      auto [dr, dc] = topo.pu_pos[dst];
-      int dir = xyRouteDir(sr, sc, dr, dc);
-      table[static_cast<uint16_t>(dst)] = topo.pu_dir_to_egress[src].at(dir);
-    }
-
-    for (int mc = 0; mc < num_mc; ++mc) {
-      bool local_eject = std::find(topo.pu_mc_ejects[src].begin(), topo.pu_mc_ejects[src].end(), mc) !=
-                         topo.pu_mc_ejects[src].end();
-      if (local_eject) continue;
-
-      int nearest = topo.mc_conns[mc].front();
-      int best_dist = INT32_MAX;
-      for (int conn : topo.mc_conns[mc]) {
-        int dist = meshDist(sr, sc, topo.pu_pos[conn].first, topo.pu_pos[conn].second);
-        if (dist < best_dist) {
-          best_dist = dist;
-          nearest = conn;
-        }
-      }
-      auto [cr, cc] = topo.pu_pos[nearest];
-      int dir = xyRouteDir(sr, sc, cr, cc);
-      table[static_cast<uint16_t>(FIRST_MC_DST + mc)] = topo.pu_dir_to_egress[src].at(dir);
-    }
-
-    if (src != 1) {
-      auto [pr, pc] = topo.pu_pos[1];
-      int dir = xyRouteDir(sr, sc, pr, pc);
-      table[PERIPH_DST] = topo.pu_dir_to_egress[src].at(dir);
-    }
-  }
-
-  return topo;
+  // The peripheral memif (memif index 0) lives at memif_to_pu[0] = PU 1.
+  // pu_memif[1] takes precedence for the peripheral so the same PU can
+  // host both periph and an MC eject if it happens to coincide; the
+  // current simple selection puts periph at PU 1 and MC conns near the
+  // center, so coincidence is unlikely for non-trivial sizes.
+  if (!pu_memif[1].has_value()) pu_memif[1] = 0;
 }
 
-struct CoreState {
-  std::unique_ptr<soft_rtl> core;
-  std::optional<Flit> ext_input;
-
-  explicit CoreState(int hartid) {
-    std::string name = "soft_pu_" + std::to_string(hartid);
-    core.reset(new soft_rtl(name.c_str()));
-    core->cfg_hartid = hartid;
-    core->ext_out_ready = 0;
-  }
-
-  ~CoreState() {
-    core->final();
-  }
-
-  void clearExtInput() {
-    ext_input.reset();
-  }
-
-  void driveExtInput(const Flit &flit) {
-    ext_input = flit;
-  }
-
-  optional<Flit> pendingOut() const {
-    if (!core->ext_out_valid) return {};
-    return Flit{
-      .src = static_cast<uint16_t>(core->cfg_hartid),
-      .dst = static_cast<uint16_t>(core->ext_out_bits_dst),
-      .tag = static_cast<uint16_t>(core->ext_out_bits_tag),
-      .data = {core->ext_out_bits_data_0, core->ext_out_bits_data_1, core->ext_out_bits_data_2, core->ext_out_bits_data_3},
-    };
-  }
-
-  optional<Flit> currentOut() const {
-    if (!core->ext_out_ready) return {};
-    return pendingOut();
-  }
-};
-
-
-
-
-struct RouterOutput {
-  enum Kind { Mesh, Core, MemIf, Periph } kind = Mesh;
-  int dir = -1;
-  int mc_idx = -1;
-  int mc_input = -1;
-};
-
-struct SoftRouter {
-  int pu_id = 0;
-  int inject_port = 0;
-  vector<int> mesh_dirs;
-  map<int, int> dir_to_port;   // direction → port index (same for ingress & egress)
-  vector<RouterOutput> outputs;
-  vector<int> local_mc_output;
-  int core_output = -1;
-  int periph_output = -1;
-
-  // Routing functor: minimal per-router data; computes XY direction inline
-  // for PU dsts and reads a tiny precomputed table for memif dsts.
-  // (Periph and MC dsts never collide: PERIPH_DST=0x8000, FIRST_MC_DST+mc=0x8001+,
-  // so a single memif_port[] array indexed by (dst - 0x8000) handles both.)
-  static constexpr int MAX_MEMIF = 1 + 8;  // 1 periph + up to 8 MCs
-  struct LookupFn {
-    uint16_t src_pu = 0;
-    uint8_t core_port = 0;
-    std::pair<int8_t, int8_t> local_coord{0, 0};
-    std::array<uint8_t, 4> dir_to_port{0, 0, 0, 0};
-    std::array<uint8_t, MAX_MEMIF> memif_port{};
-    const std::pair<int, int> *pu_pos = nullptr;
-
-    size_t operator()(size_t dst) const {
-      uint16_t d = static_cast<uint16_t>(dst);
-      if (d == 0 || d == src_pu) return core_port;
-      if (d & 0x8000) return memif_port[d - 0x8000];
-      const auto &pos = pu_pos[d];
-      int dir = (local_coord.second != pos.second)
-                  ? ((pos.second > local_coord.second) ? 1 : 3)
-                  : ((pos.first > local_coord.first) ? 2 : 0);
-      return dir_to_port[dir];
-    }
-  };
-
-  // Factory matching the user-suggested API: `decltype(rtFor(nullptr, 0))`
-  // names the functor type for use as Router's RT template parameter.
-  static LookupFn rtFor(const TopologyInfo *topo, int pu) {
-    LookupFn fn;
-    if (!topo) return fn;
-    auto [sr, sc] = topo->pu_pos[pu];
-    fn.src_pu = static_cast<uint16_t>(pu);
-    fn.local_coord = {static_cast<int8_t>(sr), static_cast<int8_t>(sc)};
-    fn.pu_pos = topo->pu_pos.data();
-    return fn;
-  }
-
-  // Hardware-aligned router: depth-8 priority queues, single VC, FlitArb round-robin.
-  Router<decltype(rtFor(nullptr, 0)), 8> rt;
-
-  SoftRouter() = default;
-
-  SoftRouter(int pu, const TopologyInfo &topo, int num_mc)
-      : pu_id(pu), local_mc_output(num_mc, -1) {
-    mesh_dirs = topo.pu_mesh_dirs[pu];
-    dir_to_port = topo.pu_dir_to_egress[pu];
-    inject_port = static_cast<int>(mesh_dirs.size());
-
-    for (int dir : mesh_dirs) {
-      outputs.push_back(
-          RouterOutput{.kind = RouterOutput::Mesh, .dir = dir, .mc_idx = -1, .mc_input = -1});
-    }
-
-    core_output = static_cast<int>(outputs.size());
-    outputs.push_back(RouterOutput{.kind = RouterOutput::Core, .dir = -1, .mc_idx = -1, .mc_input = -1});
-
-    for (int mc_idx : topo.pu_mc_ejects[pu]) {
-      int mc_input = -1;
-      for (size_t ci = 0; ci < topo.mc_conns[mc_idx].size(); ++ci) {
-        if (topo.mc_conns[mc_idx][ci] == pu) { mc_input = static_cast<int>(ci); break; }
-      }
-      local_mc_output[mc_idx] = static_cast<int>(outputs.size());
-      outputs.push_back(RouterOutput{.kind = RouterOutput::MemIf, .dir = -1, .mc_idx = mc_idx, .mc_input = mc_input});
-    }
-
-    if (pu == 1) {
-      periph_output = static_cast<int>(outputs.size());
-      outputs.push_back(RouterOutput{.kind = RouterOutput::Periph, .dir = -1, .mc_idx = -1, .mc_input = -1});
-    }
-
-    if (1 + num_mc > MAX_MEMIF) throw std::runtime_error("SoftRouter: too many memifs");
-
-    // Build LookupFn: precompute memif_port[] (local or routed-via-egress);
-    // dir_to_port[] for PU dsts via XY-routing.
-    LookupFn fn = rtFor(&topo, pu);
-    fn.core_port = static_cast<uint8_t>(core_output);
-    for (auto &[dir, port] : topo.pu_dir_to_egress[pu])
-      fn.dir_to_port[dir] = static_cast<uint8_t>(port);
-
-    // Memif lookups: pu_tables[pu] already has direction-resolved egress ports
-    // for non-local memifs; local memifs override with their direct output port.
-    auto it = topo.pu_tables[pu].find(PERIPH_DST);
-    if (it != topo.pu_tables[pu].end())
-      fn.memif_port[PERIPH_DST - 0x8000] = static_cast<uint8_t>(it->second);
-    if (periph_output >= 0)
-      fn.memif_port[PERIPH_DST - 0x8000] = static_cast<uint8_t>(periph_output);
-    for (int mc = 0; mc < num_mc; ++mc) {
-      uint16_t key = static_cast<uint16_t>(FIRST_MC_DST + mc) - 0x8000;
-      auto mit = topo.pu_tables[pu].find(static_cast<uint16_t>(FIRST_MC_DST + mc));
-      if (mit != topo.pu_tables[pu].end())
-        fn.memif_port[key] = static_cast<uint8_t>(mit->second);
-      if (local_mc_output[mc] >= 0)
-        fn.memif_port[key] = static_cast<uint8_t>(local_mc_output[mc]);
-    }
-
-    rt = Router<decltype(rtFor(nullptr, 0)), 8>(fn, inject_port + 1, outputs.size());
-  }
-
-  bool canInject(const Flit &flit) const {
-    return rt.canEnq(inject_port, flit.prio());
-  }
-};
-
-struct PeriodicStat {
-  uint64_t total_hops = 0;
-  uint64_t total_injections = 0;
-  uint64_t idle_lane_cycles = 0;
-  uint64_t idle_core_cycles = 0;
-  uint64_t blocked_vc_depth = 0;
-  uint64_t blocked_structural = 0;
-  uint64_t inflight_messages_sum = 0;
-
-  // Current inflight snapshots (not subtracted in operator-)
-  uint64_t cur_inflight_messages = 0;
-
-  // FIXME(meow): memory-subsystem counters (total_mem_requests,
-  // inflight_dram_sum, inflight_resp_sum, cur_inflight_dram,
-  // cur_inflight_resp) removed alongside the memory references; restore
-  // when the new memory subsystem is integrated.
-
-  PeriodicStat operator-(const PeriodicStat &o) const {
-    PeriodicStat r;
-    r.total_hops = total_hops - o.total_hops;
-    r.total_injections = total_injections - o.total_injections;
-    r.idle_lane_cycles = idle_lane_cycles - o.idle_lane_cycles;
-    r.idle_core_cycles = idle_core_cycles - o.idle_core_cycles;
-    r.blocked_vc_depth = blocked_vc_depth - o.blocked_vc_depth;
-    r.blocked_structural = blocked_structural - o.blocked_structural;
-    r.inflight_messages_sum = inflight_messages_sum - o.inflight_messages_sum;
-    r.cur_inflight_messages = cur_inflight_messages;
-    return r;
-  }
-
-  void print(size_t cycles) const {
-    auto avg = [cycles](uint64_t val) -> double {
-      return cycles > 0 ? static_cast<double>(val) / cycles : 0;
-    };
-    cerr << "  hops:           " << total_hops
-         << " (avg " << fixed << setprecision(2) << avg(total_hops) << "/cyc)\n";
-    cerr << "  injections:     " << total_injections
-         << " (avg " << avg(total_injections) << "/cyc)\n";
-    cerr << "  idle_lanes:     " << idle_lane_cycles
-         << " (avg " << avg(idle_lane_cycles) << "/cyc)\n";
-    cerr << "  idle_cores:     " << idle_core_cycles
-         << " (avg " << avg(idle_core_cycles) << "/cyc)\n";
-    cerr << "  blocked_vc:     " << blocked_vc_depth
-         << " (avg " << avg(blocked_vc_depth) << "/cyc)\n";
-    cerr << "  blocked_hazard: " << blocked_structural
-         << " (avg " << avg(blocked_structural) << "/cyc)\n";
-    cerr << "  inflight_msg:   " << inflight_messages_sum
-         << " (avg " << avg(inflight_messages_sum) << "/cyc, cur " << cur_inflight_messages << ")\n";
-  }
-};
-
-static constexpr uint64_t STAT_PERIOD = 1000;
-
-
 // ===========================================================================
-// SoftSystemSim — software model of the system uncore (NoC, memif, distrib).
-// Aligned cycle-accurately with the HARD RTL. Driven via peek/stage/step.
+// SoftSystemBackend
 // ===========================================================================
 
-struct SoftSystemSim {
-  uint64_t cycle = 0;
-  SystemConfig cfg;
-  int num_pu;
-  int num_mc;
-  int num_clusters;
-  int clusters_per_mc;
-  TopologyInfo topo;
-  bool reset_cycle = false;
-  bool reset_just_exited = false;
+SoftSystemBackend::Stat SoftSystemBackend::Stat::operator-(const Stat &o) const {
+  Stat r;
+  r.total_hops          = total_hops          - o.total_hops;
+  r.total_injections    = total_injections    - o.total_injections;
+  r.total_mem_requests  = total_mem_requests  - o.total_mem_requests;
+  r.idle_lane_cycles    = idle_lane_cycles    - o.idle_lane_cycles;
+  r.idle_core_cycles    = idle_core_cycles    - o.idle_core_cycles;
+  r.blocked_structural  = blocked_structural  - o.blocked_structural;
+  r.inflight_messages_sum = inflight_messages_sum - o.inflight_messages_sum;
+  r.inflight_dram_sum   = inflight_dram_sum   - o.inflight_dram_sum;
+  r.inflight_resp_sum   = inflight_resp_sum   - o.inflight_resp_sum;
+  r.cur_inflight_messages = cur_inflight_messages;
+  r.cur_inflight_dram   = cur_inflight_dram;
+  r.cur_inflight_resp   = cur_inflight_resp;
+  return r;
+}
 
-  vector<unique_ptr<CoreState>> cores;
-  vector<SoftRouter> routers;
-
-  // FIXME(meow): memory subsystem (DRAMIf / PeriphIf / Distributor / Ringbus)
-  // instances will live here once soft_mem.h is integrated.
-
-  // Per-router staged state for two-phase router step (filled in routeRouters,
-  // applied after core posedge in applyRouterSteps).
-  struct PendingRouterStep {
-    std::vector<std::optional<Flit>> enqs;  // one per input port
-    std::vector<bool> deq_accepts;          // one per output port
+void SoftSystemBackend::Stat::print(uint64_t cycles) const {
+  auto avg = [cycles](uint64_t v) -> double {
+    return cycles > 0 ? static_cast<double>(v) / cycles : 0.0;
   };
-  vector<PendingRouterStep> pending_router_steps;
-  vector<pair<int, Flit>> pending_injected;
+  std::cerr << std::fixed << std::setprecision(2);
+  std::cerr << "  hops:           " << total_hops
+            << " (avg " << avg(total_hops) << "/cyc)\n";
+  std::cerr << "  injections:     " << total_injections
+            << " (avg " << avg(total_injections) << "/cyc)\n";
+  std::cerr << "  mem_requests:   " << total_mem_requests
+            << " (avg " << avg(total_mem_requests) << "/cyc)\n";
+  std::cerr << "  idle_lanes:     " << idle_lane_cycles
+            << " (avg " << avg(idle_lane_cycles) << "/cyc)\n";
+  std::cerr << "  idle_cores:     " << idle_core_cycles
+            << " (avg " << avg(idle_core_cycles) << "/cyc)\n";
+  std::cerr << "  blocked_hazard: " << blocked_structural
+            << " (avg " << avg(blocked_structural) << "/cyc)\n";
+  std::cerr << "  inflight_msg:   " << inflight_messages_sum
+            << " (avg " << avg(inflight_messages_sum)
+            << "/cyc, cur " << cur_inflight_messages << ")\n";
+  std::cerr << "  inflight_dram:  " << inflight_dram_sum
+            << " (avg " << avg(inflight_dram_sum)
+            << "/cyc, cur " << cur_inflight_dram << ")\n";
+  std::cerr << "  inflight_resp:  " << inflight_resp_sum
+            << " (avg " << avg(inflight_resp_sum)
+            << "/cyc, cur " << cur_inflight_resp << ")\n";
+}
 
-  // FIXME(meow): per-cycle staging buffers for memif/distributor inputs+fires
-  // (formerly dram_in_K / dram_fires_K / dram_peek_K / periph_in_K /
-  //  periph_fires_K / periph_peek_K / ci_io_in_K / dist_out_pre_K /
-  //  dist_fires_K / last_resp) need to be re-introduced when the new memory
-  //  subsystem is wired in.
+SoftSystemBackend::PhaseTimer::PhaseTimer(SoftSystemBackend &o)
+  : owner(o),
+    t0(std::chrono::high_resolution_clock::now()),
+    v_at_entry(g_soft_verilator_ns) {}
 
-  PeriodicStat stats;
-  PeriodicStat last_periodic;
-  int total_mesh_outputs = 0;
+SoftSystemBackend::PhaseTimer::~PhaseTimer() {
+  auto t1 = std::chrono::high_resolution_clock::now();
+  uint64_t total =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+  uint64_t v = g_soft_verilator_ns - v_at_entry;
+  owner.verilator_ns_ += v;
+  owner.uncore_ns_ += (total > v ? total - v : 0);
+}
 
-  // Runtime breakdown (ns), summed across all calls to peek/stage/step.
-  // verilator_ns: time inside soft_rtl::eval() (the two per-cycle batch
-  //               eval loops in stage()/step(), plus one-time reset-exit).
-  // uncore_ns:    remaining time inside peek/stage/step (soft NoC model logic).
-  uint64_t verilator_ns = 0;
-  uint64_t uncore_ns = 0;
+SoftSystemBackend::WrappedRouter SoftSystemBackend::buildRouter(uint16_t pu) const {
+  LinkStatus links;
+  Topology::DirectionToLinkIdx dir_to_link{};
 
-  // Timed batch eval of all cores. Caller must set core->clock before
-  // calling. Adds elapsed wall time to g_soft_verilator_ns so the outer
-  // PhaseTimer correctly attributes it to "verilator" not "uncore".
-  void evalAllCoresTimed() {
-    auto t0 = std::chrono::high_resolution_clock::now();
-    for (auto &c : cores) c->core->eval();
-    auto t1 = std::chrono::high_resolution_clock::now();
-    g_soft_verilator_ns +=
-        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-  }
-
-  // FIXME(meow): config-ROM beat helpers (makeConfigBeat0/1) removed; they
-  // belong on PeriphIf inside the new memory subsystem.
-
-  SoftSystemSim(const SystemConfig &cfg_)
-      : cfg(cfg_),
-        num_pu((int)cfg_.numPU), num_mc((int)cfg_.numMC),
-        num_clusters((int)cfg_.numPU / 16),
-        clusters_per_mc(((int)cfg_.numPU / 16) / (int)cfg_.numMC),
-        topo(buildTopology((int)cfg_.numPU, (int)cfg_.numMC)) {
-    routers.resize(num_pu + 1);
-    for (int id = 1; id <= num_pu; ++id) {
-      cores.push_back(std::make_unique<CoreState>(id));
-      routers[id] = SoftRouter(id, topo, num_mc);
-    }
-
-    // FIXME(meow): construct DRAMIf[num_mc], PeriphIf, Distributor[num_clusters],
-    // and the ringbus here once soft_mem.h is integrated. Also seed the
-    // peripheral config ROM with the system descriptor beats (formerly
-    // makeConfigBeat0 / makeConfigBeat1 at 0x28000000 / 0x28000020).
-
-    pending_router_steps.resize(num_pu + 1);
-
-    for (int id = 1; id <= num_pu; ++id)
-      total_mesh_outputs += static_cast<int>(routers[id].mesh_dirs.size());
-
-    // Pre-size pending router-step buffers to fixed widths per router so per-cycle
-    // routeRouters() only resets values via std::fill (no realloc).
-    for (int id = 1; id <= num_pu; ++id) {
-      auto &r = routers[id];
-      pending_router_steps[id].enqs.assign(r.rt.numInputs(), std::nullopt);
-      pending_router_steps[id].deq_accepts.assign(r.outputs.size(), false);
-    }
-
-    // Pre-size per-cycle scratch buffers (member-allocated, reused each cycle).
-    memif_props_buf_.resize(num_mc);
-    for (auto &v : memif_props_buf_) v.reserve(clusters_per_mc * 16);
-    core_props_K.reserve(num_pu * 4);
-
-    fprintf(stderr, "[Soft] SoftSystemSim init: numPU=%d numMC=%d numClusters=%d cpm=%d\n",
-            num_pu, num_mc, num_clusters, clusters_per_mc);
-  }
-
-  CoreState &core(int pu_id) { return *cores.at(pu_id - 1); }
-  SoftRouter &routerAt(int pu_id) { return routers.at(pu_id); }
-  const SoftRouter &routerAt(int pu_id) const { return routers.at(pu_id); }
-
-  std::pair<int, int> meshNeighbor(int row, int col, int dir) const {
+  const auto &my_dirs = topo.pu_mesh_dirs[pu];
+  auto [col, row] = topo.pu_to_coord[pu];
+  for (size_t slot = 0; slot < my_dirs.size(); ++slot) {
+    uint8_t dir = my_dirs[slot];
+    // Neighbor coord under direction `dir` (col, row).
+    int ncol = col, nrow = row;
     switch (dir) {
-      case 0: return {row - 1, col};
-      case 1: return {row, col + 1};
-      case 2: return {row + 1, col};
-      default: return {row, col - 1};
+      case 0: nrow -= 1; break; // NORTH
+      case 1: ncol += 1; break; // EAST
+      case 2: nrow += 1; break; // SOUTH
+      case 3: ncol -= 1; break; // WEST
     }
+    const auto &cell = topo.coord_to_pu[static_cast<size_t>(ncol) * topo.h + nrow];
+    if (cell.empty())
+      throw std::logic_error("buildRouter: neighbor cell is empty");
+    uint16_t npu = cell.front();
+    // Locate `opposite(dir)` in the neighbor's direction list to find the
+    // remote forward-buffer slot index.
+    uint8_t opp = static_cast<uint8_t>((dir + 2) % 4);
+    const auto &n_dirs = topo.pu_mesh_dirs[npu];
+    auto it = std::find(n_dirs.begin(), n_dirs.end(), opp);
+    if (it == n_dirs.end())
+      throw std::logic_error("buildRouter: neighbor lacks opposite link");
+    uint8_t remote_port = static_cast<uint8_t>(std::distance(n_dirs.begin(), it));
+    links.forwards[slot] = std::make_pair(npu, remote_port);
+    dir_to_link[dir] = slot;
   }
 
-  // FIXME(meow): ring-chain helpers (ringNodeCount / snapshotRingOuts) removed;
-  // re-introduce them when the new memory subsystem (DRAMIf + PeriphIf +
-  // Ringbus) is wired in so peek/stage/step can thread ring_in / ring_out
-  // around the chain.
+  links.memif = topo.pu_memif[pu];
 
-  // --- routeRouters: peek the memory subsystem for req_ready decisions
-  // and set router deq_accepts. Core ext_in acceptance is deferred to stage()
-  // where it can be checked after PU inputs are driven and the negedge
-  // eval has propagated combinational signals.
-  struct CoreProp { int pu; int output_idx; Flit flit; };
-  struct MemIfProp { int pu; int output_idx; int cluster_input; Flit flit; };
-  struct PeriphProp { int pu; int output_idx; Flit flit; };
-  vector<CoreProp> core_props_K;
-  // Per-MC scratch list of memif proposals, sized [num_mc] at construction;
-  // inner vectors are clear()-ed each cycle (capacity retained).
-  vector<vector<MemIfProp>> memif_props_buf_;
-  // FIXME(meow): per-cycle ring-chain / distributor scratch buffers
-  // (ring_outs_buf_, ring_in_per_node_buf_, dist_out_K_buf_) removed; they
-  // will return alongside the memory-subsystem state.
+  size_t num_in  = 1 + my_dirs.size();                       // core_inject + fwds
+  size_t num_out = 1 + my_dirs.size() + (links.memif ? 1 : 0); // core_eject + fwds + memif
 
-  void routeRouters() {
-    auto &memif_props = memif_props_buf_;
-    for (auto &v : memif_props) v.clear();
-    optional<PeriphProp> periph_prop;
-    core_props_K.clear();
+  // memif output-port index (passed to routing table) = num_out - 1 when present.
+  std::optional<size_t> memif_port =
+      links.memif ? std::optional<size_t>(num_out - 1) : std::nullopt;
+  auto tbl = topo.routingTableFor(pu, dir_to_link, memif_port);
+  return WrappedRouter(std::move(links), std::move(tbl), num_in, num_out);
+}
 
-    for (int pu = 1; pu <= num_pu; ++pu) core(pu).clearExtInput();
-
-    for (int pu = 1; pu <= num_pu; ++pu) {
-      auto &ps = pending_router_steps[pu];
-      // enqs/deq_accepts are pre-sized in ctor; just reset values.
-      std::fill(ps.enqs.begin(), ps.enqs.end(), std::nullopt);
-      std::fill(ps.deq_accepts.begin(), ps.deq_accepts.end(), false);
-    }
-
-    size_t num_transfers = 0;
-    for (int pu = 1; pu <= num_pu; ++pu) {
-      auto &r = routerAt(pu);
-      for (int oi = 0; oi < (int)r.outputs.size(); ++oi) {
-        auto flit_opt = r.rt.peek(oi);
-        if (!flit_opt) continue;
-        const Flit &flit = *flit_opt;
-        const RouterOutput &output = r.outputs[oi];
-        switch (output.kind) {
-          case RouterOutput::Mesh: {
-            auto [row, col] = topo.pu_pos[pu];
-            auto next_pos = meshNeighbor(row, col, output.dir);
-            int next_pu = topo.pos_to_pu.at(next_pos);
-            int opp_dir = (output.dir + 2) % 4;
-            auto it = routerAt(next_pu).dir_to_port.find(opp_dir);
-            if (it == routerAt(next_pu).dir_to_port.end()) break;
-            int ingress_port = it->second;
-            if (!routerAt(next_pu).rt.canEnq(ingress_port, flit.prio())) break;
-            pending_router_steps[next_pu].enqs[ingress_port] = flit;
-            pending_router_steps[pu].deq_accepts[oi] = true;
-            ++num_transfers;
-            break;
-          }
-          case RouterOutput::Core:
-            // Defer: requires PU's mem_unicast/broadcast inputs of this cycle
-            // to be driven first before ext_in_ready can be observed.
-            core_props_K.push_back({pu, oi, flit});
-            break;
-          case RouterOutput::MemIf:
-            memif_props[output.mc_idx].push_back({pu, oi, output.mc_input, flit});
-            break;
-          case RouterOutput::Periph:
-            periph_prop = PeriphProp{pu, oi, flit};
-            break;
-        }
-      }
-    }
-
-    // FIXME(meow): proposals for the memory-side egress ports collected into
-    // memif_props[mc] and periph_prop need to be presented to the new
-    // DRAMIf::nocCanAccept / PeriphIf::nocCanAccept. On accept, mark the
-    // corresponding pending_router_steps[pu].deq_accepts[output_idx] = true
-    // (mirroring the pattern used for core proposals below).
-    (void)memif_props;
-    (void)periph_prop;
-
-    stats.total_hops += num_transfers;
-    stats.idle_lane_cycles += total_mesh_outputs - (int)num_transfers;
+SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in)
+  : cfg(std::move(cfg_in)),
+    releaseResetAfter(0),
+    topo(cfg.numPU, cfg.numMC),
+    periph(0, 16, {}),
+    drams(),
+    cores(0),
+    ring(1 + cfg.numMC),
+    memif_eject(cfg.numMC + 1),
+    memif_ext(cfg.numMC + 1),
+    memif_ring_accept(cfg.numMC + 1, false),
+    core_mem(cfg.numPU),
+    core_mem_accept(cfg.numPU),
+    routers(cfg.numPU,
+            [this](size_t i) { return buildRouter(static_cast<uint16_t>(i)); })
+{
+  // Initialize per-MC DRAMIfs. PU range is contiguous in PU-id order.
+  const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
+  drams.reserve(cfg.numMC);
+  for (size_t m = 0; m < cfg.numMC; ++m) {
+    drams.emplace_back(m + 1, 64, 16, 2,
+                       1 + m * PU_PER_MC,
+                       1 + (m + 1) * PU_PER_MC);
   }
 
-  void applyRouterSteps() {
-    static const bool dbg = std::getenv("SOFT_DBG_ROUTER") != nullptr;
-    for (const auto &[pu, flit] : pending_injected)
-      pending_router_steps[pu].enqs[routerAt(pu).inject_port] = flit;
-    if (dbg) {
-      for (int pu = 1; pu <= num_pu; ++pu) {
-        auto &r = routerAt(pu);
-        auto &ps = pending_router_steps[pu];
-        for (int ip = 0; ip < (int)ps.enqs.size(); ++ip) {
-          if (ps.enqs[ip].has_value()) {
-            const Flit &f = *ps.enqs[ip];
-            fprintf(stderr, "[router pu=%d cy=%lu] ENQ in=%d (port=%s) dst=0x%x src=%d tag=0x%x\n",
-                    pu, g_soft_dbg_cycle, ip,
-                    ip == r.inject_port ? "inject" : "mesh",
-                    f.dst, f.src, f.tag);
-          }
-        }
-        for (int oi = 0; oi < (int)ps.deq_accepts.size(); ++oi) {
-          if (ps.deq_accepts[oi]) {
-            auto flit_opt = r.rt.peek(oi);
-            if (flit_opt) {
-              const Flit &f = *flit_opt;
-              const char *kind = "?";
-              switch (r.outputs[oi].kind) {
-                case RouterOutput::Mesh:   kind = "MESH";   break;
-                case RouterOutput::Core:   kind = "CORE";   break;
-                case RouterOutput::MemIf:  kind = "MEMIF";  break;
-                case RouterOutput::Periph: kind = "PERIPH"; break;
-              }
-              fprintf(stderr, "[router pu=%d cy=%lu] DEQ out=%d (%s) dst=0x%x src=%d tag=0x%x\n",
-                      pu, g_soft_dbg_cycle, oi, kind, f.dst, f.src, f.tag);
-            }
-          }
-        }
-      }
-    }
-    /* build fix
-    for (int pu = 1; pu <= num_pu; ++pu)
-      routerAt(pu).rt.step(pending_router_steps[pu].enqs, pending_router_steps[pu].deq_accepts);
-    */
+  char rtl_name_buffer[64];
+  cores.reserve(cfg.numPU);
+  for (size_t i = 1; i <= cfg.numPU; ++i) {
+    sprintf(rtl_name_buffer, "soft_pu_%lu", i);
+    cores.emplace_back(std::make_unique<soft_rtl>(rtl_name_buffer));
+    cores[i]->reset = true;
+    cores[i]->eval();
   }
+}
 
-  // --- Per-cycle interface: phased peek / stage / step ---
+void SoftSystemBackend::attachTrace(VerilatedFstC *trace_file, int depth) {
+  for (size_t i = 1; i <= cfg.numPU; ++i)
+    cores[i]->trace(trace_file, depth);
+}
 
-  // peek(K): produce the memory requests presented by the backend at cycle K.
-  // Reads only state from prior posedge (K-1). Does not consume bus_in.
-  void peek(uint64_t cy, vector<MemBusOut *> out) {
-    cycle = cy;
-    g_soft_dbg_cycle = cy;
-    bool was_reset = reset_cycle;
-    reset_cycle = cycle <= RESET_LENGTH;
-    if (reset_cycle) {
-      for (auto &p : out) p->req = std::nullopt;
-      return;
-    }
-    if (was_reset) reset_just_exited = true;
+SystemConfig SoftSystemBackend::config() const { return cfg; }
 
-    // First non-reset cycle: deassert reset and re-evaluate once so that
-    // combinational outputs (ext_in_ready, ring_out, etc.) reflect the
-    // post-reset Reg.Q values during this peek. In HARD, synchronous reset
-    // releases at posedge K=RESET_LENGTH+1 with reset already deasserted.
-    if (reset_just_exited) {
-      for (auto &c : cores) c->core->reset = 0;
-      evalAllCoresTimed();
-      reset_just_exited = false;
-    }
-
-    // FIXME(meow): snapshot ring_out for each memory-subsystem node
-    // (Reg.Q based) and form ring_in_per_node[i] = ring_outs[(i-1) mod N]
-    // before driving routeRouters / peek of DRAMIf / PeriphIf.
-
-    // Phase 1: routeRouters — collects router proposals and (eventually)
-    // peeks the memory subsystem for back-pressure on its egress ports.
-    routeRouters();
-
-    // FIXME(meow): present per-MC / peripheral request peeks back to the
-    // frontend bus. For now, drive all ports to "no request" so the
-    // backend compiles and runs without the memory subsystem.
-    if ((int)out.size() != num_mc + 1) {
-      throw runtime_error("[Soft] peek: out vector size mismatch");
-    }
-    for (auto &p : out) p->req = std::nullopt;
-  }
-
-  // stage(K, in): consume bus_in (resp + reqAccepting), drive PU inputs,
-  // run a single combinational negedge eval, compute fires.
-  // Does NOT advance any Reg state.
-  void stage(uint64_t cy, const vector<MemBusIn> &in) {
-    if (reset_cycle) {
-      // In reset: drive cores->reset=1 + zero inputs, but DON'T eval
-      // (eval would happen in step's posedge). Actually we need state
-      // ready for posedge in step(): set inputs here.
-      for (auto &c : cores) {
-        c->core->reset = 1;
-        c->core->mem_unicast_valid = 0;
-        c->core->mem_broadcast_valid = 0;
-        c->core->ext_in_valid = 0;
-        c->core->ext_out_ready = 0;
-      }
-      // SINGLE negedge eval under reset (matches non-reset path so each
-      // cycle gets a clock 1→0→1 transition for the posedge in step()).
-      for (auto &c : cores) c->core->clock = 0;
-      evalAllCoresTimed();
-      return;
-    }
-
-    if ((int)in.size() != num_mc + 1) {
-      throw runtime_error("[Soft] stage: in vector size mismatch");
-    }
-
-    // FIXME(meow): consume bus_in[i].resp / reqAccepting and route them into
-    // the new DRAMIf / PeriphIf step inputs (formerly periph_in_K /
-    // dram_in_K). Also compute Distributor outputs to drive PU
-    // mem_unicast / mem_broadcast inputs below.
-    (void)in;
-
-    // ---- Drive ALL per-PU inputs (no eval yet). ----
-    // ext_in defaults to 0 and is overwritten below for proposals.
-    // ext_out_ready is computed from pendingOut() reading post-step(K-1)
-    // Reg.Q values (ext_out_valid is registered, so reading it before this
-    // cycle's eval is correct).
-    //
-    // FIXME(meow): mem_unicast / mem_broadcast bits & valids must be driven
-    // from Distributor outputs (formerly dist_out_pre_K). They are zeroed
-    // for now so the cores see no memory responses.
-    for (int pu = 1; pu <= num_pu; ++pu) {
-      auto &c = core(pu);
-      c.core->ext_in_valid = 0;
-      c.core->ext_in_bits_data_0 = 0;
-      c.core->ext_in_bits_data_1 = 0;
-      c.core->ext_in_bits_data_2 = 0;
-      c.core->ext_in_bits_data_3 = 0;
-      c.core->ext_in_bits_tag = 0;
-      // FIXME(meow): drive these from Distributor::peek() outputs.
-      c.core->mem_unicast_valid = 0;
-      c.core->mem_unicast_bits_id = 0;
-      for (int w = 0; w < MEM_BUS_WORDS; ++w) c.core->mem_unicast_bits_data[w] = 0;
-      c.core->mem_broadcast_valid = 0;
-    }
-
-    // Overwrite ext_in_* for any router CORE-output proposal.
-    for (auto &cp : core_props_K) {
-      auto &c = core(cp.pu);
-      c.core->ext_in_valid = 1;
-      c.core->ext_in_bits_data_0 = cp.flit.data[0];
-      c.core->ext_in_bits_data_1 = cp.flit.data[1];
-      c.core->ext_in_bits_data_2 = cp.flit.data[2];
-      c.core->ext_in_bits_data_3 = cp.flit.data[3];
-      c.core->ext_in_bits_tag = cp.flit.tag;
-    }
-
-    // Compute ext_out_ready per PU. pendingOut() reads ext_out_valid which
-    // is registered (Reg.Q-based) and therefore valid from the post-K-1
-    // posedge eval without re-eval this cycle.
-    for (int pu = 1; pu <= num_pu; ++pu) {
-      auto &c = core(pu);
-      auto out = c.pendingOut();
-      if (!out) c.core->ext_out_ready = 1;
-      else c.core->ext_out_ready = routerAt(pu).canInject(*out) ? 1 : 0;
-    }
-
-    // ---- SINGLE negedge eval ----
-    // Flip clock to 0 and eval once per core. Combinational outputs
-    // (mem_broadcast_ready, ext_in_ready, ext_out_valid in response to
-    // new ext_out_ready) are valid after this point.
-    for (auto &c : cores) c->core->clock = 0;
-    evalAllCoresTimed();
-
-    // Resolve ext_in_ready for each proposal → decide acceptance.
-    for (auto &cp : core_props_K) {
-      auto &c = core(cp.pu);
-      if (c.core->ext_in_ready) {
-        c.driveExtInput(cp.flit);
-        pending_router_steps[cp.pu].deq_accepts[cp.output_idx] = true;
-      }
-    }
-
-    // FIXME(meow): collect per-PU mem_broadcast_ready into Distributor fires,
-    // re-peek distributors with real fires to get broadcast_enq_ready, then
-    // drive DRAMIf::step fires.broadcast_ready[ci]. Also resolve the ring
-    // chain ring_out_ready by walking ring_node[i+1].ring_in_ready back into
-    // node i's fires. Finally patch in mem_req_ready / mem_resp from
-    // bus_in[]'s reqAccepting / resp.
-  }
-
-  // step(K): commit posedge — advance all Reg state to post-K.
-  void step(uint64_t cy) {
-    if (reset_cycle) {
-      // SINGLE posedge eval under reset.
-      for (auto &c : cores) c->core->clock = 1;
-      evalAllCoresTimed();
-      if (cy <= 3 && std::getenv("SOFT_DBG_RESET")) {
-        fprintf(stderr, "[SOFT_RESET] cy=%lu cores[0]->reset=%u\n",
-                (unsigned long)cy, (unsigned)cores[0]->core->reset);
-      }
-      return;
-    }
-
-    // FIXME(meow): commit distributors (dists[ci].step) here.
-
-    // Collect pending_injected BEFORE any posedge K commits. This reads each
-    // PU's ext_out at Reg.Q post-K-1 (with ext_out_ready set in stage(K)),
-    // mirroring HARD's posedge K router-queue latch input.
-    pending_injected.clear();
-    for (int pu = 1; pu <= num_pu; ++pu) {
-      auto out = core(pu).currentOut();
-      if (out) pending_injected.emplace_back(pu, *out);
-    }
-
-    // FIXME(meow): commit DRAMIf / PeriphIf step() here (formerly periph->step
-    // and drams[m]->step) — drives memory-subsystem Reg.D → Reg.Q.
-
-    // ---- SINGLE posedge eval ----
-    // Flip clock to 1 and eval once per core. Registers latch their post-K
-    // state; combinational outputs reflect new Reg.Q values.
-    for (auto &c : cores) c->core->clock = 1;
-    evalAllCoresTimed();
-
-    applyRouterSteps();
-    stats.total_injections += pending_injected.size();
-
-    // Periodic stats
-    if (cycle % STAT_PERIOD == 0) {
-      PeriodicStat delta = stats - last_periodic;
-      delta.print(STAT_PERIOD);
-      last_periodic = stats;
-    }
-  }
-};
-
-struct SoftSystemModel::Impl {
-  std::unique_ptr<SoftSystemSim> sim;
-
-  Impl(const SystemConfig &cfg) {
-    sim = std::make_unique<SoftSystemSim>(cfg);
-  }
-
-  std::vector<std::unique_ptr<CoreState>> &cores() { return sim->cores; }
-
-  // RAII helper that attributes wall time between verilator eval (tracked
-  // separately via g_soft_verilator_ns) and uncore logic.
-  struct PhaseTimer {
-    SoftSystemSim &sim;
-    std::chrono::high_resolution_clock::time_point t0;
-    uint64_t v_at_entry;
-    PhaseTimer(SoftSystemSim &s)
-      : sim(s),
-        t0(std::chrono::high_resolution_clock::now()),
-        v_at_entry(g_soft_verilator_ns) {}
-    ~PhaseTimer() {
-      auto t1 = std::chrono::high_resolution_clock::now();
-      uint64_t total =
-          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-      uint64_t v = g_soft_verilator_ns - v_at_entry;
-      sim.verilator_ns += v;
-      sim.uncore_ns += (total > v ? total - v : 0);
+__attribute__((always_inline))
+static std::optional<Flit> peekCoreInject(const soft_rtl &core, uint16_t puIdx) {
+  if (!core.ext_out_valid) return std::nullopt;
+  return Flit {
+    .src = puIdx,
+    .dst = core.ext_out_bits_dst,
+    .tag = core.ext_out_bits_tag,
+    .data = {
+      core.ext_out_bits_data_0,
+      core.ext_out_bits_data_1,
+      core.ext_out_bits_data_2,
+      core.ext_out_bits_data_3,
     }
   };
+}
 
-  void peek(uint64_t cycle, std::vector<MemBusOut *> out) {
-    PhaseTimer _t(*sim);
-    sim->peek(cycle, std::move(out));
+__attribute__((always_inline))
+static void presentCoreEject(soft_rtl &core, uint16_t puIdx, const std::optional<Flit> &flit) {
+  core.ext_in_valid = flit.has_value();
+  if (flit) {
+    if (flit->dst != puIdx && !(flit->src == puIdx && flit->dst == 0))
+      throw std::invalid_argument("presentCoreEject: flit presented to wrong PU");
+    core.ext_in_bits_tag = flit->tag;
+    core.ext_in_bits_data_0 = flit->data[0];
+    core.ext_in_bits_data_1 = flit->data[1];
+    core.ext_in_bits_data_2 = flit->data[2];
+    core.ext_in_bits_data_3 = flit->data[3];
+  }
+}
+
+__attribute__((always_inline))
+static void presentCoreMem(soft_rtl &core, const soft_mem::DRAMIf::PUResp &resp) {
+  core.mem_unicast_valid = resp.unicast.has_value();
+  if (resp.unicast.has_value()) {
+    core.mem_unicast_bits_id = resp.unicast->first;
+    // mem_unicast_bits_data is VlWide<8> (32 bytes); MemLine is
+    // std::array<uint8_t,32>. Same size; raw copy preserves byte order.
+    static_assert(sizeof(core.mem_unicast_bits_data) == sizeof(resp.unicast->second));
+    std::memcpy(&core.mem_unicast_bits_data, resp.unicast->second.data(),
+                sizeof(resp.unicast->second));
   }
 
-  void stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
-    PhaseTimer _t(*sim);
-    sim->stage(cycle, in);
+  core.mem_broadcast_valid = resp.bcast.has_value();
+  if (resp.bcast.has_value()) {
+    core.mem_broadcast_bits_tag = resp.bcast->tag;
+    core.mem_broadcast_bits_carried_0 = resp.bcast->carried[0];
+    core.mem_broadcast_bits_carried_1 = resp.bcast->carried[1];
+
+    // BcastLine.line is Vec(4, BcastBeat) where BcastBeat is
+    // (data:32, idx:16, pu:16) — Chisel default Bundle places `data`
+    // at the MSB. Vec(0) occupies the highest 64 bits of the 256-bit
+    // line. The soft side stores the same 256 bits as uint32_t[8] in
+    // little-endian word order, so:
+    //   line(i).data       = soft.line[7 - 2*i]
+    //   line(i).idx || pu  = soft.line[6 - 2*i]   (idx upper, pu lower)
+    const auto &raw = resp.bcast->line;
+    core.mem_broadcast_bits_line_0_data = raw[7];
+    core.mem_broadcast_bits_line_0_idx  = (uint16_t)(raw[6] >> 16);
+    core.mem_broadcast_bits_line_0_pu   = (uint16_t)(raw[6] & 0xFFFF);
+    core.mem_broadcast_bits_line_1_data = raw[5];
+    core.mem_broadcast_bits_line_1_idx  = (uint16_t)(raw[4] >> 16);
+    core.mem_broadcast_bits_line_1_pu   = (uint16_t)(raw[4] & 0xFFFF);
+    core.mem_broadcast_bits_line_2_data = raw[3];
+    core.mem_broadcast_bits_line_2_idx  = (uint16_t)(raw[2] >> 16);
+    core.mem_broadcast_bits_line_2_pu   = (uint16_t)(raw[2] & 0xFFFF);
+    core.mem_broadcast_bits_line_3_data = raw[1];
+    core.mem_broadcast_bits_line_3_idx  = (uint16_t)(raw[0] >> 16);
+    core.mem_broadcast_bits_line_3_pu   = (uint16_t)(raw[0] & 0xFFFF);
+  }
+}
+
+void SoftSystemBackend::peek(uint64_t cycle, std::vector<MemBusOut *> out) {
+  PhaseTimer _t(*this);
+  if (out.size() != cfg.numMC + 1)
+    throw std::invalid_argument("peek: out size mismatch");
+  if (cycle <= releaseResetAfter) {
+    for (auto &o : out) o->req = std::nullopt;
+    return;
   }
 
-  void step(uint64_t cycle) {
-    PhaseTimer _t(*sim);
-    sim->step(cycle);
+  out[0]->req = periph.peekMem();
+  for (size_t i = 0; i < cfg.numMC; ++i)
+    out[i + 1]->req = drams[i].peekMem();
+}
+
+void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
+  PhaseTimer _t(*this);
+  if (cycle <= releaseResetAfter) {
+    for (const auto &i : in) {
+      if (i.reqAccepting) throw std::runtime_error("Memory request accepted during reset");
+      if (i.resp) throw std::runtime_error("Memory response presented during reset");
+    }
   }
 
-  SystemConfig config() const {
-    return sim->cfg;
+  memif_ext = in;
+
+  // Populate presented data on all router-facing ready-valid interfaces.
+  for (uint16_t i = 1; i <= cfg.numPU; ++i)
+    routers[i].buf.core_inject.presenting = peekCoreInject(*cores[i], i);
+
+  for (uint16_t i = 1; i <= cfg.numPU; ++i) {
+    auto &router = routers[i];
+    router.buf.core_eject.presenting = router.rt.peek(0);
+    size_t o = 0;
+    for (; o < 4 && router.links.forwards[o]; ++o)
+      router.buf.forwards[o].presenting = router.rt.peek(o + 1);
+    // o + 1 is now the memif port (if any).
+    if (router.links.memif)
+      memif_eject[*router.links.memif].presenting = router.rt.peek(o + 1);
   }
 
-  void printStats(uint64_t cycles) { sim->stats.print(cycles); }
-};
+  const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
+  for (size_t m = 0; m < cfg.numMC; ++m) {
+    auto buffer_span = core_mem.slice(m * PU_PER_MC + 1, (m + 1) * PU_PER_MC + 1);
+    drams[m].peekPUs(buffer_span, ring.peekAt(m + 1)); // 0 is periph
+  }
 
-void setSoftSystemModelLogging(bool enabled) {
-  LOG = enabled;
+  // Generate accepting signals. Each router's egress is buffered on the
+  // PEER's forward[port_idx]; we drive that buffer's `accepting` from
+  // the local router's canEnq.
+  for (uint16_t i = 1; i <= cfg.numPU; ++i) {
+    auto &local = routers[i];
+    local.buf.core_inject.accepting =
+        local.buf.core_inject.presenting &&
+        local.rt.canEnq(0, local.buf.core_inject.presenting->prio());
+    size_t o = 0;
+    for (; o < 4 && local.links.forwards[o]; ++o) {
+      auto [from, port] = *local.links.forwards[o];
+      auto &remote = routers[from];
+      auto &remoteBuf = remote.buf.forwards[port];
+      remoteBuf.accepting =
+          remoteBuf.presenting &&
+          local.rt.canEnq(o + 1, remoteBuf.presenting->prio());
+    }
+  }
+
+  memif_ring_accept[0] =
+      ring.peekAt(0) && periph.ringCanAccept(*ring.peekAt(0));
+  memif_eject[0].accepting =
+      memif_eject[0].presenting && periph.nocCanAccept(*memif_eject[0].presenting);
+  for (size_t m = 0; m < cfg.numMC; ++m) {
+    memif_ring_accept[m + 1] =
+        ring.peekAt(m + 1) && drams[m].ringCanAccept(*ring.peekAt(m + 1));
+    memif_eject[m + 1].accepting =
+        memif_eject[m + 1].presenting &&
+        drams[m].nocCanAccept(*memif_eject[m + 1].presenting);
+  }
+
+  // Drive PU inputs and settle on the negedge. Contract: accept signals
+  // from the cores are read post-eval (after combinational settle).
+  for (uint16_t i = 1; i <= cfg.numPU; ++i) {
+    presentCoreEject(*cores[i], i, routers[i].buf.core_eject.presenting);
+    presentCoreMem(*cores[i], core_mem[i]);
+    cores[i]->ext_out_ready = routers[i].buf.core_inject.accepting;
+    cores[i]->clock = false; // negedge
+    auto v0 = std::chrono::high_resolution_clock::now();
+    cores[i]->eval();
+    auto v1 = std::chrono::high_resolution_clock::now();
+    g_soft_verilator_ns +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(v1 - v0).count();
+    routers[i].buf.core_eject.accepting = cores[i]->ext_in_ready;
+    core_mem_accept[i].unicast = cores[i]->mem_unicast_valid;
+    core_mem_accept[i].broadcast =
+        cores[i]->mem_broadcast_ready && cores[i]->mem_broadcast_valid;
+  }
 }
 
-SoftSystemModel::SoftSystemModel(SystemConfig cfg) : impl_(std::make_unique<Impl>(cfg)) {}
-SoftSystemModel::~SoftSystemModel() = default;
-SoftSystemModel::SoftSystemModel(SoftSystemModel &&) noexcept = default;
-SoftSystemModel &SoftSystemModel::operator=(SoftSystemModel &&) noexcept = default;
+void SoftSystemBackend::step(uint64_t cycle) {
+  PhaseTimer _t(*this);
 
-void SoftSystemModel::attachTrace(VerilatedFstC *trace_file, int depth) {
-  TRACE = trace_file != nullptr;
-  tracer = trace_file;
-  // NOTE: do NOT call core->trace() here. soft_rtl::trace() forwards to
-  // contextp()->trace() which iterates *all* models in the shared default
-  // VerilatedContext (including HARD's sys when cosim'ing). Doing it again
-  // here causes duplicate registration of every model, which silently breaks
-  // FST dumping (clock/reset signals stop transitioning in the trace).
-  // The shared context is registered exactly once at top-level (system.cpp).
+  // Accumulate per-cycle stats BEFORE committing this cycle's
+  // transfers. The accepting signals computed in stage() are still
+  // valid; queue/inflight occupancies reflect the state entering
+  // this cycle.
+  accumulateStats();
+
+  // Posedge eval for every core.
+  for (size_t i = 1; i <= cfg.numPU; ++i) {
+    cores[i]->clock = true;
+    auto v0 = std::chrono::high_resolution_clock::now();
+    cores[i]->eval();
+    auto v1 = std::chrono::high_resolution_clock::now();
+    g_soft_verilator_ns +=
+        std::chrono::duration_cast<std::chrono::nanoseconds>(v1 - v0).count();
+
+    if (cycle == releaseResetAfter) {
+      cores[i]->reset = false;
+      cores[i]->eval();
+    }
+  }
+
+  // Step routers.
+  for (auto &router : routers) {
+    const auto &buffer = router.buf;
+    const auto &links = router.links;
+    const auto &all = this->routers;
+    bool memif_accepting = false;
+    if (links.memif.has_value())
+      memif_accepting = memif_eject[*links.memif].accepting;
+    router.rt.step(
+      [&buffer, &links, &all](size_t i) -> std::optional<Flit> {
+        if (i == 0) {
+          if (buffer.core_inject.accepting) return buffer.core_inject.presenting;
+        } else {
+          assert(i < 5 && links.forwards[i - 1]);
+          auto [from, port] = *links.forwards[i - 1];
+          const auto &remote = all[from];
+          const auto &remoteBuf = remote.buf.forwards[port];
+          if (remoteBuf.accepting) return remoteBuf.presenting;
+        }
+        return std::nullopt;
+      },
+      [&buffer, &links, memif_accepting](size_t i) -> bool {
+        if (i == 0) {
+          return buffer.core_eject.accepting;
+        } else if (i < 5 && links.forwards[i - 1]) {
+          return buffer.forwards[i - 1].accepting;
+        } else {
+          assert(links.memif);
+          return memif_accepting;
+        }
+      }
+    );
+  }
+
+  // Step memifs.
+  const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
+  bool injected;
+  periph.step(
+    soft_mem::RingIntf {
+      .buffer = &ring[0],
+      .ingress = ring.validAt(0),
+      .eject = memif_ring_accept[0],
+      // canInject: forward queue is empty AND no forward will push into
+      // the outgoing queue this cycle.
+      .canInject = !ring.validAt(1) &&
+                   (!ring.validAt(0) || memif_eject[0].accepting),
+      .injected = &injected
+    },
+    memif_ext[0],
+    memif_eject[0].accepting ? &*memif_eject[0].presenting : nullptr
+  );
+  ring.updateValidAt(0, injected, memif_ring_accept[0]);
+
+  for (size_t m = 0; m < cfg.numMC; ++m) {
+    drams[m].step(
+      soft_mem::RingIntf {
+        .buffer = &ring[m + 1],
+        .ingress = ring.validAt(m + 1),
+        .eject = memif_ring_accept[m + 1],
+        .canInject = !ring.validAt((m + 2) % (cfg.numMC + 1)) &&
+                     (!ring.validAt(m + 1) || memif_eject[m + 1].accepting),
+        .injected = &injected
+      },
+      memif_ext[m + 1],
+      memif_eject[m + 1].accepting ? &*memif_eject[m + 1].presenting : nullptr,
+      core_mem_accept.slice(1 + PU_PER_MC * m, 1 + PU_PER_MC * (m + 1))
+    );
+    ring.updateValidAt(m + 1, injected, memif_ring_accept[m + 1]);
+  }
+  ring.progress();
+
+  // Periodic delta print.
+  if (log_ && cycle > 0 && cycle % Stat::PERIOD == 0) {
+    auto delta = stats_ - last_periodic_;
+    uint64_t span = cycle - last_periodic_cycle_;
+    std::cerr << "[Soft] Periodic stats (cycles " << last_periodic_cycle_
+              << ".." << cycle << ", span=" << span << "):\n";
+    delta.print(span);
+    last_periodic_ = stats_;
+    last_periodic_cycle_ = cycle;
+  }
 }
 
-void SoftSystemModel::peek(uint64_t cycle, std::vector<MemBusOut *> out) {
-  impl_->peek(cycle, std::move(out));
+void SoftSystemBackend::accumulateStats() {
+  uint64_t hops = 0;
+  uint64_t idle_lanes = 0;
+  uint64_t blocked = 0;
+  uint64_t injections = 0;
+  uint64_t mem_reqs = 0;
+  uint64_t inflight_msgs = 0;
+  uint64_t idle_cores = 0;
+
+  for (uint16_t i = 1; i <= cfg.numPU; ++i) {
+    const auto &r = routers[i];
+    // Inflight router messages = total queued flits across all input
+    // queues of every router.
+    inflight_msgs += r.rt.totalFlits();
+    // Core inject: an injection means a flit transferred from the PU
+    // into the local router this cycle.
+    if (r.buf.core_inject.presenting) {
+      if (r.buf.core_inject.accepting) {
+        ++hops;
+        ++injections;
+      } else {
+        ++blocked;
+      }
+    }
+    // Core eject: flit delivered to the local PU.
+    if (r.buf.core_eject.presenting && r.buf.core_eject.accepting) ++hops;
+    // Forward links: each is a possible egress lane this cycle.
+    for (size_t o = 0; o < 4 && r.links.forwards[o]; ++o) {
+      const auto &fwd = r.buf.forwards[o];
+      if (fwd.presenting) {
+        if (fwd.accepting) ++hops;
+        else ++blocked;
+      } else {
+        ++idle_lanes;
+      }
+    }
+    // Memif eject (from router into memif) counts as a memory request
+    // arriving at the memif this cycle.
+    if (r.links.memif.has_value()) {
+      const auto &me = memif_eject[*r.links.memif];
+      if (me.presenting && me.accepting) {
+        ++hops;
+        ++mem_reqs;
+      }
+    }
+    // A core is "idle" this cycle if it has nothing to inject and
+    // nothing being delivered to it.
+    if (!r.buf.core_inject.presenting && !r.buf.core_eject.presenting)
+      ++idle_cores;
+  }
+
+  // DRAM inflight = scalar slots in use + 1 if a bulk is active.
+  uint64_t inflight_dram = 0;
+  for (const auto &d : drams) {
+    inflight_dram += d.scalarInflightCount();
+    if (d.bulkActive()) ++inflight_dram;
+    inflight_dram += d.bcstQueueOccupancy();
+  }
+  inflight_dram += periph.scalarInflightCount();
+
+  // Response ring occupancy = number of valid slots on the ringbus.
+  uint64_t inflight_resp = 0;
+  for (size_t i = 0; i < cfg.numMC + 1; ++i)
+    if (ring.validAt(i)) ++inflight_resp;
+
+  stats_.total_hops          += hops;
+  stats_.total_injections    += injections;
+  stats_.total_mem_requests  += mem_reqs;
+  stats_.idle_lane_cycles    += idle_lanes;
+  stats_.idle_core_cycles    += idle_cores;
+  stats_.blocked_structural  += blocked;
+  stats_.inflight_messages_sum += inflight_msgs;
+  stats_.inflight_dram_sum   += inflight_dram;
+  stats_.inflight_resp_sum   += inflight_resp;
+  stats_.cur_inflight_messages = inflight_msgs;
+  stats_.cur_inflight_dram     = inflight_dram;
+  stats_.cur_inflight_resp     = inflight_resp;
 }
 
-void SoftSystemModel::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
-  impl_->stage(cycle, in);
-}
-
-void SoftSystemModel::step(uint64_t cycle) {
-  impl_->step(cycle);
-}
-
-SystemConfig SoftSystemModel::config() const {
-  return impl_->config();
-}
-
-bool SoftSystemModel::printStats(uint64_t cycles, bool final_print) {
+bool SoftSystemBackend::printStats(uint64_t cycles, bool final_print) {
   if (final_print) {
-    cerr << "[Soft] Final stats (over " << cycles << " cycles):\n";
-    impl_->printStats(cycles);
-    double v_ms = impl_->sim->verilator_ns / 1e6;
-    double u_ms = impl_->sim->uncore_ns / 1e6;
+    double v_ms = verilator_ns_ / 1e6;
+    double u_ms = uncore_ns_ / 1e6;
     double tot_ms = v_ms + u_ms;
     auto pct = [&](double x) { return tot_ms > 0 ? (100.0 * x / tot_ms) : 0.0; };
     fprintf(stderr,
+            "[Soft] Final stats (over %lu cycles):\n"
             "[Soft] Time breakdown: verilator=%.3fms (%.1f%%) "
             "uncore=%.3fms (%.1f%%) total=%.3fms\n",
+            (unsigned long)cycles,
             v_ms, pct(v_ms), u_ms, pct(u_ms), tot_ms);
+    stats_.print(cycles);
   }
   return true;
 }
-
-// fixed-length 1-based vector because hey
-template<typename T>
-class IndexVector {
-  std::vector<T> inner;
-
-public:
-  IndexVector(size_t size) : inner(size) {}
-  T& operator[](size_t idx) { return inner[idx - 1]; }
-  const T& operator[](size_t idx) const { return inner[idx - 1]; }
-  size_t maxIndex() const { return inner.size(); }
-  // Return the mutable borrowed span [start, end), 1-based indexing
-  std::span<T> slice(size_t start, size_t end) {
-    return std::span<T>(inner.data() + start - 1, end - start);
-  }
-  auto begin() { return inner.begin(); }
-  auto end() { return inner.end(); }
-  auto cbegin() { return inner.cbegin(); }
-  auto cend() { return inner.cend(); }
-};
-
-class SoftSystemBackend : public SystemBackend {
-  static const size_t ROUTER_Q_DEPTH = 8;
-
-  // New topology info
-  // First coordinate is the East-west coord (X)
-  // Second coordinate is the North-south coord (y)
-  // (0, 0) is southwest, so west = y-, south = x-
-  struct Topology {
-    IndexVector<std::pair<uint16_t, uint16_t>> pu_to_coord;
-    std::vector<std::vector<uint16_t>> coord_to_pu;
-    // 0-based, 0 is periph
-    std::vector<uint16_t> memif_to_pu;
-
-    uint16_t h, w;
-
-    Topology(int h, int w, int memif) : pu_to_coord(h * w), coord_to_pu(h * w), memif_to_pu(memif) {
-      // FIXME: impl
-    }
-  };
-
-  template<typename T>
-  struct ReadyValidPair {
-    std::optional<T> presenting;
-    bool accepting;
-  };
-
-  size_t numPU, numMC;
-  // The cycle EDGE after which the reset is released. Since cycle increment after step,
-  // this should be K - 1 if we want K cycles of reset (0-based).
-  size_t releaseResetAfter;
-
-  Topology topo;
-  soft_mem::PeriphIf periph;
-  std::vector<soft_mem::DRAMIf> drams;
-  IndexVector<soft_rtl> cores;
-  soft_mem::Ringbus ring;
-
-  std::vector<ReadyValidPair<Flit>> memif_eject;
-  std::vector<MemBusIn> memif_ext;
-  std::vector<bool> memif_ring_accept;
-  IndexVector<soft_mem::DRAMIf::PUResp> core_mem;
-  IndexVector<soft_mem::DRAMIf::PUAccept> core_mem_accept;
-
-  // Flit buffers during peeking, except memif eject buffers
-  struct LinkBuffer {
-    ReadyValidPair<Flit> core_inject;
-    ReadyValidPair<Flit> core_eject;
-    // Forwards may not be fully utilized.
-    // This stores the **egress** buffer
-    // To read the ingress data, routers need to read from the peer router's buffer
-    std::array<ReadyValidPair<Flit>, 4> forwards;
-  };
-
-  // Port arrangement for routers:
-  // outgoing ports:
-  // 0: core eject
-  // 1..K: forwarding
-  // K+1: memif
-  //
-  // incoming ports:
-  // 0: core inject
-  // 1..K: forwarding
-  struct LinkStatus {
-    std::array<std::optional<std::pair<uint16_t, uint8_t>>, 4> forwards; // Peer router ID, port map (0-based, used to index the buffer)
-    std::optional<uint16_t> memif; // MemIf index, if any
-  };
-
-  struct WrappedRouter {
-     LinkStatus links;
-     LinkBuffer buf;
-     Router<Flit, ROUTER_Q_DEPTH> rt;
-  };
-  // Tightly-coupled router states
-  IndexVector<WrappedRouter> routers;
-
-  // Directions to links. 0 = North, 1 = east, 2 = south, 3 = west
-  typedef std::array<std::optional<size_t>, 4> DirectionToLinkIdx;
-
-  auto routingTableFor(uint16_t idx, const DirectionToLinkIdx &linkIdx, std::optional<size_t> memifIdx) const {
-    const Topology *topo = &this->topo;
-    auto selfCoord = topo->pu_to_coord[idx];
-    return [idx, topo, selfCoord, linkIdx, memifIdx](uint16_t dst) -> size_t {
-      bool isMem = (dst & 0x8000) != 0;
-      size_t tgt = 0;
-      if (isMem) {
-        uint16_t memIdx = dst & 0x7FFF;
-        if (memIdx >= topo->memif_to_pu.size()) throw std::runtime_error("Memory index too large in flit");
-        tgt = topo->memif_to_pu[memIdx];
-      } else {
-        tgt = dst;
-      }
-
-      if (tgt == 0 || tgt == idx) {
-        // Is sending to local
-        if (isMem) {
-          if (!memifIdx) throw std::runtime_error("Memory request sent to local but no memifIdx is set");
-          return *memifIdx;
-        }
-        return 0;
-      }
-
-      // Else, requires routing
-      if (tgt > topo->pu_to_coord.maxIndex()) throw std::runtime_error("Target index too large in flit");
-      auto tgtCoord = topo->pu_to_coord[tgt];
-      // X-Y routing
-      size_t dir;
-      if (tgtCoord.second == selfCoord.second) dir = tgtCoord.first < selfCoord.first ? 3 : 1;
-      else dir = tgtCoord.second < selfCoord.second ? 2 : 0;
-      auto link = linkIdx[dir];
-      if (!link) throw std::logic_error("Routed to a non-existing link");
-      return *link;
-    };
-  }
-
-  std::optional<Flit> peekCoreInject(uint16_t puIdx) const {
-    const auto &core = cores[puIdx];
-    if (!core.ext_out_valid) return std::nullopt;
-    return Flit {
-      .src = puIdx,
-      .dst = core.ext_out_bits_dst,
-      .tag = core.ext_out_bits_tag,
-      .data = {
-        core.ext_out_bits_data_0,
-        core.ext_out_bits_data_1,
-        core.ext_out_bits_data_2,
-        core.ext_out_bits_data_3,
-      }
-    };
-  }
-
-  void presentCoreEject(uint16_t puIdx, const std::optional<Flit> &flit) {
-    auto &core = cores[puIdx];
-    core.ext_in_valid = flit.has_value();
-    if (flit) {
-      if (flit->dst != puIdx && !(flit->src == puIdx && flit->dst == 0))
-        throw std::invalid_argument("presentCoreEject: flit presented to wrong PU");
-      core.ext_in_bits_tag = flit->tag;
-      core.ext_in_bits_data_0 = flit->data[0];
-      core.ext_in_bits_data_1 = flit->data[1];
-      core.ext_in_bits_data_2 = flit->data[2];
-      core.ext_in_bits_data_3 = flit->data[3];
-    }
-  }
-
-  void presentCoreMem(uint16_t puIdx, const soft_mem::DRAMIf::PUResp &resp) {
-    auto &core = cores[puIdx];
-    core.mem_unicast_valid = resp.unicast.has_value();
-    if (resp.unicast.has_value()) {
-      core.mem_unicast_bits_id = resp.unicast->first;
-      core.mem_unicast_bits_data = resp.unicast->second;
-    }
-
-    core.mem_broadcast_valid = resp.bcast.has_value();
-    if (resp.bcast.has_value()) {
-      core.mem_broadcast_bits_tag = resp.bcast->tag;
-      core.mem_broadcast_bits_carried_0 = resp.bcast->carried[0];
-      core.mem_broadcast_bits_carried_1 = resp.bcast->carried[1];
-
-      // FIXME: fill in, check endian
-    }
-  }
-
-public:
-  virtual void peek(uint64_t cycle, std::vector<MemBusOut *> out) override {
-    if (out.size() != numMC + 1) throw std::invalid_argument("peek: out size mismatch");
-    if (cycle <= releaseResetAfter) {
-      // Exposes nothing
-      for (auto &o : out)
-        o->req = std::nullopt;
-      return;
-    }
-
-    out[0]->req = periph.peekMem();
-    for (size_t i = 0; i < numMC; ++i)
-      out[i + 1]->req = drams[i].peekMem();
-  }
-
-  void stage(uint64_t cycle, const std::vector<MemBusIn> &in) override {
-    if (cycle <= releaseResetAfter) {
-      for (const auto &i : in) {
-        if (i.reqAccepting) throw std::runtime_error("Memory request accepted during reset");
-        if (i.resp) throw std::runtime_error("Memory response presented during reset");
-      }
-    }
-
-    // Copy external memory response into internal buffer
-    memif_ext = in;
-
-    // Populate all presented data in the ready-valid handshakes, except external memory requests, because we've done that
-    for (uint16_t i = 1; i <= numPU; ++i)
-      routers[i].buf.core_inject.presenting = peekCoreInject(i);
-
-    for (uint16_t i = 1; i <= numPU; ++i) {
-      auto &router = routers[i];
-      router.buf.core_eject.presenting = router.rt.peek(0);
-      size_t o = 0;
-      for (; o < 4 && router.links.forwards[o]; ++o)
-        router.buf.forwards[o].presenting = router.rt.peek(o + 1);
-      // o + 1 is now memif port (if exists)
-      if (router.links.memif)
-        memif_eject[*router.links.memif].presenting = router.rt.peek(o + 1);
-    }
-
-    const size_t PU_PER_MC = numPU / numMC;
-    for (size_t m = 0; m < numMC; ++m) {
-      auto buffer_span = core_mem.slice(m * PU_PER_MC + 1, (m + 1) * PU_PER_MC + 1);
-      drams[m].peekPUs(buffer_span, ring.peekAt(m + 1)); // 0 is periph
-    }
-
-    // TODO: during multi-threading, barrier here
-
-    // Now that all presented data are populated, generate accepting signal (for cores, cross the negedge)
-
-    for (uint16_t i = 1; i <= numPU; ++i) {
-      auto &local = routers[i];
-      local.buf.core_inject.accepting = local.buf.core_inject.presenting && local.rt.canEnq(0, local.buf.core_inject.presenting->prio());
-      size_t o = 0;
-      for (; o < 4 && local.links.forwards[o]; ++o) {
-        auto [from, port] = *local.links.forwards[o];
-        auto &remote = routers[from];
-        auto &remoteBuf = remote.buf.forwards[port];
-        remoteBuf.accepting = remoteBuf.presenting && local.rt.canEnq(o + 1, remoteBuf.presenting->prio());
-      }
-    }
-
-    memif_ring_accept[0] = ring.peekAt(0) && periph.ringCanAccept(*ring.peekAt(0));
-    memif_eject[0].accepting = memif_eject[0].presenting && periph.nocCanAccept(*memif_eject[0].presenting);
-    for (size_t m = 0; m < numMC; ++m) {
-      memif_ring_accept[m + 1] = ring.peekAt(m + 1) && drams[m].ringCanAccept(*ring.peekAt(m + 1));
-      memif_eject[m + 1].accepting = memif_eject[m + 1].presenting && drams[m].nocCanAccept(*memif_eject[m + 1].presenting);
-    }
-
-    // For cores, additionally propagate inject accepting, so we can eval only once
-    for (uint16_t i = 1; i <= numPU; ++i) {
-      presentCoreEject(i, routers[i].buf.core_eject.presenting);
-      presentCoreMem(i, core_mem[i]);
-      cores[i].ext_out_ready = routers[i].buf.core_inject.accepting;
-      // Negedge
-      cores[i].clock = false;
-      cores[i].eval();
-      routers[i].buf.core_eject.accepting = cores[i].ext_in_ready;
-      core_mem_accept[i].unicast = cores[i].mem_unicast_valid; // Cores unconditionally accepts unicast
-      core_mem_accept[i].broadcast = cores[i].mem_broadcast_ready && cores[i].mem_broadcast_valid; // Contract states accept indiates an actual transfer
-    }
-  }
-
-  virtual void step(uint64_t cycle) override {
-    // FIXME: dump
-
-    // Step cores. Cores' data should all be set. Just step
-    for (size_t i = 1; i <= numPU; ++i) {
-      cores[i].clock = true; // Posedge
-      cores[i].eval();
-
-      if (cycle == releaseResetAfter) {
-        cores[i].reset = false;
-        cores[i].eval();
-      }
-    }
-
-    // Steps routers
-    for (auto &router : routers) {
-      const auto &buffer = router.buf;
-      const auto &links = router.links;
-      const auto &routers = this->routers;
-      bool memif_accepting = false;
-      if (links.memif.has_value()) memif_accepting = memif_eject[*links.memif].accepting;
-      router.rt.step(
-        [&buffer, &links, &routers](size_t i) -> std::optional<Flit> {
-          if (i == 0) {
-            if (buffer.core_inject.accepting) return buffer.core_inject.presenting;
-          } else {
-            assert(i < 5 && links.forwards[i - 1]);
-            auto [from, port] = *links.forwards[i - 1];
-            auto &remote = routers[from];
-            auto &remoteBuf = remote.buf.forwards[port];
-            if (remoteBuf.accepting) return remoteBuf.presenting;
-          }
-
-          return std::nullopt;
-        },
-        [&buffer, &links, memif_accepting](size_t i) -> bool {
-          if (i == 0) {
-            return buffer.core_eject.accepting;
-          } else if (i < 5 && links.forwards[i - 1]) {
-            return buffer.forwards[i - 1].accepting;
-          } else {
-            assert(links.memif);
-            return memif_accepting;
-          }
-        }
-      );
-    }
-
-    // Step memifs
-    const size_t PU_PER_MC = numPU / numMC;
-    bool injected;
-    periph.step(
-      soft_mem::RingIntf {
-        .buffer = &ring[0],
-        .ingress = ring.validAt(0),
-        .eject = memif_ring_accept[0],
-        // TODO: this condition may break in the future
-        // This reads as: nothing pushed last cycle (the forward queue is empty)
-        // and no forward is pushing into the outgoing queue at this cycle
-        .canInject = !ring.validAt(1) && (!ring.validAt(0) || memif_eject[0].accepting),
-        .injected = &injected
-      },
-      memif_ext[0],
-      memif_eject[0].accepting ? &*memif_eject[0].presenting : nullptr
-    );
-    ring.updateValidAt(0, injected, memif_ring_accept[0]);
-    for (size_t m = 0; m < numMC; ++m) {
-      drams[m].step(
-        soft_mem::RingIntf {
-          .buffer = &ring[m + 1],
-          .ingress = ring.validAt(m + 1),
-          .eject = memif_ring_accept[m + 1],
-          .canInject = !ring.validAt((m + 2) % (numMC + 1)) && (!ring.validAt(m + 1) || memif_eject[m + 1].accepting),
-          .injected = &injected
-        },
-        memif_ext[m + 1],
-        memif_eject[m + 1].accepting ? &*memif_eject[m + 1].presenting : nullptr,
-        core_mem_accept.slice(1 + PU_PER_MC * m, 1 + PU_PER_MC * (m + 1))
-      );
-      ring.updateValidAt(m + 1, injected, memif_ring_accept[m + 1]);
-    }
-    ring.progress();
-  }
-};

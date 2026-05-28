@@ -11,7 +11,6 @@
 #include <bit>
 #include <stdexcept>
 #include <unordered_map>
-#include <deque>
 #include <cassert>
 #include <span>
 
@@ -65,7 +64,6 @@ struct BulkRequest {
 
   // Accessed as idx % maxInflight. Reset during allocation.
   uint64_t recentResp = 0;
-  std::vector<MemLine> buffer;
 
   uint16_t returnTag;
   std::array<uint32_t, 2> returnCarried;
@@ -77,7 +75,6 @@ struct BulkRequest {
       .base = f.data[0],
       .cnt = (uint16_t) (f.data[1] >> 16),
       .maxInflight = maxInflight,
-      .buffer = std::vector<MemLine>(maxInflight),
       .returnTag = (uint16_t) (f.data[1] & 0xFFFF),
       .returnCarried = {f.data[2], f.data[3]}
     };
@@ -95,7 +92,7 @@ struct BulkRequest {
     }};
   }
 
-  std::optional<BcastLine> peekBcastLine() const {
+  std::optional<BcastLine> peekBcastLine(const std::vector<MemLine> &buffer) const {
     // First, check if resp is already here
     size_t retireSlot = retireCnt % maxInflight;
     if (recentResp & (1ULL << retireSlot)) {
@@ -110,7 +107,7 @@ struct BulkRequest {
 
   // TODO: broadcast -> distributor
 
-  void step(bool issued, bool retire, const GlobalMemResp *resp) {
+  void step(bool issued, bool retire, const GlobalMemResp *resp, std::vector<MemLine> &buffer) {
     size_t oldIssueCnt = issueCnt;
     if (issued) {
       if (issueCnt >= maxInflight + retireCnt || issueCnt >= cnt)
@@ -191,6 +188,11 @@ public:
   /*
     * Scalar request state machine and generator
     */
+
+  // Number of currently allocated scalar inflight slots.
+  size_t scalarInflightCount() const noexcept __attribute__((always_inline)) {
+    return std::popcount(scalarAllocated);
+  }
 
   std::optional<uint8_t> scalarAllocSlot() const noexcept __attribute__((always_inline)) {
     // Returns the lowest 0 in scalarAllocated
@@ -289,12 +291,12 @@ class Ringbus {
   // Number of nodes in this ring bus
   size_t size;
   // Indexing offset
-  size_t offset;
+  size_t offset = 0;
   std::vector<RingResp> buffers;
-  uint64_t validness;
+  uint64_t validness = 0;
 
 public:
-  Ringbus(size_t size, size_t offset) : size(size), offset(offset), buffers(size), validness(0) {
+  Ringbus(size_t size) : size(size), buffers(size) {
     if (size > 64) throw std::logic_error("Ringbus: size must be <= 64");
   }
 
@@ -333,10 +335,16 @@ public:
  * The DRAMIf. Including the distributors, so it directly interfaces with PUs
  */
 class DRAMIf : public MemIf {
+  // Influenced PU range: [puStart, puEnd).
+  // puEnd - puStart has to be a multiple of 16
+  size_t puStart;
+  size_t puEnd;
+
   /*
    * Bulk state machine
    */
   std::optional<BulkRequest> bulk = {};
+  std::vector<MemLine> bulkBuffer;
   size_t bulkMaxInflight;
   uint64_t bcstDistAccepted = 0;
 
@@ -344,15 +352,10 @@ class DRAMIf : public MemIf {
    * Per-distributor states
    */
   // Bulk queues in distributors
-  std::vector<std::deque<BcastLine>> bcstQueues;
+  std::vector<FixedLenQueue<BcastLine>> bcstQueues;
   size_t bcstQueueCap;
   // Bulk acceptance states
   std::vector<uint16_t> bcstPUAccepted;
-
-  // Influenced PU range: [puStart, puEnd).
-  // puEnd - puStart has to be a multiple of 16
-  size_t puStart;
-  size_t puEnd;
 
   struct UnicastRespPeek {
     // The local responses, if exists. Index is pu index - puStart
@@ -391,6 +394,34 @@ public:
     bool broadcast;
   };
 
+  size_t numClusters() const {
+    return (puEnd - puStart) / CLUSTER_SIZE;
+  }
+
+  // True iff a bulk request is currently in-flight (occupying the
+  // single bulk slot).
+  bool bulkActive() const noexcept { return bulk.has_value(); }
+  // Sum of pending broadcast lines across cluster distributor queues.
+  size_t bcstQueueOccupancy() const noexcept {
+    size_t n = 0;
+    for (const auto &q : bcstQueues) n += q.size();
+    return n;
+  }
+
+  DRAMIf(size_t memif_idx, size_t scalarInflight, size_t bulkInflight, size_t bcstQueueCap, size_t puStart, size_t puEnd)
+    : MemIf(memif_idx, scalarInflight),
+      puStart(puStart),
+      puEnd(puEnd),
+      bulkMaxInflight(bulkInflight),
+      bulkBuffer(bulkInflight),
+      bcstQueueCap(bcstQueueCap),
+      bcstPUAccepted(numClusters()) {
+        if ((puStart - puEnd) % CLUSTER_SIZE) throw std::logic_error("PU range not aligned");
+        for (size_t dist = 0; dist < numClusters(); ++dist) {
+          bcstQueues.emplace_back(bcstQueueCap);
+        }
+      }
+
   /*
    * PU interfacing
    */
@@ -411,8 +442,9 @@ public:
 
       size_t dist = puDelta / CLUSTER_SIZE;
       uint8_t puSubidx = puDelta % CLUSTER_SIZE;
-      if (bcstQueues[dist].size() > 0 && ((bcstPUAccepted[dist] >> puSubidx) & 1) == 0)
-        pus[puDelta].bcast = bcstQueues[dist].front();
+      auto presented = bcstQueues[dist].front();
+      if (presented && ((bcstPUAccepted[dist] >> puSubidx) & 1) == 0)
+        pus[puDelta].bcast = presented.value().get();
       else pus[puDelta].bcast = std::nullopt;
     }
   }
@@ -451,11 +483,11 @@ public:
     // Bulk completion happens before any potential de-queue in distributor, so we handle that first
     bool bulkRetireOne = false;
     bool bulkAcceptOne = false;
-    if (bulk) if (auto line = bulk->peekBcastLine()) {
+    if (bulk) if (auto line = bulk->peekBcastLine(bulkBuffer)) {
       // Iterate through all distributors
       for (size_t dist = 0; dist < (puEnd - puStart) / CLUSTER_SIZE; ++dist)
         if (!(bcstDistAccepted & (1ULL << dist)) && bcstQueues[dist].size() < bcstQueueCap) {
-          bcstQueues[dist].push_back(*line);
+          bcstQueues[dist].push(*line);
           bcstDistAccepted |= 1ULL << dist;
         }
 
@@ -517,8 +549,7 @@ public:
         // All accepted
         bcstPUMask = 0;
         auto &queue = bcstQueues[dist];
-        if (queue.empty()) throw std::logic_error("Broadcast queue is empty when dequeue");
-        queue.pop_front();
+        if (!queue.pop()) throw std::logic_error("Broadcast queue is empty when dequeue");
       }
     }
 
@@ -544,7 +575,7 @@ public:
 
     // Finally, steps bulk with generated control signals
     if (bulk) {
-      bulk->step(bulkAcceptOne, bulkRetireOne, bulkMemResp);
+      bulk->step(bulkAcceptOne, bulkRetireOne, bulkMemResp, bulkBuffer);
       if (bulk->retireCnt == bulk->cnt) bulk = std::nullopt;
     } else if (bulkAcceptOne || bulkRetireOne || bulkMemResp != nullptr)
       throw std::logic_error("Bulk state mismatch");
@@ -573,6 +604,12 @@ class PeriphIf : public MemIf {
   std::unordered_map<uint32_t, MemLine> configROM;
 
 public:
+  PeriphIf(size_t memif_idx, size_t scalarInflight, std::unordered_map<uint32_t, MemLine> configROM) : MemIf(memif_idx, scalarInflight), configROM(std::move(configROM)) {
+    // Check configROM
+    for (const auto &[addr, line] : configROM)
+      if (addr & MEM_ADDR_OFFSET_MASK) throw std::logic_error("ConfigROM address not aligned");
+  }
+
   virtual bool ringIsLocal(const RingResp &resp) const noexcept override __attribute__((always_inline)) {
     return false;
   }

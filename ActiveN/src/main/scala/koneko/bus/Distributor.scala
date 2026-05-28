@@ -45,7 +45,7 @@ class Distributor(
   out.unicast.valids := Fill(16, in.unicast.valid) & UIntToOH(in.unicast.bits.dst - puStart.U, 16)
 
   // Single slot queue for broadcasts
-  val bcstQueue = Module(new Queue(new BcastLine, 1, pipe = true))
+  val bcstQueue = Module(new Queue(new BcastLine, 2))
   bcstQueue.io.enq <> in.broadcast
 
   // Broadcast

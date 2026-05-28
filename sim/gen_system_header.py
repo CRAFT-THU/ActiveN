@@ -89,8 +89,7 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
     f.write("    uint64_t cycle_ = 0;\n")
     f.write(f"    HardMemPort mem_ports[{num_mc}];\n")
     f.write("    VerilatedFstC *tracer_ = nullptr;\n")
-    f.write("    bool tracing_ = false;\n")
-    f.write("    uint64_t trace_start_ = 0;\n\n")
+    f.write("    bool tracing_ = false;\n\n")
 
     # Constructor
     f.write("    HardSystemBackend() {\n")
@@ -117,7 +116,6 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
     f.write("        // Trace registration is done once at top-level via the\n")
     f.write("        // shared VerilatedContext, so we don't call sys->trace() here.\n")
     f.write("    }\n\n")
-    f.write("    void setTraceStart(uint64_t t) { trace_start_ = t; }\n\n")
 
     # config()
     f.write("    SystemConfig config() const override {\n")

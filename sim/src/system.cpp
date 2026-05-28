@@ -11,7 +11,7 @@
  * Source layout:
  *   sim/src/system.h          SystemBackend interface, System class declaration
  *   sim/src/system.cpp         This file (frontend implementation + main)
- *   sim/src/soft_backend.h     Soft NoC backend (SoftSystemModel) declaration
+ *   sim/src/soft_backend.h     Soft NoC backend (SoftSystemBackend) declaration
  *   sim/src/soft_backend.cpp   Soft NoC backend implementation
  *   sim/src/single.cpp         Single-core simulation driver (sim_single)
  *   sim/src/devices.h          PeripheralDevice
@@ -403,7 +403,7 @@ System::System(
 System::~System() = default;
 
 void System::addBackend(unique_ptr<SystemBackend> backend) {
-  impl_->backends.push_back(move(backend));
+  impl_->backends.push_back(std::move(backend));
 }
 
 void System::setTracer(VerilatedFstC *tracer, uint64_t trace_start) {
@@ -637,10 +637,8 @@ int main(int argc, char **argv) {
     PeripheralDevice::global_seed_override = *seed;
   }
 
-  // Logging
-  if (program.get<bool>("--log")) {
-    setSoftSystemModelLogging(true);
-  }
+  // Logging is wired below on the soft backend instance (if used).
+  bool enable_logging = program.get<bool>("--log");
 
   // Build init files list
   vector<string_view> dramInitFiles;
@@ -674,8 +672,6 @@ int main(int argc, char **argv) {
   // context; if any model is constructed AFTER trace finalisation, its
   // signals are silently dropped. So defer attachTrace until all models
   // exist.
-  HardSystemBackend *hard_raw = nullptr;
-  SoftSystemModel *soft_raw = nullptr;
   if (use_hard) {
     auto hard = make_unique<HardSystemBackend>();
     // Compare hard backend's compiled config against CLI-supplied config.
@@ -696,23 +692,20 @@ int main(int argc, char **argv) {
     if (hcfg.numPU != cli_cfg.numPU) { cfg_mismatch("numPU"); return 1; }
     if (hcfg.numMC != cli_cfg.numMC) { cfg_mismatch("numMC"); return 1; }
     if (hcfg.core.mcSizes != cli_cfg.core.mcSizes) { cfg_mismatch("mcSizes"); return 1; }
-    hard->setTraceStart(trace_start);
-    hard_raw = hard.get();
-    system.addBackend(move(hard));
+    if (fst_tracer) hard->attachTrace(fst_tracer.get(), 0);
+    system.addBackend(std::move(hard));
     cerr << "[Main] Hard backend enabled" << endl;
   }
 
   if (use_soft) {
-    auto soft = make_unique<SoftSystemModel>(cli_cfg);
-    soft->setTraceStart(trace_start);
-    soft_raw = soft.get();
-    system.addBackend(move(soft));
+    auto soft = make_unique<SoftSystemBackend>(cli_cfg);
+    soft->setLogging(enable_logging);
+    if (fst_tracer) soft->attachTrace(fst_tracer.get(), 0);
+    system.addBackend(std::move(soft));
     cerr << "[Main] Soft backend enabled" << endl;
   }
 
   if (fst_tracer) {
-    if (hard_raw) hard_raw->attachTrace(fst_tracer.get(), 99);
-    if (soft_raw) soft_raw->attachTrace(fst_tracer.get(), 99);
     // Register the shared VerilatedContext with the tracer EXACTLY ONCE.
     // soft_rtl/sys_rtl share the default thread context; per-model trace()
     // calls would re-register every model, silently breaking FST dumping
