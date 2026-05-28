@@ -78,6 +78,7 @@ struct Topology {
   // memif index.
   auto routingTableFor(uint16_t idx,
                        const DirectionToLinkIdx &linkIdx,
+                       size_t coreEjectPort,
                        std::optional<size_t> memifIdx) const {
     auto selfCoord = pu_to_coord[idx];
     // Precompute the routing destination for each memif
@@ -91,7 +92,7 @@ struct Topology {
     }
 
     // Capture memif_to_pu by value! It now lives inside the lambda
-    return [idx, this, selfCoord, linkIdx, memifIdx, memif_to_pu = std::move(memif_to_pu)](uint16_t dst) -> size_t {
+    return [idx, this, selfCoord, linkIdx, coreEjectPort, memifIdx, memif_to_pu = std::move(memif_to_pu)](uint16_t dst) -> size_t {
       bool isMem = (dst & 0x8000) != 0;
       size_t tgt = 0;
       if (isMem) {
@@ -110,7 +111,7 @@ struct Topology {
             throw std::runtime_error("Memory request sent to local but no memifIdx is set");
           return *memifIdx;
         }
-        return 0; // core_eject port
+        return coreEjectPort;
       }
 
       // Else, XY routing: column (first) first, then row (second).
@@ -180,12 +181,15 @@ class SoftSystemBackend : public SystemBackend {
   // forward buffer). memif holds the memif index if this PU hosts one.
   struct LinkStatus {
     std::array<std::optional<std::pair<uint16_t, uint8_t>>, 4> forwards;
+    // Number of forward links (count of non-null entries in `forwards`),
+    // which also equals the input/output port index of core_inject/core_eject.
+    uint8_t num_forwards = 0;
     // Memif: which one, which req port
     std::optional<std::pair<uint16_t, uint8_t>> memif;
   };
 
   using RouteFn = decltype(std::declval<Topology>().routingTableFor(
-      0, std::declval<const Topology::DirectionToLinkIdx &>(), std::nullopt));
+      0, std::declval<const Topology::DirectionToLinkIdx &>(), 0, std::nullopt));
 
   struct WrappedRouter {
     LinkStatus links;

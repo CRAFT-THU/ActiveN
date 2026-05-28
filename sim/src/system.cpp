@@ -296,7 +296,7 @@ struct System::Impl {
       backends[bi]->peek(cycle, per_backend_out_ptrs[bi]);
     }
 
-    static const bool COSIM_VERBOSE = true;
+    static const bool COSIM_VERBOSE = std::getenv("COSIM_VERBOSE") != nullptr;
     static const bool COSIM_KEEP_GOING = std::getenv("COSIM_KEEP_GOING") != nullptr;
     if (n > 1) {
       for (int p = 0; p < num_ports; ++p) {
@@ -324,7 +324,11 @@ struct System::Impl {
           if (first_has && cur_has) {
             auto &a = *per_backend_out[0][p].req;
             auto &b = *per_backend_out[bi][p].req;
-            if (a != b) {
+            // Compare addr+write+size (and wdata/wbe on writes); ignore id since
+            // HARD/SOFT use distinct id formats (HARD: slot indices; SOFT: own).
+            bool eq = (a.addr == b.addr) && (a.write == b.write) && (a.size == b.size);
+            if (eq && a.write) eq = (a.wbe == b.wbe) && (a.wdata == b.wdata);
+            if (!eq) {
               cerr << "[System] COSIM MISMATCH @ cycle " << dec << cycle
                    << ": port " << p
                    << " addr 0x" << hex << a.addr << " vs 0x" << b.addr

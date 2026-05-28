@@ -93,7 +93,8 @@ struct BulkRequest {
   }
 
   std::optional<BcastLine> peekBcastLine(const std::vector<MemLine> &buffer) const {
-    // First, check if resp is already here
+    // Mirror RTL: bulkRespValid requires completedCnt != issueCnt
+    if (retireCnt == issueCnt) return std::nullopt;
     size_t retireSlot = retireCnt % maxInflight;
     if (recentResp & (1ULL << retireSlot)) {
       return BcastLine {
@@ -178,12 +179,13 @@ protected:
   uint64_t scalarSent = 0;
   uint64_t scalarCompleted = 0;
   FlitArb reqArb;
+  FlitArb scalarIssueArb;
 public:
   MemIf(
     size_t idx,
     size_t scalarInflight,
     size_t numReq
-  ) : idx(idx), scalarInflight(scalarInflight), scalarPendings(scalarInflight), reqArb(numReq) {
+  ) : idx(idx), scalarInflight(scalarInflight), scalarPendings(scalarInflight), reqArb(numReq), scalarIssueArb(scalarInflight) {
     if (scalarInflight > 64) throw std::invalid_argument("scalarInflight must be <= 64");
   }
 
@@ -216,11 +218,12 @@ public:
   }
 
   std::optional<uint8_t> scalarReqSlot() const noexcept __attribute__((always_inline)) {
-    // Find lowest 1 in (~scalarSent & scalarAllocated)
+    // RR over allocated-but-not-yet-sent slots (matches RTL FlitArb).
     uint64_t candidates = ~scalarSent & scalarAllocated;
     if (candidates == 0) return std::nullopt;
-    int r_one = std::countr_zero(candidates);
-    return r_one;
+    return scalarIssueArb.peek([&](size_t i) -> std::optional<uint8_t> {
+      return (candidates & (1ULL << i)) ? std::optional<uint8_t>(0) : std::nullopt;
+    });
   }
 
   GlobalMemReq scalarReq(uint8_t slot) const noexcept __attribute__((always_inline)) {
@@ -238,6 +241,7 @@ public:
     if((scalarAllocated & (1ULL << slot)) == 0) throw std::logic_error("scalarReqCommit: slot not yet allocated");
     if((scalarSent & (1ULL << slot))) throw std::logic_error("scalarReqCommit: slot already committed");
     scalarSent |= (1ULL << slot);
+    scalarIssueArb.commit(slot);
   }
 
   void scalarRespAccept(const GlobalMemResp &resp) __attribute__((always_inline)) {
@@ -347,7 +351,7 @@ public:
   }
 
   void progress() __attribute__((always_inline)) {
-    offset = (offset + 1) % size;
+    offset = (offset + size - 1) % size;
   }
 };
 
@@ -453,6 +457,20 @@ public:
   /*
    * PU interfacing
    */
+  // Compute the per-cluster validsMask for a broadcast line: bit set
+  // if some beat of `bl` is addressed to a PU within
+  // [clusterStart, clusterStart + CLUSTER_SIZE). Mirrors RTL Distributor's
+  // `bcstValids` computed via `e.pu -% puStart < 16.U`.
+  static uint16_t bcastValidsMask(const BcastLine &bl, uint16_t clusterStart) {
+    uint16_t mask = 0;
+    for (size_t i = 0; i < 4; ++i) {
+      uint16_t pu = (uint16_t)(bl.line[6 - 2*i] & 0xFFFF);
+      uint16_t delta = (uint16_t)(pu - clusterStart);
+      if (delta < CLUSTER_SIZE) mask |= (uint16_t)(1u << delta);
+    }
+    return mask;
+  }
+
   void peekPUs(const std::span<PUResp> &pus, const RingResp *ingress) const __attribute__((always_inline)) {
     if (pus.size() != puEnd - puStart) throw std::logic_error("Incorrect peekPUs buffer length");
 
@@ -471,9 +489,13 @@ public:
       size_t dist = puDelta / CLUSTER_SIZE;
       uint8_t puSubidx = puDelta % CLUSTER_SIZE;
       auto presented = bcstQueues[dist].front();
-      if (presented && ((bcstPUAccepted[dist] >> puSubidx) & 1) == 0)
-        pus[puDelta].bcast = presented.value().get();
-      else pus[puDelta].bcast = std::nullopt;
+      pus[puDelta].bcast = std::nullopt;
+      if (presented && ((bcstPUAccepted[dist] >> puSubidx) & 1) == 0) {
+        uint16_t clusterStart = (uint16_t)(puStart + dist * CLUSTER_SIZE);
+        uint16_t valids = bcastValidsMask(presented.value().get(), clusterStart);
+        if (valids & (1u << puSubidx))
+          pus[puDelta].bcast = presented.value().get();
+      }
     }
   }
 
@@ -514,7 +536,7 @@ public:
         }
 
       // FIXME: may overflow here! assert that dist count < 64
-      if (bcstDistAccepted == (1ULL << (puEnd - puStart) / CLUSTER_SIZE) - 1) {
+      if (bcstDistAccepted == ((1ULL << ((puEnd - puStart) / CLUSTER_SIZE)) - 1)) {
         // Step to next bulk line
         bcstDistAccepted = 0;
         bulkRetireOne = true;
@@ -554,7 +576,9 @@ public:
       scalarDealloc = true;
     }
 
-    if (scalarDealloc) MemIf::scalarDeallocCommit(*scalarRet);
+    if (scalarDealloc) {
+      MemIf::scalarDeallocCommit(*scalarRet);
+    }
 
     // Distributor bcst acceptance
     for (size_t dist = 0; dist < (puEnd - puStart) / CLUSTER_SIZE; ++dist) {
@@ -567,11 +591,16 @@ public:
         }
       }
 
-      if (bcstPUMask == ((uint16_t) ~0ULL)) {
-        // All accepted
-        bcstPUMask = 0;
-        auto &queue = bcstQueues[dist];
-        if (!queue.pop()) throw std::logic_error("Broadcast queue is empty when dequeue");
+      auto &queue = bcstQueues[dist];
+      auto head = queue.front();
+      if (head) {
+        uint16_t clusterStart = (uint16_t)(puStart + dist * CLUSTER_SIZE);
+        uint16_t valids = bcastValidsMask(head.value().get(), clusterStart);
+        // Pop when every addressed PU has accepted (matches RTL bcstWait==0)
+        if ((bcstPUMask & valids) == valids) {
+          bcstPUMask = 0;
+          if (!queue.pop()) throw std::logic_error("Broadcast queue is empty when dequeue");
+        }
       }
     }
 
@@ -580,9 +609,10 @@ public:
     // that still used the state from the previous cycle
     //
     // If scalar has memory request, it's given priority
-    if (mem.reqAccepting) {
-      if (auto slot = MemIf::scalarReqSlot())
+    if (mem.reqAccepting && peekMem().has_value()) {
+      if (auto slot = MemIf::scalarReqSlot()) {
         scalarReqCommit(*slot);
+      }
       else if (bulk)
         bulkAcceptOne = true;
       else
@@ -592,7 +622,9 @@ public:
     GlobalMemResp *bulkMemResp = nullptr;
     if (mem.resp) {
       if (mem.resp->id & 0x80) bulkMemResp = &*mem.resp;
-      else MemIf::scalarRespAccept(*mem.resp);
+      else {
+        MemIf::scalarRespAccept(*mem.resp);
+      }
     }
 
     // Finally, steps bulk with generated control signals
@@ -691,7 +723,7 @@ public:
     }
 
     // External memory request
-    if (mem.reqAccepting || romServed) {
+    if (romServed || (mem.reqAccepting && peekMem().has_value())) {
       if (auto slot = MemIf::scalarReqSlot())
         scalarReqCommit(*slot);
       else

@@ -128,7 +128,7 @@ public:
 
   // Returns index
   template <FlitArbInputs Inputs>
-  inline std::optional<uint8_t> peek(Inputs inputs) const {
+  inline std::optional<uint8_t> peek(Inputs inputs) const __attribute__((always_inline)) {
     // Look for first valid since nextGrant
     uint8_t i = _next_grant;
     std::optional<uint8_t> selected = std::nullopt;
@@ -241,10 +241,10 @@ class Router : std::is_invocable_r<size_t, RT, size_t> {
 
 private:
   std::optional<std::pair<size_t, size_t>> peek_iq_slot(size_t o_port) const {
-    const FlitArb &arb = _output_arbs.at(o_port);
+    const FlitArb &arb = _output_arbs[o_port];
     // Build the input lambda
-    auto inputs = [this, o_port](size_t idx) -> std::optional<uint8_t> {
-      const auto &q = _input_queues.at(idx);
+    auto inputs = [this, o_port](size_t idx) __attribute__((always_inline)) -> std::optional<uint8_t> {
+      const auto &q = _input_queues[idx];
       auto slot = q.peekIdx();
       if (!slot.has_value()) return std::nullopt;
 
@@ -258,7 +258,7 @@ private:
 
     auto idx = arb.peek(inputs);
     if (!idx.has_value()) return std::nullopt;
-    const auto &selected_queue = _input_queues.at(idx.value());
+    const auto &selected_queue = _input_queues[idx.value()];
     const auto slot = selected_queue.peekIdx();
     assert(slot.has_value());
     return {{ idx.value(), slot.value() }};
@@ -280,11 +280,11 @@ public:
     auto selected = peek_iq_slot(o_port);
     if (!selected.has_value()) return std::nullopt;
     auto [iq, slot] = *selected;
-    return _input_queues.at(iq)[slot];
+    return _input_queues[iq][slot];
   }
 
   bool canEnq(size_t i_port, uint8_t prio) const {
-    const auto &q = _input_queues.at(i_port);
+    const auto &q = _input_queues[i_port];
     return q.canEnq(prio);
   }
 
@@ -321,20 +321,5 @@ public:
     size_t n = 0;
     for (auto &q : _input_queues) n += q.size();
     return n;
-  }
-  size_t queueSize(size_t i_port) const {
-    return _input_queues.at(i_port).size();
-  }
-  // For debugging: iterate input queue contents.
-  const FlitQueue<Flit, Q_DEPTH> &inputQueue(size_t i_port) const {
-    return _input_queues.at(i_port);
-  }
-  // Routing table lookup (output port for a given destination).
-  size_t lookup(uint16_t dst) const { return _tbl(dst); }
-  // Returns the winning input port index for the given output port (-1 if none)
-  int winningInputPort(size_t o_port) const {
-    auto sel = peek_iq_slot(o_port);
-    if (!sel.has_value()) return -1;
-    return (int)sel->first;
   }
 };

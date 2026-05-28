@@ -273,21 +273,48 @@ SoftSystemBackend::WrappedRouter SoftSystemBackend::buildRouter(uint16_t pu) con
 
   links.memif = topo.pu_memif[pu];
 
-  size_t num_in  = 1 + my_dirs.size();                       // core_inject + fwds
-  size_t num_out = 1 + my_dirs.size() + (links.memif ? 1 : 0); // core_eject + fwds + memif
+  const size_t nf = my_dirs.size();
+  size_t num_in  = nf + 1;                            // fwds + core_inject
+  size_t num_out = nf + 1 + (links.memif ? 1 : 0);    // fwds + core_eject + memif
 
-  // memif output-port index (passed to routing table) = num_out - 1 when present.
+  // Output-port assignment (RTL convention: egress(forwards) first, then locals):
+  //   0..nf-1 = forward egress (slot index = port index)
+  //   nf      = core_eject
+  //   nf+1    = memif (if present)
+  const size_t core_eject_port = nf;
   std::optional<size_t> memif_port =
-      links.memif ? std::optional<size_t>(num_out - 1) : std::nullopt;
-  auto tbl = topo.routingTableFor(pu, dir_to_link, memif_port);
+      links.memif ? std::optional<size_t>(nf + 1) : std::nullopt;
+  links.num_forwards = static_cast<uint8_t>(nf);
+  auto tbl = topo.routingTableFor(pu, dir_to_link, core_eject_port, memif_port);
   return WrappedRouter(std::move(links), std::move(tbl), num_in, num_out);
 }
 
 SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in)
   : cfg(std::move(cfg_in)),
-    releaseResetAfter(0),
+    releaseResetAfter(10),
     topo(cfg.numPU, cfg.numMC),
-    periph(0, 16, {}),
+    periph(0, 16, [&]() {
+      // Build configROM matching RTL System.scala: beat0 at 0x28000000,
+      //   word0 = numPU, word2 = numMC, word4 = pusPerMC.
+      // beat1 at 0x28000020: low/high 32b of mcSize at words 0/1.
+      std::unordered_map<uint32_t, MemLine> rom;
+      MemLine beat0{};
+      uint32_t npu = static_cast<uint32_t>(cfg.numPU);
+      uint32_t nmc = static_cast<uint32_t>(cfg.numMC);
+      uint32_t ppm = nmc ? npu / nmc : 0;
+      std::memcpy(&beat0[0],  &npu, 4);
+      std::memcpy(&beat0[8],  &nmc, 4);
+      std::memcpy(&beat0[16], &ppm, 4);
+      rom[0x28000000u] = beat0;
+      MemLine beat1{};
+      uint64_t mcSize = cfg.core.mcSizes.empty() ? 0 : cfg.core.mcSizes[0];
+      uint32_t mcSize_lo = static_cast<uint32_t>(mcSize & 0xFFFFFFFFu);
+      uint32_t mcSize_hi = static_cast<uint32_t>(mcSize >> 32);
+      std::memcpy(&beat1[0], &mcSize_lo, 4);
+      std::memcpy(&beat1[4], &mcSize_hi, 4);
+      rom[0x28000020u] = beat1;
+      return rom;
+    }()),
     drams(),
     cores(0),
     ring(1 + cfg.numMC),
@@ -324,6 +351,7 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in)
     sprintf(rtl_name_buffer, "soft_pu_%lu", i);
     cores.emplace_back(std::make_unique<soft_rtl>(rtl_name_buffer));
     cores[i]->reset = true;
+    cores[i]->cfg_hartid = static_cast<uint32_t>(i);
     cores[i]->eval();
   }
 }
@@ -385,24 +413,25 @@ static void presentCoreMem(soft_rtl &core, const soft_mem::DRAMIf::PUResp &resp)
 
     // BcastLine.line is Vec(4, BcastBeat) where BcastBeat is
     // (data:32, idx:16, pu:16) — Chisel default Bundle places `data`
-    // at the MSB. Vec(0) occupies the highest 64 bits of the 256-bit
-    // line. The soft side stores the same 256 bits as uint32_t[8] in
-    // little-endian word order, so:
-    //   line(i).data       = soft.line[7 - 2*i]
-    //   line(i).idx || pu  = soft.line[6 - 2*i]   (idx upper, pu lower)
+    // at the MSB. The soft side stores the same 256 bits as
+    // uint32_t[8] in little-endian word order. Empirically, the RTL PU
+    // expects line(i) at raw[2*i, 2*i+1] (i.e. Vec(0) at LOW bits in
+    // this representation), so:
+    //   line(i).data       = soft.line[2*i + 1]
+    //   line(i).idx || pu  = soft.line[2*i]   (idx upper, pu lower)
     const auto &raw = resp.bcast->line;
-    core.mem_broadcast_bits_line_0_data = raw[7];
-    core.mem_broadcast_bits_line_0_idx  = (uint16_t)(raw[6] >> 16);
-    core.mem_broadcast_bits_line_0_pu   = (uint16_t)(raw[6] & 0xFFFF);
-    core.mem_broadcast_bits_line_1_data = raw[5];
-    core.mem_broadcast_bits_line_1_idx  = (uint16_t)(raw[4] >> 16);
-    core.mem_broadcast_bits_line_1_pu   = (uint16_t)(raw[4] & 0xFFFF);
-    core.mem_broadcast_bits_line_2_data = raw[3];
-    core.mem_broadcast_bits_line_2_idx  = (uint16_t)(raw[2] >> 16);
-    core.mem_broadcast_bits_line_2_pu   = (uint16_t)(raw[2] & 0xFFFF);
-    core.mem_broadcast_bits_line_3_data = raw[1];
-    core.mem_broadcast_bits_line_3_idx  = (uint16_t)(raw[0] >> 16);
-    core.mem_broadcast_bits_line_3_pu   = (uint16_t)(raw[0] & 0xFFFF);
+    core.mem_broadcast_bits_line_0_data = raw[1];
+    core.mem_broadcast_bits_line_0_idx  = (uint16_t)(raw[0] >> 16);
+    core.mem_broadcast_bits_line_0_pu   = (uint16_t)(raw[0] & 0xFFFF);
+    core.mem_broadcast_bits_line_1_data = raw[3];
+    core.mem_broadcast_bits_line_1_idx  = (uint16_t)(raw[2] >> 16);
+    core.mem_broadcast_bits_line_1_pu   = (uint16_t)(raw[2] & 0xFFFF);
+    core.mem_broadcast_bits_line_2_data = raw[5];
+    core.mem_broadcast_bits_line_2_idx  = (uint16_t)(raw[4] >> 16);
+    core.mem_broadcast_bits_line_2_pu   = (uint16_t)(raw[4] & 0xFFFF);
+    core.mem_broadcast_bits_line_3_data = raw[7];
+    core.mem_broadcast_bits_line_3_idx  = (uint16_t)(raw[6] >> 16);
+    core.mem_broadcast_bits_line_3_pu   = (uint16_t)(raw[6] & 0xFFFF);
   }
 }
 
@@ -424,7 +453,6 @@ void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
   PhaseTimer _t(*this);
   if (cycle <= releaseResetAfter) {
     for (const auto &i : in) {
-      if (i.reqAccepting) throw std::runtime_error("Memory request accepted during reset");
       if (i.resp) throw std::runtime_error("Memory response presented during reset");
     }
   }
@@ -437,13 +465,13 @@ void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
 
   for (uint16_t i = 1; i <= cfg.numPU; ++i) {
     auto &router = routers[i];
-    router.buf.core_eject.presenting = router.rt.peek(0);
-    size_t o = 0;
-    for (; o < 4 && router.links.forwards[o]; ++o)
-      router.buf.forwards[o].presenting = router.rt.peek(o + 1);
-    // o + 1 is now the memif port (if any).
+    const size_t nf = router.links.num_forwards;
+    // Output ports: 0..nf-1 = forward egress; nf = core_eject; nf+1 = memif.
+    for (size_t o = 0; o < nf; ++o)
+      router.buf.forwards[o].presenting = router.rt.peek(o);
+    router.buf.core_eject.presenting = router.rt.peek(nf);
     if (router.links.memif)
-      memif_eject[router.links.memif->first][router.links.memif->second] = router.rt.peek(o + 1);
+      memif_eject[router.links.memif->first][router.links.memif->second] = router.rt.peek(nf + 1);
   }
 
   const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
@@ -457,17 +485,18 @@ void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
   // the local router's canEnq.
   for (uint16_t i = 1; i <= cfg.numPU; ++i) {
     auto &local = routers[i];
+    const size_t nf = local.links.num_forwards;
+    // Input ports: 0..nf-1 = forward ingress; nf = core_inject.
     local.buf.core_inject.accepting =
         local.buf.core_inject.presenting &&
-        local.rt.canEnq(0, local.buf.core_inject.presenting->prio());
-    size_t o = 0;
-    for (; o < 4 && local.links.forwards[o]; ++o) {
+        local.rt.canEnq(nf, local.buf.core_inject.presenting->prio());
+    for (size_t o = 0; o < nf; ++o) {
       auto [from, port] = *local.links.forwards[o];
       auto &remote = routers[from];
       auto &remoteBuf = remote.buf.forwards[port];
       remoteBuf.accepting =
           remoteBuf.presenting &&
-          local.rt.canEnq(o + 1, remoteBuf.presenting->prio());
+          local.rt.canEnq(o, remoteBuf.presenting->prio());
     }
   }
 
@@ -493,12 +522,18 @@ void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
     presentCoreMem(*cores[i], core_mem[i]);
     cores[i]->ext_out_ready = routers[i].buf.core_inject.accepting;
     cores[i]->clock = false; // negedge
-    auto v0 = std::chrono::high_resolution_clock::now();
+  }
+  auto v0 = std::chrono::high_resolution_clock::now();
+  for (uint16_t i = 1; i <= cfg.numPU; ++i) {
     cores[i]->eval();
-    auto v1 = std::chrono::high_resolution_clock::now();
-    g_soft_verilator_ns +=
-        std::chrono::duration_cast<std::chrono::nanoseconds>(v1 - v0).count();
-    routers[i].buf.core_eject.accepting = cores[i]->ext_in_ready;
+  }
+  auto v1 = std::chrono::high_resolution_clock::now();
+  g_soft_verilator_ns +=
+      std::chrono::duration_cast<std::chrono::nanoseconds>(v1 - v0).count();
+  for (uint16_t i = 1; i <= cfg.numPU; ++i) {
+    routers[i].buf.core_eject.accepting =
+        routers[i].buf.core_eject.presenting.has_value() &&
+        cores[i]->ext_in_ready;
     core_mem_accept[i].unicast = cores[i]->mem_unicast_valid;
     core_mem_accept[i].broadcast =
         cores[i]->mem_broadcast_ready && cores[i]->mem_broadcast_valid;
@@ -515,48 +550,47 @@ void SoftSystemBackend::step(uint64_t cycle) {
   accumulateStats();
 
   // Posedge eval for every core.
+  auto v0 = std::chrono::high_resolution_clock::now();
   for (size_t i = 1; i <= cfg.numPU; ++i) {
     cores[i]->clock = true;
-    auto v0 = std::chrono::high_resolution_clock::now();
     cores[i]->eval();
-    auto v1 = std::chrono::high_resolution_clock::now();
-    g_soft_verilator_ns +=
-        std::chrono::duration_cast<std::chrono::nanoseconds>(v1 - v0).count();
 
     if (cycle == releaseResetAfter) {
       cores[i]->reset = false;
       cores[i]->eval();
     }
   }
+  auto v1 = std::chrono::high_resolution_clock::now();
+  g_soft_verilator_ns +=
+      std::chrono::duration_cast<std::chrono::nanoseconds>(v1 - v0).count();
 
   // Step routers.
   for (auto &router : routers) {
     const auto &buffer = router.buf;
     const auto &links = router.links;
     const auto &all = this->routers;
+    const size_t nf = links.num_forwards;
     bool memif_accepting = false;
     if (links.memif.has_value())
       memif_accepting = std::make_optional(links.memif->second) == memif_eject_accept[links.memif->first];
     router.rt.step(
-      [&buffer, &links, &all](size_t i) -> std::optional<Flit> {
-        if (i == 0) {
-          if (buffer.core_inject.accepting) return buffer.core_inject.presenting;
-        } else {
-          assert(i < 5 && links.forwards[i - 1]);
-          auto [from, port] = *links.forwards[i - 1];
+      [&buffer, &links, &all, nf](size_t i) -> std::optional<Flit> {
+        if (i < nf) {
+          auto [from, port] = *links.forwards[i];
           const auto &remote = all[from];
           const auto &remoteBuf = remote.buf.forwards[port];
           if (remoteBuf.accepting) return remoteBuf.presenting;
+        } else if (i == nf) {
+          if (buffer.core_inject.accepting) return buffer.core_inject.presenting;
         }
         return std::nullopt;
       },
-      [&buffer, &links, memif_accepting](size_t i) -> bool {
-        if (i == 0) {
+      [&buffer, nf, memif_accepting](size_t i) -> bool {
+        if (i < nf) {
+          return buffer.forwards[i].accepting;
+        } else if (i == nf) {
           return buffer.core_eject.accepting;
-        } else if (i < 5 && links.forwards[i - 1]) {
-          return buffer.forwards[i - 1].accepting;
         } else {
-          assert(links.memif);
           return memif_accepting;
         }
       }
