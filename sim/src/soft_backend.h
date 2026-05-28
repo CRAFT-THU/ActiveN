@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -31,11 +32,16 @@
 //    peripheral connection PU; memif_to_pu[1..numMC] are MC connection
 //    PUs. memif_to_pu entries must never be 0 (loopback marker).
 //
-// Note: RTL has one MC connection PER cluster (multiple connections per
-// MC zone). Soft simplifies to a single connection per MC for now (the
-// cluster connection closest to the grid center across the zone). This
-// is a deviation from RTL routing that should be revisited if alignment
-// requires per-cluster MC distribution.
+//  - memif_req_at[i] = list of PU ids (1-based) hosting a request port
+//    of memif i. memif_req_at[0] = {1} (peripheral on PU 1);
+//    memif_req_at[1..numMC] lists one connection PU per cluster in the
+//    MC's zone, in zone-cluster order (matches RTL `memIfs(mc).req(ci)`).
+//  - pu_memif[pu] = (memif_idx, port_idx) when PU hosts a memif port;
+//    the port_idx is the position of `pu` inside memif_req_at[memif_idx].
+//  - Routing for memory destinations is anycast to the *nearest* request
+//    port of the target memif (Manhattan distance; first-encountered on
+//    tie, matching RTL Scala `minBy` semantics on the same iteration
+//    order).
 struct Topology {
   static constexpr int CLUSTER_SIZE = 16;
 
@@ -45,9 +51,8 @@ struct Topology {
   // 1 entry in a 2-D mesh, but kept as vector to mirror multi-occupancy
   // designs).
   std::vector<std::vector<uint16_t>> coord_to_pu;
-  // [0] = peripheral connection PU (1-based);
-  // [1..numMC] = MC connection PUs (1-based).
-  std::vector<uint16_t> memif_to_pu;
+  // Request port locations for each of the MC
+  std::vector<std::vector<uint16_t>> memif_req_at;
 
   // For each PU, the ordered list of active mesh directions. The order
   // determines the router-port mapping (port i+1 for inputs/outputs
@@ -56,7 +61,7 @@ struct Topology {
   // For each PU, the memif index hosted here, or nullopt. Used by the
   // router to know which output port (and the routing table) talks to a
   // local memif.
-  IndexVector<std::optional<uint16_t>> pu_memif;
+  IndexVector<std::optional<std::pair<uint16_t, uint8_t>>> pu_memif;
 
   uint16_t w = 0; // # columns
   uint16_t h = 0; // # rows
@@ -75,7 +80,18 @@ struct Topology {
                        const DirectionToLinkIdx &linkIdx,
                        std::optional<size_t> memifIdx) const {
     auto selfCoord = pu_to_coord[idx];
-    return [idx, this, selfCoord, linkIdx, memifIdx](uint16_t dst) -> size_t {
+    // Precompute the routing destination for each memif
+    std::vector<size_t> memif_to_pu;
+    memif_to_pu.resize(memif_req_at.size());
+    for (size_t i = 0; i < memif_req_at.size(); i++) {
+      memif_to_pu[i] = *std::ranges::min_element(memif_req_at[i], std::less{}, [&selfCoord, this](auto pu) -> size_t {
+        auto coord = this->pu_to_coord[pu];
+        return std::abs(int(coord.first) - int(selfCoord.first)) + std::abs(int(coord.second) - int(selfCoord.second));
+      });
+    }
+
+    // Capture memif_to_pu by value! It now lives inside the lambda
+    return [idx, this, selfCoord, linkIdx, memifIdx, memif_to_pu = std::move(memif_to_pu)](uint16_t dst) -> size_t {
       bool isMem = (dst & 0x8000) != 0;
       size_t tgt = 0;
       if (isMem) {
@@ -164,7 +180,8 @@ class SoftSystemBackend : public SystemBackend {
   // forward buffer). memif holds the memif index if this PU hosts one.
   struct LinkStatus {
     std::array<std::optional<std::pair<uint16_t, uint8_t>>, 4> forwards;
-    std::optional<uint16_t> memif;
+    // Memif: which one, which req port
+    std::optional<std::pair<uint16_t, uint8_t>> memif;
   };
 
   using RouteFn = decltype(std::declval<Topology>().routingTableFor(
@@ -191,7 +208,8 @@ class SoftSystemBackend : public SystemBackend {
   IndexVector<std::unique_ptr<soft_rtl>> cores;
   soft_mem::Ringbus ring;
 
-  std::vector<ReadyValidPair<Flit>> memif_eject;
+  std::vector<std::vector<std::optional<Flit>>> memif_eject;
+  std::vector<std::optional<uint8_t>> memif_eject_accept;
   std::vector<MemBusIn> memif_ext;
   std::vector<bool> memif_ring_accept;
   IndexVector<soft_mem::DRAMIf::PUResp> core_mem;
@@ -228,6 +246,14 @@ class SoftSystemBackend : public SystemBackend {
 
   // Per-cycle stat accumulation. Called at the end of stage()/step().
   void accumulateStats();
+
+  std::optional<std::pair<std::reference_wrapper<const Flit>, uint8_t>>
+  memifAcceptedEject(size_t memifIdx) __attribute__((always_inline)) {
+    if (!memif_eject_accept[memifIdx]) return std::nullopt;
+    uint8_t accept = *memif_eject_accept[memifIdx];
+    const Flit &f = *memif_eject[memifIdx][accept];
+    return {{ f, accept }};
+  }
 
  public:
   explicit SoftSystemBackend(SystemConfig cfg);

@@ -13,11 +13,13 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
 #include "soft_backend.h"
 #include "soft_components.h"
+#include "soft_mem.h"
 
 using namespace std;
 
@@ -86,7 +88,7 @@ static int meshDist(int r1, int c1, int r2, int c2) {
 Topology::Topology(size_t num_pu, size_t num_mc)
   : pu_to_coord(num_pu),
     coord_to_pu(),
-    memif_to_pu(1 + num_mc, 0),
+    memif_req_at(num_mc + 1),
     pu_mesh_dirs(num_pu),
     pu_memif(num_pu)
 {
@@ -147,28 +149,31 @@ Topology::Topology(size_t num_pu, size_t num_mc)
     return best_pu;
   };
 
-  // memif_to_pu[0] = peripheral connection = PU 1 (matches old impl).
-  memif_to_pu[0] = 1;
+  // Generate memif connection information
+  memif_req_at[0].push_back(1); // Peripheral memif only connects to PU 1.
 
+  // For each MC, every cluster in its zone contributes one connection
+  // PU (the one in that cluster closest to the grid center). The order
+  // of clusters in the zone determines the request-port index inside
+  // the memif (matches RTL: System.scala `req(ci)` for ci in zone).
   for (size_t mc = 0; mc < num_mc; ++mc) {
-    uint16_t best_pu = 0;
-    double best_dist = 1e30;
+    size_t memif_idx = 1 + mc;
     for (size_t ci = mc * clusters_per_mc; ci < (mc + 1) * clusters_per_mc; ++ci) {
       uint16_t cpu = best_conn_in_cluster(ci);
-      auto [col, row] = pu_to_coord[cpu];
-      double d = std::abs(row - grid_h / 2.0) + std::abs(col - grid_w / 2.0);
-      if (d < best_dist) { best_dist = d; best_pu = cpu; }
+      uint8_t port_idx = static_cast<uint8_t>(memif_req_at[memif_idx].size());
+      memif_req_at[memif_idx].push_back(cpu);
+      if (pu_memif[cpu].has_value())
+        throw std::logic_error("Conflicting memif assignment for PU");
+      pu_memif[cpu] = std::make_pair(static_cast<uint16_t>(memif_idx), port_idx);
     }
-    memif_to_pu[1 + mc] = best_pu;
-    pu_memif[best_pu] = static_cast<uint16_t>(1 + mc);
   }
 
-  // The peripheral memif (memif index 0) lives at memif_to_pu[0] = PU 1.
-  // pu_memif[1] takes precedence for the peripheral so the same PU can
-  // host both periph and an MC eject if it happens to coincide; the
-  // current simple selection puts periph at PU 1 and MC conns near the
-  // center, so coincidence is unlikely for non-trivial sizes.
-  if (!pu_memif[1].has_value()) pu_memif[1] = 0;
+  // The peripheral memif (memif index 0) lives at PU 1. If PU 1 also
+  // happens to be an MC connection PU for some MC, that conflict was
+  // already caught above. Periph wins for PU 1 (overwrite is not
+  // allowed by the throws above).
+  if (pu_memif[1].has_value()) throw std::logic_error("Conflicting memif assignment for PU 1");
+  pu_memif[1] = std::make_pair<uint16_t, uint8_t>(0, 0);
 }
 
 // ===========================================================================
@@ -287,6 +292,7 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in)
     cores(0),
     ring(1 + cfg.numMC),
     memif_eject(cfg.numMC + 1),
+    memif_eject_accept(cfg.numMC + 1),
     memif_ext(cfg.numMC + 1),
     memif_ring_accept(cfg.numMC + 1, false),
     core_mem(cfg.numPU),
@@ -295,13 +301,22 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in)
             [this](size_t i) { return buildRouter(static_cast<uint16_t>(i)); })
 {
   // Initialize per-MC DRAMIfs. PU range is contiguous in PU-id order.
+  if (cfg.numPU % cfg.numMC != 0) throw std::invalid_argument("numPU must be divisible by numMC");
+  if ((cfg.numPU / cfg.numMC) % soft_mem::CLUSTER_SIZE != 0) throw std::invalid_argument("PU per MC must be a multiple of cluster size");
+
   const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
+  const size_t CLUSTER_PER_MC = PU_PER_MC / soft_mem::CLUSTER_SIZE;
   drams.reserve(cfg.numMC);
   for (size_t m = 0; m < cfg.numMC; ++m) {
-    drams.emplace_back(m + 1, 64, 16, 2,
+    drams.emplace_back(m + 1, CLUSTER_PER_MC, 64, 16, 2,
                        1 + m * PU_PER_MC,
                        1 + (m + 1) * PU_PER_MC);
   }
+
+  // Size per-memif eject buffers: one slot per request port (matches
+  // topo.memif_req_at[i].size()).
+  for (size_t i = 0; i < topo.memif_req_at.size(); ++i)
+    memif_eject[i].assign(topo.memif_req_at[i].size(), std::nullopt);
 
   char rtl_name_buffer[64];
   cores.reserve(cfg.numPU);
@@ -428,7 +443,7 @@ void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
       router.buf.forwards[o].presenting = router.rt.peek(o + 1);
     // o + 1 is now the memif port (if any).
     if (router.links.memif)
-      memif_eject[*router.links.memif].presenting = router.rt.peek(o + 1);
+      memif_eject[router.links.memif->first][router.links.memif->second] = router.rt.peek(o + 1);
   }
 
   const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
@@ -456,16 +471,19 @@ void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
     }
   }
 
-  memif_ring_accept[0] =
-      ring.peekAt(0) && periph.ringCanAccept(*ring.peekAt(0));
-  memif_eject[0].accepting =
-      memif_eject[0].presenting && periph.nocCanAccept(*memif_eject[0].presenting);
+  memif_ring_accept[0] = ring.peekAt(0) && periph.ringCanAccept(*ring.peekAt(0));
+  memif_eject_accept[0] = periph.nocAcceptMultiple(
+    [&ejects = this->memif_eject[0]](size_t idx) -> const std::optional<Flit> & {
+      return ejects[idx];
+    });
   for (size_t m = 0; m < cfg.numMC; ++m) {
     memif_ring_accept[m + 1] =
         ring.peekAt(m + 1) && drams[m].ringCanAccept(*ring.peekAt(m + 1));
-    memif_eject[m + 1].accepting =
-        memif_eject[m + 1].presenting &&
-        drams[m].nocCanAccept(*memif_eject[m + 1].presenting);
+    auto &ejects = this->memif_eject[m + 1];
+    memif_eject_accept[m + 1] = drams[m].nocAcceptMultiple(
+      [&ejects](size_t idx) -> const std::optional<Flit> & {
+        return ejects[idx];
+      });
   }
 
   // Drive PU inputs and settle on the negedge. Contract: accept signals
@@ -518,7 +536,7 @@ void SoftSystemBackend::step(uint64_t cycle) {
     const auto &all = this->routers;
     bool memif_accepting = false;
     if (links.memif.has_value())
-      memif_accepting = memif_eject[*links.memif].accepting;
+      memif_accepting = std::make_optional(links.memif->second) == memif_eject_accept[links.memif->first];
     router.rt.step(
       [&buffer, &links, &all](size_t i) -> std::optional<Flit> {
         if (i == 0) {
@@ -556,11 +574,11 @@ void SoftSystemBackend::step(uint64_t cycle) {
       // canInject: forward queue is empty AND no forward will push into
       // the outgoing queue this cycle.
       .canInject = !ring.validAt(1) &&
-                   (!ring.validAt(0) || memif_eject[0].accepting),
+                   (!ring.validAt(0) || memif_ring_accept[0]),
       .injected = &injected
     },
     memif_ext[0],
-    memif_eject[0].accepting ? &*memif_eject[0].presenting : nullptr
+    memifAcceptedEject(0)
   );
   ring.updateValidAt(0, injected, memif_ring_accept[0]);
 
@@ -571,11 +589,11 @@ void SoftSystemBackend::step(uint64_t cycle) {
         .ingress = ring.validAt(m + 1),
         .eject = memif_ring_accept[m + 1],
         .canInject = !ring.validAt((m + 2) % (cfg.numMC + 1)) &&
-                     (!ring.validAt(m + 1) || memif_eject[m + 1].accepting),
+                     (!ring.validAt(m + 1) || memif_ring_accept[m + 1]),
         .injected = &injected
       },
       memif_ext[m + 1],
-      memif_eject[m + 1].accepting ? &*memif_eject[m + 1].presenting : nullptr,
+      memifAcceptedEject(m + 1),
       core_mem_accept.slice(1 + PU_PER_MC * m, 1 + PU_PER_MC * (m + 1))
     );
     ring.updateValidAt(m + 1, injected, memif_ring_accept[m + 1]);
@@ -630,19 +648,19 @@ void SoftSystemBackend::accumulateStats() {
         ++idle_lanes;
       }
     }
-    // Memif eject (from router into memif) counts as a memory request
-    // arriving at the memif this cycle.
-    if (r.links.memif.has_value()) {
-      const auto &me = memif_eject[*r.links.memif];
-      if (me.presenting && me.accepting) {
-        ++hops;
-        ++mem_reqs;
-      }
-    }
     // A core is "idle" this cycle if it has nothing to inject and
     // nothing being delivered to it.
     if (!r.buf.core_inject.presenting && !r.buf.core_eject.presenting)
       ++idle_cores;
+  }
+
+  // Memif eject (from router into memif) counts as a memory request
+  // arriving at the memif this cycle.
+  for (auto &a : memif_eject_accept) {
+    if (a) {
+      ++hops;
+      ++mem_reqs;
+    }
   }
 
   // DRAM inflight = scalar slots in use + 1 if a bulk is active.

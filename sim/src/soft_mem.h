@@ -177,11 +177,13 @@ protected:
   uint64_t scalarAllocated = 0;
   uint64_t scalarSent = 0;
   uint64_t scalarCompleted = 0;
+  FlitArb reqArb;
 public:
   MemIf(
     size_t idx,
-    size_t scalarInflight
-  ) : idx(idx), scalarInflight(scalarInflight), scalarPendings(scalarInflight) {
+    size_t scalarInflight,
+    size_t numReq
+  ) : idx(idx), scalarInflight(scalarInflight), scalarPendings(scalarInflight), reqArb(numReq) {
     if (scalarInflight > 64) throw std::invalid_argument("scalarInflight must be <= 64");
   }
 
@@ -279,7 +281,25 @@ public:
   /*
    * NoC ejection interface
    */
+protected:
   virtual bool nocCanAccept(const Flit &f) const = 0;
+public:
+  template<typename FI>
+  std::optional<uint8_t> nocAcceptMultiple(FI flits) const
+  requires(std::is_invocable_r_v<const std::optional<Flit>&, FI, size_t>)
+  __attribute__((always_inline)) {
+    // Iterate through all request ports
+    auto selected = reqArb.peek([&flits](size_t idx) -> std::optional<uint8_t> {
+      auto &flit = flits(idx);
+      if (!flit) return std::nullopt;
+      return flit->prio();
+    });
+    if (selected && !nocCanAccept(*flits(*selected))) return std::nullopt;
+    return selected;
+  }
+  void nocAcceptCommit(uint8_t accepted) {
+    reqArb.commit(accepted);
+  }
 };
 
 // Ring bus implementation
@@ -408,15 +428,23 @@ public:
     return n;
   }
 
-  DRAMIf(size_t memif_idx, size_t scalarInflight, size_t bulkInflight, size_t bcstQueueCap, size_t puStart, size_t puEnd)
-    : MemIf(memif_idx, scalarInflight),
+protected:
+  virtual bool nocCanAccept(const Flit &f) const override __attribute__((always_inline)) {
+    bool isBulk = (f.tag & 0x10) != 0;
+    if (isBulk) return !bulk.has_value();
+    else return scalarAllocSlot().has_value();
+  }
+
+public:
+  DRAMIf(size_t memif_idx, size_t numReq, size_t scalarInflight, size_t bulkInflight, size_t bcstQueueCap, size_t puStart, size_t puEnd)
+    : MemIf(memif_idx, scalarInflight, numReq),
       puStart(puStart),
       puEnd(puEnd),
       bulkMaxInflight(bulkInflight),
       bulkBuffer(bulkInflight),
       bcstQueueCap(bcstQueueCap),
       bcstPUAccepted(numClusters()) {
-        if ((puStart - puEnd) % CLUSTER_SIZE) throw std::logic_error("PU range not aligned");
+        if ((puEnd - puStart) % CLUSTER_SIZE) throw std::logic_error("PU range not aligned");
         for (size_t dist = 0; dist < numClusters(); ++dist) {
           bcstQueues.emplace_back(bcstQueueCap);
         }
@@ -460,19 +488,13 @@ public:
     else return std::nullopt;
   }
 
-  virtual bool nocCanAccept(const Flit &f) const override __attribute__((always_inline)) {
-    bool isBulk = (f.tag & 0x10) != 0;
-    if (isBulk) return !bulk.has_value();
-    else return scalarAllocSlot().has_value();
-  }
-
   /*
    * Step function
    */
   void step(
     RingIntf ring,
     MemBusIn &mem,
-    Flit *flit,
+    std::optional<std::pair<std::reference_wrapper<const Flit>, uint8_t>> flit,
     const std::span<PUAccept> &puAccepts
   ) __attribute__((always_inline)) {
     *ring.injected = false;
@@ -582,14 +604,15 @@ public:
 
     // Finally, allocations
     if (flit) {
-      bool isBulk = (flit->tag & 0x10) != 0;
+      bool isBulk = (flit->first.get().tag & 0x10) != 0;
       if (isBulk) {
         if (bulk.has_value()) throw std::logic_error("Received a bulk request while another bulk is in-flight");
-        bulk = BulkRequest::fromFlit(bulkMaxInflight, *flit);
+        bulk = BulkRequest::fromFlit(bulkMaxInflight, flit->first);
       } else {
         if (!scalarAlloc) throw std::logic_error("Received a scalar request while no slot is available");
-        scalarAllocCommit(*scalarAlloc, ScalarRequest::fromFlit(*flit));
+        scalarAllocCommit(*scalarAlloc, ScalarRequest::fromFlit(flit->first));
       }
+      nocAcceptCommit(flit->second);
     }
   }
 };
@@ -603,8 +626,13 @@ class PeriphIf : public MemIf {
   // TODO: check for addr alignment in ctor
   std::unordered_map<uint32_t, MemLine> configROM;
 
+protected:
+  virtual bool nocCanAccept(const Flit &f) const override __attribute__((always_inline)) {
+    return scalarAllocSlot().has_value();
+  }
+
 public:
-  PeriphIf(size_t memif_idx, size_t scalarInflight, std::unordered_map<uint32_t, MemLine> configROM) : MemIf(memif_idx, scalarInflight), configROM(std::move(configROM)) {
+  PeriphIf(size_t memif_idx, size_t scalarInflight, std::unordered_map<uint32_t, MemLine> configROM) : MemIf(memif_idx, scalarInflight, 1), configROM(std::move(configROM)) {
     // Check configROM
     for (const auto &[addr, line] : configROM)
       if (addr & MEM_ADDR_OFFSET_MASK) throw std::logic_error("ConfigROM address not aligned");
@@ -622,14 +650,10 @@ public:
     return req;
   };
 
-  virtual bool nocCanAccept(const Flit &f) const override __attribute__((always_inline)) {
-    return scalarAllocSlot().has_value();
-  }
-
   void step(
     RingIntf ring,
     MemBusIn &mem,
-    Flit *flit
+    std::optional<std::pair<std::reference_wrapper<const Flit>, uint8_t>> flit
   ) __attribute__((always_inline)) {
     *ring.injected = false;
 
@@ -676,7 +700,8 @@ public:
 
     if (flit) {
       if (!scalarAlloc) throw std::logic_error("Received a scalar request while no slot is available");
-      MemIf::scalarAllocCommit(*scalarAlloc, ScalarRequest::fromFlit(*flit));
+      MemIf::scalarAllocCommit(*scalarAlloc, ScalarRequest::fromFlit(flit->first));
+      nocAcceptCommit(flit->second);
     }
   }
 };
