@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <optional>
 #include <utility>
 #include <vector>
+#include <barrier>
+#include <thread>
 
 #include <verilated_fst_c.h>
 
@@ -242,6 +245,14 @@ class SoftSystemBackend : public SystemBackend {
   uint64_t last_periodic_cycle_ = 0;
   bool log_ = false;
 
+  // Parallelism
+  size_t numThreads = 8; // TODO: add ctor parameter
+  std::atomic_bool halted = false;
+  std::barrier<> stageStart, stagePresented, stageDone;
+  std::barrier<> stepStart, stepDone;
+  bool resetReleaseNow;
+  std::vector<std::thread> workers; // Should be numThreads - 1
+
   // RAII helper that attributes wall time between verilator eval
   // (tracked separately via a thread-local accumulator) and uncore.
   struct PhaseTimer {
@@ -265,6 +276,17 @@ class SoftSystemBackend : public SystemBackend {
     uint8_t accept = *memif_eject_accept[memifIdx];
     const Flit &f = *memif_eject[memifIdx][accept];
     return {{ f, accept }};
+  }
+
+  void stageWorkPresent(size_t threadId);
+  void stageWorkAccept(size_t threadId);
+  void stepWork(size_t threadId);
+  void worker(size_t threadId);
+
+  std::pair<size_t, size_t> puWorkRange(size_t threadId) const {
+    size_t start = threadId * cfg.numPU / numThreads;
+    size_t end = (threadId + 1) * cfg.numPU / numThreads;
+    return {start + 1, end + 1}; // PUs are 1-based
   }
 
  public:

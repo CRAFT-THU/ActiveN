@@ -742,5 +742,9 @@ int main(int argc, char **argv) {
     fst_tracer->close();
   }
 
-  return rc;
+  // The soft backend's worker threads are parked on the per-cycle barriers and
+  // are never joined (graceful shutdown is deferred). Destroying the still
+  // joinable std::threads would call std::terminate, so exit directly instead
+  // of returning through the backend destructors.
+  std::exit(rc);
 }

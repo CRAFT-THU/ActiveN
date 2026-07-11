@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -325,11 +326,17 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in)
     core_mem(cfg.numPU),
     core_mem_accept(cfg.numPU),
     routers(cfg.numPU,
-            [this](size_t i) { return buildRouter(static_cast<uint16_t>(i)); })
+            [this](size_t i) { return buildRouter(static_cast<uint16_t>(i)); }),
+    stageStart(numThreads),
+    stagePresented(numThreads),
+    stageDone(numThreads),
+    stepStart(numThreads),
+    stepDone(numThreads)
 {
   // Initialize per-MC DRAMIfs. PU range is contiguous in PU-id order.
   if (cfg.numPU % cfg.numMC != 0) throw std::invalid_argument("numPU must be divisible by numMC");
   if ((cfg.numPU / cfg.numMC) % soft_mem::CLUSTER_SIZE != 0) throw std::invalid_argument("PU per MC must be a multiple of cluster size");
+  if (numThreads < 1 || numThreads > cfg.numPU) throw std::invalid_argument("numThreads must be between 1 and numPU");
 
   const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
   const size_t CLUSTER_PER_MC = PU_PER_MC / soft_mem::CLUSTER_SIZE;
@@ -354,6 +361,11 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in)
     cores[i]->cfg_hartid = static_cast<uint32_t>(i);
     cores[i]->eval();
   }
+
+  // Kickoff worker threads
+  workers.reserve(numThreads - 1);
+  for (size_t i = 1; i < numThreads; ++i)
+    workers.emplace_back(&SoftSystemBackend::worker, this, i);
 }
 
 void SoftSystemBackend::attachTrace(VerilatedFstC *trace_file, int depth) {
@@ -453,21 +465,65 @@ void SoftSystemBackend::peek(uint64_t cycle, std::vector<MemBusOut *> out) {
 
 void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
   PhaseTimer _t(*this);
-  if constexpr (ASSERTIONS_ENABLED) {
-    if (cycle <= releaseResetAfter) {
-      for (const auto &i : in) {
-        if (i.resp) throw std::runtime_error("Memory response presented during reset");
+  // We can release right now, because only the leader thread touches memif input
+  stageStart.arrive_and_wait();
+  try {
+    if constexpr (ASSERTIONS_ENABLED) {
+      if (cycle <= releaseResetAfter) {
+        for (const auto &i : in) {
+          if (i.resp) throw std::runtime_error("Memory response presented during reset");
+        }
       }
     }
+
+    memif_ext = in;
+
+    stageWorkPresent(0);
+    const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
+    for (size_t m = 0; m < cfg.numMC; ++m) {
+      auto buffer_span = core_mem.slice(m * PU_PER_MC + 1, (m + 1) * PU_PER_MC + 1);
+      drams[m].peekPUs(buffer_span, ring.peekAt(m + 1)); // 0 is periph
+    }
+  } catch (const std::exception &e) {
+    std::cerr << "Exception at thread " << 0 << ": " << e.what() << std::endl;
+    std::exit(1);
   }
 
-  memif_ext = in;
+  stagePresented.arrive_and_wait();
+
+  try {
+    stageWorkAccept(0);
+
+    memif_ring_accept[0] = ring.peekAt(0) && periph.ringCanAccept(*ring.peekAt(0));
+    memif_eject_accept[0] = periph.nocAcceptMultiple(
+      [&ejects = this->memif_eject[0]](size_t idx) -> const std::optional<Flit> & {
+        return ejects[idx];
+      });
+    for (size_t m = 0; m < cfg.numMC; ++m) {
+      memif_ring_accept[m + 1] =
+          ring.peekAt(m + 1) && drams[m].ringCanAccept(*ring.peekAt(m + 1));
+      auto &ejects = this->memif_eject[m + 1];
+      memif_eject_accept[m + 1] = drams[m].nocAcceptMultiple(
+        [&ejects](size_t idx) -> const std::optional<Flit> & {
+          return ejects[idx];
+        });
+    }
+  } catch (const std::exception &e) {
+    std::cerr << "Exception at thread " << 0 << ": " << e.what() << std::endl;
+    std::exit(1);
+  }
+
+  stageDone.arrive_and_wait();
+}
+
+void SoftSystemBackend::stageWorkPresent(size_t threadId) {
+  auto [puStart, puEnd] = puWorkRange(threadId);
 
   // Populate presented data on all router-facing ready-valid interfaces.
-  for (uint16_t i = 1; i <= cfg.numPU; ++i)
+  for (uint16_t i = puStart; i < puEnd; ++i)
     routers[i].buf.core_inject.presenting = peekCoreInject(*cores[i], i);
 
-  for (uint16_t i = 1; i <= cfg.numPU; ++i) {
+  for (uint16_t i = puStart; i < puEnd; ++i) {
     auto &router = routers[i];
     const size_t nf = router.links.num_forwards;
     // Output ports: 0..nf-1 = forward egress; nf = core_eject; nf+1 = memif.
@@ -477,17 +533,15 @@ void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
     if (router.links.memif)
       memif_eject[router.links.memif->first][router.links.memif->second] = router.rt.peek(nf + 1);
   }
+}
 
-  const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
-  for (size_t m = 0; m < cfg.numMC; ++m) {
-    auto buffer_span = core_mem.slice(m * PU_PER_MC + 1, (m + 1) * PU_PER_MC + 1);
-    drams[m].peekPUs(buffer_span, ring.peekAt(m + 1)); // 0 is periph
-  }
+void SoftSystemBackend::stageWorkAccept(size_t threadId) {
+  auto [puStart, puEnd] = puWorkRange(threadId);
 
   // Generate accepting signals. Each router's egress is buffered on the
   // PEER's forward[port_idx]; we drive that buffer's `accepting` from
   // the local router's canEnq.
-  for (uint16_t i = 1; i <= cfg.numPU; ++i) {
+  for (uint16_t i = puStart; i < puEnd; ++i) {
     auto &local = routers[i];
     const size_t nf = local.links.num_forwards;
     // Input ports: 0..nf-1 = forward ingress; nf = core_inject.
@@ -504,37 +558,23 @@ void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
     }
   }
 
-  memif_ring_accept[0] = ring.peekAt(0) && periph.ringCanAccept(*ring.peekAt(0));
-  memif_eject_accept[0] = periph.nocAcceptMultiple(
-    [&ejects = this->memif_eject[0]](size_t idx) -> const std::optional<Flit> & {
-      return ejects[idx];
-    });
-  for (size_t m = 0; m < cfg.numMC; ++m) {
-    memif_ring_accept[m + 1] =
-        ring.peekAt(m + 1) && drams[m].ringCanAccept(*ring.peekAt(m + 1));
-    auto &ejects = this->memif_eject[m + 1];
-    memif_eject_accept[m + 1] = drams[m].nocAcceptMultiple(
-      [&ejects](size_t idx) -> const std::optional<Flit> & {
-        return ejects[idx];
-      });
-  }
-
   // Drive PU inputs and settle on the negedge. Contract: accept signals
   // from the cores are read post-eval (after combinational settle).
-  for (uint16_t i = 1; i <= cfg.numPU; ++i) {
+  for (uint16_t i = puStart; i < puEnd; ++i) {
     presentCoreEject(*cores[i], i, routers[i].buf.core_eject.presenting);
     presentCoreMem(*cores[i], core_mem[i]);
     cores[i]->ext_out_ready = routers[i].buf.core_inject.accepting;
     cores[i]->clock = false; // negedge
   }
   auto v0 = std::chrono::high_resolution_clock::now();
-  for (uint16_t i = 1; i <= cfg.numPU; ++i) {
+  for (uint16_t i = puStart; i < puEnd; ++i) {
     cores[i]->eval();
   }
   auto v1 = std::chrono::high_resolution_clock::now();
+  // TODO: move into non-thread local atomic member variable
   g_soft_verilator_ns +=
       std::chrono::duration_cast<std::chrono::nanoseconds>(v1 - v0).count();
-  for (uint16_t i = 1; i <= cfg.numPU; ++i) {
+  for (uint16_t i = puStart; i < puEnd; ++i) {
     routers[i].buf.core_eject.accepting =
         routers[i].buf.core_eject.presenting.has_value() &&
         cores[i]->ext_in_ready;
@@ -553,13 +593,78 @@ void SoftSystemBackend::step(uint64_t cycle) {
   // this cycle.
   accumulateStats();
 
+  resetReleaseNow = cycle == releaseResetAfter;
+
+  stepStart.arrive_and_wait();
+
+  try {
+    stepWork(0);
+
+    // Step memifs.
+    const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
+    bool injected;
+    periph.step(
+      soft_mem::RingIntf {
+        .buffer = &ring[0],
+        .ingress = ring.validAt(0),
+        .eject = memif_ring_accept[0],
+        // canInject: forward queue is empty AND no forward will push into
+        // the outgoing queue this cycle.
+        .canInject = !ring.validAt(1) &&
+                     (!ring.validAt(0) || memif_ring_accept[0]),
+        .injected = &injected
+      },
+      memif_ext[0],
+      memifAcceptedEject(0)
+    );
+    ring.updateValidAt(0, injected, memif_ring_accept[0]);
+
+    for (size_t m = 0; m < cfg.numMC; ++m) {
+      drams[m].step(
+        soft_mem::RingIntf {
+          .buffer = &ring[m + 1],
+          .ingress = ring.validAt(m + 1),
+          .eject = memif_ring_accept[m + 1],
+          .canInject = !ring.validAt((m + 2) % (cfg.numMC + 1)) &&
+                       (!ring.validAt(m + 1) || memif_ring_accept[m + 1]),
+          .injected = &injected
+        },
+        memif_ext[m + 1],
+        memifAcceptedEject(m + 1),
+        core_mem_accept.slice(1 + PU_PER_MC * m, 1 + PU_PER_MC * (m + 1))
+      );
+      ring.updateValidAt(m + 1, injected, memif_ring_accept[m + 1]);
+    }
+    ring.progress();
+  } catch (const std::exception &e) {
+    std::cerr << "Exception at thread " << 0 << ": " << e.what() << std::endl;
+    std::exit(1);
+  }
+
+  stepDone.arrive_and_wait();
+
+  // Periodic delta print.
+  if (log_ && cycle > 0 && cycle % Stat::PERIOD == 0) {
+    auto delta = stats_ - last_periodic_;
+    uint64_t span = cycle - last_periodic_cycle_;
+    std::cerr << "[Soft] Periodic stats (cycles " << last_periodic_cycle_
+              << ".." << cycle << ", span=" << span << "):\n";
+    delta.print(span);
+    last_periodic_ = stats_;
+    last_periodic_cycle_ = cycle;
+  }
+}
+
+void SoftSystemBackend::stepWork(size_t threadId) {
+  auto [puStart, puEnd] = puWorkRange(threadId);
+
   // Posedge eval for every core.
   auto v0 = std::chrono::high_resolution_clock::now();
-  for (size_t i = 1; i <= cfg.numPU; ++i) {
+  for (size_t i = puStart; i < puEnd; ++i) {
     cores[i]->clock = true;
     cores[i]->eval();
 
-    if (cycle == releaseResetAfter) {
+    if (resetReleaseNow) {
       cores[i]->reset = false;
       cores[i]->eval();
     }
@@ -569,7 +674,9 @@ void SoftSystemBackend::step(uint64_t cycle) {
       std::chrono::duration_cast<std::chrono::nanoseconds>(v1 - v0).count();
 
   // Step routers.
-  for (auto &router : routers) {
+  for (size_t i = puStart; i < puEnd; ++i) {
+    auto &router = routers[i];
+
     const auto &buffer = router.buf;
     const auto &links = router.links;
     const auto &all = this->routers;
@@ -599,54 +706,6 @@ void SoftSystemBackend::step(uint64_t cycle) {
         }
       }
     );
-  }
-
-  // Step memifs.
-  const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
-  bool injected;
-  periph.step(
-    soft_mem::RingIntf {
-      .buffer = &ring[0],
-      .ingress = ring.validAt(0),
-      .eject = memif_ring_accept[0],
-      // canInject: forward queue is empty AND no forward will push into
-      // the outgoing queue this cycle.
-      .canInject = !ring.validAt(1) &&
-                   (!ring.validAt(0) || memif_ring_accept[0]),
-      .injected = &injected
-    },
-    memif_ext[0],
-    memifAcceptedEject(0)
-  );
-  ring.updateValidAt(0, injected, memif_ring_accept[0]);
-
-  for (size_t m = 0; m < cfg.numMC; ++m) {
-    drams[m].step(
-      soft_mem::RingIntf {
-        .buffer = &ring[m + 1],
-        .ingress = ring.validAt(m + 1),
-        .eject = memif_ring_accept[m + 1],
-        .canInject = !ring.validAt((m + 2) % (cfg.numMC + 1)) &&
-                     (!ring.validAt(m + 1) || memif_ring_accept[m + 1]),
-        .injected = &injected
-      },
-      memif_ext[m + 1],
-      memifAcceptedEject(m + 1),
-      core_mem_accept.slice(1 + PU_PER_MC * m, 1 + PU_PER_MC * (m + 1))
-    );
-    ring.updateValidAt(m + 1, injected, memif_ring_accept[m + 1]);
-  }
-  ring.progress();
-
-  // Periodic delta print.
-  if (log_ && cycle > 0 && cycle % Stat::PERIOD == 0) {
-    auto delta = stats_ - last_periodic_;
-    uint64_t span = cycle - last_periodic_cycle_;
-    std::cerr << "[Soft] Periodic stats (cycles " << last_periodic_cycle_
-              << ".." << cycle << ", span=" << span << "):\n";
-    delta.print(span);
-    last_periodic_ = stats_;
-    last_periodic_cycle_ = cycle;
   }
 }
 
@@ -744,4 +803,34 @@ bool SoftSystemBackend::printStats(uint64_t cycles, bool final_print) {
     stats_.print(cycles);
   }
   return true;
+}
+
+void SoftSystemBackend::worker(size_t threadId) {
+  // Count cycle ourself
+  while (true) {
+    if (halted) return;
+    stageStart.arrive_and_wait();
+    try {
+      stageWorkPresent(threadId);
+    } catch (const std::exception &e) {
+      std::cerr << "Exception at thread " << threadId << ": " << e.what() << std::endl;
+      std::exit(1);
+    }
+    stagePresented.arrive_and_wait();
+    try {
+      stageWorkAccept(threadId);
+    } catch (const std::exception &e) {
+      std::cerr << "Exception at thread " << threadId << ": " << e.what() << std::endl;
+      std::exit(1);
+    }
+    stageDone.arrive_and_wait();
+    stepStart.arrive_and_wait();
+    try {
+      stepWork(threadId);
+    } catch (const std::exception &e) {
+      std::cerr << "Exception at thread " << threadId << ": " << e.what() << std::endl;
+      std::exit(1);
+    }
+    stepDone.arrive_and_wait();
+  }
 }

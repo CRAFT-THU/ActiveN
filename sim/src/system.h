@@ -9,7 +9,7 @@
 #include <memory>
 #include <array>
 
-static const bool ASSERTIONS_ENABLED = false;
+static const bool ASSERTIONS_ENABLED = true;
 
 // System-level simulators
 
