@@ -213,9 +213,12 @@ public:
   }
 
   std::optional<uint8_t> scalarAllocSlot() const noexcept __attribute__((always_inline)) {
-    // Returns the lowest 0 in scalarAllocated
+    // Returns the lowest 0 in scalarAllocated, bounded by the configured
+    // inflight depth. Comparing against the fixed mask width (64) instead
+    // would hand out slot == scalarInflight once every real slot is taken,
+    // overflowing scalarPendings (e.g. the 16-slot peripheral at boot).
     int r_one = std::countr_one(scalarAllocated);
-    if (r_one == 64) return std::nullopt;
+    if ((size_t) r_one >= scalarInflight) return std::nullopt;
     return r_one;
   }
 

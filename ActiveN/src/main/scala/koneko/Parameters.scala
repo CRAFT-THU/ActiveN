@@ -4,7 +4,7 @@ import chisel3._
 import chisel3.util._
 
 case class CoreParameters(
-  val initVec: BigInt = BigInt("80000000", 16),
+  val initVec: BigInt = BigInt("60000000", 16),
   val i$Lines: Int = 16,
   val i$BlockSize: Int = 64,
   val i$Assoc: Int = 2,

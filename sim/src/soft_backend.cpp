@@ -290,7 +290,7 @@ SoftSystemBackend::WrappedRouter SoftSystemBackend::buildRouter(uint16_t pu) con
   return WrappedRouter(std::move(links), std::move(tbl), num_in, num_out);
 }
 
-SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in)
+SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads)
   : cfg(std::move(cfg_in)),
     releaseResetAfter(10),
     topo(cfg.numPU, cfg.numMC),
@@ -327,6 +327,7 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in)
     core_mem_accept(cfg.numPU),
     routers(cfg.numPU,
             [this](size_t i) { return buildRouter(static_cast<uint16_t>(i)); }),
+    numThreads(threads),
     stageStart(numThreads),
     stagePresented(numThreads),
     stageDone(numThreads),

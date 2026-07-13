@@ -5,6 +5,8 @@
 #include <iostream>
 #include <optional>
 #include <random>
+#include <string>
+#include <vector>
 
 // Peripheral device: handles MMIO requests in the 0x40000000 region.
 // Address map (relative to 0x40000000):
@@ -40,8 +42,20 @@ struct PeripheralDevice {
   // Global override for RNG seed (set by main before any PeripheralDevice is used).
   static inline std::optional<uint32_t> global_seed_override;
 
+  // Boot ROM served in peripheral-local [0x20000000, 0x28000000) (physical
+  // 0x60000000, the reset-vector region, below the config ROM). Reads return
+  // whole memory beats filled from this image; bytes past the image read as
+  // zero. Populated by the constructor from global_bootrom_override if set
+  // (via --bootrom), otherwise from the embedded default (see devices.cpp).
+  static constexpr uint32_t kBootromBase = 0x20000000u; // peripheral-local
+  static constexpr uint32_t kBootromEnd  = 0x28000000u; // == config ROM base
+  static inline std::optional<std::vector<uint8_t>> global_bootrom_override;
+  std::vector<uint8_t> bootrom;
+
   PeripheralDevice() : rng(effectiveSeed()) {
     rng_seed = effectiveSeed();
+    if (global_bootrom_override) bootrom = *global_bootrom_override;
+    else loadDefaultBootrom();
   }
 
   void setConfig(uint32_t npu, uint32_t nmc, uint64_t mcsz) {
@@ -97,6 +111,24 @@ struct PeripheralDevice {
     }
     return 0;
   }
+
+  // True if `addr` (peripheral-local) is within the boot ROM window.
+  static bool isBootrom(uint32_t addr) {
+    return addr >= kBootromBase && addr < kBootromEnd;
+  }
+
+  // Fill `nbytes` bytes of a memory beat at peripheral-local `addr` from the
+  // boot image, zero-padding past its end. Instruction fetches refill whole
+  // cache lines, so boot ROM reads must populate the entire beat, not one word.
+  void readBootrom(uint32_t addr, uint8_t *out, size_t nbytes) const {
+    uint32_t off = addr - kBootromBase;
+    for (size_t i = 0; i < nbytes; ++i)
+      out[i] = (off + i < bootrom.size()) ? bootrom[off + i] : uint8_t{0};
+  }
+
+  // Load the built-in default boot image (embedded bootrom.bin). Defined in
+  // devices.cpp to isolate the #embed dependency on the generated binary.
+  void loadDefaultBootrom();
 };
 
 // Decodes a single-flit memory/peripheral request from ext_out.

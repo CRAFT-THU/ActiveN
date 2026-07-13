@@ -139,11 +139,13 @@ struct SingleCoreSim {
     size_t word_idx = (addr & ((MEM_BUS_WORDS * sizeof(uint32_t)) - 1)) /
                       sizeof(uint32_t);
 
+    bool bootrom = !decoder.isStore() && PeripheralDevice::isBootrom(addr);
+
     if (decoder.isStore()) {
       periph.write(addr, decoder.wdata());
       if (LOG) cerr << "[Single] Periph write: addr=0x" << hex << addr
                     << " data=0x" << decoder.wdata() << dec << endl;
-    } else {
+    } else if (!bootrom) {
       rdata = periph.read(addr);
       if (LOG) cerr << "[Single] Periph read: addr=0x" << hex << addr
                     << " data=0x" << rdata << dec << endl;
@@ -152,7 +154,15 @@ struct SingleCoreSim {
     MemResponse resp;
     resp.id = resp_tag;
     memset(resp.data, 0, sizeof(resp.data));
-    if (!decoder.isStore()) resp.data[word_idx] = rdata;
+    if (bootrom) {
+      // Boot ROM fetch/load: fill the whole beat (I-cache refills full lines).
+      uint32_t beat_base =
+          addr & ~((uint32_t)(MEM_BUS_WORDS * sizeof(uint32_t) - 1));
+      periph.readBootrom(beat_base, reinterpret_cast<uint8_t *>(resp.data),
+                         sizeof(resp.data));
+    } else if (!decoder.isStore()) {
+      resp.data[word_idx] = rdata;
+    }
     mem_resps.push_back(resp);
   }
 
@@ -262,6 +272,9 @@ int main(int argc, char **argv) {
     .help("RNG seed for peripheral device")
     .scan<'u', uint32_t>();
 
+  program.add_argument("--bootrom")
+    .help("Boot ROM image served at 0x60000000 (default: built-in)");
+
   try {
     program.parse_args(argc, argv);
   } catch (const std::exception &err) {
@@ -277,6 +290,19 @@ int main(int argc, char **argv) {
 
   if (auto seed = program.present<uint32_t>("--rng-seed")) {
     PeripheralDevice::global_seed_override = *seed;
+  }
+
+  // Optional boot ROM override, loaded before the peripheral is constructed.
+  if (auto bpath = program.present<string>("--bootrom")) {
+    ifstream f(*bpath, ios::binary | ios::ate);
+    if (!f) { cerr << "Error: cannot open bootrom image " << *bpath << endl; return 1; }
+    streamsize sz = f.tellg();
+    f.seekg(0);
+    vector<uint8_t> buf(sz > 0 ? static_cast<size_t>(sz) : 0);
+    if (sz > 0 && !f.read(reinterpret_cast<char *>(buf.data()), sz)) {
+      cerr << "Error: cannot read bootrom image " << *bpath << endl; return 1;
+    }
+    PeripheralDevice::global_bootrom_override = std::move(buf);
   }
 
   if (TRACE) cerr << "[Single] Tracing enabled" << endl;

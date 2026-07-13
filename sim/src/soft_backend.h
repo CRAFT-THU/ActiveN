@@ -246,7 +246,7 @@ class SoftSystemBackend : public SystemBackend {
   bool log_ = false;
 
   // Parallelism
-  size_t numThreads = 8; // TODO: add ctor parameter
+  size_t numThreads = 8; // Overridden by the ctor's threads parameter.
   std::atomic_bool halted = false;
   std::barrier<> stageStart, stagePresented, stageDone;
   std::barrier<> stepStart, stepDone;
@@ -290,7 +290,7 @@ class SoftSystemBackend : public SystemBackend {
   }
 
  public:
-  explicit SoftSystemBackend(SystemConfig cfg);
+  explicit SoftSystemBackend(SystemConfig cfg, size_t threads = 8);
   ~SoftSystemBackend() override = default;
   SoftSystemBackend(const SoftSystemBackend &) = delete;
   SoftSystemBackend &operator=(const SoftSystemBackend &) = delete;

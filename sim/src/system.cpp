@@ -262,6 +262,11 @@ struct System::Impl {
       uint32_t wdata;
       memcpy(&wdata, req.wdata.data() + byte_offset, sizeof(uint32_t));
       periph.write(req.addr, wdata);
+    } else if (PeripheralDevice::isBootrom(req.addr)) {
+      // Boot ROM fetch/load: fill the whole beat (I-cache refills full lines).
+      uint32_t beat_base =
+          req.addr & ~((uint32_t)(MEM_BUS_WORDS * sizeof(uint32_t) - 1));
+      periph.readBootrom(beat_base, resp.data.data(), resp.data.size());
     } else {
       uint32_t rdata = periph.read(req.addr);
       memcpy(resp.data.data() + word_idx * sizeof(uint32_t), &rdata, sizeof(uint32_t));
@@ -583,6 +588,14 @@ int main(int argc, char **argv) {
     .help("RNG seed for peripheral device")
     .scan<'u', uint32_t>();
 
+  program.add_argument("--soft-threads")
+    .help("Worker thread count for the soft backend")
+    .default_value(uint32_t(8))
+    .scan<'u', uint32_t>();
+
+  program.add_argument("--bootrom")
+    .help("Boot ROM image served at 0x60000000 (default: built-in)");
+
   program.add_argument("--pu")
     .help("Number of PUs in the system")
     .required()
@@ -645,10 +658,24 @@ int main(int argc, char **argv) {
   }
 
   uint64_t max_cycles = program.get<uint64_t>("--max-cycles");
+  size_t soft_threads = program.get<uint32_t>("--soft-threads");
 
   // RNG seed
   if (auto seed = program.present<uint32_t>("--rng-seed")) {
     PeripheralDevice::global_seed_override = *seed;
+  }
+
+  // Optional boot ROM override, loaded before any PeripheralDevice is built.
+  if (auto bpath = program.present<string>("--bootrom")) {
+    ifstream f(*bpath, ios::binary | ios::ate);
+    if (!f) { cerr << "Error: cannot open bootrom image " << *bpath << endl; return 1; }
+    streamsize sz = f.tellg();
+    f.seekg(0);
+    vector<uint8_t> buf(sz > 0 ? static_cast<size_t>(sz) : 0);
+    if (sz > 0 && !f.read(reinterpret_cast<char *>(buf.data()), sz)) {
+      cerr << "Error: cannot read bootrom image " << *bpath << endl; return 1;
+    }
+    PeripheralDevice::global_bootrom_override = std::move(buf);
   }
 
   // Logging is wired below on the soft backend instance (if used).
@@ -712,7 +739,7 @@ int main(int argc, char **argv) {
   }
 
   if (use_soft) {
-    auto soft = make_unique<SoftSystemBackend>(cli_cfg);
+    auto soft = make_unique<SoftSystemBackend>(cli_cfg, soft_threads);
     soft->setLogging(enable_logging);
     if (fst_tracer) soft->attachTrace(fst_tracer.get(), 0);
     system.addBackend(std::move(soft));

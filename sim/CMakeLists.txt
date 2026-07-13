@@ -131,10 +131,42 @@ set(VERILATOR_COMMON_ARGS -O3 -Wall -Wno-fatal -Wno-DECLFILENAME --trace-params 
 set(VERILATOR_CORE_ARGS ${VERILATOR_COMMON_ARGS} --top-module Core)
 set(VERILATOR_SYSTEM_ARGS ${VERILATOR_COMMON_ARGS} --top-module System --threads 8)
 
+# ---------------------------------------------------------------------------
+# Boot ROM
+#
+# The core resets into the peripheral boot-ROM window (physical 0x60000000).
+# Assemble sim/bootrom.S to a raw binary and #embed it into devices.cpp as the
+# built-in default image; --bootrom overrides it at runtime.
+# ---------------------------------------------------------------------------
+set(RISCV_PREFIX "riscv64-unknown-none-elf-" CACHE STRING
+    "RISC-V bare-metal toolchain prefix for the boot ROM")
+set(BOOTROM_SRC ${CMAKE_CURRENT_SOURCE_DIR}/bootrom.S)
+set(BOOTROM_ELF ${CMAKE_CURRENT_BINARY_DIR}/bootrom.elf)
+set(BOOTROM_BIN ${CMAKE_CURRENT_BINARY_DIR}/bootrom.bin)
+add_custom_command(
+    OUTPUT ${BOOTROM_BIN}
+    COMMAND ${RISCV_PREFIX}gcc -march=rv32i -mabi=ilp32 -nostdlib -nostartfiles
+            -Wl,-Ttext=0x60000000 -o ${BOOTROM_ELF} ${BOOTROM_SRC}
+    COMMAND ${RISCV_PREFIX}objcopy -O binary ${BOOTROM_ELF} ${BOOTROM_BIN}
+    DEPENDS ${BOOTROM_SRC}
+    COMMENT "Assembling boot ROM (bootrom.S -> bootrom.bin)"
+    VERBATIM
+)
+add_custom_target(gen_bootrom DEPENDS ${BOOTROM_BIN})
+
+# devices.cpp #embeds bootrom.bin; make the object depend on it and silence the
+# C23 #embed extension warning (we compile C++20 with clang).
+set_source_files_properties(src/devices.cpp PROPERTIES
+    OBJECT_DEPENDS ${BOOTROM_BIN}
+    COMPILE_OPTIONS "-Wno-c23-extensions"
+)
+
 # Single-core simulation driver (no DRAM dependency)
 add_executable(sim_single
     src/single.cpp
+    src/devices.cpp
 )
+add_dependencies(sim_single gen_bootrom)
 
 verilate(
     sim_single
@@ -210,8 +242,9 @@ verilate(
 # Unified binary: sim_system --soft / --hard / --soft --hard (cosim)
 add_executable(sim_system
   src/system.cpp
+  src/devices.cpp
 )
-add_dependencies(sim_system gen_system_headers)
+add_dependencies(sim_system gen_system_headers gen_bootrom)
 add_dependencies(soft_backend_lib gen_system_headers)
 target_link_libraries(sim_system PRIVATE
   soft_backend_lib
