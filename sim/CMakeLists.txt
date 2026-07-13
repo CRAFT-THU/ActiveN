@@ -170,7 +170,7 @@ add_dependencies(sim_single gen_bootrom)
 
 verilate(
     sim_single
-  SOURCES ${CVFPU_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/../Aux.sv
+  SOURCES ${CVFPU_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/../FPU.sv
     PREFIX rtl
     TRACE_FST
     DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/verilated
@@ -215,7 +215,7 @@ add_library(hard_backend_lib STATIC
 )
 verilate(
   hard_backend_lib
-    SOURCES ${CVFPU_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/../Aux.sv
+    SOURCES ${CVFPU_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/../FPU.sv
     PREFIX sys_rtl
     TRACE_FST
     DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/sys_verilated
@@ -231,7 +231,7 @@ add_library(soft_backend_lib STATIC
 
 verilate(
   soft_backend_lib
-    SOURCES ${CVFPU_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/../Aux.sv
+    SOURCES ${CVFPU_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/../FPU.sv
     PREFIX soft_rtl
     TRACE_FST
     DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/soft_verilated
