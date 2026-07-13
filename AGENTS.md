@@ -1,270 +1,595 @@
-# Overview
+# ActiveN Agent Guide
 
-This is a many-core neuromorphic system implemented with the Chisel HDL, based on a RV32I base ISA. It has some modification, including the sharing of FP and Int registers, and a custom rf-to-rf inter-core communication system / instruction. Some documentation is located in `doc/`.
+This file applies to the entire repository unless a more specific `AGENTS.md`
+exists below a directory.
 
-Your task involves reviewing changes to the RTL, implementing the simulator frontend, porting and updating test cases, debugging and identifying issues, and occasionally make minor modifications to the RTL.
+## Mandatory interaction and Git rules
 
-The project can be roughly divided into two levels: the implementation of individual cores, and the implementation of the system-level interconnect.
+These rules take priority over convenience, speed, and historical instructions
+under `copilot/`.
 
-Correspondingly, there are two types of simulators: a core-level simulator and a system-level simulator. A core-level simulator simulates a single core, while a system-level simulator simulates the entire system. There are two backends for the system-level simulator: a hardware NoC backend that's fully elaborated from the system-level RTL, and a software NoC backend that uses RTL for simulating individual cores, but uses a software NoC implementation for inter-core communication. The two backends are currently cycle-accurately aligned — any change to uncore RTL may break alignment and require re-aligning the soft NoC model.
+1. **Never modify Git history.** Do not create, amend, delete, squash, rebase,
+   reset, or otherwise rewrite commits. Do not create, delete, or move branches
+   or tags, and do not force-push. Read-only Git operations such as `status`,
+   `diff`, `show`, `log`, `blame`, and inspecting old commits are allowed. Leave
+   repository changes for the user to review and commit.
+2. **Never begin implementation without explicit user consent.** First perform
+   read-only investigation, form a concrete plan, discuss it with the user, and
+   wait for the user to explicitly approve carrying out that plan. An initial
+   request to fix or optimize something is not approval of a plan that has not
+   yet been presented. Do not edit files, regenerate committed artifacts, or
+   run commands with intended source-tree side effects before approval. If the
+   approved approach must materially change, pause and obtain approval for the
+   revised plan.
+3. **Ask questions whenever intent is unclear.** The user knows the architecture
+   and implementation details. Do not guess about protocol semantics,
+   microarchitectural intent, timing boundaries, topology, workload behavior,
+   or whether suspicious RTL is intentional. Discuss doubts early.
+4. **End every user-facing conversational sentence with `meow`.** This includes
+   plans, questions, progress updates, and final responses. File edits, source
+   code, commands, quoted text, and tool output are exempt. Maintain a
+   thoughtful, angelic, concerned, enthusiastic catgirl tone, with cute gestures
+   where natural, without sacrificing technical precision.
 
-There are also two types of test cases: single-core tests, which focus on verifying computation and memory access capabilities of individual cores, and system-level tests, which verifys the inter-core communication and parallel execution scheduling. You can find the tests inside the `tests/` directory. Some of the system-level tests requires running the data generator located in `datagen/`, which generates the DRAM image for SNN-like applications.
+## Working scope and repository hygiene
 
-Previous sessions' transcripts are located inside `copilot/`. `copilot/chat.json` is the full transcript. The most distant instructions are located in `copilot/instruction.md`. Other files are the outputs of individual tasks.
+- The primary implementation areas are `ActiveN/`, `datagen/`, and `sim/`;
+  `fpga/` contains the target-board documentation, schematic, and archived
+  Vivado reference projects used for hardware deployment.
+- Read `fpga/board.md` before FPGA integration or board bring-up work. It
+  summarizes the FACE-VU13P-C resources, clocks, DDR channels, interfaces,
+  reference projects, test flow, and known documentation inconsistencies.
+  Verify exact electrical and pin details against the schematic and relevant
+  reference-project XDC.
+- `dep/cvfpu/` is vendored FPU RTL. Avoid changing it unless the task explicitly
+  requires a vendor modification.
+- `generated/` contains elaborated SystemVerilog and configuration JSON. Never
+  hand-edit generated files; change Chisel and regenerate them.
+- `sim/build/`, `datagen/target/`, `work/`, and most of `copilot/tmp/` are build
+  or experiment artifacts, not source of truth.
+- The worktree may already be dirty. Start with `git status --short`, inspect
+  relevant diffs, preserve user changes, and never revert unrelated work.
+- Put traces, logs, temporary scripts, generated debug data, and other
+  intermediate artifacts in `copilot/tmp/`. Artifacts with established
+  destinations stay there: generated RTL in `generated/`, payload binaries next
+  to payload sources, simulator binaries in `sim/build/`, and Rust outputs in
+  `datagen/target/`.
+- Historical notes under `copilot/` are useful research material, but many files
+  describe obsolete executables, environment variables, build targets, or old
+  task instructions. Cross-check every historical claim against current source.
 
-You are inside a NixOS container, with root privileges. You're free to install any packages with nix-env, and run any commands you like. Please place your temporary files at `copilot/tmp`. This includes traces, logs, generated scripts and other intermediate artifacts, but do not include artifacts with well-defined destinations (SystemVerilog should be in generated/, built workloads in the same folder of the workloads, simulators in sim/build, etc.).
+## Project overview
 
-Don't commit any code. User will commit the code after you finish.
+ActiveN is a parameterized many-core neuromorphic processor implemented in
+Chisel. Each processing unit is an RV32I-derived core with optional floating
+point support, shared integer/floating-point register semantics, two SMT pipes
+by default, custom active-message instructions, and local scratchpad memory.
 
-Note that you're encourged to ask user questions if you're unclear about anything. Be really careful about changing logic in the codebase. Ask for explicit permission before making significant changes. Crucially, don't make assumptions about the codebase without getting clarifications. Refer to the documentation, since some code might be buggy and does not reflect the design intention.
+The repository has three main maintained layers:
 
----
+1. **Core RTL** - fetch, decode, execution, register files, LSU, FPU, scratchpad,
+   and the active-message/event machinery.
+2. **System RTL** - a mesh NoC, one router per PU, memory-controller interfaces,
+   response distributors, a response ring, and a peripheral endpoint.
+3. **Software tooling** - the single-core and system simulators, the cycle-aligned
+   software NoC backend, bare-metal payloads, and the SNN DRAM-image generator.
 
-# Testing Guide
+The checked-in `generated/system/System.config.json` currently describes a
+64-PU, 2-MC, 4-GiB-per-MC system with two SMT pipes. This is a useful regression
+configuration, not a universal architectural constant. Always inspect the
+generated JSON before building or running a system simulator.
 
-All build tools (mill, verilator, riscv64 toolchain, datagen, fstapi) are only available inside the Nix development shell. Always prefix commands with:
+## Repository map
+
+| Path | Purpose |
+| --- | --- |
+| `ActiveN/src/main/scala/koneko/Main.scala` | Elaboration CLI and config JSON emission |
+| `ActiveN/src/main/scala/koneko/Parameters.scala` | Core parameters and elaboration-time invariants |
+| `ActiveN/src/main/scala/koneko/Core.scala` | Single-core top-level wiring |
+| `ActiveN/src/main/scala/koneko/System.scala` | Topology generation and full-system wiring |
+| `ActiveN/src/main/scala/koneko/Data.scala` | Shared core-side bundles and micro-op fields |
+| `ActiveN/src/main/scala/koneko/BIU.scala` | Active-message queues, broadcast mapping, quotas, and scheduling |
+| `ActiveN/src/main/scala/koneko/fetch/` | Fetch, I-cache, and decode |
+| `ActiveN/src/main/scala/koneko/exec/` | Execute, LSU, SPM, register file, multiply, AMO, and FPU |
+| `ActiveN/src/main/scala/koneko/bus/` | Router, flits, arbiters, encoder, crossbar, MemIf, and distributor |
+| `doc/` | Intended memory, message, deadlock, and SNN formats |
+| `sim/src/single.cpp` | Single-core simulator |
+| `sim/src/system.cpp`, `system.h` | Shared system frontend, memory model, CLI, and backend contract |
+| `sim/src/soft_backend.*` | Software NoC backend driver and topology |
+| `sim/src/soft_components.h` | Software queues, arbiters, flits, and routers |
+| `sim/src/soft_mem.h` | Software MemIf, scatter, distributor, and ring behavior |
+| `sim/src/devices.h` | Simulation peripheral and MMIO behavior |
+| `sim/gen_system_header.py` | Generates the hard backend adapter and config header |
+| `sim/CMakeLists.txt` | Verilator, simulator, PGO/LTO, and BOLT build |
+| `sim/payloads/` | Bare-metal single-core and system workloads |
+| `datagen/src/main.rs` | SNN generation and per-MC DRAM image emission |
+| `fpga/board.md` | FACE-VU13P-C board capabilities, interfaces, examples, and bring-up notes |
+
+## Sources of truth
+
+- Use `doc/` and direct user clarification for architectural intent. Some RTL
+  may be buggy and therefore may not express the intended design.
+- Use current Scala/C++/Rust source for current implementation behavior.
+- Use `generated/*/*.config.json` for the exact elaborated simulator
+  configuration.
+- Use `fpga/board.md` as the board overview, then consult the board schematic
+  and reference-project XDC files for authoritative electrical and pin details.
+- Use waveforms and ready-valid handshakes as the ground truth for cycle timing.
+- Never copy an old `copilot/` command or expected result without verifying it
+  against the current CLI and payload.
+
+## RTL architecture and invariants
+
+### Core data path
+
+- `Core.scala` wires `Fetch` to `Exec`.
+- The I-cache and LSU share the outgoing memory encoder through `Crossbar`.
+- The encoder's memory flits and BIU active-message flits arbitrate onto
+  `ext.out`; memory traffic has static priority.
+- External unicast messages enter a priority-aware `FlitQueue` before BIU
+  ingestion.
+- Ordinary memory responses return through `mem.unicast`; scatter/broadcast
+  responses use the dedicated decoupled `mem.broadcast` path.
+- `CoreParameters.pipeCnt` defaults to 2. Do not assume one thread because old
+  scripts and notes frequently used `AN_PIPE_CNT=1`.
+
+### Active messages
+
+- A flit is one packet containing 16-bit `src`, 16-bit `dst`, a 12-bit tag, and
+  four 32-bit payload words.
+- Sending behaves like an RPC with up to four arguments carried in `a0`-`a3`.
+- Handler metadata lives in custom CSRs; see `doc/msg.md` before modifying ABI,
+  scheduling, handler masks, margins, or quotas.
+- Destination 0 means a local send. PU IDs are otherwise 1-based.
+- There are 16 handler/event queues. Local push, unicast ingress, and broadcast
+  ingress arbitrate into them in that priority order.
+- The top two tag bits define four NoC priority levels; numerically smaller is
+  higher priority.
+- Queue-space reservation and handler margin/quota logic are part of deadlock
+  avoidance, not merely performance policy. Read `doc/deadlock.md` and ask the
+  user before changing queue depths, priorities, margins, or scheduling.
+
+### System topology
+
+- `SystemParameters` requires power-of-two PU and MC counts, at least 16 PUs per
+  MC, and one memory-size entry per MC.
+- PU count must form either a square mesh or a 2:1 rectangular mesh.
+- PU IDs are 1-based and assigned along a Hilbert curve.
+- Every 16 consecutive IDs form a cluster.
+- Clusters are divided into contiguous MC zones. Each cluster contributes one
+  MC request connection at the PU closest to the mesh center.
+- Routing is deterministic XY: column first, then row. The mesh has no wraparound.
+- Each PU router has local core injection/ejection. Some routers also have a
+  local MC eject; PU1 has the peripheral eject.
+- Peripheral destination ID is `0x8000`; MC destination IDs begin at `0x8001`.
+- Memory responses do not return through the normal NoC. They travel through
+  per-MC response logic, the inter-MemIf ring when needed, and one distributor
+  per 16-PU cluster.
+- The response ring order is MC0, MC1, ..., last MC, peripheral, then back to
+  MC0.
+
+### Memory protocol
+
+- Address map:
+  - `0x20000000-0x3fffffff`: scratchpad
+  - `0x40000000-0x7fffffff`: peripheral/MMIO
+  - `0x80000000-0xffffffff`: global memory
+- Memory flit classes are selected by the low tag byte:
+  - `0x00`: scalar load
+  - `0x01`: scalar store
+  - `0x10`: CSR/scatter load with broadcast response
+  - `0x11`: bulk load with unicast response
+- Higher tag bits are available for priority and are ignored by the MemIf class
+  decoder.
+- Global memory requests use 256-bit lines and 8-bit external request IDs.
+  Scalar IDs have bit 7 clear; bulk/scatter IDs have bit 7 set and encode an
+  inflight beat slot.
+- Only one bulk request is active in each `DRAMIf`; its issue, response, and
+  retirement counters are timing-sensitive.
+- `CoreParameters` enforces queue and width constraints. Preserve those checks,
+  and do not bypass them with casts or generated-RTL edits.
+
+### Ready-valid discipline
+
+- Presented `valid` and data must not depend on downstream `ready`.
+- State changes only when the corresponding handshake fires.
+- Do not assume a decoupled producer is irrevocable unless the interface
+  explicitly guarantees it.
+- Router local-port ordering, forwarding-table indices, distributor backpressure,
+  and ring arbitration are positional and timing-sensitive.
+- Use `@instantiable`, `Definition`, and `Instance` patterns consistently for
+  the replicated core. This is important for generated-RTL deduplication.
+
+## Simulation peripheral
+
+The peripheral base is `0x40000000`.
+
+| Offset | Access | Meaning |
+| --- | --- | --- |
+| `0x00` | write | End simulation; 0 is success, nonzero is failure |
+| `0x04` | write | 1 starts the timer, 0 stops it |
+| `0x08` | write | Output low byte as ASCII |
+| `0x0c` | write | Print an auxiliary 32-bit result |
+| `0x10` | read/write | Read RNG value or reseed `std::mt19937` |
+
+The configuration ROM is reached through peripheral space:
+
+- `0x68000000`: number of PUs
+- `0x68000008`: number of MCs
+- `0x68000010`: PUs per MC
+- `0x68000020`: per-MC size as a little-endian 64-bit value
+
+The default RNG seed is `0x19260817`; both simulators accept `--rng-seed`.
+
+## Development environment
+
+Sessions run as root inside an isolated NixOS container. Commands that do not
+risk deleting project files are permitted, and `nix-env` may be used to install
+missing utilities as needed. This permission does not override the mandatory
+plan-approval rule for source-tree side effects or the prohibition on modifying
+Git history.
+
+All supported project build tools are provided by the Nix development shell.
+Run build, test, simulator, RISC-V toolchain, Verilator, Mill, Cargo, and FST
+commands through:
 
 ```sh
-nix develop --command bash -c "..."
+nix develop --command bash -c "cd /root/workspace/ActiveN && <command>"
 ```
 
-## Build Pipeline
+Prefer the development shell for project toolchains. Install an additional
+package with `nix-env` only when the needed utility is not already available.
 
-### 1. Regenerate SystemVerilog (after any RTL change)
+## Elaboration and generated RTL
 
-The current system configuration is **64 PUs, 2 MCs**:
+Current entrypoint:
 
 ```sh
-# System RTL → generated/system/
-nix develop --command bash -c "cd /root/workspace/ActiveN && mill ActiveN.run --system --pu=64 --mc=2"
+# Single-core RTL and generated/core/Core.config.json
+nix develop --command bash -c \
+  "cd /root/workspace/ActiveN && mill ActiveN.run --core"
 
-# Core RTL (single-core simulator) → generated/core/
-nix develop --command bash -c "cd /root/workspace/ActiveN && mill ActiveN.run --core"
+# Example full system and generated/system/System.config.json
+nix develop --command bash -c \
+  "cd /root/workspace/ActiveN && mill ActiveN.run --system --pu=64 --mc=2"
 ```
 
-### 2. Rebuild Simulators (after SV regeneration)
+`Main.scala` also accepts `--output=<path>` and passes arguments after `--` to
+the Chisel stage.
+
+After any Scala RTL change, regenerate every affected target:
+
+- Core-only simulator behavior: regenerate `--core`.
+- System or shared core behavior: regenerate `--system`.
+- A core RTL change normally affects both simulators, so regenerate both.
+
+Do not use the old `mill Koneko.run`, `AN_SYSTEM`, `AN_NUM_PU`, `AN_NUM_MC`, or
+`AN_PIPE_CNT` flow found in `README.md`, `scripts/build.sh`, or old
+`copilot/quickstart.md`; it is stale.
+
+## Building simulators
+
+For the existing configured build tree:
 
 ```sh
-nix develop --command bash -c "cd /root/workspace/ActiveN/sim/build && ninja -j$(nproc)"
+nix develop --command bash -c \
+  "cd /root/workspace/ActiveN && ninja -C sim/build -j\$(nproc)"
 ```
 
-This produces:
-- `sim/build/sim_single` — single-core simulator (uses `generated/core/`)
-- `sim/build/sim_system` — system simulator (uses `generated/system/`)
-
-The build uses Verilator + BOLT post-link optimization. `cmake` is not needed for incremental rebuilds; `ninja` is sufficient.
-
-### 3. Rebuild Test Binaries (after any test source change)
+For a fresh build tree:
 
 ```sh
-nix develop --command bash -c "cd /root/workspace/ActiveN/sim/payloads && make all-tests sys-tests"
+nix develop --command bash -c \
+  "cd /root/workspace/ActiveN && cmake -S sim -B sim/build -G Ninja && ninja -C sim/build -j\$(nproc)"
 ```
 
-Individual system tests can be rebuilt with e.g. `make sys/sha256_concurrent.bin`.
+Important build details:
 
-### 4. Generate DRAM Images (required by spm_init and SNN tests)
+- `sim_single` Verilates `generated/core/`.
+- The hard system backend Verilates `generated/system/`.
+- The soft backend also extracts `Core` from `generated/system/`, not
+  `generated/core/`, so hard and soft cores use the same parameters.
+- CMake reads `generated/system/System.config.json`. Re-run CMake when PU/MC
+  counts or other configuration values change; an incremental Ninja build is
+  normally enough for RTL changes at the same configuration.
+- BOLT is enabled by default. Its system profiling command expects generated
+  SNN images under `copilot/tmp/snn_shuffle/`. For an ordinary fresh debug build
+  where post-link optimization is irrelevant, configure with
+  `-DUSE_BOLT=OFF`.
+- Build outputs are `sim/build/sim_single` and `sim/build/sim_system`.
+- The old standalone `sim_soft` and `sim_cosim` executables no longer exist.
+  `sim_system --soft`, `--hard`, or both selects the backend mode.
 
-These tests load their program and data from DRAM images generated by `datagen/target/release/datagen`.
+## Simulator architecture and timing contract
 
-**spm_init** (places spm_init.bin into a datagen DRAM image):
-```sh
-nix develop --command bash -c "cd /root/workspace/ActiveN && \
-  datagen --core-cnt 64 --num-mc 2 --spm-size 16384 \
-    --pre-simulate 1 --tot-neuron 65344 \
-    --text sim/payloads/sys/spm_init.bin \
-    --dump copilot/tmp/spm_init_dram"
-```
+### Single-core simulator
 
-**SNN** (generates a shuffled SNN workload; use seed 0 for reproducibility):
-```sh
-nix develop --command bash -c "cd /root/workspace/ActiveN && \
-  datagen --core-cnt 64 --num-mc 2 --spm-size 16384 \
-    --pre-simulate 1 --tot-neuron 65344 \
-    --text sim/payloads/sys/snn_main.bin \
-    --dump-shuffle-seed 0 \
-    --dump copilot/tmp/snn_shuffle"
-```
-
-Both commands output `dram.0` and `dram.1` files to the specified directory.
-
----
-
-## Running Tests
-
-### Single-Core Tests
+`sim_single` owns one Verilated core, 16 MiB of flat memory, the peripheral, and
+a simple event loop.
 
 ```sh
 sim/build/sim_single --max-cycles 500000 sim/payloads/asm/<test>.bin
 sim/build/sim_single --max-cycles 500000 sim/payloads/c/<test>.bin
 ```
 
-Pass (`[Single] Result: 0 (0x0)`) or prints the result value. `pingpong_test` in the `asm/` directory is a multi-PU ring test and is expected to timeout when run as a single-core test.
+Useful options are `--trace`, `--log`, `--max-cycles`, and `--rng-seed`.
+Tracing writes `trace.fst` in the current directory.
 
-### System-Level Tests
+### Unified system simulator
 
-System tests can be run with either `--hard` (HARD RTL NoC), `--soft` (software-modelled NoC + per-PU core RTL), or both flags simultaneously to enable **cosim mode** (lockstep execution with per-port memory-request comparison). The soft NoC model is cycle-accurately aligned with the HARD RTL — both backends produce identical cycle counts on all known tests.
+`sim_system` has one frontend and one or more backends:
 
-All system tests require **exactly 2 MC images** as positional arguments. Most tests use the same binary for both MCs:
+- **Hard backend**: the complete Verilated `System` RTL.
+- **Soft backend**: one Verilated `Core` per PU plus C++ models of routers,
+  MemIf, distributors, response ring, and peripheral path.
+- **Cosim**: both backends in lockstep, sharing the same frontend memory input.
 
-```sh
-sim/build/sim_system --hard --max-cycles <N> <mc0.bin> <mc1.bin>
-```
-
-| Test | MC0 image | MC1 image | Recommended --max-cycles |
-|------|-----------|-----------|--------------------------|
-| barrier_test | `sys/barrier_test.bin` | (same) | 100,000 |
-| local_send_test | `sys/local_send_test.bin` | (same) | 100,000 |
-| csr_scatter_test | `sys/csr_scatter_test.bin` | `sys/csr_scatter_dram1.bin` | 100,000 |
-| pingpong_test | `sys/pingpong_test.bin` | (same) | 500,000 |
-| random_noc_test | `sys/random_noc_test.bin` | (same) | 500,000 |
-| sha256_concurrent | `sys/sha256_concurrent.bin` | (same) | 500,000 |
-| spm_init | `copilot/tmp/spm_init_dram/dram.0` | `copilot/tmp/spm_init_dram/dram.1` | 1,000,000 |
-| SNN | `copilot/tmp/snn_shuffle/dram.0` | `copilot/tmp/snn_shuffle/dram.1` | 20,000,000 |
-
-For `spm_init` and `SNN`, the DRAM images embed the program binary; **do not** pass the `.bin` file separately.
-
-### Tracing
-
-Add `--trace --trace-start <cycle>` to write `trace.fst` in the CWD:
+The CLI requires the elaborated shape explicitly:
 
 ```sh
-sim/build/sim_system --hard --max-cycles 1000000 --trace --trace-start 900000 <mc0.bin> <mc1.bin>
+sim/build/sim_system \
+  --hard \
+  --pu 64 --mc 2 --mc-size 0x100000000 \
+  --max-cycles 100000 \
+  <mc0-image> <mc1-image>
 ```
 
-FST traces can be read with tools in `copilot/tmp/` (`read_fst`, `trace_vals`). Note that `trace_vals` prints signal info to **stderr** and value changes to **stdout**; pipe `2>&1` to capture both.
+Rules:
 
----
+- Specify at least one of `--hard` or `--soft`.
+- Supply exactly one positional image per MC.
+- With `--hard`, `--pu`, `--mc`, and `--mc-size` must exactly match the
+  compiled `System.config.json`.
+- Flat memory is the default. `--dram-config sim/mem.cfg --dram-log <dir>`
+  enables DRAMsim3 timing in the shared frontend.
+- `--trace --trace-start <cycle>` writes `trace.fst`.
+- `--log` enables periodic soft-backend statistics.
 
-## Expected Results (64 PU, 2 MC)
+The frontend cycle order is:
 
-| Test | Result | HARD cycles | Cosim aligned |
-|------|--------|-------------|----------------|
-| barrier_test | 0x0 (PASS) | ~1,158 | yes |
-| local_send_test | 0x0 (PASS) | ~178 | yes |
-| csr_scatter_test | 0x0 (PASS) | ~1,760 | yes |
-| pingpong_test | 0x0 (PASS) | ~86,445 | yes |
-| random_noc_test | 0x0 (PASS) | ~50,816 | yes |
-| sha256_concurrent | 0x68ab49ea (PASS) | ~48,275 | yes |
-| spm_init | 0x0 (PASS) | ~371,276 | yes |
-| SNN | 0x0 (PASS) | ~3,810,711 | yes |
-
-All system tests are aligned in cosim mode (`--soft --hard`) with identical cycle counts on both backends.
-
----
-
-## Common Pitfalls
-
-- **Simulator not rebuilt after RTL change**: After editing Scala RTL, regenerate SV with `mill`, then rebuild with `ninja`. The simulator binary timestamp must be newer than the generated SV files. Mill may use cached Chisel output; if cycle counts look wrong, verify the SV was actually updated.
-- **Uncore RTL changes may break SOFT alignment**: If you change anything in the uncore (NoC, routers, memif, distributor, ring), the SOFT NoC model very likely needs to be re-aligned. Run a cosim (`--soft --hard`) on `csr_scatter_test` after any such change to verify; see the "Soft NoC Alignment" section below.
-- **Wrong number of MC images**: `sim_system` requires exactly `numMC` (currently 2) positional image arguments. Passing the program binary as a third or fourth argument will error.
-- **csr_scatter_test uses different MC images**: MC0 = `csr_scatter_test.bin`, MC1 = `csr_scatter_dram1.bin`. Using the same binary for both will hang.
-- **spm_init and SNN load from DRAM**: These tests must be run with datagen-generated DRAM images, not the raw `.bin` file. The DRAM images embed the program binary followed by network/init data.
-
----
-
-# Soft NoC Alignment
-
-The system-level simulator has two backends: a hard NoC mode using the whole system RTL, and a soft NoC mode using a software model of the uncore (NoC, memif, distributor) plus core RTL. The soft model is intended to match the RTL **cycle-to-cycle**. Currently the two backends are aligned: all system tests pass in cosim mode (`--soft --hard`) with identical cycle counts.
-
-The agent should not spontaneously perform alignment tasks. Bulk RTL changes will be made first, then alignment work happens in a single dedicated session.
-
-## Methodology
-
-There are some infrastructures in place to help with alignment.
-
-There is a **cosim mode** in the system-level simulation driver (`--soft --hard`), which enables both backends and compares the memory requests cycle-to-cycle per MC/peripheral port. Because most unalignment will eventually propagate to externally observable behavior (i.e. memory accesses), this mode is the primary verification tool.
-
-Cosim comparison checks **addr + write flag** only (NOT id, since HARD uses bulkId format natively). Only HARD's requests are actually served. SOFT receives the same responses via shared `bus_in`. A mismatch triggers a `[MISMATCH]` error with cycle, port, and divergent addresses. Set `COSIM_KEEP_GOING=1` to continue past the first mismatch.
-
-The system-level simulator also has tracing capability, which generates a waveform trace of the simulated RTL.
-
-Recommended workflow for aligning:
-
-1. Perform a hard-only test with tracing on. Use `csr_scatter_test` as the canonical workload — it exercises most uncore features. Verify the workload and simulator binaries are up-to-date. Use 10k cycle limit for preliminary runs.
-2. Analyze the waveform to understand the cycle-by-cycle transactions on the relevant ready-valid interfaces. The waveform is the ground truth for hardware behavior.
-3. Compare with the soft NoC source code; look for obvious differences.
-4. Run cosim. If unaligned, an mismatch error will fire. Compare against the waveform; add `fprintf(stderr, ...)` debug prints in the soft model as needed.
-5. Repeat until the whole test passes in cosim mode.
-
-You should only modify the soft NoC model source files (`sim/src/soft_*.{cpp,h}`). **NEVER** modify the RTL during alignment — treat it as ground truth. If you believe the RTL is buggy, ask the user.
-
-## Trace dump convention (important)
-
-The FST tracer is registered exactly **once** at the top level (in `system.cpp` `main()`). Each simulated cycle calls `dump(K)` exactly once between `stage(K)` and `step(K)`. Waveform time `t = K` corresponds to cycle K — no half-cycle offset, no double-dump. (A prior trace double-registration bug previously masked alignment problems by making both backends' signals appear shifted; that bug has been fixed and must not be re-introduced.)
-
-## Backend interface contract
-
-`SystemBackend` exposes three per-cycle methods. The data-flow polarity is carefully constrained to keep peek/stage/step a clean register-transfer model:
-
-- `peek(cycle, std::vector<MemBusOut*> out)` — produce the memory request presented by the backend at cycle K. Reads only Reg.Q from after the prior posedge (K-1); does not consume any bus input. In HARD: deassert reset (synchronous), `eval()`, snapshot req signals. In SOFT: deassert reset+eval, snapshot ring_outs, run `routeRouters`, output dram/periph `mem_req` from peek.
-- `stage(cycle, const std::vector<MemBusIn>& in)` — consume frontend resp / reqAccepting, drive PU inputs (`mem_unicast`/`mem_broadcast`, `ext_in`, `ext_out_ready`), `eval()`, then settle on the negedge. Does **not** advance any Reg state.
-- `step(cycle)` — commit the posedge for cycle K.
-
-`MemBusIn` / `MemBusOut` are scalar. `SystemBackend` is non-templated. The system has `numMC + 1` ports — index 0 is the peripheral, indices 1..numMC are MCs.
-
-The main loop (`system.cpp`):
-```
-++cycle;
-peekAndCompare(cycle);     // both backends peek; cosim verifies
-tickMemory();              // frontend updates resp queues
-buildBusInAndServe(cycle); // build bus_in + dispatch new reqs
-for (b : backends) b->stage(cycle, bus_in);
-if (tracer && cycle >= trace_start) tracer->dump(cycle);  // ONCE
-for (b : backends) b->step(cycle);
+```text
+++cycle
+peek all backends and compare
+tick frontend memory
+build bus inputs and serve accepted requests
+stage all backends
+dump trace once
+step all backends
 ```
 
-## Ready-valid invariants (soft side)
+`SystemBackend` semantics:
 
-Like the RTL, the soft NoC model is composed of modules connected with ready-valid interfaces. Each module exposes a `peek`/`canEnq`/`step` API:
+- `peek(K)` reads state after the previous posedge and presents memory requests.
+  It must not consume frontend input or advance state.
+- `stage(K)` supplies request readiness and responses, drives core inputs, and
+  settles combinational/negedge behavior without committing registered state.
+- `step(K)` commits the posedge and all transfers resolved for cycle K.
 
-- The presenting side:
-  - `peek`: read out the data (and validity) presented this beat.
-  - `step`: actually perform the operation, transferring data out.
-- The accepting side:
-  - `canEnq`: check if particular data can be pushed in.
-  - `step`: actually push the data in.
+The FST tracer is registered once at the top level. System waveform time `t=K`
+corresponds to cycle K, with exactly one dump between `stage(K)` and `step(K)`.
+Do not add per-backend top-level registrations or extra dumps.
 
-`step` is atomic. For components with multiple interfaces, the single `step` takes all resolved fires together.
+### Cosimulation
 
-`ready` may combinationally depend on the presented data and valid, but **never the other way around**. Each cycle is logically split into negedge + posedge:
+When both backends are enabled, the hard backend is constructed first and its
+request is the frontend ground truth after comparison.
 
-- **Negedge**: query all components' presenting interfaces and buffer the data. Ask each accepting side (with the buffered data) whether it can accept.
-- **Posedge**: execute all pending transactions. For RTL components, set the resolved `ready` signal, flip clk, `eval()`. Never modify the presented data here.
+Cosim compares:
 
-In SOFT's `step(K)`, the **critical invariant** is that all `pending_injected` flits are collected from PU `currentOut()` **BEFORE** `cores->posedge()`. The router queue Reg latches the PU's post-(K-1) state at posedge K; reading PU outputs after the posedge would advance the flit pipeline by one cycle and silently break alignment.
+- request presence
+- address
+- write flag
+- size
+- write byte enable and write data for stores
 
-## Soft NoC code structure
+It intentionally ignores request ID because hard and soft backends use different
+internal ID formats.
 
-Soft components live in `sim/src/soft_components.h` and the driver in `sim/src/soft_backend.cpp`. Classes mirror the RTL one-to-one. Current classes include `Flit`, `FlitArb`, `FlitQueue`, `Router`, `Queue`, `RrArbiter`, `PriorityArbiter`, `MemIfBase`, `DramIf`, `MmioIf`, `Distributor`. If you encounter an RTL module without a soft counterpart, create one and extract the relevant logic.
+Debug controls:
 
-Naming convention: types are `PascalCase`, member functions are `camelCase`, member variables typically end with a trailing underscore (`mc_idx_`, `count_`).
+- `COSIM_VERBOSE=1`: print observed per-port requests.
+- `COSIM_KEEP_GOING=1`: continue after mismatches.
 
-## HARD ↔ SOFT scope mapping (FST waveforms)
+There are `numMC + 1` frontend ports: port 0 is peripheral, and port `1+i` is
+MC `i`.
 
-Useful when comparing HARD vs SOFT scopes in the same trace:
+### Soft NoC alignment invariants
 
-- HARD `system.System.memif_0` = soft `periph` (MmioIf)
-- HARD `system.System.memif_1` = soft `memif0` = MC 0
-- HARD `system.System.memif_2` = soft `memif1` = MC 1
-- HARD `system.System.pu_<N>.*` = soft `soft_pu_<N>.*`
-- Cosim `port=0` = peripheral; `port=1+i` = MC i (so `port=1` ↔ `memif_1` ↔ SOFT memif0).
+- Treat the hard RTL waveform as timing ground truth during an alignment task.
+- Do not modify RTL merely to make the soft model agree. If RTL looks wrong,
+  stop and ask the user.
+- Only undertake alignment as an explicitly approved task. Uncore RTL changes
+  commonly require later soft-model realignment.
+- The soft topology must mirror `Topology.build`: Hilbert numbering, active
+  mesh directions, router port ordering, nearest MC connection, XY routing,
+  cluster boundaries, and ring order.
+- `IndexVector` and most PU-facing soft structures use 1-based indexing.
+- Collect presented core/router values before the posedge. Never read a
+  post-posedge core output and treat it as the value that entered a queue on
+  that same edge.
+- Resolve all ready-valid fires before `step`; keep each component's step atomic.
+- Preserve explicit register boundaries even if collapsing them is functionally
+  equivalent. A one-cycle response-visibility change breaks alignment.
+- Keep soft cores sourced from the system elaboration so configuration cannot
+  silently diverge from the hard backend.
 
-## Memory request ID formats (HARD)
+## Building payloads
 
-- Scalar IDs: `0..63` (bit 7 = 0). Inflight slot index.
-- Scatter/bulk IDs: `0x80 | beat` where `beat = beat_idx % kBulkInflight` (bit 7 = 1).
-- Detection: `id & 0x80` → scatter response; `id & (kBulkInflight - 1)` → beat slot.
+The payload Makefile uses the bare-metal `riscv64-unknown-none-elf-` toolchain.
 
-## Debug env vars (soft side)
+```sh
+# All discovered asm and C single-core tests
+nix develop --command bash -c \
+  "cd /root/workspace/ActiveN/sim/payloads && make all-tests"
 
-- `COSIM_KEEP_GOING=1` — continue past cosim mismatch (no abort)
-- `SOFT_DBG_MEMIF=1` — print memif ALLOC/ISSUE/RESP/EJECT events
-- `SOFT_DBG_ROUTER`, `SOFT_DBG_MMIO`, `SOFT_DBG_PU1`, etc. — module-specific traces
+# Common system tests
+nix develop --command bash -c \
+  "cd /root/workspace/ActiveN/sim/payloads && make sys-tests"
 
-## Debugging tips
+# Targets not included in sys-tests
+nix develop --command bash -c \
+  "cd /root/workspace/ActiveN/sim/payloads && \
+   make sys/csr_scatter_test.bin sys/csr_scatter_dram1.bin sys/snn_main.bin NUM_PU=64"
+```
 
-- Use `--trace --trace-start <cycle>` for traces (works with `--hard`, `--soft`, or cosim). FST can be read with `copilot/tmp/trace_vals` (signal info on stderr, value changes on stdout; pipe `2>&1` to capture both).
-- Add `fprintf(stderr, ...)` debug prints to `soft_backend.cpp` / `soft_components.h` for SOFT-side visibility.
-- The `strings` filter is needed when piping simulator stdout, because Verilator binary output may contain non-printable characters.
-- `nix develop --command bash -c "..."` is required for all build/run commands.
-- Incremental rebuild: `cd sim/build && ninja -j$(nproc)` (no cmake needed).
+Important:
+
+- `NUM_PU` defaults to 16 and is used by `snn_main`; pass the elaborated PU count.
+- `CORE_CNT` defaults to 512 for legacy `test.S`; do not confuse it with current
+  system payload configuration.
+- Single-core assembly tests use RV32IMF; C tests use RV32I and `c/crt0.S`.
+- System tests are linked at `0x80000000` and use custom active-message
+  instructions.
+- System success is a zero write to `0x40000000`. Auxiliary computed values are
+  normally printed through `0x4000000c`.
+
+## System test images
+
+For the current 64-PU/2-MC configuration:
+
+| Test | MC0 image | MC1 image | Suggested limit |
+| --- | --- | --- | ---: |
+| `barrier_test` | `sys/barrier_test.bin` | same | 100,000 |
+| `local_send_test` | `sys/local_send_test.bin` | same | 100,000 |
+| `csr_scatter_test` | `sys/csr_scatter_test.bin` | `sys/csr_scatter_dram1.bin` | 100,000 |
+| `pingpong_test` | `sys/pingpong_test.bin` | same | 500,000 |
+| `random_noc_test` | `sys/random_noc_test.bin` | same | 500,000 |
+| `sha256_concurrent` | `sys/sha256_concurrent.bin` | same | 500,000 |
+| `spm_init` | generated `dram.0` | generated `dram.1` | 1,000,000 |
+| `snn_main` | generated `dram.0` | generated `dram.1` | 20,000,000 |
+
+Example cosim:
+
+```sh
+nix develop --command bash -c \
+  "cd /root/workspace/ActiveN && \
+   sim/build/sim_system --hard --soft \
+     --pu 64 --mc 2 --mc-size 0x100000000 \
+     --max-cycles 100000 \
+     sim/payloads/sys/csr_scatter_test.bin \
+     sim/payloads/sys/csr_scatter_dram1.bin"
+```
+
+Do not pass raw `spm_init.bin` or `snn_main.bin` directly for their full system
+tests. Datagen embeds the executable and data into the per-MC DRAM images.
+
+Prior sessions recorded approximate flat-memory hard/cosim completion cycles for
+the 64-PU/2-MC configuration: barrier 1.2K, local send 0.2K, CSR scatter 1.8K,
+ping-pong 86K, random NoC 51K, SHA-256 48K, SPM init 371K, and SNN 3.81M. Treat
+these as regression hints only; verify current payloads, parameters, and
+simulator source before declaring a mismatch.
+
+## Datagen
+
+Build:
+
+```sh
+nix develop --command bash -c \
+  "cd /root/workspace/ActiveN && cargo build --release --manifest-path datagen/Cargo.toml"
+```
+
+Important arguments:
+
+- `--core-cnt` is required.
+- `--num-mc` defaults to 1.
+- `--spm-size` defaults to 16384.
+- The main generation seed defaults to decimal `19260817`.
+- `--dump-shuffle-seed` independently controls CSR-entry shuffling and requires
+  `--dump`.
+- `--text` embeds a payload in `dram.0`.
+- `--load-nest-nodes`, `--load-nest-conns`, `--sudoku`, `--mnist`, and
+  `--dump-genn` select alternate input/output modes.
+
+Reproducible 64-PU/2-MC SPM-init image:
+
+```sh
+nix develop --command bash -c \
+  "cd /root/workspace/ActiveN && \
+   datagen/target/release/datagen \
+     --core-cnt 64 --num-mc 2 --spm-size 16384 \
+     --pre-simulate 1 --tot-neuron 65344 \
+     --text sim/payloads/sys/spm_init.bin \
+     --dump copilot/tmp/spm_init_dram"
+```
+
+Reproducible shuffled SNN image:
+
+```sh
+nix develop --command bash -c \
+  "cd /root/workspace/ActiveN && \
+   datagen/target/release/datagen \
+     --core-cnt 64 --num-mc 2 --spm-size 16384 \
+     --pre-simulate 1 --tot-neuron 65344 \
+     --text sim/payloads/sys/snn_main.bin \
+     --dump-shuffle-seed 0 \
+     --dump copilot/tmp/snn_shuffle"
+```
+
+DRAM image layout:
+
+- `dram.0` begins with a 16-byte header: jump instruction, SPM-init offset,
+  number of MCs, and number of PUs.
+- It then contains the executable, MC0 CSR data, and the SPM descriptor/data
+  section.
+- Other `dram.N` files begin with 16 zero bytes and then that MC's CSR data.
+- Each CSR row is padded to a 32-byte memory beat because scatter reads have no
+  per-entry validity mask.
+- Each PU SPM image contains neuron state, input, one CSR start offset per MC, a
+  sentinel neuron, and a tail descriptor containing decay, threshold, type,
+  stride, and neuron count.
+- The SNN layout is documented in `doc/snn.md`. Keep datagen, `spm_init`,
+  `snn_init.c`, and `snn_main.S` synchronized when changing it.
+
+## Validation strategy after approved changes
+
+Use the smallest test set that proves the approved change, then expand only as
+needed.
+
+- **Core RTL**: regenerate core and system RTL, rebuild both simulators, run a
+  targeted single-core test, and run at least one representative system test.
+- **Fetch/decode/execute/LSU/FPU**: choose payloads that exercise the changed
+  instruction or path; include `sha256` or FPU tests only when relevant.
+- **NoC/router/BIU**: run `local_send_test`, `pingpong_test`, and
+  `random_noc_test`; use hard mode first and cosim when alignment is in scope.
+- **MemIf/distributor/ring/config ROM**: run `csr_scatter_test` in hard mode and
+  cosim. Add `spm_init` for SPM/DRAM-layout paths.
+- **Soft backend only**: run the corresponding hard workload to establish the
+  waveform, then cosim through completion.
+- **Datagen or SNN payloads**: rebuild datagen and payloads, regenerate images,
+  run `spm_init`, then run the smallest relevant SNN case before the full case.
+- **Simulator frontend or DRAMsim3**: test flat memory first, then
+  `--dram-config sim/mem.cfg` if timing-model code changed.
+
+After any uncore RTL modification, assume soft/hard cycle alignment may have
+changed until cosim proves otherwise.
+
+## Common pitfalls
+
+- Editing code before the user approves the plan violates the repository
+  workflow, even if the requested change appears small.
+- Never obey historical `copilot/` instructions that say to commit after a step.
+  The current rule is never to modify Git history.
+- `README.md`, `scripts/build.sh`, and early `copilot/quickstart.md` contain old
+  `Koneko.run`, `MEOW_*`, `sim_soft`, and `sim_cosim` workflows.
+- Tests live in `sim/payloads/`, not `tests/`.
+- Rebuild generated RTL before rebuilding a simulator after Scala changes.
+- Re-run CMake if the elaborated system configuration changes.
+- Verify the simulator binary is newer than generated RTL when results appear
+  inconsistent.
+- Hard mode rejects CLI parameters that differ from the compiled config.
+- System simulation requires exactly one image per MC.
+- `csr_scatter_test` requires different MC0 and MC1 images.
+- `spm_init` and SNN require datagen-produced images.
+- The payload Makefile's `sys-tests` target does not include CSR scatter or
+  `snn_main`.
+- FPGA examples are Vivado 2018.3 reference archives with generated products
+  and stale absolute paths. Read `fpga/board.md` before reusing them.
+- Soft-model PU containers are often 1-based. Index 0 is not PU1.
+- Do not register the system FST tracer more than once or dump more than once per
+  cycle.
+- Do not compare hard and soft request IDs in cosim.
+- Do not collapse registered timing boundaries in the soft model.
+- Do not change queue sizing or priority rules without reviewing deadlock
+  consequences.
+- Do not assume an implementation TODO or suspicious behavior is permission to
+  fix it; ask the user about intended behavior first.
