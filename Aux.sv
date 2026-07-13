@@ -141,14 +141,21 @@ module FPU (
     .early_valid_o  ( )
   );
 
-  // Output holding register: captures fpnew result when valid, holds it otherwise.
-  // This provides the 1-cycle latency expected by the exec pipeline.
+  // Free-running output register.
+  //
+  // The exec pipeline consumes this value exactly one cycle later and gates the
+  // use with delayedIsFP, so a result captured on a non-FP or invalid cycle is
+  // ignored downstream. Dropping the enable (and the reset) turns r_held into a
+  // plain free-running register, which is the precondition for backward
+  // retiming: with the retiming_backward attribute, Vivado may push this
+  // register into the combinational cvFPU FMA cloud. That splits the long
+  // single-cycle FMA path (operands -> r_held, ~62 logic levels) across the two
+  // register boundaries that already exist in the microarchitecture
+  // (operands -> r_held -> regfile writeback), without adding any latency.
+  (* retiming_backward = 1 *)
   reg [31:0] r_held;
   always_ff @(posedge clock) begin
-    if (reset)
-      r_held <= 32'h0;
-    else if (valid)
-      r_held <= fpnew_result;
+    r_held <= fpnew_result;
   end
   assign r = r_held;
 
