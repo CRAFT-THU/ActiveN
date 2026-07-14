@@ -39,6 +39,7 @@
             llvmPackages.llvm
             bolt_21
             linuxPackages.perf
+            mimalloc
           ];
         };
       }

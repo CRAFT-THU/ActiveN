@@ -13,6 +13,7 @@ option(PGO_USE "Build with PGO optimization (profile use)" OFF)
 set(PGO_PROFILE_DIR "${CMAKE_BINARY_DIR}/pgo-profiles" CACHE STRING "Directory for PGO profile data")
 option(USE_LTO "Enable ThinLTO" OFF)
 option(USE_BOLT "Apply BOLT post-link optimization (instrumentation mode)" ON)
+option(USE_MIMALLOC "Link mimalloc as the global memory allocator" ON)
 
 if(PGO_GENERATE AND PGO_USE)
   message(FATAL_ERROR "Cannot enable both PGO_GENERATE and PGO_USE simultaneously")
@@ -93,6 +94,32 @@ find_package(verilator HINTS $ENV{VERILATOR_ROOT})
 
 find_library(DRAMSIM3 dramsim3)
 
+# ---------------------------------------------------------------------------
+# mimalloc global allocator (static override)
+#
+# The mimalloc docs recommend linking the single mimalloc object file as the
+# FIRST object of the final program for a reliable global override of
+# malloc/free and operator new/delete. Unlike linking the shared library, this
+# does not depend on DT_NEEDED ordering or --as-needed behavior. nix splits
+# mimalloc into dev/non-dev outputs and ships mimalloc.o next to libmimalloc.so
+# in the non-dev output, which find_library resolves; we derive mimalloc.o from
+# that directory (find_package's MIMALLOC_OBJECT_DIR points at the wrong output
+# under nix). Build with -DUSE_MIMALLOC=OFF to use the system allocator.
+# ---------------------------------------------------------------------------
+if(USE_MIMALLOC)
+  find_library(MIMALLOC_SO NAMES mimalloc REQUIRED)
+  get_filename_component(MIMALLOC_LIBDIR "${MIMALLOC_SO}" DIRECTORY)
+  set(MIMALLOC_OBJ "${MIMALLOC_LIBDIR}/mimalloc.o")
+  if(NOT EXISTS "${MIMALLOC_OBJ}")
+    message(FATAL_ERROR "USE_MIMALLOC=ON but mimalloc.o not found at ${MIMALLOC_OBJ}")
+  endif()
+  set_source_files_properties(${MIMALLOC_OBJ} PROPERTIES
+    EXTERNAL_OBJECT TRUE GENERATED FALSE)
+  message(STATUS "mimalloc: static override via first-object ${MIMALLOC_OBJ}")
+else()
+  set(MIMALLOC_OBJ "")
+endif()
+
 # Generated RTL directories
 set(GENERATED_CORE_DIR ${CMAKE_SOURCE_DIR}/../generated/core)
 set(GENERATED_SYSTEM_DIR ${CMAKE_SOURCE_DIR}/../generated/system)
@@ -163,6 +190,7 @@ set_source_files_properties(src/devices.cpp PROPERTIES
 
 # Single-core simulation driver (no DRAM dependency)
 add_executable(sim_single
+    ${MIMALLOC_OBJ}
     src/single.cpp
     src/devices.cpp
 )
@@ -241,6 +269,7 @@ verilate(
 
 # Unified binary: sim_system --soft / --hard / --soft --hard (cosim)
 add_executable(sim_system
+  ${MIMALLOC_OBJ}
   src/system.cpp
   src/devices.cpp
 )
@@ -251,6 +280,7 @@ target_link_libraries(sim_system PRIVATE
   hard_backend_lib
   ${DRAMSIM3}
 )
+
 apply_bolt(sim_system "${BOLT_MULTI_PAYLOAD}" "${BOLT_MULTI_CYCLES}"
   "--soft" "--hard" "--pu" "${SYSTEM_NUM_PU}" "--mc" "${SYSTEM_NUM_MC}"
   "--mc-size" "${SYSTEM_MC_SIZE_0}"

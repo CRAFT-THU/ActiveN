@@ -99,6 +99,8 @@ struct FixedLenQueue {
   }
 };
 
+// TODO: align as 32 bytes
+// TODO: buffer prio because we actually has the extra space
 struct Flit {
   uint16_t src;
   uint16_t dst;
