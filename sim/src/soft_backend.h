@@ -271,6 +271,64 @@ class SoftSystemBackend : public SystemBackend {
 
   // Parallelism
   size_t numThreads = 8; // Overridden by the ctor's threads parameter.
+
+  enum class WorkProfilePhase : uint8_t {
+    StageStart,
+    StagePresented,
+    StageDone,
+    StepStart,
+    StepDone,
+    Count,
+  };
+
+  enum class WorkProfileUnit : uint8_t {
+    Stats,
+    PeekMC,
+    AcceptPeriph,
+    AcceptMC,
+    StepPeriph,
+    StepMC,
+    RingUpdate,
+    RingProgress,
+  };
+
+  static constexpr size_t WORK_PROFILE_SAMPLE_PERIOD = 256;
+  static constexpr size_t WORK_PROFILE_PHASE_COUNT =
+      static_cast<size_t>(WorkProfilePhase::Count);
+
+  // Each thread writes only its own slot. The leader reads all slots after the
+  // corresponding barrier, whose acquire/release ordering publishes them.
+  struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) WorkProfileThreadTimes {
+    std::array<uint64_t, WORK_PROFILE_PHASE_COUNT> local_done{};
+    std::array<uint64_t, WORK_PROFILE_PHASE_COUNT> barrier_arrival{};
+  };
+
+  struct WorkProfilePhaseSample {
+    uint64_t cycle;
+    WorkProfilePhase phase;
+    uint64_t local_spread_ns;
+    uint64_t worker_spread_ns;
+    uint64_t leader_extra_ns;
+    uint64_t arrival_spread_ns;
+    uint64_t critical_extension_ns;
+  };
+
+  struct WorkProfileUnitSample {
+    uint64_t cycle;
+    WorkProfilePhase phase;
+    WorkProfileUnit unit;
+    uint16_t index;
+    uint64_t duration_ns;
+  };
+
+  static_assert(alignof(WorkProfileThreadTimes) >=
+                DESTRUCTIVE_INTERFERENCE_SIZE);
+
+  bool workProfileEnabled = false;
+  std::vector<WorkProfileThreadTimes> workProfileTimes;
+  std::vector<WorkProfilePhaseSample> workProfilePhaseSamples;
+  std::vector<WorkProfileUnitSample> workProfileUnitSamples;
+
   std::atomic_bool halted = false;
   SpinBarrier stageStart, stagePresented, stageDone;
   SpinBarrier stepStart, stepDone;
@@ -293,6 +351,16 @@ class SoftSystemBackend : public SystemBackend {
 
   // Per-cycle stat accumulation. Called at the end of stage()/step().
   void accumulateStats();
+
+  static uint64_t workProfileNowNs();
+  bool workProfileSampleCycle(uint64_t cycle) const;
+  void workProfileMark(size_t threadId, WorkProfilePhase phase,
+                       uint64_t localDone, uint64_t barrierArrival);
+  void workProfileRecordPhase(uint64_t cycle, WorkProfilePhase phase);
+  void workProfileRecordUnit(uint64_t cycle, WorkProfilePhase phase,
+                             WorkProfileUnit unit, size_t index,
+                             uint64_t duration);
+  void printWorkProfile() const;
 
   void stageWorkPresent(size_t threadId);
   void stageWorkAccept(size_t threadId);
