@@ -4,6 +4,8 @@
 #include <concepts>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <array>
 #include <type_traits>
 #include <optional>
 #include <span>
@@ -171,7 +173,7 @@ template<WithPrio T, std::size_t N_DEPTH>
 class FlitQueue {
   // We use a uint64_t as occupancy bitmask — N_DEPTH must be < 64
   static_assert(N_DEPTH < 64, "N_DEPTH must be < 64 (uint64_t bitmask limit)");
-  T buffer[N_DEPTH];
+  std::unique_ptr<T> buffer[N_DEPTH];
   uint64_t occupied = 0;
 
   // Every cycle, the invoker should first peek & ask if it can enqueue,
@@ -188,7 +190,7 @@ public:
     uint64_t remaining = occupied & (occupied - 1);
     while (remaining != 0) {
       size_t idx = std::countr_zero(remaining);
-      if (buffer[idx].prio() < buffer[returning].prio()) {
+      if (buffer[idx]->prio() < buffer[returning]->prio()) {
         returning = idx;
       }
       remaining = remaining & (remaining - 1);
@@ -197,7 +199,7 @@ public:
     return { returning };
   }
 
-  const T& operator[](size_t idx) const {
+  const std::unique_ptr<T>& operator[](size_t idx) const {
     return buffer[idx];
   }
 
@@ -216,21 +218,40 @@ public:
     return space > prio;
   }
 
-  // Atomically enqueue a item, and also dequeue the selected item if it's accepted
-  void step(std::optional<T> enq, std::optional<size_t> deq) {
-    if constexpr (ASSERTIONS_ENABLED) {
-      if (enq.has_value() && !canEnq(enq->prio())) throw std::runtime_error("queue overflow");
-      if (deq.has_value() && !(occupied & (1ull << *deq))) throw std::runtime_error("deq slot is not occupied");
-    }
-
-    // Select lowest zero, may be undefined if queue is full
-    size_t enq_idx = std::countr_one(occupied);
-    if (deq.has_value()) occupied &= ~(1ull << *deq);
-    if (enq.has_value()) {
-      buffer[enq_idx] = *enq;
-      occupied |= (1ull << enq_idx);
-    }
+  std::optional<size_t> firstFreeSlot() const {
+    size_t idx = std::countr_one(occupied);
+    if (idx == N_DEPTH) return std::nullopt;
+    return idx;
   }
+
+  std::unique_ptr<T> take(size_t idx) {
+    if constexpr (ASSERTIONS_ENABLED) {
+      if (!(occupied & (1ull << idx))) throw std::runtime_error("take slot is not occupied");
+      if (!buffer[idx]) throw std::runtime_error("take slot was already moved");
+    }
+    return std::move(buffer[idx]);
+  }
+
+  void place(size_t idx, std::unique_ptr<T> value) {
+    if constexpr (ASSERTIONS_ENABLED) {
+      if (!value) throw std::runtime_error("placing a null value");
+      if (occupied & (1ull << idx)) throw std::runtime_error("place slot is occupied");
+      if (buffer[idx]) throw std::runtime_error("place slot already contains a value");
+    }
+    buffer[idx] = std::move(value);
+  }
+
+  void commit(std::optional<size_t> deq, std::optional<size_t> enq) {
+    if (deq) occupied &= ~(1ull << *deq);
+    if (enq) occupied |= 1ull << *enq;
+  }
+};
+
+struct RouterOutputToken {
+  uint8_t input;
+  uint8_t slot;
+  uint8_t output;
+  uint8_t prio;
 };
 
 // A routing table is a function that spits out a
@@ -243,6 +264,7 @@ class Router : std::is_invocable_r<size_t, RT, size_t> {
   std::vector<FlitArb> _output_arbs;
   // Scratch for Router::step (pre-allocated to _num_inputs).
   std::vector<std::optional<size_t>> _input_deqs_scratch;
+  std::vector<std::optional<size_t>> _input_enqs;
 
 private:
   std::optional<std::pair<size_t, size_t>> peek_iq_slot(size_t o_port) const __attribute__((always_inline)) {
@@ -253,7 +275,7 @@ private:
       auto slot = q.peekIdx();
       if (!slot.has_value()) return std::nullopt;
 
-      const Flit &flit = q[slot.value()];
+      const Flit &flit = *q[slot.value()];
       // Query routing table
       size_t fwd_to = _tbl(flit.dst);
       if (fwd_to != o_port) return std::nullopt;
@@ -270,58 +292,75 @@ private:
   }
 
 public:
+  static constexpr size_t MAX_PORTS = 6;
+  using OutputTokens = std::array<std::optional<RouterOutputToken>, MAX_PORTS>;
+
   Router() : _num_inputs(0), _num_outputs(0) {}
 
   Router(RT tbl, size_t num_inputs, size_t num_outputs) : _tbl(tbl), _num_inputs(num_inputs), _num_outputs(num_outputs) {
     _input_queues.resize(num_inputs);
     _input_deqs_scratch.assign(num_inputs, std::nullopt);
+    _input_enqs.assign(num_inputs, std::nullopt);
     for (size_t i = 0; i < num_outputs; ++i)
       // There are num_inputs queues
       _output_arbs.emplace_back(num_inputs);
   }
 
-  // Peek ports
-  std::optional<Flit> peek(size_t o_port) const {
+  std::optional<RouterOutputToken> peekToken(size_t o_port) const {
     auto selected = peek_iq_slot(o_port);
     if (!selected.has_value()) return std::nullopt;
     auto [iq, slot] = *selected;
-    return _input_queues[iq][slot];
+    return RouterOutputToken {
+      .input = static_cast<uint8_t>(iq),
+      .slot = static_cast<uint8_t>(slot),
+      .output = static_cast<uint8_t>(o_port),
+      .prio = _input_queues[iq][slot]->prio(),
+    };
   }
 
-  bool canEnq(size_t i_port, uint8_t prio) const {
+  const Flit *peek(const RouterOutputToken &token) const {
+    return _input_queues[token.input][token.slot].get();
+  }
+
+  bool prepareEnq(size_t i_port, std::optional<uint8_t> prio) {
+    auto &reservation = _input_enqs[i_port];
+    reservation = std::nullopt;
+    if (!prio.has_value()) return false;
+
     const auto &q = _input_queues[i_port];
-    return q.canEnq(prio);
+    if (!q.canEnq(*prio)) return false;
+    reservation = q.firstFreeSlot();
+    return true;
   }
 
-  template<typename FE, typename FD>
-  void step(FE enqs, FD deq_accepts)
-    requires(std::is_invocable_r_v<std::optional<Flit>, FE, size_t> && std::is_invocable_r_v<bool, FD, size_t>)
-    __attribute__((always_inline))
-  {
-    // Reverse-tracing the dequeue signal for each input queue.
-    // Reuse pre-allocated scratch buffer; reset values only.
+  std::unique_ptr<Flit> take(const RouterOutputToken &token) {
+    return _input_queues[token.input].take(token.slot);
+  }
+
+  void place(size_t i_port, std::unique_ptr<Flit> flit) {
+    if constexpr (ASSERTIONS_ENABLED) {
+      if (!_input_enqs[i_port]) throw std::runtime_error("place without a reserved input slot");
+    }
+    _input_queues[i_port].place(*_input_enqs[i_port], std::move(flit));
+  }
+
+  void step(const OutputTokens &accepted) {
     auto &input_deqs = _input_deqs_scratch;
     std::fill(input_deqs.begin(), input_deqs.end(), std::nullopt);
-
-    for (size_t o = 0; o < _num_outputs; ++o)
-      if (deq_accepts(o)) {
-        auto selected = peek_iq_slot(o);
-        if constexpr (ASSERTIONS_ENABLED) {
-          if (!selected.has_value()) throw std::runtime_error("deq_accepts is true but peek_iq_slot returns nullopt");
-        }
-        auto [iq, slot] = *selected;
-        if constexpr (ASSERTIONS_ENABLED) {
-          if (input_deqs[iq].has_value()) throw std::runtime_error("one flit routed to multiple output ports");
-        }
-        input_deqs[iq] = slot;
-
-        // Update arbiter
-        _output_arbs[o].commit(iq);
+    for (size_t o = 0; o < _num_outputs; ++o) {
+      if (!accepted[o]) continue;
+      const auto &token = *accepted[o];
+      if constexpr (ASSERTIONS_ENABLED) {
+        if (token.output != o) throw std::runtime_error("accepted token has wrong output");
+        if (input_deqs[token.input]) throw std::runtime_error("one flit routed to multiple output ports");
       }
-
-    // Update input queues
-    for (size_t i = 0; i < _num_inputs; ++i)
-      _input_queues[i].step(enqs(i), input_deqs[i]);
+      input_deqs[token.input] = token.slot;
+      _output_arbs[o].commit(token.input);
+    }
+    for (size_t i = 0; i < _num_inputs; ++i) {
+      _input_queues[i].commit(input_deqs[i], _input_enqs[i]);
+      _input_enqs[i] = std::nullopt;
+    }
   }
 
   size_t totalFlits() const {

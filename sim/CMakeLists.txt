@@ -115,6 +115,8 @@ if(USE_MIMALLOC)
   endif()
   set_source_files_properties(${MIMALLOC_OBJ} PROPERTIES
     EXTERNAL_OBJECT TRUE GENERATED FALSE)
+  # mimalloc.o (linked first) already provides operator new/delete overrides
+  # that route straight to mi_new/mi_free, so no C++ header include is needed.
   message(STATUS "mimalloc: static override via first-object ${MIMALLOC_OBJ}")
 else()
   set(MIMALLOC_OBJ "")

@@ -311,11 +311,11 @@ protected:
 public:
   template<typename FI>
   std::optional<uint8_t> nocAcceptMultiple(FI flits) const
-  requires(std::is_invocable_r_v<const std::optional<Flit>&, FI, size_t>)
+  requires(std::is_invocable_r_v<const Flit*, FI, size_t>)
   __attribute__((always_inline)) {
     // Iterate through all request ports
     auto selected = reqArb.peek([&flits](size_t idx) __attribute__((always_inline)) -> std::optional<uint8_t> {
-      auto &flit = flits(idx);
+      const Flit *flit = flits(idx);
       if (!flit) return std::nullopt;
       return flit->prio();
     });

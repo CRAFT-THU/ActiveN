@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -171,20 +172,42 @@ class SoftSystemBackend : public SystemBackend {
   };
 
  private:
-  template<typename T>
-  struct ReadyValidPair {
-    std::optional<T> presenting;
-    bool accepting;
+  // Router-facing ready-valid link. The token identifies the source queue slot;
+  // the destination uses it to move ownership directly during commit.
+  struct PrioLink {
+    std::optional<RouterOutputToken> presenting;
+    bool accepting = false;
+  };
+
+  struct CoreInjectLink {
+    std::optional<uint8_t> presenting;
+    bool accepting = false;
+  };
+
+  // Eject to the local core: the full flit is borrowed from the router's own
+  // queue to drive ext_in during stage (same thread). No xfer -- the core
+  // captures the data at stage and the router pops+discards at step.
+  struct EjectLink {
+    std::optional<RouterOutputToken> presenting;
+    bool accepting = false;
+  };
+
+  // Eject to a memif (cross-thread: routers run on workers, memif on the
+  // leader). The token identifies the source slot; presenting is its stage-only
+  // borrow for nocCanAccept.
+  struct MemifEject {
+    std::optional<RouterOutputToken> token;
+    const Flit *presenting = nullptr;
   };
 
   // Per-router buffered ready-valid state, populated during stage().
   struct LinkBuffer {
-    ReadyValidPair<Flit> core_inject;
-    ReadyValidPair<Flit> core_eject;
+    CoreInjectLink core_inject;
+    EjectLink core_eject;
     // forwards[o] is *this router's egress* on link slot o (output
     // port o+1). To read the ingress data, the router reads its peer's
     // forward buffer for the corresponding slot.
-    std::array<ReadyValidPair<Flit>, 4> forwards;
+    std::array<PrioLink, 4> forwards;
   };
 
   // Per-router static topology: for each forward link slot, the remote
@@ -223,7 +246,7 @@ class SoftSystemBackend : public SystemBackend {
   IndexVector<std::unique_ptr<soft_rtl>> cores;
   soft_mem::Ringbus ring;
 
-  std::vector<std::vector<std::optional<Flit>>> memif_eject;
+  std::vector<std::vector<MemifEject>> memif_eject;
   std::vector<std::optional<uint8_t>> memif_eject_accept;
   std::vector<MemBusIn> memif_ext;
   std::vector<bool> memif_ring_accept;
@@ -270,17 +293,10 @@ class SoftSystemBackend : public SystemBackend {
   // Per-cycle stat accumulation. Called at the end of stage()/step().
   void accumulateStats();
 
-  std::optional<std::pair<std::reference_wrapper<const Flit>, uint8_t>>
-  memifAcceptedEject(size_t memifIdx) __attribute__((always_inline)) {
-    if (!memif_eject_accept[memifIdx]) return std::nullopt;
-    uint8_t accept = *memif_eject_accept[memifIdx];
-    const Flit &f = *memif_eject[memifIdx][accept];
-    return {{ f, accept }};
-  }
-
   void stageWorkPresent(size_t threadId);
   void stageWorkAccept(size_t threadId);
   void stepWork(size_t threadId);
+  void stepCleanup(size_t threadId);
   void worker(size_t threadId);
 
   std::pair<size_t, size_t> puWorkRange(size_t threadId) const {
