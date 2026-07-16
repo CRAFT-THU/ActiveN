@@ -534,15 +534,15 @@ void SoftSystemBackend::stageWorkPresent(size_t threadId) {
 
   // Populate presented data on all router-facing ready-valid interfaces.
   for (uint16_t i = puStart; i < puEnd; ++i)
-    routers[i].buf.core_inject.presenting = peekCoreInjectPrio(*cores[i]);
+    routers[i].buf.presenting.core_inject = peekCoreInjectPrio(*cores[i]);
 
   for (uint16_t i = puStart; i < puEnd; ++i) {
     auto &router = routers[i];
     const size_t nf = router.links.num_forwards;
     // Output ports: 0..nf-1 = forward egress; nf = core_eject; nf+1 = memif.
     for (size_t o = 0; o < nf; ++o)
-      router.buf.forwards[o].presenting = router.rt.peekToken(o);
-    router.buf.core_eject.presenting = router.rt.peekToken(nf);
+      router.buf.presenting.forwards[o] = router.rt.peekToken(o);
+    router.buf.presenting.core_eject = router.rt.peekToken(nf);
     if (router.links.memif) {
       auto &eject = memif_eject[router.links.memif->first][router.links.memif->second];
       eject.token = router.rt.peekToken(nf + 1);
@@ -554,21 +554,19 @@ void SoftSystemBackend::stageWorkPresent(size_t threadId) {
 void SoftSystemBackend::stageWorkAccept(size_t threadId) {
   auto [puStart, puEnd] = puWorkRange(threadId);
 
-  // Generate accepting signals. Each router's egress is buffered on the
-  // PEER's forward[port_idx]; we drive that buffer's `accepting` from
-  // the local router's canEnq.
+  // Generate accepting signals in the destination router's cache-line-owned
+  // block. The source token remains in the peer's presentation block.
   for (uint16_t i = puStart; i < puEnd; ++i) {
     auto &local = routers[i];
     const size_t nf = local.links.num_forwards;
     // Input ports: 0..nf-1 = forward ingress; nf = core_inject.
-    local.buf.core_inject.accepting =
-        local.rt.prepareEnq(nf, local.buf.core_inject.presenting);
+    local.buf.accepting.core_inject =
+        local.rt.prepareEnq(nf, local.buf.presenting.core_inject);
     for (size_t o = 0; o < nf; ++o) {
       auto [from, port] = *local.links.forwards[o];
-      auto &remote = routers[from];
-      auto &remoteBuf = remote.buf.forwards[port];
-      remoteBuf.accepting = local.rt.prepareEnq(
-          o, remoteBuf.presenting ? std::optional<uint8_t>(remoteBuf.presenting->prio) : std::nullopt);
+      const auto &remoteToken = routers[from].buf.presenting.forwards[port];
+      local.buf.accepting.forwards[o] = local.rt.prepareEnq(
+          o, remoteToken ? std::optional<uint8_t>(remoteToken->prio) : std::nullopt);
     }
   }
 
@@ -576,11 +574,11 @@ void SoftSystemBackend::stageWorkAccept(size_t threadId) {
   // from the cores are read post-eval (after combinational settle).
   for (uint16_t i = puStart; i < puEnd; ++i) {
     auto &router = routers[i];
-    const Flit *core_eject = router.buf.core_eject.presenting
-        ? router.rt.peek(*router.buf.core_eject.presenting) : nullptr;
+    const Flit *core_eject = router.buf.presenting.core_eject
+        ? router.rt.peek(*router.buf.presenting.core_eject) : nullptr;
     presentCoreEject(*cores[i], i, core_eject);
     presentCoreMem(*cores[i], core_mem[i]);
-    cores[i]->ext_out_ready = routers[i].buf.core_inject.accepting;
+    cores[i]->ext_out_ready = router.buf.accepting.core_inject;
     cores[i]->clock = false; // negedge
   }
   auto v0 = std::chrono::high_resolution_clock::now();
@@ -592,8 +590,8 @@ void SoftSystemBackend::stageWorkAccept(size_t threadId) {
   g_soft_verilator_ns +=
       std::chrono::duration_cast<std::chrono::nanoseconds>(v1 - v0).count();
   for (uint16_t i = puStart; i < puEnd; ++i) {
-    routers[i].buf.core_eject.accepting =
-        routers[i].buf.core_eject.presenting.has_value() &&
+    routers[i].buf.accepting.core_eject =
+        routers[i].buf.presenting.core_eject.has_value() &&
         cores[i]->ext_in_ready;
     core_mem_accept[i].unicast = cores[i]->mem_unicast_valid;
     core_mem_accept[i].broadcast =
@@ -695,7 +693,7 @@ void SoftSystemBackend::stepWork(size_t threadId) {
   auto v0 = std::chrono::high_resolution_clock::now();
   for (size_t i = puStart; i < puEnd; ++i) {
     auto &router = routers[i];
-    if (router.buf.core_inject.accepting)
+    if (router.buf.accepting.core_inject)
       router.rt.place(router.links.num_forwards,
           std::make_unique<Flit>(peekCoreInjectFlit(*cores[i], static_cast<uint16_t>(i))));
 
@@ -718,12 +716,12 @@ void SoftSystemBackend::stepWork(size_t threadId) {
     const size_t nf = links.num_forwards;
     for (size_t k = 0; k < nf; ++k) {
       auto [from, port] = *links.forwards[k];
-      auto &remoteBuf = routers[from].buf.forwards[port];
-      if (remoteBuf.accepting)
-        router.rt.place(k, routers[from].rt.take(*remoteBuf.presenting));
+      const auto &remoteToken = routers[from].buf.presenting.forwards[port];
+      if (router.buf.accepting.forwards[k])
+        router.rt.place(k, routers[from].rt.take(*remoteToken));
     }
-    if (router.buf.core_eject.accepting)
-      (void)router.rt.take(*router.buf.core_eject.presenting);
+    if (router.buf.accepting.core_eject)
+      (void)router.rt.take(*router.buf.presenting.core_eject);
   }
 }
 
@@ -733,9 +731,12 @@ void SoftSystemBackend::stepCleanup(size_t threadId) {
     auto &router = routers[i];
     const size_t nf = router.links.num_forwards;
     Router<RouteFn, ROUTER_Q_DEPTH>::OutputTokens accepted{};
-    for (size_t o = 0; o < nf; ++o)
-      if (router.buf.forwards[o].accepting) accepted[o] = router.buf.forwards[o].presenting;
-    if (router.buf.core_eject.accepting) accepted[nf] = router.buf.core_eject.presenting;
+    for (size_t o = 0; o < nf; ++o) {
+      auto [to, port] = *router.links.forwards[o];
+      if (routers[to].buf.accepting.forwards[port])
+        accepted[o] = router.buf.presenting.forwards[o];
+    }
+    if (router.buf.accepting.core_eject) accepted[nf] = router.buf.presenting.core_eject;
     if (router.links.memif &&
         std::make_optional(router.links.memif->second) == memif_eject_accept[router.links.memif->first])
       accepted[nf + 1] = memif_eject[router.links.memif->first][router.links.memif->second].token;
@@ -759,8 +760,8 @@ void SoftSystemBackend::accumulateStats() {
     inflight_msgs += r.rt.totalFlits();
     // Core inject: an injection means a flit transferred from the PU
     // into the local router this cycle.
-    if (r.buf.core_inject.presenting) {
-      if (r.buf.core_inject.accepting) {
+    if (r.buf.presenting.core_inject) {
+      if (r.buf.accepting.core_inject) {
         ++hops;
         ++injections;
       } else {
@@ -768,12 +769,13 @@ void SoftSystemBackend::accumulateStats() {
       }
     }
     // Core eject: flit delivered to the local PU.
-    if (r.buf.core_eject.presenting && r.buf.core_eject.accepting) ++hops;
+    if (r.buf.presenting.core_eject && r.buf.accepting.core_eject) ++hops;
     // Forward links: each is a possible egress lane this cycle.
     for (size_t o = 0; o < 4 && r.links.forwards[o]; ++o) {
-      const auto &fwd = r.buf.forwards[o];
-      if (fwd.presenting) {
-        if (fwd.accepting) ++hops;
+      const auto &fwd = r.buf.presenting.forwards[o];
+      if (fwd) {
+        auto [to, port] = *r.links.forwards[o];
+        if (routers[to].buf.accepting.forwards[port]) ++hops;
         else ++blocked;
       } else {
         ++idle_lanes;
@@ -781,7 +783,7 @@ void SoftSystemBackend::accumulateStats() {
     }
     // A core is "idle" this cycle if it has nothing to inject and
     // nothing being delivered to it.
-    if (!r.buf.core_inject.presenting && !r.buf.core_eject.presenting)
+    if (!r.buf.presenting.core_inject && !r.buf.presenting.core_eject)
       ++idle_cores;
   }
 

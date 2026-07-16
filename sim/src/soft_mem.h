@@ -429,15 +429,18 @@ class DRAMIf : public MemIf {
   }
 
 public:
-  struct PUResp {
+  struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) PUResp {
     std::optional<std::pair<uint16_t, MemLine>> unicast;
     std::optional<BcastLine> bcast;
   };
 
-  struct PUAccept {
+  struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) PUAccept {
     bool unicast; // Right now, PU unconditionally accepts unicast. The ringbus impl depends on this. TODO: add a assertion
     bool broadcast;
   };
+
+  static_assert(alignof(PUResp) >= DESTRUCTIVE_INTERFERENCE_SIZE);
+  static_assert(alignof(PUAccept) >= DESTRUCTIVE_INTERFERENCE_SIZE);
 
   size_t numClusters() const {
     return (puEnd - puStart) / CLUSTER_SIZE;

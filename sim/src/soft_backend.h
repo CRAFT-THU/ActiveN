@@ -9,7 +9,6 @@
 #include <optional>
 #include <utility>
 #include <vector>
-#include <barrier>
 #include <thread>
 
 #include <verilated_fst_c.h>
@@ -18,6 +17,7 @@
 #include "soft_components.h"
 #include "soft_mem.h"
 #include "system.h"
+#include "util.h"
 
 // Toggle verbose soft-model logging. (Member function — see
 // SoftSystemBackend::setLogging.)
@@ -172,43 +172,42 @@ class SoftSystemBackend : public SystemBackend {
   };
 
  private:
-  // Router-facing ready-valid link. The token identifies the source queue slot;
-  // the destination uses it to move ownership directly during commit.
-  struct PrioLink {
-    std::optional<RouterOutputToken> presenting;
-    bool accepting = false;
-  };
-
-  struct CoreInjectLink {
-    std::optional<uint8_t> presenting;
-    bool accepting = false;
-  };
-
-  // Eject to the local core: the full flit is borrowed from the router's own
-  // queue to drive ext_in during stage (same thread). No xfer -- the core
-  // captures the data at stage and the router pops+discards at step.
-  struct EjectLink {
-    std::optional<RouterOutputToken> presenting;
-    bool accepting = false;
-  };
-
   // Eject to a memif (cross-thread: routers run on workers, memif on the
   // leader). The token identifies the source slot; presenting is its stage-only
   // borrow for nocCanAccept.
-  struct MemifEject {
+  struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) MemifEject {
     std::optional<RouterOutputToken> token;
     const Flit *presenting = nullptr;
   };
 
-  // Per-router buffered ready-valid state, populated during stage().
-  struct LinkBuffer {
-    CoreInjectLink core_inject;
-    EjectLink core_eject;
-    // forwards[o] is *this router's egress* on link slot o (output
-    // port o+1). To read the ingress data, the router reads its peer's
-    // forward buffer for the corresponding slot.
-    std::array<PrioLink, 4> forwards;
+  // Source-owned values presented by this router. Forward tokens identify the
+  // source queue slots that destination routers move during commit.
+  struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) LinkPresentBuffer {
+    std::optional<uint8_t> core_inject;
+    std::optional<RouterOutputToken> core_eject;
+    std::array<std::optional<RouterOutputToken>, 4> forwards;
   };
+
+  // Destination-owned acceptance state. forwards[o] corresponds to this
+  // router's forward input o, keeping every write in the destination's block.
+  struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) LinkAcceptBuffer {
+    bool core_inject = false;
+    bool core_eject = false;
+    std::array<bool, 4> forwards{};
+  };
+
+  // Keep each router's link state isolated from adjacent routers. The two
+  // sub-buffers are independently aligned because different phases transfer
+  // ownership of their cache lines between different threads.
+  struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) LinkBuffer {
+    LinkPresentBuffer presenting;
+    LinkAcceptBuffer accepting;
+  };
+
+  static_assert(alignof(MemifEject) >= DESTRUCTIVE_INTERFERENCE_SIZE);
+  static_assert(alignof(LinkPresentBuffer) >= DESTRUCTIVE_INTERFERENCE_SIZE);
+  static_assert(alignof(LinkAcceptBuffer) >= DESTRUCTIVE_INTERFERENCE_SIZE);
+  static_assert(alignof(LinkBuffer) >= DESTRUCTIVE_INTERFERENCE_SIZE);
 
   // Per-router static topology: for each forward link slot, the remote
   // PU id and the remote port index (0-based, indexes the remote's
@@ -225,7 +224,7 @@ class SoftSystemBackend : public SystemBackend {
   using RouteFn = decltype(std::declval<Topology>().routingTableFor(
       0, std::declval<const Topology::DirectionToLinkIdx &>(), 0, std::nullopt));
 
-  struct WrappedRouter {
+  struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) WrappedRouter {
     LinkStatus links;
     LinkBuffer buf;
     Router<RouteFn, ROUTER_Q_DEPTH> rt;
@@ -233,6 +232,8 @@ class SoftSystemBackend : public SystemBackend {
     WrappedRouter(LinkStatus l, RouteFn tbl, size_t num_in, size_t num_out)
       : links(std::move(l)), buf{}, rt(std::move(tbl), num_in, num_out) {}
   };
+
+  static_assert(alignof(WrappedRouter) >= DESTRUCTIVE_INTERFERENCE_SIZE);
 
   SystemConfig cfg;
 
@@ -271,8 +272,8 @@ class SoftSystemBackend : public SystemBackend {
   // Parallelism
   size_t numThreads = 8; // Overridden by the ctor's threads parameter.
   std::atomic_bool halted = false;
-  std::barrier<> stageStart, stagePresented, stageDone;
-  std::barrier<> stepStart, stepDone;
+  SpinBarrier stageStart, stagePresented, stageDone;
+  SpinBarrier stepStart, stepDone;
   bool resetReleaseNow;
   std::vector<std::thread> workers; // Should be numThreads - 1
 
