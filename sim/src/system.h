@@ -4,12 +4,13 @@
 #include <cwchar>
 #include <optional>
 #include <cstdint>
+#include <string>
 #include <vector>
 #include <string_view>
 #include <memory>
 #include <array>
 
-static const bool ASSERTIONS_ENABLED = true;
+static const bool ASSERTIONS_ENABLED = false;
 
 // System-level simulators
 
@@ -153,8 +154,8 @@ public:
 };
 
 struct DRAMsim3Config {
-  std::string_view configFile;
-  std::string_view workDir;
+  std::string configFile;
+  std::string workDir;
 };
 
 class VerilatedFstC;
