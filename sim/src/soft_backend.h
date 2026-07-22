@@ -172,42 +172,27 @@ class SoftSystemBackend : public SystemBackend {
   };
 
  private:
-  // Eject to a memif (cross-thread: routers run on workers, memif on the
-  // leader). The token identifies the source slot; presenting is its stage-only
-  // borrow for nocCanAccept.
-  struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) MemifEject {
+  // The leader resolves MemIf ejections directly from their source routers.
+  // Retain the token so the selected flit can be moved during commit.
+  struct MemifEject {
     std::optional<RouterOutputToken> token;
-    const Flit *presenting = nullptr;
   };
 
-  // Source-owned values presented by this router. Forward tokens identify the
-  // source queue slots that destination routers move during commit.
-  struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) LinkPresentBuffer {
-    std::optional<uint8_t> core_inject;
-    std::optional<RouterOutputToken> core_eject;
-    std::array<std::optional<RouterOutputToken>, 4> forwards;
+  // A router's owner resolves all of its incoming transfers directly from the
+  // committed source queues. Tokens remain valid until the following step.
+  struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) LinkDecisionBuffer {
+    std::optional<uint8_t> core_inject_presenting;
+    bool core_inject_accepting = false;
+    std::optional<RouterOutputToken> core_eject_presenting;
+    bool core_eject_accepting = false;
+    std::array<std::optional<RouterOutputToken>, 4> forward_presenting;
+    std::array<bool, 4> forward_accepting{};
   };
 
-  // Destination-owned acceptance state. forwards[o] corresponds to this
-  // router's forward input o, keeping every write in the destination's block.
-  struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) LinkAcceptBuffer {
-    bool core_inject = false;
-    bool core_eject = false;
-    std::array<bool, 4> forwards{};
-  };
-
-  // Keep each router's link state isolated from adjacent routers. The two
-  // sub-buffers are independently aligned because different phases transfer
-  // ownership of their cache lines between different threads.
-  struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) LinkBuffer {
-    LinkPresentBuffer presenting;
-    LinkAcceptBuffer accepting;
-  };
-
-  static_assert(alignof(MemifEject) >= DESTRUCTIVE_INTERFERENCE_SIZE);
-  static_assert(alignof(LinkPresentBuffer) >= DESTRUCTIVE_INTERFERENCE_SIZE);
-  static_assert(alignof(LinkAcceptBuffer) >= DESTRUCTIVE_INTERFERENCE_SIZE);
-  static_assert(alignof(LinkBuffer) >= DESTRUCTIVE_INTERFERENCE_SIZE);
+  static_assert(alignof(LinkDecisionBuffer) >=
+                DESTRUCTIVE_INTERFERENCE_SIZE);
+  static_assert(sizeof(LinkDecisionBuffer) %
+                    DESTRUCTIVE_INTERFERENCE_SIZE == 0);
 
   // Per-router static topology: for each forward link slot, the remote
   // PU id and the remote port index (0-based, indexes the remote's
@@ -226,7 +211,7 @@ class SoftSystemBackend : public SystemBackend {
 
   struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) WrappedRouter {
     LinkStatus links;
-    LinkBuffer buf;
+    LinkDecisionBuffer buf;
     Router<RouteFn, ROUTER_Q_DEPTH> rt;
 
     WrappedRouter(LinkStatus l, RouteFn tbl, size_t num_in, size_t num_out)
@@ -274,7 +259,6 @@ class SoftSystemBackend : public SystemBackend {
 
   enum class WorkProfilePhase : uint8_t {
     StageStart,
-    StagePresented,
     StageDone,
     StepStart,
     StepDone,
@@ -292,15 +276,29 @@ class SoftSystemBackend : public SystemBackend {
     RingProgress,
   };
 
+  enum class WorkProfileSubstep : uint8_t {
+    StageResolveLinks,
+    StageDriveInputs,
+    StageNegedgeEval,
+    StageCaptureAccepts,
+    StepPosedge,
+    StepTransfer,
+    StepCleanup,
+    Count,
+  };
+
   static constexpr size_t WORK_PROFILE_SAMPLE_PERIOD = 256;
   static constexpr size_t WORK_PROFILE_PHASE_COUNT =
       static_cast<size_t>(WorkProfilePhase::Count);
+  static constexpr size_t WORK_PROFILE_SUBSTEP_COUNT =
+      static_cast<size_t>(WorkProfileSubstep::Count);
 
   // Each thread writes only its own slot. The leader reads all slots after the
   // corresponding barrier, whose acquire/release ordering publishes them.
   struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) WorkProfileThreadTimes {
     std::array<uint64_t, WORK_PROFILE_PHASE_COUNT> local_done{};
     std::array<uint64_t, WORK_PROFILE_PHASE_COUNT> barrier_arrival{};
+    std::array<uint64_t, WORK_PROFILE_SUBSTEP_COUNT> substep_duration{};
   };
 
   struct WorkProfilePhaseSample {
@@ -321,6 +319,13 @@ class SoftSystemBackend : public SystemBackend {
     uint64_t duration_ns;
   };
 
+  struct WorkProfileSubstepSample {
+    uint64_t cycle;
+    WorkProfileSubstep substep;
+    uint16_t thread;
+    uint64_t duration_ns;
+  };
+
   static_assert(alignof(WorkProfileThreadTimes) >=
                 DESTRUCTIVE_INTERFERENCE_SIZE);
 
@@ -328,9 +333,10 @@ class SoftSystemBackend : public SystemBackend {
   std::vector<WorkProfileThreadTimes> workProfileTimes;
   std::vector<WorkProfilePhaseSample> workProfilePhaseSamples;
   std::vector<WorkProfileUnitSample> workProfileUnitSamples;
+  std::vector<WorkProfileSubstepSample> workProfileSubstepSamples;
 
   std::atomic_bool halted = false;
-  SpinBarrier stageStart, stagePresented, stageDone;
+  SpinBarrier stageStart, stageDone;
   SpinBarrier stepStart, stepDone;
   bool resetReleaseNow;
   std::vector<std::thread> workers; // Should be numThreads - 1
@@ -360,12 +366,15 @@ class SoftSystemBackend : public SystemBackend {
   void workProfileRecordUnit(uint64_t cycle, WorkProfilePhase phase,
                              WorkProfileUnit unit, size_t index,
                              uint64_t duration);
+  void workProfileRecordSubsteps(uint64_t cycle,
+                                 WorkProfileSubstep first,
+                                 WorkProfileSubstep last);
   void printWorkProfile() const;
 
-  void stageWorkPresent(size_t threadId);
-  void stageWorkAccept(size_t threadId);
-  void stepWork(size_t threadId);
-  void stepCleanup(size_t threadId);
+  void stageWorkResolve(size_t threadId, bool profile);
+  void prepareNextCoreMem(uint64_t cycle);
+  void stepWork(size_t threadId, bool profile);
+  void stepCleanup(size_t threadId, bool profile);
   void worker(size_t threadId);
 
   std::pair<size_t, size_t> puWorkRange(size_t threadId) const {

@@ -310,6 +310,22 @@ void SoftSystemBackend::workProfileRecordUnit(uint64_t cycle,
   });
 }
 
+void SoftSystemBackend::workProfileRecordSubsteps(
+    uint64_t cycle, WorkProfileSubstep first, WorkProfileSubstep last) {
+  const size_t firstIndex = static_cast<size_t>(first);
+  const size_t lastIndex = static_cast<size_t>(last);
+  for (size_t s = firstIndex; s <= lastIndex; ++s) {
+    for (size_t thread = 0; thread < numThreads; ++thread) {
+      workProfileSubstepSamples.push_back({
+          .cycle = cycle,
+          .substep = static_cast<WorkProfileSubstep>(s),
+          .thread = static_cast<uint16_t>(thread),
+          .duration_ns = workProfileTimes[thread].substep_duration[s],
+      });
+    }
+  }
+}
+
 SoftSystemBackend::WrappedRouter SoftSystemBackend::buildRouter(uint16_t pu) const {
   LinkStatus links;
   Topology::DirectionToLinkIdx dir_to_link{};
@@ -404,7 +420,6 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads)
     }()),
     workProfileTimes(numThreads),
     stageStart(numThreads),
-    stagePresented(numThreads),
     stageDone(numThreads),
     stepStart(numThreads),
     stepDone(numThreads)
@@ -417,6 +432,7 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads)
   if (workProfileEnabled) {
     workProfilePhaseSamples.reserve(1 << 18);
     workProfileUnitSamples.reserve(1 << 20);
+    workProfileSubstepSamples.reserve(1 << 20);
     std::cerr << "[Soft work profile] sampling every "
               << WORK_PROFILE_SAMPLE_PERIOD << " cycles\n";
   }
@@ -429,6 +445,7 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads)
                        1 + m * PU_PER_MC,
                        1 + (m + 1) * PU_PER_MC);
   }
+  prepareNextCoreMem(0);
 
   // Size per-memif eject buffers: one slot per request port (matches
   // topo.memif_req_at[i].size()).
@@ -561,12 +578,16 @@ void SoftSystemBackend::peek(uint64_t cycle, std::vector<MemBusOut *> out) {
 void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
   PhaseTimer _t(*this);
   const bool profile = workProfileSampleCycle(cycle);
-  // We can release right now, because only the leader thread touches memif input
+  // Publish completion of the preceding cleanup before any thread reads a
+  // neighboring router's committed queues.
   if (profile) {
     const uint64_t now = workProfileNowNs();
     workProfileMark(0, WorkProfilePhase::StageStart, now, now);
   }
   stageStart.arrive_and_wait();
+  if (cycle > 0 && workProfileSampleCycle(cycle - 1))
+    workProfileRecordSubsteps(cycle - 1, WorkProfileSubstep::StepCleanup,
+                              WorkProfileSubstep::StepCleanup);
   if (profile)
     workProfileRecordPhase(cycle, WorkProfilePhase::StageStart);
   try {
@@ -579,44 +600,37 @@ void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
     }
 
     memif_ext = in;
-
-    stageWorkPresent(0);
-    if (profile)
-      workProfileTimes[0].local_done[static_cast<size_t>(
-          WorkProfilePhase::StagePresented)] = workProfileNowNs();
-    const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
-    for (size_t m = 0; m < cfg.numMC; ++m) {
-      const uint64_t unitStart = profile ? workProfileNowNs() : 0;
-      auto buffer_span = core_mem.slice(m * PU_PER_MC + 1, (m + 1) * PU_PER_MC + 1);
-      drams[m].peekPUs(buffer_span, ring.peekAt(m + 1)); // 0 is periph
-      if (profile)
-        workProfileRecordUnit(cycle, WorkProfilePhase::StagePresented,
-                              WorkProfileUnit::PeekMC, m,
-                              workProfileNowNs() - unitStart);
-    }
-  } catch (const std::exception &e) {
-    std::cerr << "Exception at thread " << 0 << ": " << e.what() << std::endl;
-    std::exit(1);
-  }
-
-  if (profile)
-    workProfileTimes[0].barrier_arrival[static_cast<size_t>(
-        WorkProfilePhase::StagePresented)] = workProfileNowNs();
-  stagePresented.arrive_and_wait();
-  if (profile)
-    workProfileRecordPhase(cycle, WorkProfilePhase::StagePresented);
-
-  try {
-    stageWorkAccept(0);
+    stageWorkResolve(0, profile);
     if (profile)
       workProfileTimes[0].local_done[static_cast<size_t>(
           WorkProfilePhase::StageDone)] = workProfileNowNs();
 
+    auto resolveMemifTokens = [this](size_t memifIdx) {
+      for (size_t port = 0; port < memif_eject[memifIdx].size(); ++port) {
+        const uint16_t pu = topo.memif_req_at[memifIdx][port];
+        auto &router = routers[pu];
+        if constexpr (ASSERTIONS_ENABLED) {
+          if (!router.links.memif || router.links.memif->first != memifIdx ||
+              router.links.memif->second != port)
+            throw std::logic_error("MemIf source router mapping mismatch");
+        }
+        memif_eject[memifIdx][port].token =
+            router.rt.peekToken(router.links.num_forwards + 1);
+      }
+    };
+    auto peekMemifFlit = [this](size_t memifIdx, size_t port) -> const Flit * {
+      const auto &token = memif_eject[memifIdx][port].token;
+      if (!token) return nullptr;
+      const uint16_t pu = topo.memif_req_at[memifIdx][port];
+      return routers[pu].rt.peek(*token);
+    };
+
     uint64_t unitStart = profile ? workProfileNowNs() : 0;
+    resolveMemifTokens(0);
     memif_ring_accept[0] = ring.peekAt(0) && periph.ringCanAccept(*ring.peekAt(0));
     memif_eject_accept[0] = periph.nocAcceptMultiple(
-      [&ejects = this->memif_eject[0]](size_t idx) -> const Flit * {
-        return ejects[idx].presenting;
+      [&peekMemifFlit](size_t idx) -> const Flit * {
+        return peekMemifFlit(0, idx);
       });
     if (profile)
       workProfileRecordUnit(cycle, WorkProfilePhase::StageDone,
@@ -624,12 +638,12 @@ void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
                             workProfileNowNs() - unitStart);
     for (size_t m = 0; m < cfg.numMC; ++m) {
       unitStart = profile ? workProfileNowNs() : 0;
+      resolveMemifTokens(m + 1);
       memif_ring_accept[m + 1] =
           ring.peekAt(m + 1) && drams[m].ringCanAccept(*ring.peekAt(m + 1));
-      auto &ejects = this->memif_eject[m + 1];
       memif_eject_accept[m + 1] = drams[m].nocAcceptMultiple(
-        [&ejects](size_t idx) -> const Flit * {
-          return ejects[idx].presenting;
+        [&peekMemifFlit, m](size_t idx) -> const Flit * {
+          return peekMemifFlit(m + 1, idx);
         });
       if (profile)
         workProfileRecordUnit(cycle, WorkProfilePhase::StageDone,
@@ -645,61 +659,56 @@ void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
     workProfileTimes[0].barrier_arrival[static_cast<size_t>(
         WorkProfilePhase::StageDone)] = workProfileNowNs();
   stageDone.arrive_and_wait();
-  if (profile)
+  if (profile) {
     workProfileRecordPhase(cycle, WorkProfilePhase::StageDone);
-}
-
-void SoftSystemBackend::stageWorkPresent(size_t threadId) {
-  auto [puStart, puEnd] = puWorkRange(threadId);
-
-  // Populate presented data on all router-facing ready-valid interfaces.
-  for (uint16_t i = puStart; i < puEnd; ++i)
-    routers[i].buf.presenting.core_inject = peekCoreInjectPrio(*cores[i]);
-
-  for (uint16_t i = puStart; i < puEnd; ++i) {
-    auto &router = routers[i];
-    const size_t nf = router.links.num_forwards;
-    // Output ports: 0..nf-1 = forward egress; nf = core_eject; nf+1 = memif.
-    for (size_t o = 0; o < nf; ++o)
-      router.buf.presenting.forwards[o] = router.rt.peekToken(o);
-    router.buf.presenting.core_eject = router.rt.peekToken(nf);
-    if (router.links.memif) {
-      auto &eject = memif_eject[router.links.memif->first][router.links.memif->second];
-      eject.token = router.rt.peekToken(nf + 1);
-      eject.presenting = eject.token ? router.rt.peek(*eject.token) : nullptr;
-    }
+    workProfileRecordSubsteps(cycle,
+                              WorkProfileSubstep::StageResolveLinks,
+                              WorkProfileSubstep::StageCaptureAccepts);
   }
 }
 
-void SoftSystemBackend::stageWorkAccept(size_t threadId) {
+void SoftSystemBackend::stageWorkResolve(size_t threadId, bool profile) {
   auto [puStart, puEnd] = puWorkRange(threadId);
+  auto &substeps = workProfileTimes[threadId].substep_duration;
+  uint64_t substepStart = profile ? workProfileNowNs() : 0;
 
-  // Generate accepting signals in the destination router's cache-line-owned
-  // block. The source token remains in the peer's presentation block.
+  // Resolve each incoming transfer from committed source-router state. Router
+  // queues are read-only throughout stage and are not committed until step.
   for (uint16_t i = puStart; i < puEnd; ++i) {
     auto &local = routers[i];
     const size_t nf = local.links.num_forwards;
-    // Input ports: 0..nf-1 = forward ingress; nf = core_inject.
-    local.buf.accepting.core_inject =
-        local.rt.prepareEnq(nf, local.buf.presenting.core_inject);
+    local.buf.core_inject_presenting = peekCoreInjectPrio(*cores[i]);
+    local.buf.core_inject_accepting =
+        local.rt.prepareEnq(nf, local.buf.core_inject_presenting);
     for (size_t o = 0; o < nf; ++o) {
       auto [from, port] = *local.links.forwards[o];
-      const auto &remoteToken = routers[from].buf.presenting.forwards[port];
-      local.buf.accepting.forwards[o] = local.rt.prepareEnq(
-          o, remoteToken ? std::optional<uint8_t>(remoteToken->prio) : std::nullopt);
+      auto &token = local.buf.forward_presenting[o];
+      token = routers[from].rt.peekToken(port);
+      local.buf.forward_accepting[o] = local.rt.prepareEnq(
+          o, token ? std::optional<uint8_t>(token->prio) : std::nullopt);
     }
+    local.buf.core_eject_presenting = local.rt.peekToken(nf);
   }
+  if (profile)
+    substeps[static_cast<size_t>(WorkProfileSubstep::StageResolveLinks)] =
+        workProfileNowNs() - substepStart;
 
   // Drive PU inputs and settle on the negedge. Contract: accept signals
   // from the cores are read post-eval (after combinational settle).
+  if (profile) substepStart = workProfileNowNs();
   for (uint16_t i = puStart; i < puEnd; ++i) {
     auto &router = routers[i];
-    const Flit *core_eject = router.buf.presenting.core_eject
-        ? router.rt.peek(*router.buf.presenting.core_eject) : nullptr;
+    const Flit *core_eject = router.buf.core_eject_presenting
+        ? router.rt.peek(*router.buf.core_eject_presenting) : nullptr;
     presentCoreEject(*cores[i], i, core_eject);
     presentCoreMem(*cores[i], core_mem[i]);
-    cores[i]->ext_out_ready = router.buf.accepting.core_inject;
+    cores[i]->ext_out_ready = router.buf.core_inject_accepting;
     cores[i]->clock = false; // negedge
+  }
+  if (profile) {
+    substeps[static_cast<size_t>(WorkProfileSubstep::StageDriveInputs)] =
+        workProfileNowNs() - substepStart;
+    substepStart = workProfileNowNs();
   }
   auto v0 = std::chrono::high_resolution_clock::now();
   for (uint16_t i = puStart; i < puEnd; ++i) {
@@ -709,13 +718,38 @@ void SoftSystemBackend::stageWorkAccept(size_t threadId) {
   // TODO: move into non-thread local atomic member variable
   g_soft_verilator_ns +=
       std::chrono::duration_cast<std::chrono::nanoseconds>(v1 - v0).count();
+  if (profile) {
+    substeps[static_cast<size_t>(WorkProfileSubstep::StageNegedgeEval)] =
+        workProfileNowNs() - substepStart;
+    substepStart = workProfileNowNs();
+  }
   for (uint16_t i = puStart; i < puEnd; ++i) {
-    routers[i].buf.accepting.core_eject =
-        routers[i].buf.presenting.core_eject.has_value() &&
+    routers[i].buf.core_eject_accepting =
+        routers[i].buf.core_eject_presenting.has_value() &&
         cores[i]->ext_in_ready;
     core_mem_accept[i].unicast = cores[i]->mem_unicast_valid;
     core_mem_accept[i].broadcast =
         cores[i]->mem_broadcast_ready && cores[i]->mem_broadcast_valid;
+  }
+  if (profile)
+    substeps[static_cast<size_t>(WorkProfileSubstep::StageCaptureAccepts)] =
+        workProfileNowNs() - substepStart;
+}
+
+void SoftSystemBackend::prepareNextCoreMem(uint64_t cycle) {
+  const bool profile = workProfileSampleCycle(cycle);
+  const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
+  for (size_t m = 0; m < cfg.numMC; ++m) {
+    const uint64_t unitStart = profile ? workProfileNowNs() : 0;
+    auto bufferSpan = core_mem.slice(m * PU_PER_MC + 1,
+                                     (m + 1) * PU_PER_MC + 1);
+    // This snapshot is consumed by the cores during the next iteration's
+    // stage, after the current DRAMIf and ring state has committed.
+    drams[m].peekPUs(bufferSpan, ring.peekAt(m + 1));
+    if (profile)
+      workProfileRecordUnit(cycle, WorkProfilePhase::StepDone,
+                            WorkProfileUnit::PeekMC, m,
+                            workProfileNowNs() - unitStart);
   }
 }
 
@@ -747,7 +781,7 @@ void SoftSystemBackend::step(uint64_t cycle) {
     workProfileRecordPhase(cycle, WorkProfilePhase::StepStart);
 
   try {
-    stepWork(0);
+    stepWork(0, profile);
     if (profile)
       workProfileTimes[0].local_done[static_cast<size_t>(
           WorkProfilePhase::StepDone)] = workProfileNowNs();
@@ -827,6 +861,7 @@ void SoftSystemBackend::step(uint64_t cycle) {
       workProfileRecordUnit(cycle, WorkProfilePhase::StepDone,
                             WorkProfileUnit::RingProgress, 0,
                             workProfileNowNs() - unitStart);
+    prepareNextCoreMem(cycle);
   } catch (const std::exception &e) {
     std::cerr << "Exception at thread " << 0 << ": " << e.what() << std::endl;
     std::exit(1);
@@ -836,9 +871,12 @@ void SoftSystemBackend::step(uint64_t cycle) {
     workProfileTimes[0].barrier_arrival[static_cast<size_t>(
         WorkProfilePhase::StepDone)] = workProfileNowNs();
   stepDone.arrive_and_wait();
-  if (profile)
+  if (profile) {
     workProfileRecordPhase(cycle, WorkProfilePhase::StepDone);
-  stepCleanup(0);
+    workProfileRecordSubsteps(cycle, WorkProfileSubstep::StepPosedge,
+                              WorkProfileSubstep::StepTransfer);
+  }
+  stepCleanup(0, profile);
 
   // Periodic delta print.
   if (log_ && cycle > 0 && cycle % Stat::PERIOD == 0) {
@@ -852,15 +890,17 @@ void SoftSystemBackend::step(uint64_t cycle) {
   }
 }
 
-void SoftSystemBackend::stepWork(size_t threadId) {
+void SoftSystemBackend::stepWork(size_t threadId, bool profile) {
   auto [puStart, puEnd] = puWorkRange(threadId);
+  auto &substeps = workProfileTimes[threadId].substep_duration;
+  const uint64_t posedgeStart = profile ? workProfileNowNs() : 0;
 
   // Materialize accepted core-inject flits from RTL BEFORE the posedge (the
   // posedge consumes ext_out), then posedge-eval every core.
   auto v0 = std::chrono::high_resolution_clock::now();
   for (size_t i = puStart; i < puEnd; ++i) {
     auto &router = routers[i];
-    if (router.buf.accepting.core_inject)
+    if (router.buf.core_inject_accepting)
       router.rt.place(router.links.num_forwards,
           std::make_unique<Flit>(peekCoreInjectFlit(*cores[i], static_cast<uint16_t>(i))));
 
@@ -875,40 +915,55 @@ void SoftSystemBackend::stepWork(size_t threadId) {
   auto v1 = std::chrono::high_resolution_clock::now();
   g_soft_verilator_ns +=
       std::chrono::duration_cast<std::chrono::nanoseconds>(v1 - v0).count();
+  if (profile)
+    substeps[static_cast<size_t>(WorkProfileSubstep::StepPosedge)] =
+        workProfileNowNs() - posedgeStart;
 
   // Each destination router moves accepted flits directly from source slots.
+  const uint64_t transferStart = profile ? workProfileNowNs() : 0;
   for (size_t i = puStart; i < puEnd; ++i) {
     auto &router = routers[i];
     const auto &links = router.links;
     const size_t nf = links.num_forwards;
     for (size_t k = 0; k < nf; ++k) {
-      auto [from, port] = *links.forwards[k];
-      const auto &remoteToken = routers[from].buf.presenting.forwards[port];
-      if (router.buf.accepting.forwards[k])
-        router.rt.place(k, routers[from].rt.take(*remoteToken));
+      const uint16_t from = links.forwards[k]->first;
+      const auto &sourceToken = router.buf.forward_presenting[k];
+      if (router.buf.forward_accepting[k])
+        router.rt.place(k, routers[from].rt.take(*sourceToken));
     }
-    if (router.buf.accepting.core_eject)
-      (void)router.rt.take(*router.buf.presenting.core_eject);
+    if (router.buf.core_eject_accepting)
+      (void)router.rt.take(*router.buf.core_eject_presenting);
   }
+  if (profile)
+    substeps[static_cast<size_t>(WorkProfileSubstep::StepTransfer)] =
+        workProfileNowNs() - transferStart;
 }
 
-void SoftSystemBackend::stepCleanup(size_t threadId) {
+void SoftSystemBackend::stepCleanup(size_t threadId, bool profile) {
   auto [puStart, puEnd] = puWorkRange(threadId);
+  const uint64_t cleanupStart = profile ? workProfileNowNs() : 0;
   for (size_t i = puStart; i < puEnd; ++i) {
     auto &router = routers[i];
     const size_t nf = router.links.num_forwards;
     Router<RouteFn, ROUTER_Q_DEPTH>::OutputTokens accepted{};
     for (size_t o = 0; o < nf; ++o) {
       auto [to, port] = *router.links.forwards[o];
-      if (routers[to].buf.accepting.forwards[port])
-        accepted[o] = router.buf.presenting.forwards[o];
+      const auto &destination = routers[to].buf;
+      if (destination.forward_accepting[port])
+        accepted[o] = destination.forward_presenting[port];
     }
-    if (router.buf.accepting.core_eject) accepted[nf] = router.buf.presenting.core_eject;
+    if (router.buf.core_eject_accepting)
+      accepted[nf] = router.buf.core_eject_presenting;
     if (router.links.memif &&
         std::make_optional(router.links.memif->second) == memif_eject_accept[router.links.memif->first])
       accepted[nf + 1] = memif_eject[router.links.memif->first][router.links.memif->second].token;
     router.rt.step(accepted);
   }
+  if (profile)
+    workProfileTimes[threadId]
+        .substep_duration[static_cast<size_t>(
+            WorkProfileSubstep::StepCleanup)] =
+        workProfileNowNs() - cleanupStart;
 }
 
 void SoftSystemBackend::accumulateStats() {
@@ -927,8 +982,8 @@ void SoftSystemBackend::accumulateStats() {
     inflight_msgs += r.rt.totalFlits();
     // Core inject: an injection means a flit transferred from the PU
     // into the local router this cycle.
-    if (r.buf.presenting.core_inject) {
-      if (r.buf.accepting.core_inject) {
+    if (r.buf.core_inject_presenting) {
+      if (r.buf.core_inject_accepting) {
         ++hops;
         ++injections;
       } else {
@@ -936,13 +991,13 @@ void SoftSystemBackend::accumulateStats() {
       }
     }
     // Core eject: flit delivered to the local PU.
-    if (r.buf.presenting.core_eject && r.buf.accepting.core_eject) ++hops;
-    // Forward links: each is a possible egress lane this cycle.
-    for (size_t o = 0; o < 4 && r.links.forwards[o]; ++o) {
-      const auto &fwd = r.buf.presenting.forwards[o];
+    if (r.buf.core_eject_presenting && r.buf.core_eject_accepting) ++hops;
+    // Each incoming forward link corresponds one-to-one with a mesh egress
+    // lane, so destination-owned decisions can count the same global totals.
+    for (size_t o = 0; o < r.links.num_forwards; ++o) {
+      const auto &fwd = r.buf.forward_presenting[o];
       if (fwd) {
-        auto [to, port] = *r.links.forwards[o];
-        if (routers[to].buf.accepting.forwards[port]) ++hops;
+        if (r.buf.forward_accepting[o]) ++hops;
         else ++blocked;
       } else {
         ++idle_lanes;
@@ -950,7 +1005,7 @@ void SoftSystemBackend::accumulateStats() {
     }
     // A core is "idle" this cycle if it has nothing to inject and
     // nothing being delivered to it.
-    if (!r.buf.presenting.core_inject && !r.buf.presenting.core_eject)
+    if (!r.buf.core_inject_presenting && !r.buf.core_eject_presenting)
       ++idle_cores;
   }
 
@@ -1021,7 +1076,6 @@ void SoftSystemBackend::printWorkProfile() const {
   auto phaseName = [](WorkProfilePhase phase) {
     switch (phase) {
       case WorkProfilePhase::StageStart: return "stageStart";
-      case WorkProfilePhase::StagePresented: return "stagePresented";
       case WorkProfilePhase::StageDone: return "stageDone";
       case WorkProfilePhase::StepStart: return "stepStart";
       case WorkProfilePhase::StepDone: return "stepDone";
@@ -1042,12 +1096,35 @@ void SoftSystemBackend::printWorkProfile() const {
     }
     return "unknown";
   };
+  auto substepName = [](WorkProfileSubstep substep) {
+    switch (substep) {
+      case WorkProfileSubstep::StageResolveLinks: return "stageResolveLinks";
+      case WorkProfileSubstep::StageDriveInputs: return "stageDriveInputs";
+      case WorkProfileSubstep::StageNegedgeEval: return "stageNegedgeEval";
+      case WorkProfileSubstep::StageCaptureAccepts:
+        return "stageCaptureAccepts";
+      case WorkProfileSubstep::StepPosedge: return "stepPosedge";
+      case WorkProfileSubstep::StepTransfer: return "stepTransfer";
+      case WorkProfileSubstep::StepCleanup: return "stepCleanup";
+      case WorkProfileSubstep::Count: break;
+    }
+    return "unknown";
+  };
   auto printDistribution = [](const Distribution &d) {
     std::cerr << "mean=" << std::fixed << std::setprecision(1) << d.mean
               << " p50=" << d.p50
               << " p90=" << d.p90
               << " p99=" << d.p99
               << " max=" << d.max;
+  };
+  auto printScaledDistribution = [](const Distribution &d, double scale,
+                                    const char *suffix) {
+    std::cerr << "mean=" << std::fixed << std::setprecision(2)
+              << d.mean / scale
+              << " p50=" << d.p50 / scale
+              << " p90=" << d.p90 / scale
+              << " p99=" << d.p99 / scale
+              << " max=" << d.max / scale << suffix;
   };
 
   std::cerr << "[Soft work profile] times are nanoseconds; local-spread is "
@@ -1133,6 +1210,98 @@ void SoftSystemBackend::printWorkProfile() const {
                 << (100.0 * hidden / durations.size()) << "%\n";
     }
   }
+
+  for (size_t s = 0; s < WORK_PROFILE_SUBSTEP_COUNT; ++s) {
+    const auto substep = static_cast<WorkProfileSubstep>(s);
+    std::vector<const WorkProfileSubstepSample *> samples;
+    std::vector<std::vector<uint64_t>> byThread(numThreads);
+    for (const auto &sample : workProfileSubstepSamples) {
+      if (sample.substep != substep) continue;
+      samples.push_back(&sample);
+      byThread[sample.thread].push_back(sample.duration_ns);
+    }
+    if (samples.empty()) continue;
+
+    for (size_t thread = 0; thread < numThreads; ++thread) {
+      if (byThread[thread].empty()) continue;
+      const auto [puStart, puEnd] = puWorkRange(thread);
+      std::cerr << "[Soft work profile] substep " << substepName(substep)
+                << " thread=" << thread << " pu=" << puStart << '-'
+                << (puEnd - 1) << " samples=" << byThread[thread].size()
+                << " duration ";
+      printDistribution(distribution(std::move(byThread[thread])));
+      std::cerr << '\n';
+    }
+
+    std::vector<uint64_t> maxMinusMin;
+    std::vector<uint64_t> maxMinusMean;
+    std::vector<uint64_t> efficiencyBasisPoints;
+    std::vector<uint64_t> idealSpeedupMilli;
+    std::vector<size_t> slowestCount(numThreads, 0);
+    uint64_t totalMax = 0;
+    long double totalMean = 0;
+    size_t completeCycles = 0;
+    for (size_t offset = 0; offset + numThreads <= samples.size();
+         offset += numThreads) {
+      const uint64_t cycle = samples[offset]->cycle;
+      bool complete = true;
+      uint64_t sum = 0;
+      uint64_t minimum = samples[offset]->duration_ns;
+      uint64_t maximum = minimum;
+      for (size_t thread = 0; thread < numThreads; ++thread) {
+        const auto &sample = *samples[offset + thread];
+        if (sample.cycle != cycle || sample.thread != thread) {
+          complete = false;
+          break;
+        }
+        sum += sample.duration_ns;
+        minimum = std::min(minimum, sample.duration_ns);
+        maximum = std::max(maximum, sample.duration_ns);
+      }
+      if (!complete) continue;
+
+      const uint64_t mean = sum / numThreads;
+      maxMinusMin.push_back(maximum - minimum);
+      maxMinusMean.push_back(maximum - mean);
+      efficiencyBasisPoints.push_back(
+          maximum == 0 ? 10000 : (sum * 10000) / (numThreads * maximum));
+      idealSpeedupMilli.push_back(
+          sum == 0 ? 1000 : (maximum * numThreads * 1000) / sum);
+      for (size_t thread = 0; thread < numThreads; ++thread) {
+        if (samples[offset + thread]->duration_ns == maximum)
+          ++slowestCount[thread];
+      }
+      totalMax += maximum;
+      totalMean += static_cast<long double>(sum) / numThreads;
+      ++completeCycles;
+    }
+    if (completeCycles == 0) continue;
+
+    std::cerr << "[Soft work profile] substep " << substepName(substep)
+              << " cycles=" << completeCycles << " max-minus-min ";
+    printDistribution(distribution(std::move(maxMinusMin)));
+    std::cerr << "\n[Soft work profile] substep " << substepName(substep)
+              << " max-minus-mean ";
+    printDistribution(distribution(std::move(maxMinusMean)));
+    std::cerr << "\n[Soft work profile] substep " << substepName(substep)
+              << " balance-efficiency ";
+    printScaledDistribution(distribution(std::move(efficiencyBasisPoints)),
+                            100.0, "%");
+    std::cerr << "\n[Soft work profile] substep " << substepName(substep)
+              << " ideal-balance-speedup ";
+    printScaledDistribution(distribution(std::move(idealSpeedupMilli)),
+                            1000.0, "x");
+    std::cerr << " aggregate=" << std::fixed << std::setprecision(3)
+              << (totalMean > 0 ? totalMax / totalMean : 1.0L) << "x";
+    std::cerr << "\n[Soft work profile] substep " << substepName(substep)
+              << " tied-for-slowest";
+    for (size_t thread = 0; thread < numThreads; ++thread) {
+      std::cerr << " t" << thread << '=' << std::fixed
+                << std::setprecision(1)
+                << (100.0 * slowestCount[thread] / completeCycles) << '%';
+    }
+    std::cerr << '\n';
+  }
 }
 
 bool SoftSystemBackend::printStats(uint64_t cycles, bool final_print) {
@@ -1165,18 +1334,7 @@ void SoftSystemBackend::worker(size_t threadId) {
     }
     stageStart.arrive_and_wait();
     try {
-      stageWorkPresent(threadId);
-    } catch (const std::exception &e) {
-      std::cerr << "Exception at thread " << threadId << ": " << e.what() << std::endl;
-      std::exit(1);
-    }
-    if (profile) {
-      const uint64_t now = workProfileNowNs();
-      workProfileMark(threadId, WorkProfilePhase::StagePresented, now, now);
-    }
-    stagePresented.arrive_and_wait();
-    try {
-      stageWorkAccept(threadId);
+      stageWorkResolve(threadId, profile);
     } catch (const std::exception &e) {
       std::cerr << "Exception at thread " << threadId << ": " << e.what() << std::endl;
       std::exit(1);
@@ -1192,7 +1350,7 @@ void SoftSystemBackend::worker(size_t threadId) {
     }
     stepStart.arrive_and_wait();
     try {
-      stepWork(threadId);
+      stepWork(threadId, profile);
     } catch (const std::exception &e) {
       std::cerr << "Exception at thread " << threadId << ": " << e.what() << std::endl;
       std::exit(1);
@@ -1203,7 +1361,7 @@ void SoftSystemBackend::worker(size_t threadId) {
     }
     stepDone.arrive_and_wait();
     try {
-      stepCleanup(threadId);
+      stepCleanup(threadId, profile);
     } catch (const std::exception &e) {
       std::cerr << "Exception at thread " << threadId << ": " << e.what() << std::endl;
       std::exit(1);
