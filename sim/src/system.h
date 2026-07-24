@@ -1,6 +1,8 @@
 #pragma once
 
+#include "system_config.h"
 #include "verilated_fst_c.h"
+#include <bit>
 #include <cwchar>
 #include <optional>
 #include <cstdint>
@@ -9,23 +11,25 @@
 #include <string_view>
 #include <memory>
 #include <array>
+#include <type_traits>
 
 static const bool ASSERTIONS_ENABLED = false;
 
 // System-level simulators
 
-const uint8_t MEM_BUS_WIDTH_SIZE = 5; // Log_2(MEM_BUS_WIDTH / 8)
-const size_t MEM_BUS_WIDTH_B = (((size_t ) 1) << MEM_BUS_WIDTH_SIZE);
-const size_t MEM_BUS_WIDTH = MEM_BUS_WIDTH_B * 8;
+const size_t MEM_BUS_WIDTH = SYSTEM_MEM_BUS_WIDTH;
+const size_t MEM_BUS_WIDTH_B = MEM_BUS_WIDTH / 8;
+const uint8_t MEM_BUS_WIDTH_SIZE = std::countr_zero(MEM_BUS_WIDTH_B);
+static_assert(MEM_BUS_WIDTH >= 64 && std::has_single_bit(MEM_BUS_WIDTH));
+static_assert(MEM_BUS_WIDTH_B <= 64, "memory byte-enable mask is at most 64 bits");
 const uint32_t MEM_ADDR_OFFSET_MASK = ((((uint32_t) 1) << MEM_BUS_WIDTH_SIZE) - 1);
 const uint32_t MEM_ADDR_ALIGN_MASK = ~MEM_ADDR_OFFSET_MASK;
 
-// FIXME: alignment
 typedef std::array<uint8_t, MEM_BUS_WIDTH / 8> MemLine;
 struct alignas(MEM_BUS_WIDTH_B) AlignedMemLine {
   MemLine inner;
 };
-typedef uint32_t mem_mask_t;
+using mem_mask_t = std::conditional_t<(MEM_BUS_WIDTH_B <= 32), uint32_t, uint64_t>;
 
 struct GlobalMemReq {
   uint8_t id;
@@ -36,7 +40,7 @@ struct GlobalMemReq {
   uint32_t addr;
 
   // Small endian, lane-aligned (NOT ADDRESS-ALIGNED) data,
-  // so wdata[0] always corresponds to the byte 0 at the 32-byte chunk
+  // so wdata[0] always corresponds to byte 0 of the memory line
   // being written
   MemLine wdata;
 

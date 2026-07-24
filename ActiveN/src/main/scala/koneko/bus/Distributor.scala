@@ -1,12 +1,12 @@
 // Memory response distributor. Operates within a cluster (16 PUs).
-// Buffers at most one beat of response data (256 bits).
+// Buffers at most one memory line of response data.
 // Accepts from MemIf resp port, delivers to individual PU mem ports.
 //
 // Two modes:
 //   Unicast (dst = specific PU ID): delivers to that one PU.
 //   Broadcast (dst = 0xFFFF): delivers to ALL 16 PUs simultaneously.
 //     Used for CSR-aware memory scatter. Each PU's BIU inspects the
-//     256-bit payload and picks out entries addressed to it.
+//     memory-line payload and picks out entries addressed to it.
 //
 // PU ID range: [puStart, puStart + 16)
 
@@ -40,9 +40,10 @@ class Distributor(
   val out = IO(new DistributorOutput)
 
   // Unicast
-  out.unicast.resp.id := in.unicast.bits.id
-  out.unicast.resp.data := in.unicast.bits.data
-  out.unicast.valids := Fill(16, in.unicast.valid) & UIntToOH(in.unicast.bits.dst - puStart.U, 16)
+  val unicast = Common.pipeValid(in.unicast)
+  out.unicast.resp.id := unicast.bits.id
+  out.unicast.resp.data := unicast.bits.data
+  out.unicast.valids := Fill(16, unicast.valid) & UIntToOH(unicast.bits.dst - puStart.U, 16)
 
   // Single slot queue for broadcasts
   val bcstQueue = Module(new Queue(new BcastLine, 2))

@@ -86,17 +86,18 @@ struct McImage {
   }
 
   GlobalMemResp handle(const GlobalMemReq &req) {
-    if ((1 << req.size) > MEM_BUS_WIDTH / 8) {
+    const size_t request_bytes = size_t{1} << req.size;
+    if (request_bytes > MEM_BUS_WIDTH_B) {
       throw runtime_error("Memory request size exceeds bus width");
     }
 
-    uint32_t aligned_addr = req.addr & ~(MEM_BUS_WIDTH / 8 - 1);
+    uint32_t aligned_addr = req.addr & ~uint32_t(MEM_BUS_WIDTH_B - 1);
     if constexpr (ASSERTIONS_ENABLED) {
       if (aligned_addr >= tot_size) {
         throw runtime_error("Memory request address out of bounds");
       }
 
-      if (aligned_addr % (1 << req.size) != 0) {
+      if (req.addr % request_bytes != 0) {
         throw runtime_error("Memory request address not aligned");
       }
     }
@@ -109,11 +110,14 @@ struct McImage {
 
     if (req.write) {
       uint32_t subline_addr = req.addr - aligned_addr;
-      mem_mask_t mask = ((((uint64_t) 1) << (1 << req.size)) - 1) << subline_addr; // Byte-enables
+      mem_mask_t request_mask = request_bytes == MEM_BUS_WIDTH_B
+          ? ~mem_mask_t{0}
+          : (mem_mask_t{1} << request_bytes) - 1;
+      mem_mask_t mask = request_mask << subline_addr;
       mask &= req.wbe;
 
-      for (size_t i = 0; i < MEM_BUS_WIDTH / 8; ++i) {
-        if (mask & (1 << i)) {
+      for (size_t i = 0; i < MEM_BUS_WIDTH_B; ++i) {
+        if (mask & (mem_mask_t{1} << i)) {
           cur.inner[i] = req.wdata[i];
         }
       }

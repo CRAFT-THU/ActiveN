@@ -3,7 +3,8 @@
  *
  * Called from snn_main.S after stack setup.
  * Reads the SPM init descriptor from DRAM, copies neuron data to SPM,
- * and runs the init loop (state += input, clear input).
+ * and runs the current-based init loop (state += input, clear input).
+ * Conductance images already contain their pre-simulated ge/gi/v state.
  *
  * Returns hartid.
  *
@@ -74,6 +75,7 @@ unsigned int snn_init(void) {
     if (stride == 0)
         halt(0xbad20000u | hartid);
 
+#ifndef CONDUCTANCE
     /* Init loop: state += input, clear input */
     unsigned int nn_end = SPM_BASE + nn_count * stride;
     for (unsigned int addr = SPM_BASE; addr < nn_end; addr += stride) {
@@ -94,6 +96,7 @@ unsigned int snn_init(void) {
         *st = result;
         *input = 0;
     }
+#endif
 
     return hartid;
 }

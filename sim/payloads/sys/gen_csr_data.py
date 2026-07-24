@@ -72,7 +72,7 @@ def emit_asm(csr0, csr1, ref_xor, outpath):
 
     # CSR0 macro
     lines.append(".macro CSR0")
-    lines.append(".balign 32")
+    lines.append(".balign 64")
     lines.append(".globl csr0")
     lines.append("csr0:")
     for pu_id, sub_idx, weight in csr0:
@@ -85,7 +85,7 @@ def emit_asm(csr0, csr1, ref_xor, outpath):
 
     # CSR1 macro
     lines.append(".macro CSR1")
-    lines.append(".balign 32")
+    lines.append(".balign 64")
     lines.append(".globl csr1")
     lines.append("csr1:")
     for pu_id, sub_idx, weight in csr1:

@@ -70,7 +70,7 @@ class BIU(implicit val param: CoreParameters) extends Module {
   bcastQueue.io.enq <> bcast
 
   // Braodcast reinterpret state machine
-  val BcastBeats = 256 / (32 + 32) // 32 bits of data, 32 bits of index
+  val BcastBeats = param.memBusWidth / (32 + 32) // 32 bits of data, 32 bits of index
   val bcastBeats = bcastQueue.io.deq.bits.line
   val bcastValids: UInt = VecInit(bcastBeats.map(_.pu === hartid)).asUInt
   val bcastSent = RegInit(0.U(BcastBeats.W))

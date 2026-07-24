@@ -14,6 +14,19 @@ import koneko._
 // 2-deep ring buffer. Deadlock avoidance: only push internal→ring when ring
 // buffer is empty; ring input for local PUs delivered directly.
 
+case class MemBusParameters(
+  core: CoreParameters,
+  extIdWidth: Int = 8,
+  extAddrWidth: Int = 32,
+) {
+  def replicateScalar(input: UInt): UInt = {
+    require(core.memBusWidth % 32 == 0, "memBusWidth must be a multiple of 32")
+    Fill(core.memBusWidth / 32, input)
+  }
+
+  def lineAddrShift: Int = log2Ceil(core.memBusWidth / 8)
+}
+
 object ScalarType extends ChiselEnum {
   val Load = Value
   val Store = Value
@@ -51,7 +64,7 @@ object ScalarPending {
     p.id := flit.data(1)(15, 0)
 
     // Operand 2
-    val data = Fill(8, flit.data(2))
+    val data = flit.data(2)
 
     (isScalar, p, data)
   }
@@ -85,21 +98,22 @@ class BulkPending extends Bundle {
   val completedCnt = UInt(16.W)
 
   // FIXME: parametric beat size
-  def isFullyIssued: Bool = issueCnt === ((end >> 5) - (base >> 5))
-  def isCompletedNext: Bool = (completedCnt + 1.U) === ((end >> 5) - (base >> 5))
+  def isFullyIssued(implicit busParams: MemBusParameters): Bool = issueCnt === ((end >> busParams.lineAddrShift) - (base >> busParams.lineAddrShift))
+  def isCompletedNext(implicit busParams: MemBusParameters): Bool = (completedCnt + 1.U) === ((end >> busParams.lineAddrShift) - (base >> busParams.lineAddrShift))
   def canIssue(maxInflight: Int): Bool = issueCnt < completedCnt + maxInflight.U
-  def issueAddr = base + (issueCnt << 5)
+  def issueAddr(implicit busParams: MemBusParameters) = base + (issueCnt << busParams.lineAddrShift)
 }
 
 object BulkPending {
-  def initFromFlit(flit: Flit): (Bool, BulkPending) = {
+  def initFromFlit(flit: Flit)(implicit params: MemBusParameters): (Bool, BulkPending) = {
     val p = Wire(new BulkPending)
     p.src := flit.src
 
     val (isBulk, ty) = BulkType.fromTag(flit.tag)
     p.ty := ty
     p.base := flit.data(0)
-    p.end := flit.data(0) + ((flit.data(1)(31, 16)) << 5) // length in beats
+    val sizeOffset = log2Ceil(params.core.memBusWidth / 8)
+    p.end := flit.data(0) + ((flit.data(1)(31, 16)) << sizeOffset) // length in beats
     p.tag := flit.data(1).apply(15, 0)
 
     p.extras(0) := flit.data(2)
@@ -113,24 +127,24 @@ object BulkPending {
 }
 
 // TODO: parametric id / data width for global memory interface
-class GlobalMemReq extends Bundle {
-  val id    = UInt(8.W)
-  val addr  = UInt(32.W)
-  val wdata = UInt(256.W)
-  val wbe   = UInt(32.W)
+class GlobalMemReq(implicit params: MemBusParameters) extends Bundle {
+  val id    = UInt(params.extIdWidth.W)
+  val addr  = UInt(params.extAddrWidth.W)
+  val wdata = UInt(params.core.memBusWidth.W)
+  val wbe   = UInt((params.core.memBusWidth / 8).W)
   val size  = UInt(3.W)
   val write = Bool()
 }
 
-class GlobalMemResp extends Bundle {
-  val id    = UInt(8.W)
-  val rdata = UInt(256.W)
+class GlobalMemResp(implicit params: MemBusParameters) extends Bundle {
+  val id    = UInt(params.extIdWidth.W)
+  val rdata = UInt(params.core.memBusWidth.W)
 }
 
-class RingResp extends Bundle {
+class RingResp(implicit params: CoreParameters) extends Bundle {
   val dst  = UInt(16.W)
   val id   = UInt(16.W)
-  val data = UInt(256.W)
+  val data = UInt(params.memBusWidth.W)
 }
 
 // Base class for DRAMIf and MMIOIf, the former implements scatter & bulk access & local response egress, the latter implements config ROM.
@@ -139,8 +153,9 @@ abstract class MemIf(
   mcIdx: Int,
   scalarInflight: Int,
   numReq: Int,
-) extends Module {
+)(implicit busParams: MemBusParameters) extends Module {
   assert(scalarInflight <= 32768)
+  implicit val coreParams: CoreParameters = busParams.core
 
   // Common IO
   val req = IO(Vec(numReq, Flipped(Decoupled(new Flit))))
@@ -162,7 +177,7 @@ abstract class MemIf(
   protected val scalarPendings  = Reg(Vec(scalarInflight, new ScalarPending))
   protected val scalarIssued    = RegInit(VecInit.fill(scalarInflight)(false.B))
   protected val scalarCompleted = RegInit(VecInit.fill(scalarInflight)(false.B))
-  protected val scalarBuffer    = Reg(Vec(scalarInflight, UInt(256.W)))
+  protected val scalarBuffer    = Reg(Vec(scalarInflight, UInt(coreParams.memBusWidth.W)))
   // Buffers either write data, or response data, or both (for AMO)
   // We cannot reduce this to 32 bit: ICache fetches whole lines, and AMOs
 
@@ -182,7 +197,7 @@ abstract class MemIf(
       when(scalarAlloc(s)) {
         scalarAllocated(s) := true.B
         scalarPendings(s) := parsedScalar
-        scalarBuffer(s) := parsedData
+        scalarBuffer(s) := busParams.replicateScalar(parsedData)
         scalarIssued(s) := false.B
         scalarCompleted(s) := false.B
       }
@@ -215,17 +230,17 @@ abstract class MemIf(
       scalarIssued(s) := true.B
     }
   }
-  private val scalarReqData = Mux1H(scalarReqArb.io.in.map(_.fire), scalarBuffer)
+  private val scalarReqData = scalarBuffer(scalarReqArb.io.chosen)
 
   protected val scalarReq = Wire(Decoupled(new GlobalMemReq))
   scalarReq.valid := scalarReqArb.io.out.valid
   scalarReqArb.io.out.ready := scalarReq.ready
   scalarReq.bits.id := scalarReqArb.io.chosen // Zero extended slot idx, highest bit == 0 => scalar req
   scalarReq.bits.addr := scalarReqArb.io.out.bits.address
-  scalarReq.bits.wdata := Fill(8, scalarReqData)
-  scalarReq.bits.wbe := Fill(8, "b1111".U(4.W)) // TDOO: parametric bus width, width check
+  scalarReq.bits.wdata := scalarReqData
+  scalarReq.bits.wbe := busParams.replicateScalar("b1111".U(4.W))
   scalarReq.bits.size := scalarReqArb.io.out.bits.size
-  assert(!scalarReqArb.io.out.valid || scalarReqArb.io.out.bits.size <= 5.U, "Unsupported scalar access size")
+  assert(!scalarReqArb.io.out.valid || scalarReqArb.io.out.bits.size <= busParams.lineAddrShift.U, "Unsupported scalar access size")
   scalarReq.bits.write := scalarReqArb.io.out.bits.ty === ScalarType.Store // TODO: handle RMW for subline writes, or let's have a LLDC
 
   // Scalar response pathway
@@ -279,7 +294,7 @@ class DRAMIf(
   numClusters: Int, // Clusters in this zone
   scalarInflight: Int,
   bulkInflight: Int, // Number of inflight sub-line for the ONLY pending bulk request
-) extends MemIf(mcIdx, scalarInflight, numClusters) {
+)(implicit busParams: MemBusParameters) extends MemIf(mcIdx, scalarInflight, numClusters) {
   require(numClusters >= 1)
   require(puEnd >= puStart)
   require(puEnd - puStart + 1 == numClusters * 16, "PU IDs must map cleanly to clusters")
@@ -302,7 +317,7 @@ class DRAMIf(
 
   val bulkAllocated = RegInit(false.B)
   val bulkPending = Reg(new BulkPending)
-  val bulkBuffer = Reg(Vec(bulkInflight, UInt(256.W))) // Buffer for the different bits of the ONLY pending bulk request
+  val bulkBuffer = Reg(Vec(bulkInflight, UInt(coreParams.memBusWidth.W))) // Buffer for the different bits of the ONLY pending bulk request
   val bulkCompleted = RegInit(VecInit.fill(bulkInflight)(false.B))
 
   // -- Bulk bus handling: allocation & dealloc --
@@ -333,7 +348,7 @@ class DRAMIf(
   bulkReq.bits.addr := bulkPending.issueAddr
   bulkReq.bits.wdata := DontCare // Right now we only do bulk loads
   bulkReq.bits.wbe := 0.U
-  bulkReq.bits.size := 5.U // 32 bytes per beat
+  bulkReq.bits.size := busParams.lineAddrShift.U
   bulkReq.bits.write := false.B
   when(bulkReq.fire) {
     bulkPending.issueCnt := bulkPending.issueCnt + 1.U
@@ -398,7 +413,7 @@ class DRAMIf(
     // FIXME: gate by if any data lands in that distributor
     bcstDist.valid := bcstValid && !bcstAccepted(ci)
     bcstDist.bits.tag := bulkPending.tag
-    bcstDist.bits.line := bulkBuffer(bulkPending.completedCnt).asTypeOf(Vec(4, new BcastBeat))
+    bcstDist.bits.line := bulkBuffer(bulkPending.completedCnt).asTypeOf((new BcastLine).line)
     bcstDist.bits.carried := bulkPending.extras
     bcstAccept(ci) := bcstDist.fire
     bcstDist
@@ -464,10 +479,11 @@ class DRAMIf(
 class PeripheralIf(
   externalInflight: Int,
   configROM: Map[BigInt, BigInt] = Map.empty,
-) extends MemIf(0, externalInflight, 1) {
+)(implicit busParams: MemBusParameters) extends MemIf(0, externalInflight, 1) {
   override lazy val scalarResp: ValidIO[GlobalMemResp] = Wire(Valid(new GlobalMemResp))
 
-  val configHits = configROM.map({ case (addr, data) => ((scalarReq.bits.addr(31, 5) << 5) === addr.U, data.U(256.W)) }).toSeq
+  val addrMask = ~(busParams.core.memBusWidth / 8 - 1).U(32.W)
+  val configHits = configROM.map({ case (addr, data) => ((scalarReq.bits.addr & addrMask) === addr.U, data.U(busParams.core.memBusWidth.W)) }).toSeq
   val configHit = VecInit(configHits.map(_._1)).asUInt.orR
   val configReadout = Mux1H(configHits)
   val configGrant = !mem.resp.valid

@@ -34,7 +34,7 @@ We currently allocates the following events Tag for memory requests / responses.
   - TODO: operand[2] & operand[3]: Carried data, passed to the handler.
 - 0x?11: Bulk load
   - operand[0]: the start of the row
-  - operand[1][31:16]: the length of the access (in 8 bytes)
+  - operand[1][31:16]: the length of the access (in MEM_BEATS bytes)
   - operand[1][15:0]: the return tag value (which is unicasted, potentially remotely)
 
 The highest 4-bits of the tag is ignored, and should be assigned based on wanted priority. Hardware-initiated requests (e.g. fetch, ordinary load/store/AMO) uses the highest priority (0x0??), as their responses never blocks. Software-initiated requests should select appropriate priority. See deadlock.md for details.
@@ -43,6 +43,11 @@ The highest 4-bits of the tag is ignored, and should be assigned based on wanted
 Memory response is sent on the memory response bus, which is separated from the normal AM NoC.
 
 The width of the bus is based on a parameter.
+
+The current system configuration uses 512-bit (64-byte) memory lines. Scatter
+and bulk lengths count memory lines, not bytes. Image generators must align CSR
+row starts and ends to the configured line size because responses do not carry
+an entry-valid mask.
 
 ## Address map
 
@@ -54,3 +59,14 @@ The width of the bus is based on a parameter.
 - Address might no align to the bus width, but is always aligned to the size of the request.
 - Data (written data, response data, wbe) are lane aligned.
 - Data outside the size of the request is undefined / ignored.
+
+## Configuration ROM
+
+The configuration ROM is mapped through peripheral space and currently fits in
+one memory line. Multi-byte values are little-endian.
+
+- `0x68000000`: number of PUs (32 bits)
+- `0x68000008`: number of memory controllers (32 bits)
+- `0x68000010`: PUs per memory controller (32 bits)
+- `0x68000018`: log2 of the memory-line size in bytes (32 bits)
+- `0x68000020`: per-controller memory size (64 bits)

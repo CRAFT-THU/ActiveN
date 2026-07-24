@@ -279,6 +279,7 @@ object Topology {
 
 class System(implicit val params: SystemParameters) extends Module {
   implicit val coreParams: CoreParameters = params.coreParams
+  implicit val busParams: MemBusParameters = MemBusParameters(coreParams)
 
   val topo = Topology.build(params.numPU, params.numMC)
   val flitType = new bus.Flit
@@ -379,20 +380,18 @@ class System(implicit val params: SystemParameters) extends Module {
   //   0x28000000: numPU (word 0)
   //   0x28000008: numMC (word 2)
   //   0x28000010: PUs per MC (word 4)
+  //   0x28000018: log2(memory line size in bytes) (word 6)
   //   0x28000020: each MC's memory size (64-bit, little-endian)
   val pusPerMC = params.numPU / params.numMC
   val mcSize = coreParams.memCtrlSizes.head // all MCs have the same size
-  // Beat 0 at 0x28000000: 256-bit = 8 words (32-bit each), little-endian byte order
-  //   word0 = numPU, word1 = 0, word2 = numMC, word3 = 0, word4 = pusPerMC, ...
-  val beat0 = BigInt(params.numPU) |
+  val configLine = BigInt(params.numPU) |
     (BigInt(params.numMC) << 64) |
-    (BigInt(pusPerMC) << 128)
-  // Beat 1 at 0x28000020: MC memory size (64-bit LE in words 0-1)
-  val beat1 = mcSize
+    (BigInt(pusPerMC) << 128) |
+    (BigInt(busParams.lineAddrShift) << 192) |
+    (mcSize << 256)
 
   val configROM = Map(
-    BigInt("28000000", 16) -> beat0,
-    BigInt("28000020", 16) -> beat1,
+    BigInt("28000000", 16) -> configLine,
   )
   val periphMemIf = Module(new PeripheralIf(16, configROM = configROM))
   periphMemIf.suggestName("memif_0")

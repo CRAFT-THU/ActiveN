@@ -45,5 +45,13 @@ object Common {
       (left, right)
     }
   }
-}
 
+  def pipeValid[D <: Data](input: ValidIO[D]): ValidIO[D] = {
+    val data = RegEnable(input.bits, input.valid)
+    val valid = RegNext(input.valid, false.B)
+    val output = Wire(Valid(data.cloneType))
+    output.bits := data
+    output.valid := valid
+    output
+  }
+}

@@ -27,11 +27,16 @@
   #   s4  = decay factor (FP32), accessed as fs4
   #   s5  = num_mc
   #   s6  = num_pu
+  #   s10 = log2(memory-line bytes)
   #
-  # SPM layout per neuron (stride = 8 + 4*num_mc bytes):
+  # Current SPM layout per neuron (stride = 8 + 4*num_mc bytes):
   #   +0:  state (f32)
   #   +4:  input accumulator (f32)
   #   +8:  CSR start[mc0], +12: CSR start[mc1], ...
+  # Conductance SPM layout (stride = 16 + 4*num_mc bytes):
+  #   +0:  g_e, +4: g_i, +8: membrane potential (all f32)
+  #   +12: metadata (bit 0: 0=excitatory, 1=inhibitory)
+  #   +16: CSR start[mc0], +20: CSR start[mc1], ...
   # Sentinel neuron at end: past-the-end CSR addresses.
   #
   # SPM tail descriptor (end of 16KB SPM):
@@ -62,11 +67,23 @@
 #define STOP_ADDR       0x40000000
 #define TIMER_ADDR      0x40000004
 #define PRINT_PORT      0x4000000C
+#define CONFIG_ROM_ADDR 0x68000000
 
 #define MC_DST_BASE     0x8001
 #define SCATTER_TAG     0x410  /* prio=1, scatter type=0x10 */
 #define SCATTER_RESP_TAG 0x401 /* prio=1, handler=1 (spike) */
 #define DRAIN_LIMIT     1000
+
+#ifdef CONDUCTANCE
+#define NN_ACCUM_OFFSET 0
+#define NN_V_OFFSET     8
+#define NN_META_OFFSET  12
+#define NN_CSR_OFFSET   16
+#else
+#define NN_ACCUM_OFFSET 4
+#define NN_V_OFFSET     0
+#define NN_CSR_OFFSET   8
+#endif
 
   .macro SEND dst_reg, tag_reg
   .insn r 0x0B, 0x4, 0x0, x0, \dst_reg, \tag_reg
@@ -204,11 +221,16 @@ install_runtime:
   li    a0, (1 << 3) | 1      # thread 0 only, argcnt=1
   csrw  0x710, a0             # hancfg (thread 0 only for now)
 
-  # Handler 1: spike (argcnt=2, margin=0, quota=0) — second highest
+  # Handler 1: spike — second highest. Conductance mode also receives a2,
+  # the presynaptic E/I metadata carried by the scatter request.
   la    a0, spike
   csrw  0x701, a0
   csrw  0x721, zero           # hanmargin: quota=0, margin=0
+#ifdef CONDUCTANCE
+  li    a0, (1 << 3) | 3      # thread 0 only, argcnt=3
+#else
   li    a0, (1 << 3) | 2      # thread 0 only, argcnt=2
+#endif
   csrw  0x711, a0             # hancfg (thread 0 only for now)
 
   # Handler 2: work_drain (argcnt=1, margin=0, quota=0)
@@ -258,8 +280,8 @@ spm_init_finished:
   j     do_wfi
 
   #============================================================
-  # spike (tag=1, argcnt=2: a0=neuron_sub_idx, a1=weight)
-  # Hardware delivers: a0=BcastBeat.idx (sub_idx), a1=BcastBeat.data (weight)
+  # spike: a0=neuron_sub_idx, a1=weight. Conductance mode also receives
+  # a2=presynaptic metadata through the scatter carried-data field.
   #============================================================
   .globl spike
 spike:
@@ -269,9 +291,15 @@ spike:
   mul   a0, a0, s2            # sub_idx * stride
   li    t0, SPM_BASE
   add   a0, a0, t0            # neuron address
-  addi  t2, a0, 4             # t2 = &neuron->input
+#ifdef CONDUCTANCE
+  andi  t2, a2, 1             # source type: 0=excitatory, 1=inhibitory
+  slli  t2, t2, 2             # select g_e (+0) or g_i (+4)
+  add   t2, a0, t2
+#else
+  addi  t2, a0, NN_ACCUM_OFFSET
+#endif
 spike_lrsc:
-  lr.w  t0, (t2)              # t0/f5 = input (load reserved)
+  lr.w  t0, (t2)              # t0/f5 = accumulator (load reserved)
   fadd.s f5, f5, fa1          # f5 += weight (fa1 = a1 via shared regs)
   sc.w  t3, t0, (t2)          # try store; t3=0 on success
   bnez  t3, spike_lrsc        # retry if reservation lost
@@ -301,22 +329,97 @@ work_update:
   sw    t1, 0(t0)
 2:
 
-  lw    t0, 0(a0)             # x5/f5 = state
+#ifdef CONDUCTANCE
+  # Preserve the neuron pointer while the shared integer/FP a-registers are
+  # used by the midpoint update and software exponential.
+  mv    s7, a0
+
+  lw    t0, 0(s7)             # f5  = g_e
+  lw    t1, 4(s7)             # f6  = g_i
+  lw    t2, 8(s7)             # f7  = v
+  lw    s8, 12(s7)            # source metadata
+
+  # Midpoint conductances for dt=0.5 ms, tau_e=1 ms, tau_i=2 ms.
+  li    a1, 0x3f475f7d        # exp(-dt/(2*tau_e))
+  fmul.s f28, f5, fa1         # f28 = g_e midpoint
+  li    a1, 0x3f61eb51        # exp(-dt/(2*tau_i))
+  fmul.s f29, f6, fa1         # f29 = g_i midpoint
+  fadd.s f30, f28, f29
+  li    a1, 0x3f800000        # 1.0 leak conductance
+  fadd.s f30, f30, fa1        # f30 = g_mid
+
+  # Commit full-step conductance decay before the exponential helper reuses
+  # the shared t/f register bank.
+  li    a1, 0x3f1b4598        # exp(-dt/tau_e)
+  fmul.s f5, f5, fa1
+  sw    t0, 0(s7)
+  li    a1, 0x3f475f7d        # exp(-dt/tau_i)
+  fmul.s f6, f6, fa1
+  sw    t1, 4(s7)
+
+  # Select the one-trace model's E/I membrane constants.
+  andi  s9, s8, 1
+  bnez  s9, conductance_inhibitory
+  li    a1, 0xbd851eb8        # excitatory v_rest = -65 mV
+  li    a2, 0xbdcccccd        # excitatory E_inh  = -100 mV
+  li    a3, 0xbba3d70a        # -dt/tau_m = -0.005
+  j     conductance_constants_ready
+conductance_inhibitory:
+  li    a1, 0xbd75c28f        # inhibitory v_rest = -60 mV
+  li    a2, 0xbdae147b        # inhibitory E_inh  = -85 mV
+  li    a3, 0xbd4ccccd        # -dt/tau_m = -0.05
+conductance_constants_ready:
+  fmul.s f31, f29, fa2
+  fadd.s f31, f31, fa1
+  fdiv.s f31, f31, f30        # f31 = v_inf at midpoint
+  fmul.s fa0, f30, fa3        # fa0 = -dt*g_mid/tau_m
+  jal   ra, snn_exp_approx    # fa0 = exp(-dt*g_mid/tau_m)
+  lw    t2, 8(s7)             # reload v after helper reused f7
+  fsub.s fa1, f7, f31
+  fmul.s fa1, fa1, fa0
+  fadd.s f7, f31, fa1         # f7 = updated membrane potential
+  sw    t2, 8(s7)
+
+  bnez  s9, conductance_inhibitory_threshold
+  li    a1, 0xbd54fdf4        # excitatory threshold = -52 mV
+  flt.s t1, f7, fa1
+  bnez  t1, work_not_fired
+  li    t2, 0xbd851eb8        # excitatory reset = -65 mV
+  j     conductance_fired
+conductance_inhibitory_threshold:
+  li    a1, 0xbd23d70a        # inhibitory threshold = -40 mV
+  flt.s t1, f7, fa1
+  bnez  t1, work_not_fired
+  li    t2, 0xbd3851ec        # inhibitory reset = -45 mV
+conductance_fired:
+  sw    t2, NN_V_OFFSET(s7)
+  mv    a0, s7
+#else
+  lw    t0, NN_V_OFFSET(a0)   # x5/f5 = state
   flt.s t1, f5, fs3           # t1 = (state < threshold)
   bnez  t1, work_not_fired
 
   # Fired: reset state, scatter CSR to all MCs
-  sw    zero, 0(a0)
+  sw    zero, NN_V_OFFSET(a0)
+#endif
 
+  # Preserve the source pointer and carry its E/I metadata to every response.
+  mv    t0, a0
+#ifdef CONDUCTANCE
+  lw    a2, NN_META_OFFSET(t0)
+#else
+  li    a2, 0                 # current-based neurons are excitatory by ABI
+#endif
+  li    a3, 0
   li    t3, 0                 # mc index
   li    t4, MC_DST_BASE       # mc dst
 scatter_loop:
   beq   t3, s5, scatter_done
 
-  # csr_start: at neuron + 8 + 4*mc_idx
+  # csr_start: at neuron + NN_CSR_OFFSET + 4*mc_idx
   slli  t2, t3, 2
-  addi  t2, t2, 8
-  add   t2, a0, t2
+  addi  t2, t2, NN_CSR_OFFSET
+  add   t2, t0, t2
   lw    t5, 0(t2)             # csr_start (MC-local)
 
   # csr_end: next neuron's same field
@@ -325,13 +428,11 @@ scatter_loop:
 
   beq   t5, t6, scatter_next  # no synapses
 
-  # length in beats = (end - start) / 32
+  # length in memory lines = (end - start) >> line-byte shift
   sub   t1, t6, t5
-  srli  t1, t1, 5
+  srl   t1, t1, s10
 
   # Build scatter payload: a0=csr_start, a1=(beats<<16)|handler_tag(=1)
-  # Save our neuron pointer
-  mv    a2, a0
   mv    a0, t5                # a0 = csr_start
   slli  a1, t1, 16
   ori   a1, a1, SCATTER_RESP_TAG # prio=1, handler_tag=1 (spike)
@@ -339,7 +440,7 @@ scatter_loop:
   li    t1, SCATTER_TAG
   SEND  t4, t1
 
-  mv    a0, a2                # restore neuron pointer
+  mv    a0, t0                # restore neuron pointer
 
 scatter_next:
   addi  t3, t3, 1
@@ -354,9 +455,13 @@ scatter_done:
   j     do_wfi
 
 work_not_fired:
+#ifdef CONDUCTANCE
+  mv    a0, s7
+#else
   # Decay: state *= decay_factor
   fmul.s f5, f5, fs4
-  sw    t0, 0(a0)
+  sw    t0, NN_V_OFFSET(a0)
+#endif
 
   # Advance
   add   a0, a0, s2
@@ -403,7 +508,7 @@ work_drain_done:
   li    a0, 0
 drain_sum_loop:
   beq   t0, s1, drain_report
-  lw    t1, 4(t0)             # input field (raw FP32 bits)
+  lw    t1, NN_ACCUM_OFFSET(t0) # accumulator field (raw FP32 bits)
   add   a0, a0, t1            # integer sum of FP32 bit patterns
   add   t0, t0, s2
   j     drain_sum_loop
@@ -476,6 +581,8 @@ setup_regs:
   li    t0, 0x80000000
   lw    s5, 8(t0)             # num_mc
   lw    s6, 12(t0)            # num_pu
+  li    t0, CONFIG_ROM_ADDR
+  lw    s10, 24(t0)           # log2(memory-line bytes)
   ret
 
   #============================================================
@@ -484,3 +591,45 @@ setup_regs:
 load_sregisters:
   j     setup_regs
 
+#ifdef CONDUCTANCE
+  # exp(x) for x <= 0, using x = n*ln(2) + r and a fifth-order polynomial
+  # over r in [0, ln(2)). Input/output: fa0. No stack or saved registers.
+snn_exp_approx:
+  li    t0, 0x3fb8aa3b        # 1/ln(2)
+  fmul.s f7, fa0, f5
+  fcvt.w.s t1, f7, rdn        # n = floor(x/ln(2))
+  fcvt.s.w f7, t1
+  li    t0, 0x3f317218        # ln(2)
+  fmul.s f7, f7, f5
+  fsub.s f7, fa0, f7          # r = x - n*ln(2)
+
+  li    t3, 0x3c088889        # 1/120
+  fmul.s f28, f28, f7
+  li    t0, 0x3d2aaaab        # 1/24
+  fadd.s f28, f28, f5
+  fmul.s f28, f28, f7
+  li    t0, 0x3e2aaaab        # 1/6
+  fadd.s f28, f28, f5
+  fmul.s f28, f28, f7
+  li    t0, 0x3f000000        # 1/2
+  fadd.s f28, f28, f5
+  fmul.s f28, f28, f7
+  li    t0, 0x3f800000        # 1
+  fadd.s f28, f28, f5
+  fmul.s f28, f28, f7
+  fadd.s f28, f28, f5
+
+  addi  t2, t1, 127
+  blez  t2, snn_exp_zero
+  li    t0, 255
+  bge   t2, t0, snn_exp_saturate
+  slli  t2, t2, 23            # f7 = 2^n
+  fmul.s fa0, f28, f7
+  ret
+snn_exp_zero:
+  li    a0, 0
+  ret
+snn_exp_saturate:
+  li    a0, 0x7f7fffff
+  ret
+#endif

@@ -17,7 +17,7 @@
   #
   # Memory layout:
   #   dram.0: [text including CSR0 data at .csr0]
-  #   dram.1: [16-byte zero header | CSR1 data starting at offset 0x10]
+  #   dram.1: [one zero memory line | CSR1 data]
   #
   # New ISA SEND format:
   #   .insn r 0x0B, 0x4, 0x0, rd, dst_reg, tag_reg   (blocking SEND)
@@ -49,10 +49,7 @@
 #define SCATTER_TAG     0x010
 
   /* CSR0: located at csr0 symbol in this binary (dram.0). Address = symbol offset. */
-  /* CSR1: located at offset 0x20 in dram.1 (after 32-byte zero header). */
-#define CSR1_BASE       0x20
 #define CSR_ENTRIES     64
-#define CSR_BEATS       ((CSR_ENTRIES * 8) / 32)  /* 64*8/32 = 16 beats */
 
   .macro SEND dst_reg, tag_reg
   .insn r 0x0B, 0x4, 0x0, x0, \dst_reg, \tag_reg
@@ -77,6 +74,7 @@ _start:
   lw    t1, 8(t0)            # word2 = numMC
   li    t2, NUM_MC
   bne   t1, t2, bad_config
+  lw    s1, 24(t0)           # log2(memory-line bytes)
 
   #------------------------------------------------------------
   # Initialize SPM, then configure handlers
@@ -118,14 +116,21 @@ _start:
   la    a0, csr0              # CPU address of CSR0 in dram.0
   li    t2, 0x80000000
   sub   a0, a0, t2            # Convert to MC-local file offset
-  li    a1, (CSR_BEATS << 16) | 1    # 16 beats, response handler tag=1
+  li    t1, (CSR_ENTRIES * 8)
+  srl   t1, t1, s1
+  slli  a1, t1, 16
+  ori   a1, a1, 1            # response handler tag=1
   li    t0, MC0_DST
   li    t1, SCATTER_TAG
   SEND  t0, t1
 
   # --- Trigger scatter to MC1 ---
-  li    a0, CSR1_BASE         # MC-local base address in dram.1
-  li    a1, (CSR_BEATS << 16) | 1    # 16 beats, response handler tag=1
+  li    a0, 1
+  sll   a0, a0, s1            # CSR1 follows one zero memory line
+  li    t1, (CSR_ENTRIES * 8)
+  srl   t1, t1, s1
+  slli  a1, t1, 16
+  ori   a1, a1, 1             # response handler tag=1
   li    t0, MC1_DST
   li    t1, SCATTER_TAG
   SEND  t0, t1
@@ -230,4 +235,3 @@ ref_result:
 
   # CSR0 data (embedded in dram.0 binary)
   CSR0
-

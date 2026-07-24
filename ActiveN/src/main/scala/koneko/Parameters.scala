@@ -8,7 +8,7 @@ case class CoreParameters(
   val i$Lines: Int = 16,
   val i$BlockSize: Int = 64,
   val i$Assoc: Int = 2,
-  val memBusWidth: Int = 256,
+  val memBusWidth: Int = 512,
   val memCtrlSizes: List[BigInt] = List(BigInt("100000000", 16)), // 4 GiB default-addressable mem
   val scratchpadSize: Int = 16384,
   val useFPU: Boolean = true,
@@ -24,7 +24,9 @@ case class CoreParameters(
   val bcastQueueDepth: Int = 8,
 ) {
   require(scratchpadSize % 4 == 0)
-  require(memBusWidth >= 32 && isPow2(memBusWidth), "memBusWidth must be a power of 2 and >= 32")
+  require(memBusWidth >= 64 && isPow2(memBusWidth), "memBusWidth must be a power of 2 and >= 64")
+  require(i$BlockSize >= memBusWidth / 8, "I-cache block must contain at least one memory line")
+  require(i$BlockSize % (memBusWidth / 8) == 0, "I-cache block size must be a multiple of the memory line size")
   require(sendQueueDepth >= 4 && isPow2(sendQueueDepth), "sendQueueDepth must be a power of 2 and >= 4")
   require(evQueueDepth >= 2, "evQueueDepth must be at least 2 to avoid deadlock when waiting for a response")
   require(bcastQueueDepth >= 2, "bcastQueueDepth must be at least 2 to avoid deadlock when waiting for a response")

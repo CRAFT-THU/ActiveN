@@ -401,6 +401,8 @@ class DRAMIf : public MemIf {
   size_t bcstQueueCap;
   // Bulk acceptance states
   std::vector<uint16_t> bcstPUAccepted;
+  // Registered unicast output of each distributor.
+  std::vector<std::optional<RingResp>> unicastPipes;
 
   struct UnicastRespPeek {
     // The local responses, if exists. Index is pu index - puStart
@@ -435,7 +437,7 @@ public:
   };
 
   struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) PUAccept {
-    bool unicast; // Right now, PU unconditionally accepts unicast. The ringbus impl depends on this. TODO: add a assertion
+    bool unicast;
     bool broadcast;
   };
 
@@ -471,7 +473,8 @@ public:
       bulkMaxInflight(bulkInflight),
       bulkBuffer(bulkInflight),
       bcstQueueCap(bcstQueueCap),
-      bcstPUAccepted(numClusters()) {
+      bcstPUAccepted(numClusters()),
+      unicastPipes(numClusters()) {
         if ((puEnd - puStart) % CLUSTER_SIZE) throw std::logic_error("PU range not aligned");
         for (size_t dist = 0; dist < numClusters(); ++dist) {
           bcstQueues.emplace_back(bcstQueueCap);
@@ -487,33 +490,29 @@ public:
   // `bcstValids` computed via `e.pu -% puStart < 16.U`.
   static uint16_t bcastValidsMask(const BcastLine &bl, uint16_t clusterStart) {
     uint16_t mask = 0;
-    for (size_t i = 0; i < 4; ++i) {
-      uint16_t pu = (uint16_t)(bl.line[6 - 2*i] & 0xFFFF);
+    for (size_t i = 0; i < MEM_BUS_WIDTH_B / sizeof(uint64_t); ++i) {
+      uint16_t pu = (uint16_t)(bl.line[2*i] & 0xFFFF);
       uint16_t delta = (uint16_t)(pu - clusterStart);
       if (delta < CLUSTER_SIZE) mask |= (uint16_t)(1u << delta);
     }
     return mask;
   }
 
-  void peekPUs(const std::span<PUResp> &pus, const RingResp *ingress) const __attribute__((always_inline)) {
+  void peekPUs(const std::span<PUResp> &pus) const __attribute__((always_inline)) {
     if constexpr (ASSERTIONS_ENABLED) {
       if (pus.size() != puEnd - puStart) throw std::logic_error("Incorrect peekPUs buffer length");
     }
 
-    // Generate the UNIQUE arbitration of unicast response
-    auto unicast = unicastRespPeek(ingress);
-    RingResp scalarResp;
-    if (unicast.scalarLocal) scalarResp = scalarReturn(*scalarReturnSlot());
-
     // Populate PU responses
     for (size_t puDelta = 0; puDelta < puEnd - puStart; ++puDelta) {
-      if (std::make_optional(puDelta) == unicast.ringLocal) pus[puDelta].unicast = { ingress->tag, ingress->data };
-      else if (std::make_optional(puDelta) == unicast.scalarLocal) {
-        pus[puDelta].unicast = { scalarResp.tag, scalarResp.data };
-      } else pus[puDelta].unicast = std::nullopt;
-
       size_t dist = puDelta / CLUSTER_SIZE;
       uint8_t puSubidx = puDelta % CLUSTER_SIZE;
+      const auto &unicast = unicastPipes[dist];
+      if (unicast && unicast->dst == puStart + puDelta)
+        pus[puDelta].unicast = {unicast->tag, unicast->data};
+      else
+        pus[puDelta].unicast = std::nullopt;
+
       auto presented = bcstQueues[dist].front();
       pus[puDelta].bcast = std::nullopt;
       if (presented && ((bcstPUAccepted[dist] >> puSubidx) & 1) == 0) {
@@ -573,28 +572,20 @@ public:
     auto unicast = unicastRespPeek(ring.ingress ? ring.buffer : nullptr);
     auto scalarRet = MemIf::scalarReturnSlot();
     bool scalarDealloc = false;
-    // For unicast responses that's from ringbus forward, we don't need to handle it here.
-    // it's automatically overwritten by the ringbus injection logic
-    // Check if any PU accepted a unicast
-    if constexpr (ASSERTIONS_ENABLED) {
-      for (size_t puDelta = 0; puDelta < puEnd - puStart; ++ puDelta)
-        if (puAccepts[puDelta].unicast) {
-          if (
-            std::make_optional(puDelta) != unicast.ringLocal
-            && std::make_optional(puDelta) != unicast.scalarLocal
-          ) throw std::logic_error("PU accepted a non-existing unicast");
-        }
+    for (auto &pipe : unicastPipes) pipe = std::nullopt;
 
-      if (unicast.ringLocal && puAccepts[*unicast.ringLocal].unicast) {
-        if (!ring.eject) throw std::logic_error("PU accepted a ringbus forward, but ringbus does not eject");
+    if (unicast.ringLocal) {
+      if constexpr (ASSERTIONS_ENABLED) {
+        if (!ring.eject) throw std::logic_error("local ring response was not ejected");
       }
+      size_t dist = *unicast.ringLocal / CLUSTER_SIZE;
+      unicastPipes[dist] = *ring.buffer;
     }
 
-    if (unicast.scalarLocal && puAccepts[*unicast.scalarLocal].unicast) {
+    if (unicast.scalarLocal) {
       auto resp = MemIf::scalarReturn(*scalarRet);
-      if constexpr (ASSERTIONS_ENABLED) {
-        if (*unicast.scalarLocal + puStart != resp.dst) throw std::logic_error("locally returning a unicast with wrong dest");
-      }
+      size_t dist = *unicast.scalarLocal / CLUSTER_SIZE;
+      unicastPipes[dist] = resp;
       scalarDealloc = true;
     }
 

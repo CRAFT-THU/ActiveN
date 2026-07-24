@@ -381,25 +381,20 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads)
     releaseResetAfter(10),
     topo(cfg.numPU, cfg.numMC),
     periph(0, 16, [&]() {
-      // Build configROM matching RTL System.scala: beat0 at 0x28000000,
-      //   word0 = numPU, word2 = numMC, word4 = pusPerMC.
-      // beat1 at 0x28000020: low/high 32b of mcSize at words 0/1.
+      // Build the single config-ROM line matching RTL System.scala.
       std::unordered_map<uint32_t, MemLine> rom;
-      MemLine beat0{};
+      MemLine line{};
       uint32_t npu = static_cast<uint32_t>(cfg.numPU);
       uint32_t nmc = static_cast<uint32_t>(cfg.numMC);
       uint32_t ppm = nmc ? npu / nmc : 0;
-      std::memcpy(&beat0[0],  &npu, 4);
-      std::memcpy(&beat0[8],  &nmc, 4);
-      std::memcpy(&beat0[16], &ppm, 4);
-      rom[0x28000000u] = beat0;
-      MemLine beat1{};
+      uint32_t lineShift = MEM_BUS_WIDTH_SIZE;
       uint64_t mcSize = cfg.core.mcSizes.empty() ? 0 : cfg.core.mcSizes[0];
-      uint32_t mcSize_lo = static_cast<uint32_t>(mcSize & 0xFFFFFFFFu);
-      uint32_t mcSize_hi = static_cast<uint32_t>(mcSize >> 32);
-      std::memcpy(&beat1[0], &mcSize_lo, 4);
-      std::memcpy(&beat1[4], &mcSize_hi, 4);
-      rom[0x28000020u] = beat1;
+      std::memcpy(&line[0],  &npu, 4);
+      std::memcpy(&line[8],  &nmc, 4);
+      std::memcpy(&line[16], &ppm, 4);
+      std::memcpy(&line[24], &lineShift, 4);
+      std::memcpy(&line[32], &mcSize, 8);
+      rom[0x28000000u] = line;
       return rom;
     }()),
     drams(),
@@ -522,8 +517,7 @@ static void presentCoreMem(soft_rtl &core, const soft_mem::DRAMIf::PUResp &resp)
   core.mem_unicast_valid = resp.unicast.has_value();
   if (resp.unicast.has_value()) {
     core.mem_unicast_bits_id = resp.unicast->first;
-    // mem_unicast_bits_data is VlWide<8> (32 bytes); MemLine is
-    // std::array<uint8_t,32>. Same size; raw copy preserves byte order.
+    // The Verilated wide value and MemLine have the same byte layout.
     static_assert(sizeof(core.mem_unicast_bits_data) == sizeof(resp.unicast->second));
     std::memcpy(&core.mem_unicast_bits_data, resp.unicast->second.data(),
                 sizeof(resp.unicast->second));
@@ -535,10 +529,10 @@ static void presentCoreMem(soft_rtl &core, const soft_mem::DRAMIf::PUResp &resp)
     core.mem_broadcast_bits_carried_0 = resp.bcast->carried[0];
     core.mem_broadcast_bits_carried_1 = resp.bcast->carried[1];
 
-    // BcastLine.line is Vec(4, BcastBeat) where BcastBeat is
+    // BcastLine.line is a Vec of BcastBeat, where BcastBeat is
     // (data:32, idx:16, pu:16) — Chisel default Bundle places `data`
-    // at the MSB. The soft side stores the same 256 bits as
-    // uint32_t[8] in little-endian word order. Empirically, the RTL PU
+    // at the MSB. The soft side stores the same line as uint32_t words
+    // in little-endian order. The RTL PU
     // expects line(i) at raw[2*i, 2*i+1] (i.e. Vec(0) at LOW bits in
     // this representation), so:
     //   line(i).data       = soft.line[2*i + 1]
@@ -556,6 +550,18 @@ static void presentCoreMem(soft_rtl &core, const soft_mem::DRAMIf::PUResp &resp)
     core.mem_broadcast_bits_line_3_data = raw[7];
     core.mem_broadcast_bits_line_3_idx  = (uint16_t)(raw[6] >> 16);
     core.mem_broadcast_bits_line_3_pu   = (uint16_t)(raw[6] & 0xFFFF);
+    core.mem_broadcast_bits_line_4_data = raw[9];
+    core.mem_broadcast_bits_line_4_idx  = (uint16_t)(raw[8] >> 16);
+    core.mem_broadcast_bits_line_4_pu   = (uint16_t)(raw[8] & 0xFFFF);
+    core.mem_broadcast_bits_line_5_data = raw[11];
+    core.mem_broadcast_bits_line_5_idx  = (uint16_t)(raw[10] >> 16);
+    core.mem_broadcast_bits_line_5_pu   = (uint16_t)(raw[10] & 0xFFFF);
+    core.mem_broadcast_bits_line_6_data = raw[13];
+    core.mem_broadcast_bits_line_6_idx  = (uint16_t)(raw[12] >> 16);
+    core.mem_broadcast_bits_line_6_pu   = (uint16_t)(raw[12] & 0xFFFF);
+    core.mem_broadcast_bits_line_7_data = raw[15];
+    core.mem_broadcast_bits_line_7_idx  = (uint16_t)(raw[14] >> 16);
+    core.mem_broadcast_bits_line_7_pu   = (uint16_t)(raw[14] & 0xFFFF);
   }
 }
 
@@ -745,7 +751,7 @@ void SoftSystemBackend::prepareNextCoreMem(uint64_t cycle) {
                                      (m + 1) * PU_PER_MC + 1);
     // This snapshot is consumed by the cores during the next iteration's
     // stage, after the current DRAMIf and ring state has committed.
-    drams[m].peekPUs(bufferSpan, ring.peekAt(m + 1));
+    drams[m].peekPUs(bufferSpan);
     if (profile)
       workProfileRecordUnit(cycle, WorkProfilePhase::StepDone,
                             WorkProfileUnit::PeekMC, m,

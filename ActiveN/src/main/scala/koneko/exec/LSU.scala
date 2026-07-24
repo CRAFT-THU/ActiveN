@@ -134,7 +134,7 @@ class LSU(implicit val param: CoreParameters) extends Module {
 
   // Extract word from wide response based on address within the beat
   val wordsPerBeat = param.memBusWidth / 32
-  val beatAlignBits = log2Ceil(param.memBusWidth / 8) // log2(32) = 5 for 256-bit
+  val beatAlignBits = log2Ceil(param.memBusWidth / 8)
   val wordInBeat = alignedAddr(beatAlignBits - 1, 2) // word offset within the beat
   val respWords = Wire(Vec(wordsPerBeat, UInt(32.W)))
   for (i <- 0 until wordsPerBeat) {

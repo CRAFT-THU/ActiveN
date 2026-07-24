@@ -5,7 +5,6 @@
 #include <iostream>
 #include <optional>
 #include <random>
-#include <string>
 #include <vector>
 
 // Peripheral device: handles MMIO requests in the 0x40000000 region.

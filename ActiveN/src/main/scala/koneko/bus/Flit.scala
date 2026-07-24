@@ -1,6 +1,7 @@
 package koneko.bus
 
 import chisel3._
+import koneko.CoreParameters
 
 object Flit {
   def Content = Vec(4, UInt(32.W))
@@ -47,8 +48,10 @@ class BcastBeat extends Bundle {
 // a0: subindex (truncated)
 // a1: data
 // a2~a3: carried data
-class BcastLine extends Bundle {
-  val line = Vec(4, new BcastBeat)
+class BcastLine(implicit val params: CoreParameters) extends Bundle {
+  require(params.memBusWidth % 64 == 0, "BcastLine width must be multiple of 64 bits")
+  val slots = params.memBusWidth / 64
+  val line = Vec(slots, new BcastBeat)
   val tag = UInt(12.W)
   val carried = Vec(2, UInt(32.W))
 }

@@ -5,7 +5,7 @@
  * - Loads a binary file as the initial memory image.
  * - Memory requests arrive as single flits on ext.out (tag 0xF00 = load, 0xF01 = store).
  *   Flit layout: data[0]=addr, data[1]=size|id, data[2]=wdata, data[3]=reserved
- * - Memory responses are sent on the mem_unicast bus (id + 256-bit data).
+ * - Memory responses are sent on the mem_unicast bus (id + one memory line).
  * - AM events (tag != 0xF00/0xF01) are captured and logged.
  * - End-of-simulation: store to peripheral address 0x40000000 (dst 0x8000).
  *
@@ -38,7 +38,8 @@ static bool exiting = false;
 
 static const uint64_t RESET_LENGTH = 10;
 static const uint32_t TEXT_BASE = 0x80000000ul;
-static const int MEM_BUS_WORDS = 256 / 32; // 8 words per beat
+static_assert(CORE_MEM_BUS_WIDTH >= 64 && (CORE_MEM_BUS_WIDTH & (CORE_MEM_BUS_WIDTH - 1)) == 0);
+static const int MEM_BUS_WORDS = CORE_MEM_BUS_WIDTH / 32;
 
 static uint32_t *text_aligned = nullptr;
 static size_t text_size = 0;
@@ -49,10 +50,10 @@ static void sighandler(int) {
   exiting = true;
 }
 
-// Memory response: id + 256-bit data (8 words)
+// Memory response: id + one memory line
 struct MemResponse {
   uint16_t id;
-  uint32_t data[MEM_BUS_WORDS]; // 8 words, little-endian
+  uint32_t data[MEM_BUS_WORDS]; // little-endian
 };
 
 // State for collecting multi-flit memory requests
@@ -81,11 +82,11 @@ struct SingleCoreSim {
     core->final();
   }
 
-  // Read 256-bit aligned block from backing memory at given byte address
+  // Read one aligned memory line from backing memory at the given byte address
   MemResponse readBlock(uint32_t addr, uint16_t resp_tag) {
     MemResponse resp;
     resp.id = resp_tag;
-    // Align to 32-byte boundary (256 bits)
+    // Align to a memory-line boundary
     uint32_t aligned = addr & ~((MEM_BUS_WORDS * 4) - 1);
     for (int i = 0; i < MEM_BUS_WORDS; i++) {
       uint32_t byte_addr = aligned + i * 4;

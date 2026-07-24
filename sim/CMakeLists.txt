@@ -127,6 +127,13 @@ endif()
 set(GENERATED_CORE_DIR ${CMAKE_SOURCE_DIR}/../generated/core)
 set(GENERATED_SYSTEM_DIR ${CMAKE_SOURCE_DIR}/../generated/system)
 
+set(CORE_CONFIG_JSON ${GENERATED_CORE_DIR}/Core.config.json)
+if(NOT EXISTS ${CORE_CONFIG_JSON})
+  message(FATAL_ERROR "Core.config.json not found at ${CORE_CONFIG_JSON}. Run Mill elaboration first.")
+endif()
+file(READ ${CORE_CONFIG_JSON} CORE_CONFIG_CONTENT)
+string(JSON CORE_MEM_BUS_WIDTH GET ${CORE_CONFIG_CONTENT} "memBusWidth")
+
 # cvfpu source files
 set(CVFPU_DIR ${CMAKE_SOURCE_DIR}/../dep/cvfpu)
 set(CVFPU_SOURCES
@@ -198,6 +205,7 @@ add_executable(sim_single
     src/devices.cpp
 )
 add_dependencies(sim_single gen_bootrom)
+target_compile_definitions(sim_single PRIVATE CORE_MEM_BUS_WIDTH=${CORE_MEM_BUS_WIDTH})
 
 verilate(
     sim_single

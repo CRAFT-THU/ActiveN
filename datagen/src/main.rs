@@ -13,15 +13,15 @@ use std::io::BufReader;
 use std::io::BufWriter;
 use std::io::Write;
 
-const CSR_ROW_ALIGN_WORDS: usize = 8;
 const DRAM_HEADER_BYTES: usize = 16;
 const SPM_INIT_DESC_BYTES: usize = 8;
 
-fn pad_csr_row(words: &mut Vec<u32>) {
-    while words.len() % CSR_ROW_ALIGN_WORDS != 0 {
-        words.push(0);
-        words.push(0);
-    }
+fn align_up(value: usize, alignment: usize) -> usize {
+    (value + alignment - 1) & !(alignment - 1)
+}
+
+fn pad_csr_row(words: &mut Vec<u32>, line_words: usize) {
+    words.resize(align_up(words.len(), line_words), 0);
 }
 
 #[derive(Parser)]
@@ -34,6 +34,10 @@ struct Args {
 
     #[clap(long, default_value = "16384")]
     spm_size: usize,
+
+    /// Memory-line width in bits.
+    #[clap(long, default_value = "512")]
+    mem_line_width: usize,
 
     #[clap(long)]
     load_nest_nodes: Option<PathBuf>,
@@ -132,12 +136,15 @@ fn dump<R: Rng>(
     text: Option<&PathBuf>,
     decay: f32,
     threshold: f32,
+    mem_line_width: usize,
     mut dump_shuffle_rng: Option<&mut R>,
 ) -> anyhow::Result<()> {
     println!("Dumping to {}", base.display());
 
     let core_cnt = cores.len();
     let pus_per_mc = core_cnt / num_mc;
+    let line_bytes = mem_line_width / 8;
+    let line_words = line_bytes / 4;
 
     // Per neuron in SPM: state(f32), input(f32), starts[0..num_mc-1]
     // Plus 1 sentinel neuron at the end with past-the-end CSR offsets
@@ -187,10 +194,10 @@ fn dump<R: Rng>(
                 csr_per_mc[target_mc].push(neigh.weight.to_bits());
             }
 
-            // Scatter reads whole 256-bit beats without a per-entry valid mask,
-            // so each per-neuron row must end on a beat boundary.
+            // Scatter reads whole memory lines without a per-entry valid mask,
+            // so each per-neuron row must end on a line boundary.
             for mc in 0..num_mc {
-                pad_csr_row(&mut csr_per_mc[mc]);
+                pad_csr_row(&mut csr_per_mc[mc], line_words);
             }
         }
         // Sentinel: past-the-end for last neuron
@@ -201,10 +208,9 @@ fn dump<R: Rng>(
 
     // Step 2: Compute neuron starts as DRAM-image-local offsets.
     // Per spec: starts are relative to the START OF THE DRAM IMAGE.
-    // MC0 layout: [header(16B)][text][CSR data...], so CSR base = 16 + text_len
-    // Other MCs:  [header(16B)][CSR data...], so CSR base = 16
-    let csr_local_base_mc0 = (DRAM_HEADER_BYTES + text_len) as u32;
-    let csr_local_base_other = DRAM_HEADER_BYTES as u32;
+    // Each CSR section begins at a memory-line boundary.
+    let csr_local_base_mc0 = align_up(DRAM_HEADER_BYTES + text_len, line_bytes) as u32;
+    let csr_local_base_other = align_up(DRAM_HEADER_BYTES, line_bytes) as u32;
 
     // Step 3: Build full SPM images (spm_size bytes each).
     let mut all_spm_images: Vec<Vec<u8>> = Vec::new();
@@ -273,10 +279,10 @@ fn dump<R: Rng>(
     // Step 4: Compute dram.0 layout (per doc/snn.md):
     // [0..16): header (jump to after header, spm_init_offset, num_mc, num_pu)
     // [16..16+text_len): executable text binary
-    // [16+text_len..+csr0_bytes): CSR data for MC 0
+    // [aligned after text..+csr0_bytes): CSR data for MC 0
     // [after csr..): SPM init section (descriptors + data)
     let csr0_bytes = csr_per_mc[0].len() * 4;
-    let spm_init_offset = (DRAM_HEADER_BYTES + text_len + csr0_bytes) as u32;
+    let spm_init_offset = csr_local_base_mc0 + csr0_bytes as u32;
     let spm_init_desc_total = core_cnt * SPM_INIT_DESC_BYTES;
     let spm_init_data_total = core_cnt * spm_size;
     let spm_init_section_size = spm_init_desc_total + spm_init_data_total;
@@ -303,6 +309,7 @@ fn dump<R: Rng>(
     if !text_data.is_empty() {
         writer.write_all(&text_data)?;
     }
+    writer.write_all(&vec![0u8; csr_local_base_mc0 as usize - DRAM_HEADER_BYTES - text_len])?;
 
     // CSR data for MC 0
     for word in &csr_per_mc[0] {
@@ -324,7 +331,7 @@ fn dump<R: Rng>(
     }
 
     writer.flush()?;
-    let dram0_size = DRAM_HEADER_BYTES + text_len + csr0_bytes + spm_init_section_size;
+    let dram0_size = csr_local_base_mc0 as usize + csr0_bytes + spm_init_section_size;
     println!("  dram.0: {} bytes (header={}, text={}, csr={}, init_section={})",
         dram0_size, DRAM_HEADER_BYTES, text_len, csr0_bytes, spm_init_section_size);
 
@@ -334,10 +341,8 @@ fn dump<R: Rng>(
         out_file.push(format!("dram.{}", mc));
         let mut writer = BufWriter::new(File::create(&out_file)?);
 
-        // 16 bytes of zeros (header for non-primary images)
-        for _ in 0..4 {
-            writer.write_u32::<LittleEndian>(0)?;
-        }
+        // Header plus padding up to the first memory-line boundary.
+        writer.write_all(&vec![0u8; csr_local_base_other as usize])?;
 
         // CSR data for this MC
         for word in &csr_per_mc[mc] {
@@ -345,7 +350,7 @@ fn dump<R: Rng>(
         }
 
         writer.flush()?;
-        let mc_size = DRAM_HEADER_BYTES + csr_per_mc[mc].len() * 4;
+        let mc_size = csr_local_base_other as usize + csr_per_mc[mc].len() * 4;
         println!("  dram.{}: {} bytes (header={}, csr={})",
             mc, mc_size, DRAM_HEADER_BYTES, csr_per_mc[mc].len() * 4);
     }
@@ -497,6 +502,13 @@ impl Iterator for SudokuIterator {
 
 fn main() -> anyhow::Result<()> {
     let mut args = Args::parse();
+
+    if args.mem_line_width < 64
+        || !args.mem_line_width.is_power_of_two()
+        || args.mem_line_width % 32 != 0
+    {
+        anyhow::bail!("--mem-line-width must be a power of two at least 64 bits");
+    }
 
     if args.sudoku {
         assert_eq!(args.tot_neuron % (9 * 9 * 9), 0);
@@ -812,7 +824,8 @@ fn main() -> anyhow::Result<()> {
     if let Some(ref snapshot) = dump_snapshot {
         if let Some(ref p) = args.dump {
             let mut dump_shuffle_rng = args.dump_shuffle_seed.map(|seed| Xoshiro256PlusPlus::seed_from_u64(seed));
-            dump(p, snapshot, args.num_mc, args.spm_size, args.text.as_ref(), e_neg_tau, args.threshold, dump_shuffle_rng.as_mut())?;
+            dump(p, snapshot, args.num_mc, args.spm_size, args.text.as_ref(), e_neg_tau,
+                 args.threshold, args.mem_line_width, dump_shuffle_rng.as_mut())?;
         }
 
         if let Some(ref p) = args.dump_genn {

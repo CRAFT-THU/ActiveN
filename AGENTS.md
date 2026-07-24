@@ -181,7 +181,8 @@ generated JSON before building or running a system simulator.
   - `0x11`: bulk load with unicast response
 - Higher tag bits are available for priority and are ignored by the MemIf class
   decoder.
-- Global memory requests use 256-bit lines and 8-bit external request IDs.
+- Global memory requests use 512-bit lines in the current configuration and
+  8-bit external request IDs.
   Scalar IDs have bit 7 clear; bulk/scatter IDs have bit 7 set and encode an
   inflight beat slot.
 - Only one bulk request is active in each `DRAMIf`; its issue, response, and
@@ -217,6 +218,7 @@ The configuration ROM is reached through peripheral space:
 - `0x68000000`: number of PUs
 - `0x68000008`: number of MCs
 - `0x68000010`: PUs per MC
+- `0x68000018`: log2 of the memory-line size in bytes
 - `0x68000020`: per-MC size as a little-endian 64-bit value
 
 The default RNG seed is `0x19260817`; both simulators accept `--rng-seed`.
@@ -493,6 +495,7 @@ Important arguments:
 - `--core-cnt` is required.
 - `--num-mc` defaults to 1.
 - `--spm-size` defaults to 16384.
+- `--mem-line-width` is specified in bits and defaults to 512.
 - The main generation seed defaults to decimal `19260817`.
 - `--dump-shuffle-seed` independently controls CSR-entry shuffling and requires
   `--dump`.
@@ -531,9 +534,10 @@ DRAM image layout:
   number of MCs, and number of PUs.
 - It then contains the executable, MC0 CSR data, and the SPM descriptor/data
   section.
-- Other `dram.N` files begin with 16 zero bytes and then that MC's CSR data.
-- Each CSR row is padded to a 32-byte memory beat because scatter reads have no
-  per-entry validity mask.
+- Other `dram.N` files begin with a 16-byte zero header, followed by zero
+  padding through the next memory-line boundary and then that MC's CSR data.
+- Each CSR row is padded to the configured memory-line size because scatter
+  reads have no per-entry validity mask.
 - Each PU SPM image contains neuron state, input, one CSR start offset per MC, a
   sentinel neuron, and a tail descriptor containing decay, threshold, type,
   stride, and neuron count.
