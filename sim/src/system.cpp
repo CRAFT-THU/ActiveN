@@ -56,7 +56,9 @@
 #include "system.h"
 #include "devices.h"
 #include "soft_backend.h"
+#if HARD_BACKEND_ENABLED
 #include "hard_backend.h"
+#endif
 #include "dramsim3/dramsim3.h"
 #include <verilated_fst_c.h>
 
@@ -621,6 +623,13 @@ int main(int argc, char **argv) {
   bool use_soft = program.get<bool>("--soft");
   bool use_hard = program.get<bool>("--hard");
 
+#if !HARD_BACKEND_ENABLED
+  if (use_hard) {
+    cerr << "Error: --hard is unavailable because the hard backend was disabled at build time" << endl;
+    return 1;
+  }
+#endif
+
   if (!use_soft && !use_hard) {
     cerr << "Error: specify at least one of --soft or --hard" << endl;
     cerr << program;
@@ -713,6 +722,7 @@ int main(int argc, char **argv) {
   // context; if any model is constructed AFTER trace finalisation, its
   // signals are silently dropped. So defer attachTrace until all models
   // exist.
+#if HARD_BACKEND_ENABLED
   if (use_hard) {
     auto hard = make_unique<HardSystemBackend>();
     // Compare hard backend's compiled config against CLI-supplied config.
@@ -737,6 +747,7 @@ int main(int argc, char **argv) {
     system.addBackend(std::move(hard));
     cerr << "[Main] Hard backend enabled" << endl;
   }
+#endif
 
   if (use_soft) {
     auto soft = make_unique<SoftSystemBackend>(cli_cfg, soft_threads);

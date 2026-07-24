@@ -14,6 +14,7 @@ set(PGO_PROFILE_DIR "${CMAKE_BINARY_DIR}/pgo-profiles" CACHE STRING "Directory f
 option(USE_LTO "Enable ThinLTO" OFF)
 option(USE_BOLT "Apply BOLT post-link optimization (instrumentation mode)" ON)
 option(USE_MIMALLOC "Link mimalloc as the global memory allocator" ON)
+option(ENABLE_HARD_BACKEND "Build the Verilated full-system hard backend" ON)
 
 if(PGO_GENERATE AND PGO_USE)
   message(FATAL_ERROR "Cannot enable both PGO_GENERATE and PGO_USE simultaneously")
@@ -239,19 +240,21 @@ add_custom_target(gen_system_headers DEPENDS
 )
 
 # Hard backend: Verilated System RTL
-file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/hard_backend_stub.cpp "// stub for verilator linkage\n")
-add_library(hard_backend_lib STATIC
-    ${CMAKE_CURRENT_BINARY_DIR}/hard_backend_stub.cpp
-)
-verilate(
-  hard_backend_lib
-    SOURCES ${CVFPU_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/../FPU.sv
-    PREFIX sys_rtl
-    TRACE_FST
-    DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/sys_verilated
-    INCLUDE_DIRS ${GENERATED_SYSTEM_DIR}
-    VERILATOR_ARGS "-f" "${GENERATED_SYSTEM_DIR}/filelist.f" ${VERILATOR_SYSTEM_ARGS}
-)
+if(ENABLE_HARD_BACKEND)
+  file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/hard_backend_stub.cpp "// stub for verilator linkage\n")
+  add_library(hard_backend_lib STATIC
+      ${CMAKE_CURRENT_BINARY_DIR}/hard_backend_stub.cpp
+  )
+  verilate(
+    hard_backend_lib
+      SOURCES ${CVFPU_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/../FPU.sv
+      PREFIX sys_rtl
+      TRACE_FST
+      DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/sys_verilated
+      INCLUDE_DIRS ${GENERATED_SYSTEM_DIR}
+      VERILATOR_ARGS "-f" "${GENERATED_SYSTEM_DIR}/filelist.f" ${VERILATOR_SYSTEM_ARGS}
+  )
+endif()
 
 # Soft backend: many Core instances + C++ NoC model
 # Uses Core.sv from generated/system so config matches the hard backend exactly.
@@ -279,12 +282,25 @@ add_dependencies(sim_system gen_system_headers gen_bootrom)
 add_dependencies(soft_backend_lib gen_system_headers)
 target_link_libraries(sim_system PRIVATE
   soft_backend_lib
-  hard_backend_lib
   ${DRAMSIM3}
 )
+target_compile_definitions(sim_system PRIVATE
+  HARD_BACKEND_ENABLED=$<BOOL:${ENABLE_HARD_BACKEND}>
+)
+
+if(ENABLE_HARD_BACKEND)
+  target_link_libraries(sim_system PRIVATE hard_backend_lib)
+endif()
+
+if(ENABLE_HARD_BACKEND)
+  set(BOLT_SYSTEM_BACKEND_ARGS "--soft" "--hard")
+else()
+  set(BOLT_SYSTEM_BACKEND_ARGS "--soft")
+endif()
 
 apply_bolt(sim_system "${BOLT_MULTI_PAYLOAD}" "${BOLT_MULTI_CYCLES}"
-  "--soft" "--hard" "--pu" "${SYSTEM_NUM_PU}" "--mc" "${SYSTEM_NUM_MC}"
+  ${BOLT_SYSTEM_BACKEND_ARGS}
+  "--pu" "${SYSTEM_NUM_PU}" "--mc" "${SYSTEM_NUM_MC}"
   "--mc-size" "${SYSTEM_MC_SIZE_0}"
   # apply_bolt appends BOLT_PAYLOAD (= dram.1) at the end, so dram.0 goes
   # here to satisfy the MC0/MC1 positional ordering.
