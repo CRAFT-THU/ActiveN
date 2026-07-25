@@ -320,6 +320,7 @@ endif()
 
 apply_bolt(sim_system "${BOLT_MULTI_PAYLOAD}" "${BOLT_MULTI_CYCLES}"
   ${BOLT_SYSTEM_BACKEND_ARGS}
+  "--soft-threads" "8"
   "--pu" "${SYSTEM_NUM_PU}" "--mc" "${SYSTEM_NUM_MC}"
   "--mc-size" "${SYSTEM_MC_SIZE_0}"
   # apply_bolt appends BOLT_PAYLOAD (= dram.1) at the end, so dram.0 goes

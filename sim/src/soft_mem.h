@@ -185,6 +185,18 @@ struct RingIntf {
 //
 class MemIf {
 protected:
+  struct IdleNotifier {
+    uint16_t tgt;
+    uint16_t tag;
+    uint16_t cycles;
+  };
+
+  struct IdleReturn {
+    uint16_t tgt;
+    uint16_t tag;
+    uint32_t data;
+  };
+
   size_t idx;
 
   size_t scalarInflight;
@@ -194,6 +206,81 @@ protected:
   uint64_t scalarCompleted = 0;
   FlitArb reqArb;
   FlitArb scalarIssueArb;
+  std::optional<IdleNotifier> idleNotifier;
+  std::optional<IdleReturn> idleReturn;
+  uint16_t idleCycles = 0;
+
+  static bool isScalarRequest(const Flit &f) noexcept {
+    const uint8_t tag = static_cast<uint8_t>(f.tag);
+    return tag == 0x00 || tag == 0x01;
+  }
+
+  static bool isBulkRequest(const Flit &f) noexcept {
+    const uint8_t tag = static_cast<uint8_t>(f.tag);
+    return tag == 0x10 || tag == 0x11;
+  }
+
+  static bool isIdleRequest(const Flit &f) noexcept {
+    const uint8_t tag = static_cast<uint8_t>(f.tag);
+    return tag == 0xF0 || tag == 0xF1;
+  }
+
+  bool idleCanAccept(const Flit &f) const noexcept {
+    return isIdleRequest(f) && !idleReturn.has_value();
+  }
+
+  void idleStep(bool idleCurrently, const Flit *request,
+                bool nocOutAccepted) __attribute__((always_inline)) {
+    const bool notifierWasValid = idleNotifier.has_value();
+    const bool requestIsIdle = request && isIdleRequest(*request);
+
+    // These are registered RTL updates: all decisions below observe the
+    // pre-edge notifier, return buffer, and accumulated idle count.
+    if (notifierWasValid && !idleReturn &&
+        idleCycles > idleNotifier->cycles && !requestIsIdle) {
+      idleReturn = IdleReturn {
+        .tgt = idleNotifier->tgt,
+        .tag = idleNotifier->tag,
+        .data = 0,
+      };
+      idleNotifier = std::nullopt;
+    }
+
+    if (requestIsIdle) {
+      const uint8_t tag = static_cast<uint8_t>(request->tag);
+      const uint16_t returnTag = static_cast<uint16_t>(request->data[0]);
+      if (tag == 0xF0) {
+        if (!notifierWasValid) {
+          idleNotifier = IdleNotifier {
+            .tgt = request->src,
+            .tag = returnTag,
+            .cycles = static_cast<uint16_t>(request->data[0] >> 16),
+          };
+        } else {
+          idleReturn = IdleReturn {
+            .tgt = request->src,
+            .tag = returnTag,
+            .data = UINT32_MAX,
+          };
+        }
+      } else {
+        idleNotifier = std::nullopt;
+        idleReturn = IdleReturn {
+          .tgt = request->src,
+          .tag = returnTag,
+          .data = notifierWasValid ? 0u : UINT32_MAX,
+        };
+      }
+    }
+
+    // nocOut is driven from the old return register, so a simultaneous
+    // transfer clears it after all other next-state decisions.
+    if (nocOutAccepted) idleReturn = std::nullopt;
+
+    if (!idleCurrently) idleCycles = 0;
+    else if (idleCycles != UINT16_MAX) ++idleCycles;
+  }
+
 public:
   MemIf(
     size_t idx,
@@ -201,6 +288,12 @@ public:
     size_t numReq
   ) : idx(idx), scalarInflight(scalarInflight), scalarPendings(scalarInflight), reqArb(numReq), scalarIssueArb(scalarInflight) {
     if (scalarInflight > 64) throw std::invalid_argument("scalarInflight must be <= 64");
+  }
+
+  void resetIdle() noexcept {
+    idleNotifier = std::nullopt;
+    idleReturn = std::nullopt;
+    idleCycles = 0;
   }
 
   /*
@@ -302,6 +395,16 @@ public:
    */
 
   virtual std::optional<GlobalMemReq> peekMem() const = 0;
+
+  std::optional<Flit> peekNoc() const noexcept __attribute__((always_inline)) {
+    if (!idleReturn) return std::nullopt;
+    return Flit {
+      .src = static_cast<uint16_t>(0x8000u + idx),
+      .dst = idleReturn->tgt,
+      .tag = static_cast<uint16_t>(idleReturn->tag & 0x0FFFu),
+      .data = {idleReturn->data, 0, 0, 0},
+    };
+  }
 
   /*
    * NoC ejection interface
@@ -460,9 +563,10 @@ public:
 
 protected:
   virtual bool nocCanAccept(const Flit &f) const override __attribute__((always_inline)) {
-    bool isBulk = (f.tag & 0x10) != 0;
-    if (isBulk) return !bulk.has_value();
-    else return scalarAllocSlot().has_value();
+    if (isIdleRequest(f)) return idleCanAccept(f);
+    if (isBulkRequest(f)) return !bulk.has_value();
+    if (isScalarRequest(f)) return scalarAllocSlot().has_value();
+    return false;
   }
 
 public:
@@ -498,28 +602,31 @@ public:
     return mask;
   }
 
-  void peekPUs(const std::span<PUResp> &pus) const __attribute__((always_inline)) {
+  void peekPUs(size_t rangeStart, const std::span<PUResp> &pus) const
+      __attribute__((always_inline)) {
     if constexpr (ASSERTIONS_ENABLED) {
-      if (pus.size() != puEnd - puStart) throw std::logic_error("Incorrect peekPUs buffer length");
+      if (rangeStart < puStart || rangeStart + pus.size() > puEnd)
+        throw std::logic_error("peekPUs range is outside the MemIf domain");
     }
 
     // Populate PU responses
-    for (size_t puDelta = 0; puDelta < puEnd - puStart; ++puDelta) {
+    for (size_t rangeDelta = 0; rangeDelta < pus.size(); ++rangeDelta) {
+      const size_t puDelta = rangeStart + rangeDelta - puStart;
       size_t dist = puDelta / CLUSTER_SIZE;
       uint8_t puSubidx = puDelta % CLUSTER_SIZE;
       const auto &unicast = unicastPipes[dist];
       if (unicast && unicast->dst == puStart + puDelta)
-        pus[puDelta].unicast = {unicast->tag, unicast->data};
+        pus[rangeDelta].unicast = {unicast->tag, unicast->data};
       else
-        pus[puDelta].unicast = std::nullopt;
+        pus[rangeDelta].unicast = std::nullopt;
 
       auto presented = bcstQueues[dist].front();
-      pus[puDelta].bcast = std::nullopt;
+      pus[rangeDelta].bcast = std::nullopt;
       if (presented && ((bcstPUAccepted[dist] >> puSubidx) & 1) == 0) {
         uint16_t clusterStart = (uint16_t)(puStart + dist * CLUSTER_SIZE);
         uint16_t valids = bcastValidsMask(presented.value().get(), clusterStart);
         if (valids & (1u << puSubidx))
-          pus[puDelta].bcast = presented.value().get();
+          pus[rangeDelta].bcast = presented.value().get();
       }
     }
   }
@@ -542,9 +649,19 @@ public:
     RingIntf ring,
     MemBusIn &mem,
     std::optional<std::pair<std::reference_wrapper<const Flit>, uint8_t>> flit,
-    const std::span<PUAccept> &puAccepts
+    const std::span<const uint16_t> &bcstAcceptMasks,
+    bool nocOutAccepted
   ) __attribute__((always_inline)) {
     *ring.injected = false;
+
+    if constexpr (ASSERTIONS_ENABLED) {
+      if (bcstAcceptMasks.size() != numClusters())
+        throw std::logic_error("Incorrect broadcast acceptance mask count");
+    }
+
+    const Flit *acceptedFlit = flit ? &flit->first.get() : nullptr;
+    idleStep(scalarAllocated == 0 && !bulk.has_value(), acceptedFlit,
+             nocOutAccepted);
 
     // Remember allocation slots
     auto scalarAlloc = scalarAllocSlot();
@@ -605,14 +722,12 @@ public:
     for (size_t dist = 0; dist < (puEnd - puStart) / CLUSTER_SIZE; ++dist) {
       // Per dist handling
       uint16_t &bcstPUMask = bcstPUAccepted[dist];
-      for (size_t puDelta = 0; puDelta < CLUSTER_SIZE; ++puDelta) {
-        if (puAccepts[dist * CLUSTER_SIZE + puDelta].broadcast) {
-          if constexpr (ASSERTIONS_ENABLED) {
-            if (bcstPUMask & (1 << puDelta)) throw std::logic_error("PU accepted a non-existing broadcast");
-          }
-          bcstPUMask |= 1 << puDelta;
-        }
+      const uint16_t accepted = bcstAcceptMasks[dist];
+      if constexpr (ASSERTIONS_ENABLED) {
+        if (bcstPUMask & accepted)
+          throw std::logic_error("PU accepted a non-existing broadcast");
       }
+      bcstPUMask |= accepted;
 
       auto &queue = bcstQueues[dist];
       auto head = queue.front();
@@ -667,17 +782,20 @@ public:
 
     // Finally, allocations
     if (flit) {
-      bool isBulk = (flit->first.get().tag & 0x10) != 0;
-      if (isBulk) {
+      const Flit &accepted = flit->first.get();
+      if (isBulkRequest(accepted)) {
         if constexpr (ASSERTIONS_ENABLED) {
           if (bulk.has_value()) throw std::logic_error("Received a bulk request while another bulk is in-flight");
         }
         bulk = BulkRequest::fromFlit(bulkMaxInflight, flit->first);
-      } else {
+      } else if (isScalarRequest(accepted)) {
         if constexpr (ASSERTIONS_ENABLED) {
           if (!scalarAlloc) throw std::logic_error("Received a scalar request while no slot is available");
         }
         scalarAllocCommit(*scalarAlloc, ScalarRequest::fromFlit(flit->first));
+      } else if constexpr (ASSERTIONS_ENABLED) {
+        if (!isIdleRequest(accepted))
+          throw std::logic_error("Received unknown DRAMIf request tag");
       }
       nocAcceptCommit(flit->second);
     }
@@ -695,7 +813,9 @@ class PeriphIf : public MemIf {
 
 protected:
   virtual bool nocCanAccept(const Flit &f) const override __attribute__((always_inline)) {
-    return scalarAllocSlot().has_value();
+    if (isIdleRequest(f)) return idleCanAccept(f);
+    if (isScalarRequest(f)) return scalarAllocSlot().has_value();
+    return false;
   }
 
 public:
@@ -722,9 +842,13 @@ public:
   void step(
     RingIntf ring,
     MemBusIn &mem,
-    std::optional<std::pair<std::reference_wrapper<const Flit>, uint8_t>> flit
+    std::optional<std::pair<std::reference_wrapper<const Flit>, uint8_t>> flit,
+    bool nocOutAccepted
   ) __attribute__((always_inline)) {
     *ring.injected = false;
+
+    const Flit *acceptedFlit = flit ? &flit->first.get() : nullptr;
+    idleStep(scalarAllocated == 0, acceptedFlit, nocOutAccepted);
 
     // Remember alloc slots
     auto scalarAlloc = scalarAllocSlot();
@@ -773,10 +897,16 @@ public:
     }
 
     if (flit) {
-      if constexpr (ASSERTIONS_ENABLED) {
-        if (!scalarAlloc) throw std::logic_error("Received a scalar request while no slot is available");
+      const Flit &accepted = flit->first.get();
+      if (isScalarRequest(accepted)) {
+        if constexpr (ASSERTIONS_ENABLED) {
+          if (!scalarAlloc) throw std::logic_error("Received a scalar request while no slot is available");
+        }
+        MemIf::scalarAllocCommit(*scalarAlloc, ScalarRequest::fromFlit(flit->first));
+      } else if constexpr (ASSERTIONS_ENABLED) {
+        if (!isIdleRequest(accepted))
+          throw std::logic_error("Received unknown PeripheralIf request tag");
       }
-      MemIf::scalarAllocCommit(*scalarAlloc, ScalarRequest::fromFlit(flit->first));
       nocAcceptCommit(flit->second);
     }
   }

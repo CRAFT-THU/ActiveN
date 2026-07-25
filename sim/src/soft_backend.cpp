@@ -91,7 +91,8 @@ Topology::Topology(size_t num_pu, size_t num_mc)
     coord_to_pu(),
     memif_req_at(num_mc + 1),
     pu_mesh_dirs(num_pu),
-    pu_memif(num_pu)
+    pu_memif(num_pu),
+    pu_memif_inject(num_pu)
 {
   auto [grid_w, grid_h] = gridDims(static_cast<int>(num_pu));
   w = static_cast<uint16_t>(grid_w);
@@ -166,6 +167,8 @@ Topology::Topology(size_t num_pu, size_t num_mc)
       if (pu_memif[cpu].has_value())
         throw std::logic_error("Conflicting memif assignment for PU");
       pu_memif[cpu] = std::make_pair(static_cast<uint16_t>(memif_idx), port_idx);
+      if (port_idx == 0)
+        pu_memif_inject[cpu] = static_cast<uint16_t>(memif_idx);
     }
   }
 
@@ -175,6 +178,7 @@ Topology::Topology(size_t num_pu, size_t num_mc)
   // allowed by the throws above).
   if (pu_memif[1].has_value()) throw std::logic_error("Conflicting memif assignment for PU 1");
   pu_memif[1] = std::make_pair<uint16_t, uint8_t>(0, 0);
+  pu_memif_inject[1] = 0;
 }
 
 // ===========================================================================
@@ -359,9 +363,10 @@ SoftSystemBackend::WrappedRouter SoftSystemBackend::buildRouter(uint16_t pu) con
   }
 
   links.memif = topo.pu_memif[pu];
+  links.memif_inject = topo.pu_memif_inject[pu];
 
   const size_t nf = my_dirs.size();
-  size_t num_in  = nf + 1;                            // fwds + core_inject
+  size_t num_in  = nf + 1 + (links.memif_inject ? 1 : 0);
   size_t num_out = nf + 1 + (links.memif ? 1 : 0);    // fwds + core_eject + memif
 
   // Output-port assignment (RTL convention: egress(forwards) first, then locals):
@@ -374,6 +379,34 @@ SoftSystemBackend::WrappedRouter SoftSystemBackend::buildRouter(uint16_t pu) con
   links.num_forwards = static_cast<uint8_t>(nf);
   auto tbl = topo.routingTableFor(pu, dir_to_link, core_eject_port, memif_port);
   return WrappedRouter(std::move(links), std::move(tbl), num_in, num_out);
+}
+
+soft_mem::MemIf &SoftSystemBackend::memifAt(size_t memifIdx) {
+  return memifIdx == 0 ? static_cast<soft_mem::MemIf &>(periph)
+                       : static_cast<soft_mem::MemIf &>(drams.at(memifIdx - 1));
+}
+
+bool SoftSystemBackend::memifNocAccepted(size_t memifIdx) const {
+  const uint16_t pu = topo.memif_req_at.at(memifIdx).front();
+  const auto &router = routers[pu];
+  if constexpr (ASSERTIONS_ENABLED) {
+    if (router.links.memif_inject != memifIdx)
+      throw std::logic_error("MemIf injection router mapping mismatch");
+  }
+  return router.buf.memif_inject_accepting;
+}
+
+std::unique_ptr<Flit> SoftSystemBackend::takeMemifFlit(size_t memifIdx) {
+  if (!memif_eject_accept[memifIdx]) return nullptr;
+  const uint8_t port = *memif_eject_accept[memifIdx];
+  const uint16_t pu = topo.memif_req_at[memifIdx][port];
+  return routers[pu].rt.take(*memif_eject[memifIdx][port].token);
+}
+
+bool SoftSystemBackend::ringCanInject(size_t memifIdx) const {
+  const size_t next = (memifIdx + 1) % (cfg.numMC + 1);
+  return !ring.validAt(next) &&
+         (!ring.validAt(memifIdx) || memif_ring_accept[memifIdx]);
 }
 
 SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads)
@@ -406,6 +439,16 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads)
     memif_ring_accept(cfg.numMC + 1, false),
     core_mem(cfg.numPU),
     core_mem_accept(cfg.numPU),
+    memif_step_decisions(cfg.numMC + 1),
+    memif_owner(cfg.numMC + 1),
+    thread_memifs(threads),
+    thread_bcst_accept(threads,
+                       std::vector<uint16_t>(cfg.numPU /
+                                             soft_mem::CLUSTER_SIZE)),
+    dram_bcst_accept(
+        cfg.numMC,
+        std::vector<uint16_t>((cfg.numPU / cfg.numMC) /
+                              soft_mem::CLUSTER_SIZE)),
     routers(cfg.numPU,
             [this](size_t i) { return buildRouter(static_cast<uint16_t>(i)); }),
     numThreads(threads),
@@ -440,7 +483,17 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads)
                        1 + m * PU_PER_MC,
                        1 + (m + 1) * PU_PER_MC);
   }
-  prepareNextCoreMem(0);
+
+  memif_owner[0] = puOwner(1);
+  thread_memifs[memif_owner[0]].push_back(0);
+  for (size_t m = 0; m < cfg.numMC; ++m) {
+    const size_t memifIdx = m + 1;
+    const size_t domainFirstPU = 1 + m * PU_PER_MC;
+    memif_owner[memifIdx] = puOwner(domainFirstPU);
+    thread_memifs[memif_owner[memifIdx]].push_back(memifIdx);
+  }
+  for (size_t thread = 0; thread < numThreads; ++thread)
+    prepareNextCoreMem(thread, false);
 
   // Size per-memif eject buffers: one slot per request port (matches
   // topo.memif_req_at[i].size()).
@@ -584,6 +637,14 @@ void SoftSystemBackend::peek(uint64_t cycle, std::vector<MemBusOut *> out) {
 void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
   PhaseTimer _t(*this);
   const bool profile = workProfileSampleCycle(cycle);
+  if constexpr (ASSERTIONS_ENABLED) {
+    if (in.size() != cfg.numMC + 1)
+      throw std::invalid_argument("stage: input size mismatch");
+  }
+  // Publish the frontend inputs together with completion of the preceding
+  // cleanup before any owner thread starts its MemIf work.
+  memif_ext = in;
+
   // Publish completion of the preceding cleanup before any thread reads a
   // neighboring router's committed queues.
   if (profile) {
@@ -592,7 +653,8 @@ void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
   }
   stageStart.arrive_and_wait();
   if (cycle > 0 && workProfileSampleCycle(cycle - 1))
-    workProfileRecordSubsteps(cycle - 1, WorkProfileSubstep::StepCleanup,
+    workProfileRecordSubsteps(cycle - 1,
+                              WorkProfileSubstep::StepPrepareMem,
                               WorkProfileSubstep::StepCleanup);
   if (profile)
     workProfileRecordPhase(cycle, WorkProfilePhase::StageStart);
@@ -605,57 +667,18 @@ void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
       }
     }
 
-    memif_ext = in;
     stageWorkResolve(0, profile);
+    const uint64_t memifStart = profile ? workProfileNowNs() : 0;
+    stageMemifWork(0, profile);
+    if (profile)
+      workProfileTimes[0]
+          .substep_duration[static_cast<size_t>(
+              WorkProfileSubstep::StageMemIf)] =
+          workProfileNowNs() - memifStart;
     if (profile)
       workProfileTimes[0].local_done[static_cast<size_t>(
           WorkProfilePhase::StageDone)] = workProfileNowNs();
 
-    auto resolveMemifTokens = [this](size_t memifIdx) {
-      for (size_t port = 0; port < memif_eject[memifIdx].size(); ++port) {
-        const uint16_t pu = topo.memif_req_at[memifIdx][port];
-        auto &router = routers[pu];
-        if constexpr (ASSERTIONS_ENABLED) {
-          if (!router.links.memif || router.links.memif->first != memifIdx ||
-              router.links.memif->second != port)
-            throw std::logic_error("MemIf source router mapping mismatch");
-        }
-        memif_eject[memifIdx][port].token =
-            router.rt.peekToken(router.links.num_forwards + 1);
-      }
-    };
-    auto peekMemifFlit = [this](size_t memifIdx, size_t port) -> const Flit * {
-      const auto &token = memif_eject[memifIdx][port].token;
-      if (!token) return nullptr;
-      const uint16_t pu = topo.memif_req_at[memifIdx][port];
-      return routers[pu].rt.peek(*token);
-    };
-
-    uint64_t unitStart = profile ? workProfileNowNs() : 0;
-    resolveMemifTokens(0);
-    memif_ring_accept[0] = ring.peekAt(0) && periph.ringCanAccept(*ring.peekAt(0));
-    memif_eject_accept[0] = periph.nocAcceptMultiple(
-      [&peekMemifFlit](size_t idx) -> const Flit * {
-        return peekMemifFlit(0, idx);
-      });
-    if (profile)
-      workProfileRecordUnit(cycle, WorkProfilePhase::StageDone,
-                            WorkProfileUnit::AcceptPeriph, 0,
-                            workProfileNowNs() - unitStart);
-    for (size_t m = 0; m < cfg.numMC; ++m) {
-      unitStart = profile ? workProfileNowNs() : 0;
-      resolveMemifTokens(m + 1);
-      memif_ring_accept[m + 1] =
-          ring.peekAt(m + 1) && drams[m].ringCanAccept(*ring.peekAt(m + 1));
-      memif_eject_accept[m + 1] = drams[m].nocAcceptMultiple(
-        [&peekMemifFlit, m](size_t idx) -> const Flit * {
-          return peekMemifFlit(m + 1, idx);
-        });
-      if (profile)
-        workProfileRecordUnit(cycle, WorkProfilePhase::StageDone,
-                              WorkProfileUnit::AcceptMC, m,
-                              workProfileNowNs() - unitStart);
-    }
   } catch (const std::exception &e) {
     std::cerr << "Exception at thread " << 0 << ": " << e.what() << std::endl;
     std::exit(1);
@@ -669,7 +692,7 @@ void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
     workProfileRecordPhase(cycle, WorkProfilePhase::StageDone);
     workProfileRecordSubsteps(cycle,
                               WorkProfileSubstep::StageResolveLinks,
-                              WorkProfileSubstep::StageCaptureAccepts);
+                              WorkProfileSubstep::StageMemIf);
   }
 }
 
@@ -686,6 +709,19 @@ void SoftSystemBackend::stageWorkResolve(size_t threadId, bool profile) {
     local.buf.core_inject_presenting = peekCoreInjectPrio(*cores[i]);
     local.buf.core_inject_accepting =
         local.rt.prepareEnq(nf, local.buf.core_inject_presenting);
+    if (local.links.memif_inject) {
+      local.buf.memif_inject_presenting =
+          memifAt(*local.links.memif_inject).peekNoc();
+      local.buf.memif_inject_accepting = local.rt.prepareEnq(
+          nf + 1,
+          local.buf.memif_inject_presenting
+              ? std::optional<uint8_t>(
+                    local.buf.memif_inject_presenting->prio())
+              : std::nullopt);
+    } else {
+      local.buf.memif_inject_presenting = std::nullopt;
+      local.buf.memif_inject_accepting = false;
+    }
     for (size_t o = 0; o < nf; ++o) {
       auto [from, port] = *local.links.forwards[o];
       auto &token = local.buf.forward_presenting[o];
@@ -740,23 +776,71 @@ void SoftSystemBackend::stageWorkResolve(size_t threadId, bool profile) {
   if (profile)
     substeps[static_cast<size_t>(WorkProfileSubstep::StageCaptureAccepts)] =
         workProfileNowNs() - substepStart;
+
+  auto &threadMasks = thread_bcst_accept[threadId];
+  std::fill(threadMasks.begin(), threadMasks.end(), 0);
+  for (uint16_t i = puStart; i < puEnd; ++i) {
+    if (!core_mem_accept[i].broadcast) continue;
+    const size_t puZero = i - 1;
+    threadMasks[puZero / soft_mem::CLUSTER_SIZE] |=
+        static_cast<uint16_t>(1u << (puZero % soft_mem::CLUSTER_SIZE));
+  }
+
 }
 
-void SoftSystemBackend::prepareNextCoreMem(uint64_t cycle) {
-  const bool profile = workProfileSampleCycle(cycle);
+void SoftSystemBackend::stageMemifWork(size_t threadId, bool) {
+  auto resolveMemifTokens = [this](size_t memifIdx) {
+    for (size_t port = 0; port < memif_eject[memifIdx].size(); ++port) {
+      const uint16_t pu = topo.memif_req_at[memifIdx][port];
+      auto &router = routers[pu];
+      if constexpr (ASSERTIONS_ENABLED) {
+        if (!router.links.memif || router.links.memif->first != memifIdx ||
+            router.links.memif->second != port)
+          throw std::logic_error("MemIf source router mapping mismatch");
+      }
+      memif_eject[memifIdx][port].token =
+          router.rt.peekToken(router.links.num_forwards + 1);
+    }
+  };
+  auto peekMemifFlit = [this](size_t memifIdx, size_t port) -> const Flit * {
+    const auto &token = memif_eject[memifIdx][port].token;
+    if (!token) return nullptr;
+    const uint16_t pu = topo.memif_req_at[memifIdx][port];
+    return routers[pu].rt.peek(*token);
+  };
+
+  for (const size_t memifIdx : thread_memifs[threadId]) {
+    resolveMemifTokens(memifIdx);
+    auto *ringInput = ring.peekAt(memifIdx);
+    auto &memif = memifAt(memifIdx);
+    memif_ring_accept[memifIdx] =
+        ringInput && memif.ringCanAccept(*ringInput);
+    memif_eject_accept[memifIdx] = memif.nocAcceptMultiple(
+        [&peekMemifFlit, memifIdx](size_t port) -> const Flit * {
+          return peekMemifFlit(memifIdx, port);
+        });
+  }
+}
+
+void SoftSystemBackend::prepareNextCoreMem(size_t threadId, bool profile) {
+  auto &substeps = workProfileTimes[threadId].substep_duration;
+  const uint64_t substepStart = profile ? workProfileNowNs() : 0;
+  const auto [threadStart, threadEnd] = puWorkRange(threadId);
   const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
   for (size_t m = 0; m < cfg.numMC; ++m) {
-    const uint64_t unitStart = profile ? workProfileNowNs() : 0;
-    auto bufferSpan = core_mem.slice(m * PU_PER_MC + 1,
-                                     (m + 1) * PU_PER_MC + 1);
+    const size_t domainStart = m * PU_PER_MC + 1;
+    const size_t domainEnd = (m + 1) * PU_PER_MC + 1;
+    const size_t rangeStart = std::max(threadStart, domainStart);
+    const size_t rangeEnd = std::min(threadEnd, domainEnd);
+    if (rangeStart >= rangeEnd) continue;
+    auto bufferSpan = core_mem.slice(rangeStart, rangeEnd);
     // This snapshot is consumed by the cores during the next iteration's
     // stage, after the current DRAMIf and ring state has committed.
-    drams[m].peekPUs(bufferSpan);
-    if (profile)
-      workProfileRecordUnit(cycle, WorkProfilePhase::StepDone,
-                            WorkProfileUnit::PeekMC, m,
-                            workProfileNowNs() - unitStart);
+    drams[m].peekPUs(rangeStart, bufferSpan);
   }
+  if (profile)
+    substeps[static_cast<size_t>(WorkProfileSubstep::StepPrepareMem)] =
+        workProfileNowNs() - substepStart;
 }
 
 void SoftSystemBackend::step(uint64_t cycle) {
@@ -788,86 +872,11 @@ void SoftSystemBackend::step(uint64_t cycle) {
 
   try {
     stepWork(0, profile);
+    stepPeriphWork(0);
+    stepMemifWork(0, profile);
     if (profile)
       workProfileTimes[0].local_done[static_cast<size_t>(
           WorkProfilePhase::StepDone)] = workProfileNowNs();
-
-    const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
-    bool injected;
-    auto takeMemif = [this](size_t memifIdx) {
-      std::unique_ptr<Flit> flit;
-      if (memif_eject_accept[memifIdx]) {
-        uint8_t port = *memif_eject_accept[memifIdx];
-        uint16_t pu = topo.memif_req_at[memifIdx][port];
-        flit = routers[pu].rt.take(*memif_eject[memifIdx][port].token);
-      }
-      return flit;
-    };
-    uint64_t unitStart = profile ? workProfileNowNs() : 0;
-    auto periphFlit = takeMemif(0);
-    std::optional<std::pair<std::reference_wrapper<const Flit>, uint8_t>> periphView;
-    if (periphFlit) periphView = {{*periphFlit, *memif_eject_accept[0]}};
-    periph.step(
-      soft_mem::RingIntf {
-        .buffer = &ring[0],
-        .ingress = ring.validAt(0),
-        .eject = memif_ring_accept[0],
-        // canInject: forward queue is empty AND no forward will push into
-        // the outgoing queue this cycle.
-        .canInject = !ring.validAt(1) &&
-                     (!ring.validAt(0) || memif_ring_accept[0]),
-        .injected = &injected
-      },
-      memif_ext[0],
-      periphView
-    );
-    if (profile)
-      workProfileRecordUnit(cycle, WorkProfilePhase::StepDone,
-                            WorkProfileUnit::StepPeriph, 0,
-                            workProfileNowNs() - unitStart);
-    unitStart = profile ? workProfileNowNs() : 0;
-    ring.updateValidAt(0, injected, memif_ring_accept[0]);
-    if (profile)
-      workProfileRecordUnit(cycle, WorkProfilePhase::StepDone,
-                            WorkProfileUnit::RingUpdate, 0,
-                            workProfileNowNs() - unitStart);
-
-    for (size_t m = 0; m < cfg.numMC; ++m) {
-      unitStart = profile ? workProfileNowNs() : 0;
-      auto dramFlit = takeMemif(m + 1);
-      std::optional<std::pair<std::reference_wrapper<const Flit>, uint8_t>> dramView;
-      if (dramFlit) dramView = {{*dramFlit, *memif_eject_accept[m + 1]}};
-      drams[m].step(
-        soft_mem::RingIntf {
-          .buffer = &ring[m + 1],
-          .ingress = ring.validAt(m + 1),
-          .eject = memif_ring_accept[m + 1],
-          .canInject = !ring.validAt((m + 2) % (cfg.numMC + 1)) &&
-                       (!ring.validAt(m + 1) || memif_ring_accept[m + 1]),
-          .injected = &injected
-        },
-        memif_ext[m + 1],
-        dramView,
-        core_mem_accept.slice(1 + PU_PER_MC * m, 1 + PU_PER_MC * (m + 1))
-      );
-      if (profile)
-        workProfileRecordUnit(cycle, WorkProfilePhase::StepDone,
-                              WorkProfileUnit::StepMC, m,
-                              workProfileNowNs() - unitStart);
-      unitStart = profile ? workProfileNowNs() : 0;
-      ring.updateValidAt(m + 1, injected, memif_ring_accept[m + 1]);
-      if (profile)
-        workProfileRecordUnit(cycle, WorkProfilePhase::StepDone,
-                              WorkProfileUnit::RingUpdate, m + 1,
-                              workProfileNowNs() - unitStart);
-    }
-    unitStart = profile ? workProfileNowNs() : 0;
-    ring.progress();
-    if (profile)
-      workProfileRecordUnit(cycle, WorkProfilePhase::StepDone,
-                            WorkProfileUnit::RingProgress, 0,
-                            workProfileNowNs() - unitStart);
-    prepareNextCoreMem(cycle);
   } catch (const std::exception &e) {
     std::cerr << "Exception at thread " << 0 << ": " << e.what() << std::endl;
     std::exit(1);
@@ -880,8 +889,35 @@ void SoftSystemBackend::step(uint64_t cycle) {
   if (profile) {
     workProfileRecordPhase(cycle, WorkProfilePhase::StepDone);
     workProfileRecordSubsteps(cycle, WorkProfileSubstep::StepPosedge,
-                              WorkProfileSubstep::StepTransfer);
+                              WorkProfileSubstep::StepMemIf);
   }
+
+  // The RTL holds every MemIf idle-notification register in reset through
+  // this edge. Other soft MemIf state cannot change while requests are gated.
+  if (cycle <= releaseResetAfter) {
+    for (size_t memifIdx = 0; memifIdx < cfg.numMC + 1; ++memifIdx)
+      memifAt(memifIdx).resetIdle();
+  }
+
+  uint64_t unitStart = profile ? workProfileNowNs() : 0;
+  for (size_t memifIdx = 0; memifIdx < memif_step_decisions.size();
+       ++memifIdx) {
+    ring.updateValidAt(memifIdx,
+                       memif_step_decisions[memifIdx].ring_injected,
+                       memif_ring_accept[memifIdx]);
+  }
+  if (profile)
+    workProfileRecordUnit(cycle, WorkProfilePhase::StepDone,
+                          WorkProfileUnit::RingUpdate, 0,
+                          workProfileNowNs() - unitStart);
+  unitStart = profile ? workProfileNowNs() : 0;
+  ring.progress();
+  if (profile)
+    workProfileRecordUnit(cycle, WorkProfilePhase::StepDone,
+                          WorkProfileUnit::RingProgress, 0,
+                          workProfileNowNs() - unitStart);
+
+  prepareNextCoreMem(0, profile);
   stepCleanup(0, profile);
 
   // Periodic delta print.
@@ -894,6 +930,71 @@ void SoftSystemBackend::step(uint64_t cycle) {
     last_periodic_ = stats_;
     last_periodic_cycle_ = cycle;
   }
+}
+
+void SoftSystemBackend::stepPeriphWork(size_t threadId) {
+  if (memif_owner[0] != threadId) return;
+
+  bool &injected = memif_step_decisions[0].ring_injected;
+  injected = false;
+  auto acceptedFlit = takeMemifFlit(0);
+  std::optional<std::pair<std::reference_wrapper<const Flit>, uint8_t>>
+      flitView;
+  if (acceptedFlit) flitView = {{*acceptedFlit, *memif_eject_accept[0]}};
+
+  periph.step(
+      soft_mem::RingIntf {
+        .buffer = &ring[0],
+        .ingress = ring.validAt(0),
+        .eject = static_cast<bool>(memif_ring_accept[0]),
+        .canInject = ringCanInject(0),
+        .injected = &injected,
+      },
+      memif_ext[0], flitView, memifNocAccepted(0));
+}
+
+void SoftSystemBackend::stepMemifWork(size_t threadId, bool profile) {
+  auto &substeps = workProfileTimes[threadId].substep_duration;
+  const uint64_t substepStart = profile ? workProfileNowNs() : 0;
+  const size_t clustersPerMC =
+      (cfg.numPU / cfg.numMC) / soft_mem::CLUSTER_SIZE;
+
+  for (const size_t memifIdx : thread_memifs[threadId]) {
+    if (memifIdx == 0) continue;
+    bool &injected = memif_step_decisions[memifIdx].ring_injected;
+    injected = false;
+    auto acceptedFlit = takeMemifFlit(memifIdx);
+    std::optional<std::pair<std::reference_wrapper<const Flit>, uint8_t>>
+        flitView;
+    if (acceptedFlit)
+      flitView = {{*acceptedFlit, *memif_eject_accept[memifIdx]}};
+
+    soft_mem::RingIntf ringIntf {
+      .buffer = &ring[memifIdx],
+      .ingress = ring.validAt(memifIdx),
+      .eject = static_cast<bool>(memif_ring_accept[memifIdx]),
+      .canInject = ringCanInject(memifIdx),
+      .injected = &injected,
+    };
+
+    const size_t m = memifIdx - 1;
+    auto &acceptedMasks = dram_bcst_accept[m];
+    std::fill(acceptedMasks.begin(), acceptedMasks.end(), 0);
+    const size_t firstCluster = m * clustersPerMC;
+    for (size_t thread = 0; thread < numThreads; ++thread) {
+      for (size_t dist = 0; dist < clustersPerMC; ++dist) {
+        acceptedMasks[dist] |=
+            thread_bcst_accept[thread][firstCluster + dist];
+      }
+    }
+    drams[m].step(ringIntf, memif_ext[memifIdx], flitView,
+                  std::span<const uint16_t>(acceptedMasks),
+                  memifNocAccepted(memifIdx));
+  }
+
+  if (profile)
+    substeps[static_cast<size_t>(WorkProfileSubstep::StepMemIf)] =
+        workProfileNowNs() - substepStart;
 }
 
 void SoftSystemBackend::stepWork(size_t threadId, bool profile) {
@@ -909,6 +1010,9 @@ void SoftSystemBackend::stepWork(size_t threadId, bool profile) {
     if (router.buf.core_inject_accepting)
       router.rt.place(router.links.num_forwards,
           std::make_unique<Flit>(peekCoreInjectFlit(*cores[i], static_cast<uint16_t>(i))));
+    if (router.buf.memif_inject_accepting)
+      router.rt.place(router.links.num_forwards + 1,
+          std::make_unique<Flit>(*router.buf.memif_inject_presenting));
 
     cores[i]->clock = true;
     cores[i]->eval();
@@ -1109,8 +1213,11 @@ void SoftSystemBackend::printWorkProfile() const {
       case WorkProfileSubstep::StageNegedgeEval: return "stageNegedgeEval";
       case WorkProfileSubstep::StageCaptureAccepts:
         return "stageCaptureAccepts";
+      case WorkProfileSubstep::StageMemIf: return "stageMemIf";
       case WorkProfileSubstep::StepPosedge: return "stepPosedge";
       case WorkProfileSubstep::StepTransfer: return "stepTransfer";
+      case WorkProfileSubstep::StepMemIf: return "stepMemIf";
+      case WorkProfileSubstep::StepPrepareMem: return "stepPrepareMem";
       case WorkProfileSubstep::StepCleanup: return "stepCleanup";
       case WorkProfileSubstep::Count: break;
     }
@@ -1341,6 +1448,13 @@ void SoftSystemBackend::worker(size_t threadId) {
     stageStart.arrive_and_wait();
     try {
       stageWorkResolve(threadId, profile);
+      const uint64_t memifStart = profile ? workProfileNowNs() : 0;
+      stageMemifWork(threadId, profile);
+      if (profile)
+        workProfileTimes[threadId]
+            .substep_duration[static_cast<size_t>(
+                WorkProfileSubstep::StageMemIf)] =
+            workProfileNowNs() - memifStart;
     } catch (const std::exception &e) {
       std::cerr << "Exception at thread " << threadId << ": " << e.what() << std::endl;
       std::exit(1);
@@ -1357,6 +1471,8 @@ void SoftSystemBackend::worker(size_t threadId) {
     stepStart.arrive_and_wait();
     try {
       stepWork(threadId, profile);
+      stepPeriphWork(threadId);
+      stepMemifWork(threadId, profile);
     } catch (const std::exception &e) {
       std::cerr << "Exception at thread " << threadId << ": " << e.what() << std::endl;
       std::exit(1);
@@ -1367,6 +1483,7 @@ void SoftSystemBackend::worker(size_t threadId) {
     }
     stepDone.arrive_and_wait();
     try {
+      prepareNextCoreMem(threadId, profile);
       stepCleanup(threadId, profile);
     } catch (const std::exception &e) {
       std::cerr << "Exception at thread " << threadId << ": " << e.what() << std::endl;

@@ -66,6 +66,9 @@ struct Topology {
   // router to know which output port (and the routing table) talks to a
   // local memif.
   IndexVector<std::optional<std::pair<uint16_t, uint8_t>>> pu_memif;
+  // MemIf NoC injection is present only at the first request connection in
+  // each domain, matching the inject-enabled local in System.scala.
+  IndexVector<std::optional<uint16_t>> pu_memif_inject;
 
   uint16_t w = 0; // # columns
   uint16_t h = 0; // # rows
@@ -172,8 +175,8 @@ class SoftSystemBackend : public SystemBackend {
   };
 
  private:
-  // The leader resolves MemIf ejections directly from their source routers.
-  // Retain the token so the selected flit can be moved during commit.
+  // Each MemIf owner resolves its ejections from the source routers. Retain
+  // the token so the source-router owner can move the selected flit at commit.
   struct MemifEject {
     std::optional<RouterOutputToken> token;
   };
@@ -187,6 +190,8 @@ class SoftSystemBackend : public SystemBackend {
     bool core_eject_accepting = false;
     std::array<std::optional<RouterOutputToken>, 4> forward_presenting;
     std::array<bool, 4> forward_accepting{};
+    std::optional<Flit> memif_inject_presenting;
+    bool memif_inject_accepting = false;
   };
 
   static_assert(alignof(LinkDecisionBuffer) >=
@@ -204,6 +209,8 @@ class SoftSystemBackend : public SystemBackend {
     uint8_t num_forwards = 0;
     // Memif: which one, which req port
     std::optional<std::pair<uint16_t, uint8_t>> memif;
+    // MemIf whose registered notification output injects at this router.
+    std::optional<uint16_t> memif_inject;
   };
 
   using RouteFn = decltype(std::declval<Topology>().routingTableFor(
@@ -235,9 +242,21 @@ class SoftSystemBackend : public SystemBackend {
   std::vector<std::vector<MemifEject>> memif_eject;
   std::vector<std::optional<uint8_t>> memif_eject_accept;
   std::vector<MemBusIn> memif_ext;
-  std::vector<bool> memif_ring_accept;
+  std::vector<uint8_t> memif_ring_accept;
   IndexVector<soft_mem::DRAMIf::PUResp> core_mem;
   IndexVector<soft_mem::DRAMIf::PUAccept> core_mem_accept;
+
+  struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) MemifStepDecision {
+    bool ring_injected = false;
+  };
+
+  std::vector<MemifStepDecision> memif_step_decisions;
+  std::vector<size_t> memif_owner;
+  std::vector<std::vector<size_t>> thread_memifs;
+  // One cluster mask array per worker avoids concurrent read-modify-write
+  // when a 16-PU distributor spans multiple host threads.
+  std::vector<std::vector<uint16_t>> thread_bcst_accept;
+  std::vector<std::vector<uint16_t>> dram_bcst_accept;
 
   // Tightly-coupled router states. Each WrappedRouter owns its routing
   // table closure (which captures `this` of the Topology); Topology
@@ -281,8 +300,11 @@ class SoftSystemBackend : public SystemBackend {
     StageDriveInputs,
     StageNegedgeEval,
     StageCaptureAccepts,
+    StageMemIf,
     StepPosedge,
     StepTransfer,
+    StepMemIf,
+    StepPrepareMem,
     StepCleanup,
     Count,
   };
@@ -354,6 +376,10 @@ class SoftSystemBackend : public SystemBackend {
   // Construct one router given its 1-based PU id. Used by the routers
   // factory.
   WrappedRouter buildRouter(uint16_t pu) const;
+  soft_mem::MemIf &memifAt(size_t memifIdx);
+  bool memifNocAccepted(size_t memifIdx) const;
+  std::unique_ptr<Flit> takeMemifFlit(size_t memifIdx);
+  bool ringCanInject(size_t memifIdx) const;
 
   // Per-cycle stat accumulation. Called at the end of stage()/step().
   void accumulateStats();
@@ -372,8 +398,11 @@ class SoftSystemBackend : public SystemBackend {
   void printWorkProfile() const;
 
   void stageWorkResolve(size_t threadId, bool profile);
-  void prepareNextCoreMem(uint64_t cycle);
+  void stageMemifWork(size_t threadId, bool profile);
+  void prepareNextCoreMem(size_t threadId, bool profile);
   void stepWork(size_t threadId, bool profile);
+  void stepPeriphWork(size_t threadId);
+  void stepMemifWork(size_t threadId, bool profile);
   void stepCleanup(size_t threadId, bool profile);
   void worker(size_t threadId);
 
@@ -381,6 +410,10 @@ class SoftSystemBackend : public SystemBackend {
     size_t start = threadId * cfg.numPU / numThreads;
     size_t end = (threadId + 1) * cfg.numPU / numThreads;
     return {start + 1, end + 1}; // PUs are 1-based
+  }
+
+  size_t puOwner(size_t pu) const {
+    return (pu * numThreads - 1) / cfg.numPU;
   }
 
  public:
