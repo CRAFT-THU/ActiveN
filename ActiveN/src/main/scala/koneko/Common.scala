@@ -54,4 +54,11 @@ object Common {
     output.valid := valid
     output
   }
+
+  def invalid[D <: Data](gen: D): ValidIO[D] = {
+    val ret = Wire(Valid(gen.cloneType))
+    ret.bits := DontCare
+    ret.valid := false.B
+    ret
+  }
 }

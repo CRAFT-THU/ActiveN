@@ -36,6 +36,11 @@ We currently allocates the following events Tag for memory requests / responses.
   - operand[0]: the start of the row
   - operand[1][31:16]: the length of the access (in MEM_BEATS bytes)
   - operand[1][15:0]: the return tag value (which is unicasted, potentially remotely)
+- 0x?F0: Register idle notification
+  - operand[0][31:16]: After +1, the least amount of cycle the handler need to be idle for this to trigger (+ 1 so 0 does not result in a trivially triggering notifier, i.e., idleCycle > operand[0][31:16]). Note that the idle counter will saturate at 0xFFFF, so if operand[0][31:16] = 0xFFFF, then this notifier will never fire
+  - operand[0][15:0]: the return tag value
+- 0x?F1: Unregister idle notification
+  - operand[0][15:0]: the return tag value
 
 The highest 4-bits of the tag is ignored, and should be assigned based on wanted priority. Hardware-initiated requests (e.g. fetch, ordinary load/store/AMO) uses the highest priority (0x0??), as their responses never blocks. Software-initiated requests should select appropriate priority. See deadlock.md for details.
 
@@ -70,3 +75,16 @@ one memory line. Multi-byte values are little-endian.
 - `0x68000010`: PUs per memory controller (32 bits)
 - `0x68000018`: log2 of the memory-line size in bytes (32 bits)
 - `0x68000020`: per-controller memory size (64 bits)
+
+## Idle notifier
+
+The idle notifier, when registered, will transmit a **message** (not a unicast memory response) when the MemIf is idled for longer than a certain time. The response schema is as followed:
+
+1. Tag: specified by the request
+2. data[0]: the response code (32-bit signed integer):
+  - 0: The notifier is triggered normally
+  - -1: The notifier failed to register because there is already a register pending notifier
+
+For unregister requests, the response code:
+- 0: There is pending notifier and is unregistered
+- -1: There is no pending notifier

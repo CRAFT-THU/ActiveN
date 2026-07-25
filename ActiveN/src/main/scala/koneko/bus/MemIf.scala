@@ -158,7 +158,8 @@ abstract class MemIf(
   implicit val coreParams: CoreParameters = busParams.core
 
   // Common IO
-  val req = IO(Vec(numReq, Flipped(Decoupled(new Flit))))
+  val nocIn = IO(Vec(numReq, Flipped(Decoupled(new Flit))))
+  val nocOut = IO(Decoupled(new Flit))
 
   val ringIn  = IO(Flipped(Decoupled(new RingResp)))
   val ringOut = IO(Decoupled(new RingResp))
@@ -168,8 +169,8 @@ abstract class MemIf(
     val resp = Flipped(Valid(new GlobalMemResp))
   })
 
-  protected val flitArb = Module(new FlitArb(req(0).bits.cloneType, numReq))
-  for (ci <- 0 until numReq) flitArb.io.in(ci) <> req(ci)
+  protected val flitArb = Module(new FlitArb(nocIn(0).bits.cloneType, numReq))
+  for (ci <- 0 until numReq) flitArb.io.in(ci) <> nocIn(ci)
   protected val flit = flitArb.io.out
 
   // Common scalar l/s states
@@ -285,6 +286,78 @@ abstract class MemIf(
   ringPushArb.io.in(1) <> ringSendGated
   ringFwdQueue.io.enq <> ringPushArb.io.out
   ringFwdQueue.io.deq <> ringOut
+
+  // Idle notifier
+  // TODO: rejection & unregister buffer
+  class IdleNotifier extends Bundle {
+    val tgt = UInt(16.W)
+    val tag = UInt(16.W)
+    val cycles = UInt(16.W)
+  }
+  val idleNotifier = RegInit(Common.invalid(new IdleNotifier))
+  val idleCycles = RegInit(0.U(16.W))
+  protected val idleCurrently = Wire(Bool())
+  idleCycles := MuxCase(idleCycles + 1.U, Seq(
+    !idleCurrently -> 0.U,
+    idleCycles.andR -> idleCycles
+  ))
+  class IdleReturn extends Bundle {
+    val tgt = UInt(16.W)
+    val tag = UInt(16.W)
+    val data = UInt(32.W)
+  }
+  val idleReturn = RegInit(Common.invalid(new IdleReturn))
+  val isIdle = Seq(0xF0, 0xF1).map(_.U === flit.bits.tag(7, 0)).reduce(_ || _)
+  // Idle return buffer have to be empty: all requests can generate it
+  protected val idleAcceptFlit = isIdle && !idleReturn.valid
+
+  // Fire idle notifier into idle return buffer
+  when (idleNotifier.valid && !idleReturn.valid && idleCycles > idleNotifier.bits.cycles && !(flit.valid && isIdle)) {
+    assert(!idleReturn.valid)
+    idleReturn.valid := true.B
+    idleReturn.bits.tgt := idleNotifier.bits.tgt
+    idleReturn.bits.tag := idleNotifier.bits.tag
+    idleReturn.bits.data := 0.U
+    idleNotifier.valid := false.B
+  }
+  // Request takes precedence over idle notifier firing to occupy the idle return buffer
+  when(flit.fire && flit.bits.tag(7, 0) === 0xF0.U) { // Allocation
+    idleNotifier.valid := true.B
+    when(!idleNotifier.valid) {
+      idleNotifier.bits.tgt := flit.bits.src
+      idleNotifier.bits.tag := flit.bits.data(0)(15, 0)
+      idleNotifier.bits.cycles := flit.bits.data(0)(31, 16)
+    }.otherwise {
+      assert(!idleReturn.valid)
+      idleReturn.valid := true.B
+      idleReturn.bits.tgt := flit.bits.src
+      idleReturn.bits.tag := flit.bits.data(0)(15, 0)
+      idleReturn.bits.data := "hFFFFFFFF".U // -1
+    }
+  }
+  when(flit.fire && flit.bits.tag(7, 0) === 0xF1.U) { // Deallocation
+    idleNotifier.valid := false.B
+    assert(!idleReturn.valid)
+    idleReturn.valid := true.B
+    idleReturn.bits.tgt := flit.bits.src
+    idleReturn.bits.tag := flit.bits.data(0)(15, 0)
+    idleReturn.bits.data := Mux(idleNotifier.valid, 0.U, "hFFFFFFFF".U)
+  }
+
+  val idleFlit = Wire(Decoupled(new Flit))
+  idleFlit.bits.src := (0x8000 + mcIdx).U
+  idleFlit.bits.dst := idleReturn.bits.tgt
+  idleFlit.bits.tag := idleReturn.bits.tag
+  idleFlit.bits.data(0) := idleReturn.bits.data
+  idleFlit.bits.data(1) := 0.U
+  idleFlit.bits.data(2) := 0.U
+  idleFlit.bits.data(3) := 0.U
+  idleFlit.valid := idleReturn.valid
+  when(idleFlit.fire) {
+    idleReturn.valid := false.B
+  }
+
+  nocOut <> idleFlit
 }
 
 class DRAMIf(
@@ -295,10 +368,12 @@ class DRAMIf(
   scalarInflight: Int,
   bulkInflight: Int, // Number of inflight sub-line for the ONLY pending bulk request
 )(implicit busParams: MemBusParameters) extends MemIf(mcIdx, scalarInflight, numClusters) {
+  require(mcIdx >= 1, "mcIdx must be >= 1 for DRAMIf")
   require(numClusters >= 1)
   require(puEnd >= puStart)
   require(puEnd - puStart + 1 == numClusters * 16, "PU IDs must map cleanly to clusters")
-  require(puStart == mcIdx * numClusters * 16 + 1, s"mcIdx ($mcIdx) must align with puStart ($puStart), expected ${mcIdx * numClusters * 16 + 1}")
+  require(puStart == (mcIdx - 1) * numClusters * 16 + 1,
+    s"mcIdx ($mcIdx) must align with puStart ($puStart), expected ${(mcIdx - 1) * numClusters * 16 + 1}")
   require(isPow2(bulkInflight), "bulkInflight must be a power of 2")
 
   val bulkSubIdWidth = log2Ceil(bulkInflight)
@@ -333,7 +408,7 @@ class DRAMIf(
     bulkPending := parsedBulk
   }
 
-  flit.ready := scalarAcceptFlit || bulkAcceptFlit
+  flit.ready := scalarAcceptFlit || bulkAcceptFlit || idleAcceptFlit
 
   // Bulk requests: scatter and bulk copy
   // Highest bit == 1 => bulk req, rest is beat id
@@ -473,6 +548,8 @@ class DRAMIf(
 
     broadcast(ci) <> bcstDists(ci)
   }
+
+  idleCurrently := !scalarAllocated.asUInt.orR && !bulkAllocated
 }
 
 // No distributor, no scatter / bulk, can have configROM
@@ -507,7 +584,9 @@ class PeripheralIf(
   scalarRecv.ready := DontCare
   assert(!scalarRecv.valid)
 
-  flit.ready := scalarAcceptFlit
+  flit.ready := scalarAcceptFlit || idleAcceptFlit
 
   ringSend <> scalarSend
+
+  idleCurrently := !scalarAllocated.asUInt.orR
 }

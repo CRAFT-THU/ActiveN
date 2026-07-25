@@ -10,9 +10,9 @@
   #   4. All PUs install runtime handlers and begin the simulation.
   #
   # Runtime handler assignments (lower index = higher priority):
-  #   Handler 0 (tag=0): done  — leader collects done reports (argcnt=1)
+  #   Handler 0 (tag=0): termination control — leader collects phase reports (argcnt=1)
   #   Handler 1 (tag=1): spike — incoming synapse event (argcnt=2)
-  #   Handler 2 (tag=2): drain — drain phase tick (argcnt=1)
+  #   Handler 2 (tag=2): termination ping — drain queued spike events, then pong (argcnt=0)
   #   Handler 3 (tag=3): work  — self-scheduled work loop (argcnt=1, margin=num_mc+1, quota=1)
   #
   # Scatter CSR uses handler_tag=1 (spike handler).
@@ -62,7 +62,7 @@
   /* Working memory below tail descriptor */
 #define SPM_COUNTER     (SPM_END - 0x18)
 #define SPM_INPUT_SUM   (SPM_END - 0x1C)
-#define SPM_DRAIN_CNT   (SPM_END - 0x20)
+#define SPM_PHASE       (SPM_END - 0x20)
 
 #define STOP_ADDR       0x40000000
 #define TIMER_ADDR      0x40000004
@@ -72,7 +72,17 @@
 #define MC_DST_BASE     0x8001
 #define SCATTER_TAG     0x410  /* prio=1, scatter type=0x10 */
 #define SCATTER_RESP_TAG 0x401 /* prio=1, handler=1 (spike) */
-#define DRAIN_LIMIT     1000
+#define UPDATE_DONE_TAG 0xC00  /* prio=3, handler=0 */
+#define IDLE_REGISTER_TAG 0xCF0 /* prio=3, register idle notification */
+#define IDLE_RETURN_TAG 0x400  /* prio=1, handler=0 */
+#define IDLE_GATE        0x100
+#define IDLE_REGISTER_DATA ((IDLE_GATE << 16) | IDLE_RETURN_TAG)
+#define PING_TAG        0xC02  /* prio=3, handler=2 */
+#define PONG_TAG        0x400  /* prio=1, handler=0 */
+
+#define PHASE_UPDATES   0
+#define PHASE_MC_IDLE   1
+#define PHASE_PONGS     2
 
 #ifdef CONDUCTANCE
 #define NN_ACCUM_OFFSET 0
@@ -131,10 +141,12 @@ _start:
   j     do_wfi
 
 leader_boot:
-  # Init leader counters
+  # Init leader termination state
   li    t0, SPM_COUNTER
   sw    zero, 0(t0)
   li    t0, SPM_INPUT_SUM
+  sw    zero, 0(t0)
+  li    t0, SPM_PHASE
   sw    zero, 0(t0)
 
   # Install handler now that counters are zeroed
@@ -190,11 +202,14 @@ boot_all_ready:
   li    t1, 1
   sw    t1, 0(t0)
 
-  # Reset counter for done phase
+  # Reset termination state for the update-completion phase
   li    t0, SPM_COUNTER
   sw    zero, 0(t0)
   li    t0, SPM_INPUT_SUM
   sw    zero, 0(t0)
+  li    t0, SPM_PHASE
+  li    t1, PHASE_UPDATES
+  sw    t1, 0(t0)
 
   # Broadcast "go" to all other PUs
   li    t3, 2
@@ -214,8 +229,8 @@ boot_go_self:
   # install_runtime: set up handler CSRs and start simulation
   #============================================================
 install_runtime:
-  # Handler 0: done_report (argcnt=1, margin=0, quota=0) — highest priority
-  la    a0, done_report
+  # Handler 0: termination_control (argcnt=1, margin=0, quota=0) — highest priority
+  la    a0, termination_control
   csrw  0x700, a0
   csrw  0x720, zero           # hanmargin: quota=0, margin=0
   li    a0, (1 << 3) | 1      # thread 0 only, argcnt=1
@@ -233,11 +248,12 @@ install_runtime:
 #endif
   csrw  0x711, a0             # hancfg (thread 0 only for now)
 
-  # Handler 2: work_drain (argcnt=1, margin=0, quota=0)
-  la    a0, work_drain_tick
+  # Handler 2: termination_ping (argcnt=0, margin=1, quota=0)
+  la    a0, termination_ping
   csrw  0x702, a0
-  csrw  0x722, zero           # hanmargin: quota=0, margin=0
-  li    a0, (1 << 3) | 1      # thread 0 only, argcnt=1
+  li    a0, 1
+  csrw  0x722, a0             # hanmargin: quota=0, margin=1
+  li    a0, (1 << 3) | 0      # thread 0 only, argcnt=0
   csrw  0x712, a0             # hancfg (thread 0 only for now)
 
   # Handler 3: work_update (argcnt=1, margin=num_mc+1, quota=0) — lowest priority
@@ -252,10 +268,6 @@ install_runtime:
   # Thread 1 will call load_sregisters and then add itself to handlers 0-3.
   li    t1, 4
   SEND  zero, t1              # dst=x0 (local), tag=4
-
-  # Reset drain counter
-  li    t0, SPM_DRAIN_CNT
-  sw    zero, 0(t0)
 
   # Start: enter update phase directly (snn_init already did state+=input)
   li    a0, SPM_BASE
@@ -273,9 +285,9 @@ do_wfi:
 spm_init_finished:
   call  load_sregisters       # set s0-s6 from SPM tail + DRAM header
   li    a0, (1 << 4)          # bit 4 = thread 1
-  csrs  0x710, a0             # add thread 1 to handler 0 (done_report)
+  csrs  0x710, a0             # add thread 1 to handler 0 (termination control)
   csrs  0x711, a0             # add thread 1 to handler 1 (spike)
-  csrs  0x712, a0             # add thread 1 to handler 2 (work_drain)
+  csrs  0x712, a0             # add thread 1 to handler 2 (termination ping)
   csrs  0x713, a0             # add thread 1 to handler 3 (work_update)
   j     do_wfi
 
@@ -304,9 +316,6 @@ spike_lrsc:
   sc.w  t3, t0, (t2)          # try store; t3=0 on success
   bnez  t3, spike_lrsc        # retry if reservation lost
 
-  # Reset drain counter
-  li    t0, SPM_DRAIN_CNT
-  sw    zero, 0(t0)
   wfi
 
   #------------------------------------------------------------
@@ -476,76 +485,130 @@ work_update_done:
   or    t1, t1, s0               # | hartid
   sw    t1, 0(t0)
 
-  # Enter drain phase
-  li    t0, SPM_DRAIN_CNT
-  sw    zero, 0(t0)
-  j     work_drain_tick
+  # Report update completion to the leader at the lowest NoC priority.
+  # Earlier priority-1 scatter requests leave this PU's send queue first.
+  li    a0, 0
+  li    t0, 1
+  li    t1, UPDATE_DONE_TAG
+  YIELD t0, t1
+  j     do_wfi
 
   #------------------------------------------------------------
-  # Drain phase: yield loop, count iterations.
-  # Spike resets SPM_DRAIN_CNT. After DRAIN_LIMIT, report done.
+  # termination_ping (tag=2, argcnt=0)
+  # The ping is lowest priority, below queued spike events. Compute the final
+  # input sum only after it schedules, then pong the leader at priority 1.
   #------------------------------------------------------------
-work_drain_tick:
+termination_ping:
   bnez  s2, 1f
   jal   ra, setup_regs
 1:
-  li    t0, SPM_DRAIN_CNT
-  li    t1, 1
-  amoadd.w t2, t1, (t0)
-  addi  t2, t2, 1
-
-  li    t3, DRAIN_LIMIT
-  bge   t2, t3, work_drain_done
-
-  # Yield back to drain
-  li    t1, 2                 # tag = 2 (work_drain)
-  YIELD zero, t1
-  j     do_wfi
-
-work_drain_done:
   # Compute sum of inputs across all neurons
   li    t0, SPM_BASE
   li    a0, 0
-drain_sum_loop:
-  beq   t0, s1, drain_report
+termination_sum_loop:
+  beq   t0, s1, termination_pong
   lw    t1, NN_ACCUM_OFFSET(t0) # accumulator field (raw FP32 bits)
   add   a0, a0, t1            # integer sum of FP32 bit patterns
   add   t0, t0, s2
-  j     drain_sum_loop
+  j     termination_sum_loop
 
-drain_report:
-  # Debug: report this PU finished draining
-  li    t0, PRINT_PORT
-  li    t1, 0xD2000000           # "drain done" marker
-  or    t1, t1, s0               # | hartid
-  sw    t1, 0(t0)
-
-  # Send done report to PU1 (tag=0)
+termination_pong:
   li    t0, 1
-  li    t1, 0x400             # tag = 0x400 (done_report, prio=1)
+  li    t1, PONG_TAG
   YIELD t0, t1
   j     do_wfi
 
   #============================================================
-  # done_report (tag=3, argcnt=1: a0=input_sum)
-  # Leader accumulates and checks completion.
+  # termination_control (tag=0, argcnt=1)
+  # Phase 0: count PU update-completion reports.
+  # Phase 1: count successful DRAM MemIf idle notifications.
+  # Phase 2: accumulate PU pongs and stop the workload.
   #============================================================
-  .globl done_report
-done_report:
+  .globl termination_control
+termination_control:
   bnez  s2, 1f
   jal   ra, setup_regs
 1:
-  li    t0, SPM_INPUT_SUM
-  amoadd.w t1, a0, (t0)       # *t0 += a0 (accumulate input sum)
+  li    t0, SPM_PHASE
+  lw    t1, 0(t0)
+  beqz  t1, termination_updates
+  li    t2, PHASE_MC_IDLE
+  beq   t1, t2, termination_mc_idle
+  li    t2, PHASE_PONGS
+  beq   t1, t2, termination_pongs
+  j     termination_fail
 
+termination_updates:
   li    t0, SPM_COUNTER
   li    t1, 1
   amoadd.w t2, t1, (t0)       # old = t2, *t0 += 1
   addi  t2, t2, 1             # t2 = new value
-
   bne   t2, s6, do_wfi
 
-  # All PUs done. Stop timer, output sum, exit.
+  # All PUs completed their neuron updates. Reset the shared counter and move
+  # to the MC-idle phase before sending any registrations, so an early return
+  # cannot be interpreted as another update report.
+  li    t0, SPM_COUNTER
+  sw    zero, 0(t0)
+  li    t0, SPM_PHASE
+  li    t1, PHASE_MC_IDLE
+  sw    t1, 0(t0)
+
+  # Register one accumulated-idle notifier on each DRAM MC. The peripheral
+  # MemIf at destination 0x8000 is intentionally excluded.
+  li    t3, 0
+  li    t4, MC_DST_BASE
+termination_register_loop:
+  beq   t3, s5, do_wfi
+  li    a0, IDLE_REGISTER_DATA
+  li    t1, IDLE_REGISTER_TAG
+  SEND  t4, t1
+  addi  t3, t3, 1
+  addi  t4, t4, 1
+  j     termination_register_loop
+
+termination_mc_idle:
+  # A nonzero result is a registration rejection, not an idle notification.
+  bnez  a0, termination_fail
+
+  li    t0, SPM_COUNTER
+  li    t1, 1
+  amoadd.w t2, t1, (t0)
+  addi  t2, t2, 1
+  bne   t2, s5, do_wfi
+
+  # All DRAM MCs have idled. Enter the pong phase before emitting pings and
+  # reset the final result accumulator.
+  li    t0, SPM_COUNTER
+  sw    zero, 0(t0)
+  li    t0, SPM_INPUT_SUM
+  sw    zero, 0(t0)
+  li    t0, SPM_PHASE
+  li    t1, PHASE_PONGS
+  sw    t1, 0(t0)
+
+  # Send a lowest-priority ping to every PU, including the leader itself.
+  li    t3, 1
+termination_ping_loop:
+  bgt   t3, s6, do_wfi
+  li    a0, 0
+  mv    t0, t3
+  li    t1, PING_TAG
+  SEND  t0, t1
+  addi  t3, t3, 1
+  j     termination_ping_loop
+
+termination_pongs:
+  li    t0, SPM_INPUT_SUM
+  amoadd.w t1, a0, (t0)       # *t0 += this PU's final input sum
+
+  li    t0, SPM_COUNTER
+  li    t1, 1
+  amoadd.w t2, t1, (t0)
+  addi  t2, t2, 1
+  bne   t2, s6, do_wfi
+
+  # All PUs drained their events and ponged. Stop timer, output sum, and exit.
   li    t0, TIMER_ADDR
   sw    zero, 0(t0)
 
@@ -556,6 +619,17 @@ done_report:
 
   li    t0, STOP_ADDR
   sw    zero, 0(t0)
+  j     do_wfi
+
+termination_fail:
+  li    t0, TIMER_ADDR
+  sw    zero, 0(t0)
+  li    t0, PRINT_PORT
+  li    t1, 0xBAD1D1E
+  sw    t1, 0(t0)
+  li    t0, STOP_ADDR
+  li    t1, 1
+  sw    t1, 0(t0)
   j     do_wfi
 
   #============================================================

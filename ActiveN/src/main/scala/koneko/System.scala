@@ -247,7 +247,7 @@ object Topology {
       val periphId = 0x8000
       val periphPU = 1
       if (srcId == periphPU) {
-        // PU1 has a local eject for 0x8800, no forwarding entry
+        // PU1 has a local eject for 0x8000, no forwarding entry
       } else {
         val (pr, pc) = puPos(periphPU)
         val dir = xyRouteDir(sr, sc, pr, pc)
@@ -259,14 +259,15 @@ object Topology {
 
     // 7. Build locals for each PU router
     //   - Local(id, inject=true, eject=true) for the core itself
-    //   - Local(mcId, inject=false, eject=true) for each MC this PU connects to
-    //   - Local(0x8000, inject=false, eject=true) on PU1 for peripheral
+    //   - Local(mcId, inject=true, eject=true) at the first connection in each MC zone
+    //   - Local(mcId, inject=false, eject=true) at the other MC connections
+    //   - Local(0x8000, inject=true, eject=true) on PU1 for peripheral
     val puLocals: Map[Int, Seq[Local]] = puIds.map { id =>
       val coreLocal = Local(id, inject = true, eject = true)
       val mcLocals = puMcEjects.getOrElse(id, Nil).map { mcId =>
-        Local(mcId, inject = false, eject = true)
+        Local(mcId, inject = mcConns(mcId).head == id, eject = true)
       }
-      val periphLocal = if (id == 1) Seq(Local(0x8000, inject = false, eject = true)) else Nil
+      val periphLocal = if (id == 1) Seq(Local(0x8000, inject = true, eject = true)) else Nil
       id -> (Seq(coreLocal) ++ mcLocals ++ periphLocal)
     }.toMap
 
@@ -368,7 +369,7 @@ class System(implicit val params: SystemParameters) extends Module {
   val memIfs = topo.mcIds.zipWithIndex.map { case (mcId, mcIdx) =>
     val puStart = mcIdx * clustersPerMC * 16 + 1
     val puEnd   = (mcIdx + 1) * clustersPerMC * 16
-    val memIf = Module(new DRAMIf(mcIdx, puStart, puEnd, clustersPerMC, 64, 16))
+    val memIf = Module(new DRAMIf(mcIdx + 1, puStart, puEnd, clustersPerMC, 64, 16))
     memIf.suggestName(s"memif_${mcIdx + 1}")
     io.mem(mcIdx).req <> memIf.mem.req
     memIf.mem.resp := io.mem(mcIdx).resp
@@ -398,7 +399,7 @@ class System(implicit val params: SystemParameters) extends Module {
   io.periph.req <> periphMemIf.mem.req
   periphMemIf.mem.resp := io.periph.resp
 
-  // --- Connect MC eject ports to MemIf req inputs ---
+  // --- Connect MC local ports to MemIf NoC inputs and output ---
   for ((mcId, mcIdx) <- topo.mcIds.zipWithIndex) {
     val connPUs = topo.mcConns(mcId) // one connection PU per cluster in zone
     for ((puId, ci) <- connPUs.zipWithIndex) {
@@ -406,27 +407,22 @@ class System(implicit val params: SystemParameters) extends Module {
       val mcLocalIdx = locals.indexWhere(_.id == mcId)
       val ejectPort = puRouters(puId).ejects(mcLocalIdx).get
 
-      memIfs(mcIdx).req(ci).valid    := ejectPort.valid
-      memIfs(mcIdx).req(ci).bits.src := ejectPort.bits.src
-      memIfs(mcIdx).req(ci).bits.dst := ejectPort.bits.dst
-      memIfs(mcIdx).req(ci).bits.data := ejectPort.bits.data
-      memIfs(mcIdx).req(ci).bits.tag := ejectPort.bits.tag
-      ejectPort.ready := memIfs(mcIdx).req(ci).ready
+      memIfs(mcIdx).nocIn(ci) <> ejectPort
     }
+
+    val injectPU = connPUs.head
+    val mcLocalIdx = topo.puLocals(injectPU).indexWhere(_.id == mcId)
+    puRouters(injectPU).injects(mcLocalIdx).get <> memIfs(mcIdx).nocOut
   }
 
-  // --- Connect peripheral eject port on PU1 to peripheral MemIf ---
+  // --- Connect peripheral local ports on PU1 to peripheral MemIf ---
   {
     val locals = topo.puLocals(1)
     val periphLocalIdx = locals.indexWhere(_.id == 0x8000)
     val ejectPort = puRouters(1).ejects(periphLocalIdx).get
 
-    periphMemIf.req(0).valid    := ejectPort.valid
-    periphMemIf.req(0).bits.src := ejectPort.bits.src
-    periphMemIf.req(0).bits.dst := ejectPort.bits.dst
-    periphMemIf.req(0).bits.data := ejectPort.bits.data
-    periphMemIf.req(0).bits.tag := ejectPort.bits.tag
-    ejectPort.ready := periphMemIf.req(0).ready
+    periphMemIf.nocIn(0) <> ejectPort
+    puRouters(1).injects(periphLocalIdx).get <> periphMemIf.nocOut
   }
 
   // --- Ring bus: MC[0] -> MC[1] -> ... -> MC[last] -> periph -> MC[0] ---
