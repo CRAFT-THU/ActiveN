@@ -24,6 +24,7 @@
  *   end - 0x0C: type (0)
  *   end - 0x08: stride (bytes)
  *   end - 0x04: neuron count
+ *   end - 0x24: expected post-timestep checksum
  */
 
 #define SPM_BASE    0x20000000u

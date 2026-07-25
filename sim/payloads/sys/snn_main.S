@@ -45,9 +45,18 @@
   #   end - 0x0C: type (0 = FP32 LIF)
   #   end - 0x10: threshold (FP32)
   #   end - 0x14: decay factor (FP32)
+  #   end - 0x24: expected post-timestep checksum
 
 #ifndef NUM_PU
 #define NUM_PU 64
+#endif
+
+#ifndef SNN_VERIFY_RESULT
+#define SNN_VERIFY_RESULT 1
+#endif
+
+#if SNN_VERIFY_RESULT != 0 && SNN_VERIFY_RESULT != 1
+#error "SNN_VERIFY_RESULT must be 0 or 1"
 #endif
 
 #define SPM_BASE        0x20000000
@@ -58,10 +67,11 @@
 #define SPM_STRIDE_ADDR (SPM_END - 0x08)
 #define SPM_THRESHOLD   (SPM_END - 0x10)
 #define SPM_DECAY       (SPM_END - 0x14)
+#define SPM_EXPECTED_XOR (SPM_END - 0x24)
 
   /* Working memory below tail descriptor */
 #define SPM_COUNTER     (SPM_END - 0x18)
-#define SPM_INPUT_SUM   (SPM_END - 0x1C)
+#define SPM_RESULT_XOR  (SPM_END - 0x1C)
 #define SPM_PHASE       (SPM_END - 0x20)
 
 #define STOP_ADDR       0x40000000
@@ -83,6 +93,9 @@
 #define PHASE_UPDATES   0
 #define PHASE_MC_IDLE   1
 #define PHASE_PONGS     2
+
+#define SNN_CHECKSUM_SCALE 0x41200000 /* 10.0f */
+#define SNN_CHECKSUM_TOL   15
 
 #ifdef CONDUCTANCE
 #define NN_ACCUM_OFFSET 0
@@ -144,7 +157,7 @@ leader_boot:
   # Init leader termination state
   li    t0, SPM_COUNTER
   sw    zero, 0(t0)
-  li    t0, SPM_INPUT_SUM
+  li    t0, SPM_RESULT_XOR
   sw    zero, 0(t0)
   li    t0, SPM_PHASE
   sw    zero, 0(t0)
@@ -205,7 +218,7 @@ boot_all_ready:
   # Reset termination state for the update-completion phase
   li    t0, SPM_COUNTER
   sw    zero, 0(t0)
-  li    t0, SPM_INPUT_SUM
+  li    t0, SPM_RESULT_XOR
   sw    zero, 0(t0)
   li    t0, SPM_PHASE
   li    t1, PHASE_UPDATES
@@ -495,22 +508,43 @@ work_update_done:
 
   #------------------------------------------------------------
   # termination_ping (tag=2, argcnt=0)
-  # The ping is lowest priority, below queued spike events. Compute the final
-  # input sum only after it schedules, then pong the leader at priority 1.
+  # The ping is lowest priority, below queued spike events. Compute the local
+  # numerical checksum only after it schedules, then pong the leader at
+  # priority 1. Performance builds compile out the neuron scan.
   #------------------------------------------------------------
 termination_ping:
   bnez  s2, 1f
   jal   ra, setup_regs
 1:
-  # Compute sum of inputs across all neurons
+#if SNN_VERIFY_RESULT
   li    t0, SPM_BASE
   li    a0, 0
-termination_sum_loop:
+  li    t2, SNN_CHECKSUM_SCALE
+termination_checksum_loop:
   beq   t0, s1, termination_pong
-  lw    t1, NN_ACCUM_OFFSET(t0) # accumulator field (raw FP32 bits)
-  add   a0, a0, t1            # integer sum of FP32 bit patterns
+
+  lw    t1, 0(t0)
+  fmul.s f6, f6, f7, rne
+  fcvt.w.s t1, f6, rne
+  xor   a0, a0, t1
+
+  lw    t1, 4(t0)
+  fmul.s f6, f6, f7, rne
+  fcvt.w.s t1, f6, rne
+  xor   a0, a0, t1
+
+#ifdef CONDUCTANCE
+  lw    t1, 8(t0)
+  fmul.s f6, f6, f7, rne
+  fcvt.w.s t1, f6, rne
+  xor   a0, a0, t1
+#endif
+
   add   t0, t0, s2
-  j     termination_sum_loop
+  j     termination_checksum_loop
+#else
+  li    a0, 0
+#endif
 
 termination_pong:
   li    t0, 1
@@ -522,7 +556,7 @@ termination_pong:
   # termination_control (tag=0, argcnt=1)
   # Phase 0: count PU update-completion reports.
   # Phase 1: count successful DRAM MemIf idle notifications.
-  # Phase 2: accumulate PU pongs and stop the workload.
+  # Phase 2: accumulate PU checksums and stop the workload.
   #============================================================
   .globl termination_control
 termination_control:
@@ -581,8 +615,10 @@ termination_mc_idle:
   # reset the final result accumulator.
   li    t0, SPM_COUNTER
   sw    zero, 0(t0)
-  li    t0, SPM_INPUT_SUM
+#if SNN_VERIFY_RESULT
+  li    t0, SPM_RESULT_XOR
   sw    zero, 0(t0)
+#endif
   li    t0, SPM_PHASE
   li    t1, PHASE_PONGS
   sw    t1, 0(t0)
@@ -599,8 +635,10 @@ termination_ping_loop:
   j     termination_ping_loop
 
 termination_pongs:
-  li    t0, SPM_INPUT_SUM
-  amoadd.w t1, a0, (t0)       # *t0 += this PU's final input sum
+#if SNN_VERIFY_RESULT
+  li    t0, SPM_RESULT_XOR
+  amoxor.w zero, a0, (t0)
+#endif
 
   li    t0, SPM_COUNTER
   li    t1, 1
@@ -608,18 +646,39 @@ termination_pongs:
   addi  t2, t2, 1
   bne   t2, s6, do_wfi
 
-  # All PUs drained their events and ponged. Stop timer, output sum, and exit.
+  # All PUs drained their events and ponged. Stop the timer before reporting
+  # or checking the numerical result.
   li    t0, TIMER_ADDR
   sw    zero, 0(t0)
 
-  li    t0, SPM_INPUT_SUM
+#if SNN_VERIFY_RESULT
+  li    t0, SPM_RESULT_XOR
   lw    t1, 0(t0)
   li    t0, PRINT_PORT
   sw    t1, 0(t0)
 
+  li    t0, SPM_EXPECTED_XOR
+  lw    t3, 0(t0)
+  xor   t4, t1, t3
+  li    t5, SNN_CHECKSUM_TOL
+  bgtu  t4, t5, termination_checksum_fail
+#endif
+
   li    t0, STOP_ADDR
   sw    zero, 0(t0)
   j     do_wfi
+
+#if SNN_VERIFY_RESULT
+termination_checksum_fail:
+  li    t0, PRINT_PORT
+  sw    t3, 0(t0)
+  li    t1, 0xBADCA11
+  sw    t1, 0(t0)
+  li    t0, STOP_ADDR
+  li    t1, 1
+  sw    t1, 0(t0)
+  j     do_wfi
+#endif
 
 termination_fail:
   li    t0, TIMER_ADDR

@@ -15,6 +15,29 @@ use std::io::Write;
 
 const DRAM_HEADER_BYTES: usize = 16;
 const SPM_INIT_DESC_BYTES: usize = 8;
+const SNN_CHECKSUM_SCALE: f32 = 10.0;
+
+fn round_ties_even_i64(value: f64) -> i64 {
+    let lower = value.floor();
+    let fraction = value - lower;
+    let rounded = if fraction < 0.5 {
+        lower
+    } else if fraction > 0.5 {
+        lower + 1.0
+    } else if (lower as i64) & 1 == 0 {
+        lower
+    } else {
+        lower + 1.0
+    };
+    rounded as i64
+}
+
+fn quantize_checksum_word(value: f32) -> u32 {
+    if !value.is_finite() {
+        return value.to_bits();
+    }
+    round_ties_even_i64((value * SNN_CHECKSUM_SCALE) as f64) as u32
+}
 
 fn align_up(value: usize, alignment: usize) -> usize {
     (value + alignment - 1) & !(alignment - 1)
@@ -136,6 +159,7 @@ fn dump<R: Rng>(
     text: Option<&PathBuf>,
     decay: f32,
     threshold: f32,
+    expected_checksum: u32,
     mem_line_width: usize,
     mut dump_shuffle_rng: Option<&mut R>,
 ) -> anyhow::Result<()> {
@@ -151,8 +175,8 @@ fn dump<R: Rng>(
     let words_per_neuron = 2 + num_mc;
     let bytes_per_neuron = words_per_neuron * 4;
 
-    // SPM tail descriptor (FP32 LIF): decay, threshold, type, stride, count = 5 words = 20 bytes
-    let spm_tail_bytes: usize = 20;
+    // Tail plus runtime/checksum words through end-0x24.
+    let spm_tail_bytes: usize = 36;
 
     // Read text binary if provided
     let text_data = if let Some(text_path) = text {
@@ -266,6 +290,7 @@ fn dump<R: Rng>(
         spm[end-0x0C..end-0x08].copy_from_slice(&0u32.to_le_bytes()); // type = FP32 LIF
         spm[end-0x08..end-0x04].copy_from_slice(&(bytes_per_neuron as u32).to_le_bytes());
         spm[end-0x04..end].copy_from_slice(&(nn_count as u32).to_le_bytes());
+        spm[end-0x24..end-0x20].copy_from_slice(&expected_checksum.to_le_bytes());
 
         // Accumulate XOR of all words in this SPM image
         for word_idx in 0..(spm_size / 4) {
@@ -361,7 +386,8 @@ fn dump<R: Rng>(
             mc, csr_per_mc[mc].len() * 4, csr_per_mc[mc].len() / 2);
     }
 
-    println!("Reference XOR: 0x{:08x}", global_xor);
+    println!("SPM image XOR: 0x{:08x}", global_xor);
+    println!("Expected SNN checksum: 0x{:08x}", expected_checksum);
 
     Ok(())
 }
@@ -775,6 +801,11 @@ fn main() -> anyhow::Result<()> {
     println!("Gen done, max syn per neuron = {}", max_syn_per_neuron);
 
     let mut dump_snapshot: Option<Vec<Core>> = None;
+    let mut final_round_spike_inputs: Vec<Vec<f32>> = core_nn_cnt
+        .iter()
+        .map(|count| vec![0.0; *count])
+        .collect();
+    let mut final_round_spike_deliveries = 0u64;
 
     // Simulate
     for i in 0..args.pre_simulate {
@@ -806,6 +837,11 @@ fn main() -> anyhow::Result<()> {
                         let neigh = cores[c].neurons[n].neigh[neigh].clone();
                         cores[neigh.core as usize].neurons[neigh.neuron as usize].input +=
                             neigh.weight;
+                        if i == args.pre_simulate - 1 {
+                            final_round_spike_inputs[neigh.core as usize]
+                                [neigh.neuron as usize] += neigh.weight;
+                            final_round_spike_deliveries += 1;
+                        }
                     }
                 } else {
                     cores[c].neurons[n].state *= e_neg_tau;
@@ -821,11 +857,25 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    let mut expected_checksum = 0u32;
+    for (core_idx, core) in cores.iter().enumerate() {
+        for (neuron_idx, neuron) in core.neurons.iter().enumerate() {
+            expected_checksum ^= quantize_checksum_word(neuron.state);
+            expected_checksum ^=
+                quantize_checksum_word(final_round_spike_inputs[core_idx][neuron_idx]);
+        }
+    }
+    println!(
+        "Expected final-round spike deliveries: {}",
+        final_round_spike_deliveries
+    );
+
     if let Some(ref snapshot) = dump_snapshot {
         if let Some(ref p) = args.dump {
             let mut dump_shuffle_rng = args.dump_shuffle_seed.map(|seed| Xoshiro256PlusPlus::seed_from_u64(seed));
             dump(p, snapshot, args.num_mc, args.spm_size, args.text.as_ref(), e_neg_tau,
-                 args.threshold, args.mem_line_width, dump_shuffle_rng.as_mut())?;
+                 args.threshold, expected_checksum, args.mem_line_width,
+                 dump_shuffle_rng.as_mut())?;
         }
 
         if let Some(ref p) = args.dump_genn {

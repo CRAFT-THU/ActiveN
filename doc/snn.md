@@ -59,6 +59,11 @@ The end of the SNN SPM contains a descriptor of the data:
   - For FP32 LIF neurons:
     - end - 0x10 (4 bytes): the threshold for firing, in FP32
     - end - 0x14 (4 bytes): the decay factor, in FP32 (e^-tau)
+- end - 0x24 (4 bytes): expected post-timestep numerical checksum. This value
+  is repeated in every PU image so the leader can read its local copy.
+
+The words from end - 0x18 through end - 0x20 are reserved for runtime
+termination state and are initialized to zero by the image generators.
 
 ## CSR synapse data format
 
@@ -85,3 +90,26 @@ Then, each PU re-iterate through its neurons, look for fired neurons, and for ea
 The length of the scatter request is computed by the difference between the starts of the next neuron and the current neuron.
 This byte difference is shifted by the line-size value read from configuration
 ROM to obtain the request's memory-line count.
+
+## Numerical verification and termination
+
+After every PU finishes its neuron update, the leader waits for all DRAM MemIfs
+to report the configured idle interval. It then sends a lowest-priority ping to
+every PU. Since spike handlers have higher priority, the ping handler runs only
+after locally queued spikes have drained.
+
+Each ping handler quantizes the PU's final mutable neuron fields by multiplying
+them by 10.0 in FP32 and converting to a signed integer with round-to-nearest,
+ties-to-even. It XORs those words into a local checksum and returns the checksum
+in its pong. Current-based neurons include state and input; conductance neurons
+include g_e, g_i, and membrane potential. The leader XORs all pong values and
+compares the result with the expected checksum at end - 0x24. A checksum XOR
+difference of at most 15 is accepted to tolerate small FP accumulation-order
+differences.
+
+Numerical verification is enabled by default. Performance payloads can compile
+it out while retaining the idle and ping/pong termination barrier with:
+
+```sh
+make -B sys/snn_main.bin NUM_PU=64 SNN_VERIFY_RESULT=0
+```
