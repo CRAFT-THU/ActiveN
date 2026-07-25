@@ -34,10 +34,28 @@
         "type": "github"
       }
     },
+    "ramulator2": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1783317667,
+        "narHash": "sha256-4wNVbowHUDJHUzviJx/dslESPdLP48fm8aDb9NEm0CY=",
+        "owner": "CMU-SAFARI",
+        "repo": "ramulator2",
+        "rev": "99a0e1e87a9321587492fef5b0bd6197928f8d68",
+        "type": "github"
+      },
+      "original": {
+        "owner": "CMU-SAFARI",
+        "repo": "ramulator2",
+        "rev": "99a0e1e87a9321587492fef5b0bd6197928f8d68",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "ramulator2": "ramulator2"
       }
     },
     "systems": {

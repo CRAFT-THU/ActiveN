@@ -3,7 +3,7 @@
  *
  * Contains the System class (frontend) that drives one or more SystemBackend
  * instances (soft NoC or hard RTL), serving memory requests through the mem()
- * interface with flat or DRAMsim3 backing memory.  When multiple backends are
+ * interface with flat or Ramulator backing memory.  When multiple backends are
  * attached, they run in lockstep (cosimulation) with discrepancy detection.
  *
  * Also contains main() for the sim_system binary.
@@ -27,8 +27,9 @@
  *   --soft              Use soft NoC backend
  *   --hard              Use hard RTL backend
  *   --max-cycles N      Max simulation cycles (default: 10000000)
- *   --dram-config PATH  DRAMsim3 config file
- *   --dram-log DIR      DRAMsim3 log directory (default: ".")
+ *   -f, --freq-ghz N    Core and NoC frequency in GHz (default: 1)
+ *   --ramulator-config PATH  Ramulator YAML configuration file
+ *   --ramulator-stats DIR    Optional directory for per-MC statistics
  *   --trace             Enable FST tracing
  *   --log               Enable verbose logging
  *   --rng-seed N        RNG seed for peripheral device
@@ -36,6 +37,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -44,7 +46,6 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <map>
 #include <memory>
 #include <optional>
 #include <signal.h>
@@ -59,7 +60,11 @@
 #if HARD_BACKEND_ENABLED
 #include "hard_backend.h"
 #endif
-#include "dramsim3/dramsim3.h"
+#include <ramulator/base/config.h>
+#include <ramulator/base/factory.h>
+#include <ramulator/base/request.h>
+#include <ramulator/frontend/i_frontend.h>
+#include <ramulator/memory_system/i_memory_system.h>
 #include <verilated_fst_c.h>
 
 using namespace std;
@@ -85,7 +90,13 @@ struct McImage {
     }
   }
 
-  GlobalMemResp handle(const GlobalMemReq &req) {
+  struct PreparedAccess {
+    GlobalMemResp resp;
+    AlignedMemLine *line;
+    mem_mask_t write_mask;
+  };
+
+  PreparedAccess prepare(const GlobalMemReq &req) {
     const size_t request_bytes = size_t{1} << req.size;
     if (request_bytes > MEM_BUS_WIDTH_B) {
       throw runtime_error("Memory request size exceeds bus width");
@@ -102,28 +113,38 @@ struct McImage {
       }
     }
 
-    GlobalMemResp resp;
-    // Readout
+    GlobalMemResp resp{};
     resp.id = req.id;
     AlignedMemLine &cur = access(aligned_addr);
     resp.data = cur.inner;
 
+    mem_mask_t mask = 0;
     if (req.write) {
       uint32_t subline_addr = req.addr - aligned_addr;
       mem_mask_t request_mask = request_bytes == MEM_BUS_WIDTH_B
           ? ~mem_mask_t{0}
           : (mem_mask_t{1} << request_bytes) - 1;
-      mem_mask_t mask = request_mask << subline_addr;
+      mask = request_mask << subline_addr;
       mask &= req.wbe;
+    }
 
+    return PreparedAccess{resp, &cur, mask};
+  }
+
+  void commitWrite(const GlobalMemReq &req, const PreparedAccess &access) {
+    if (req.write) {
       for (size_t i = 0; i < MEM_BUS_WIDTH_B; ++i) {
-        if (mask & (mem_mask_t{1} << i)) {
-          cur.inner[i] = req.wdata[i];
+        if (access.write_mask & (mem_mask_t{1} << i)) {
+          access.line->inner[i] = req.wdata[i];
         }
       }
     }
+  }
 
-    return resp;
+  GlobalMemResp handle(const GlobalMemReq &req) {
+    auto access = prepare(req);
+    commitWrite(req, access);
+    return access.resp;
   }
 };
 
@@ -165,11 +186,9 @@ struct McState {
   deque<GlobalMemResp> resp_queue;
 };
 
-struct DramMC {
-  dramsim3::MemorySystem *dram = nullptr;
-  struct Pending { uint64_t addr; bool is_write; GlobalMemResp resp; };
-  deque<Pending> submit_queue;
-  multimap<uint64_t, GlobalMemResp> inflight;
+struct RamulatorMC {
+  unique_ptr<Ramulator::IFrontEnd> frontend;
+  unique_ptr<Ramulator::IMemorySystem> memory;
 };
 
 // ---- System implementation ----
@@ -181,9 +200,11 @@ struct System::Impl {
   int num_mc = 0;
   vector<McState> mc_states;
 
-  // DRAMsim3
-  bool use_dram = false;
-  vector<DramMC> dram_mcs;
+  // Ramulator timing model
+  bool use_ramulator = false;
+  vector<RamulatorMC> ramulator_mcs;
+  long double ramulator_tick_phase = 0.0L;
+  long double ramulator_ticks_per_core_cycle = 1.0L;
 
   // FST tracer (single dump per cycle between stage and step).
   VerilatedFstC *tracer = nullptr;
@@ -195,12 +216,13 @@ struct System::Impl {
   // Bus arrays (numMC + 1 entries, index 0 = peripheral)
   vector<MemBusIn> bus_in;
 
-  // Deferred DRAMsim3 config
-  struct StoredDRAMConfig {
+  // Deferred Ramulator config
+  struct StoredRamulatorConfig {
     string configFile;
-    string workDir;
+    optional<string> statsDir;
+    double coreFreqGHz;
   };
-  optional<StoredDRAMConfig> dram_cfg;
+  optional<StoredRamulatorConfig> ramulator_cfg;
 
   void initMcBases(const SystemConfig &cfg) {
     num_mc = cfg.numMC;
@@ -213,47 +235,54 @@ struct System::Impl {
     bus_in.resize(num_mc + 1);
   }
 
-  void initDram(const StoredDRAMConfig &dcfg) {
-    use_dram = true;
-    dram_mcs.resize(num_mc);
+  void initRamulator(const StoredRamulatorConfig &rcfg) {
+    use_ramulator = true;
+    ramulator_mcs.resize(num_mc);
+    float tck_ns = 0.0f;
     for (int i = 0; i < num_mc; ++i) {
-      auto log = dcfg.workDir + "/" + to_string(i);
-      filesystem::create_directories(log);
-      dram_mcs[i].dram = new dramsim3::MemorySystem(
-        dcfg.configFile.c_str(), log.c_str(),
-        [this, i](uint64_t addr) { dramReadCb(i, addr); },
-        [this, i](uint64_t addr) { dramWriteCb(i, addr); }
-      );
+      auto config = Ramulator::Config::parse_config_file(rcfg.configFile);
+      auto &r = ramulator_mcs[i];
+      r.frontend.reset(Ramulator::Factory::create_frontend(config));
+      r.memory.reset(Ramulator::Factory::create_memory_system(config));
+      r.frontend->connect_memory_system(r.memory.get());
+      r.memory->connect_frontend(r.frontend.get());
+
+      if (r.memory->get_tx_bytes() != MEM_BUS_WIDTH_B) {
+        throw runtime_error("Ramulator transaction width does not match memory bus width");
+      }
+      if (r.memory->get_tCK() <= 0.0f) {
+        throw runtime_error("Ramulator returned an invalid tCK");
+      }
+      if (i == 0) {
+        tck_ns = r.memory->get_tCK();
+      } else if (fabs(r.memory->get_tCK() - tck_ns) > 1e-6f) {
+        throw runtime_error("Ramulator MCs have inconsistent tCK values");
+      }
     }
+    ramulator_ticks_per_core_cycle =
+        1.0L / (static_cast<long double>(rcfg.coreFreqGHz) * tck_ns);
   }
 
-  void dramReadCb(int mc, uint64_t addr) {
-    auto &d = dram_mcs[mc];
-    auto it = d.inflight.find(addr);
-    if (it != d.inflight.end()) {
-      mc_states[mc].resp_queue.push_back(it->second);
-      d.inflight.erase(it);
-    }
-  }
-
-  void dramWriteCb(int mc, uint64_t addr) {
-    auto &d = dram_mcs[mc];
-    auto it = d.inflight.find(addr);
-    if (it != d.inflight.end()) {
-      mc_states[mc].resp_queue.push_back(it->second);
-      d.inflight.erase(it);
-    }
-  }
-
-  // Serve a single request from a backend for MC mc
-  void serveMemReq(int mc, const GlobalMemReq &req) {
-    GlobalMemResp resp = mc_images[mc].handle(req);
-
-    if (use_dram) {
-      dram_mcs[mc].submit_queue.push_back({(uint64_t)req.addr, req.write, resp});
-    } else {
+  bool submitRamulatorReq(int mc, const GlobalMemReq &req) {
+    auto access = mc_images[mc].prepare(req);
+    auto callback = [this, mc, resp = access.resp](Ramulator::Request &completed) {
+      if (completed.ingress_id != resp.id) {
+        throw runtime_error("Ramulator request ID changed before completion");
+      }
       mc_states[mc].resp_queue.push_back(resp);
+    };
+    int type = req.write ? Ramulator::Request::Type::Write
+                         : Ramulator::Request::Type::Read;
+    bool accepted = ramulator_mcs[mc].frontend->receive_external_requests(
+        type, req.addr, -1, req.id, std::move(callback), MEM_BUS_WIDTH_B);
+    if (accepted) {
+      mc_images[mc].commitWrite(req, access);
     }
+    return accepted;
+  }
+
+  void serveFlatMemReq(int mc, const GlobalMemReq &req) {
+    mc_states[mc].resp_queue.push_back(mc_images[mc].handle(req));
   }
 
   void servePeriphReq(const GlobalMemReq &req) {
@@ -280,22 +309,20 @@ struct System::Impl {
     periph_resps.push_back(resp);
   }
 
-  // Pop consumed responses and tick DRAM
+  // Pop consumed responses and tick Ramulator
   void tickMemory() {
     periph.tick();
 
-    if (use_dram) {
-      for (int mc = 0; mc < num_mc; ++mc) {
-        auto &d = dram_mcs[mc];
-        d.dram->ClockTick();
-        while (!d.submit_queue.empty()) {
-          auto &req = d.submit_queue.front();
-          if (d.dram->WillAcceptTransaction(req.addr, req.is_write)) {
-            d.dram->AddTransaction(req.addr, req.is_write);
-            d.inflight.emplace(req.addr, req.resp);
-            d.submit_queue.pop_front();
-          } else break;
+    if (use_ramulator) {
+      ramulator_tick_phase += ramulator_ticks_per_core_cycle;
+      while (ramulator_tick_phase + 1e-12L >= 1.0L) {
+        for (auto &r : ramulator_mcs) {
+          r.memory->tick();
         }
+        ramulator_tick_phase -= 1.0L;
+      }
+      if (ramulator_tick_phase < 0.0L) {
+        ramulator_tick_phase = 0.0L;
       }
     }
   }
@@ -385,7 +412,8 @@ struct System::Impl {
     for (int mc = 0; mc < num_mc; ++mc) {
       int idx = mc + 1;
       auto &ms = mc_states[mc];
-      bus_in[idx].reqAccepting = ms.resp_queue.size() < RESP_QUEUE_DEPTH;
+      bus_in[idx].reqAccepting =
+          !use_ramulator && ms.resp_queue.size() < RESP_QUEUE_DEPTH;
       if (!ms.resp_queue.empty()) bus_in[idx].resp = ms.resp_queue.front();
       else bus_in[idx].resp = nullopt;
     }
@@ -403,8 +431,14 @@ struct System::Impl {
     }
     for (int mc = 0; mc < num_mc; ++mc) {
       int idx = mc + 1;
-      if (out[idx].req && bus_in[idx].reqAccepting) {
-        serveMemReq(mc, *out[idx].req);
+      if (use_ramulator) {
+        bus_in[idx].reqAccepting = out[idx].req
+            ? submitRamulatorReq(mc, *out[idx].req)
+            : true;
+      } else {
+        if (out[idx].req && bus_in[idx].reqAccepting) {
+          serveFlatMemReq(mc, *out[idx].req);
+        }
       }
     }
   }
@@ -412,15 +446,16 @@ struct System::Impl {
 
 System::System(
   vector<string_view> dramInitFiles,
-  optional<DRAMsim3Config> dramTimingModel
+  optional<RamulatorConfig> ramulatorTimingModel
 ) : impl_(make_unique<Impl>()) {
   for (auto &f : dramInitFiles) {
     impl_->image_paths.push_back(string(f));
   }
-  if (dramTimingModel) {
-    impl_->dram_cfg = Impl::StoredDRAMConfig{
-      string(dramTimingModel->configFile),
-      string(dramTimingModel->workDir)
+  if (ramulatorTimingModel) {
+    impl_->ramulator_cfg = Impl::StoredRamulatorConfig{
+      string(ramulatorTimingModel->configFile),
+      ramulatorTimingModel->statsDir,
+      ramulatorTimingModel->coreFreqGHz
     };
   }
 }
@@ -456,10 +491,13 @@ bool System::run(uint64_t maxCycles) {
   loadImages(impl_->image_paths, cfg.core.mcSizes);
   cerr << "[System] Loaded " << mc_images.size() << " memory image(s)" << endl;
 
-  // DRAMsim3
-  if (impl_->dram_cfg) {
-    impl_->initDram(*impl_->dram_cfg);
-    cerr << "[System] DRAMsim3 enabled" << endl;
+  // Ramulator
+  if (impl_->ramulator_cfg) {
+    impl_->initRamulator(*impl_->ramulator_cfg);
+    cerr << "[System] Ramulator enabled: tCK="
+         << impl_->ramulator_mcs[0].memory->get_tCK() << " ns, transaction="
+         << impl_->ramulator_mcs[0].memory->get_tx_bytes() << " bytes, ticks/core-cycle="
+         << static_cast<double>(impl_->ramulator_ticks_per_core_cycle) << endl;
   }
 
   // Signal handling
@@ -535,10 +573,26 @@ bool System::run(uint64_t maxCycles) {
     b->printStats(cycle, true);
   }
 
-  // Print DRAM stats
-  if (impl_->use_dram) {
-    for (int i = 0; i < impl_->num_mc; ++i)
-      impl_->dram_mcs[i].dram->PrintStats();
+  // Print Ramulator stats
+  if (impl_->use_ramulator) {
+    for (int i = 0; i < impl_->num_mc; ++i) {
+      auto &r = impl_->ramulator_mcs[i];
+      r.frontend->update_stats_recursive();
+      r.memory->update_stats_recursive();
+      if (impl_->ramulator_cfg->statsDir) {
+        filesystem::create_directories(*impl_->ramulator_cfg->statsDir);
+        ofstream stats(*impl_->ramulator_cfg->statsDir + "/mc" + to_string(i) + ".yaml");
+        if (!stats) throw runtime_error("Cannot open Ramulator statistics file");
+        r.frontend->print_stats(stats);
+        r.memory->print_stats(stats);
+      } else {
+        cerr << "[Ramulator MC " << i << "]" << endl;
+        r.frontend->print_stats(cerr);
+        r.memory->print_stats(cerr);
+      }
+      r.frontend->finalize();
+      r.memory->finalize();
+    }
   }
 
   mc_images.clear();
@@ -568,12 +622,16 @@ int main(int argc, char **argv) {
     .default_value(uint64_t(10000000))
     .scan<'u', uint64_t>();
 
-  program.add_argument("--dram-config")
-    .help("DRAMsim3 config file");
+  program.add_argument("-f", "--freq-ghz")
+    .help("Core and NoC frequency in GHz")
+    .default_value(1.0)
+    .scan<'g', double>();
 
-  program.add_argument("--dram-log")
-    .help("DRAMsim3 log directory")
-    .default_value(string("."));
+  program.add_argument("--ramulator-config")
+    .help("Ramulator YAML configuration file");
+
+  program.add_argument("--ramulator-stats")
+    .help("Directory for per-MC Ramulator statistics");
 
   program.add_argument("--trace")
     .help("Enable FST tracing")
@@ -672,6 +730,11 @@ int main(int argc, char **argv) {
 
   uint64_t max_cycles = program.get<uint64_t>("--max-cycles");
   size_t soft_threads = program.get<uint32_t>("--soft-threads");
+  double core_freq_ghz = program.get<double>("--freq-ghz");
+  if (!isfinite(core_freq_ghz) || core_freq_ghz <= 0.0) {
+    cerr << "Error: --freq-ghz must be positive and finite" << endl;
+    return 1;
+  }
 
   // RNG seed
   if (auto seed = program.present<uint32_t>("--rng-seed")) {
@@ -698,14 +761,18 @@ int main(int argc, char **argv) {
   vector<string_view> dramInitFiles;
   for (auto &p : image_paths) dramInitFiles.push_back(p);
 
-  // Optional DRAMsim3
-  optional<DRAMsim3Config> dram_cfg;
-  if (auto cfg = program.present<string>("--dram-config")) {
-    auto dram_log = program.get<string>("--dram-log");
-    dram_cfg = DRAMsim3Config{*cfg, dram_log};
+  // Optional Ramulator timing model
+  optional<RamulatorConfig> ramulator_cfg;
+  if (auto cfg = program.present<string>("--ramulator-config")) {
+    ramulator_cfg = RamulatorConfig{
+      *cfg, program.present<string>("--ramulator-stats"), core_freq_ghz
+    };
+  } else if (program.present<string>("--ramulator-stats")) {
+    cerr << "Error: --ramulator-stats requires --ramulator-config" << endl;
+    return 1;
   }
 
-  System system(dramInitFiles, dram_cfg);
+  System system(dramInitFiles, ramulator_cfg);
 
   bool enable_trace = program.get<bool>("--trace");
   uint64_t trace_start = program.get<uint64_t>("--trace-start");

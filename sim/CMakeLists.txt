@@ -92,8 +92,20 @@ endfunction()
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 find_package(verilator HINTS $ENV{VERILATOR_ROOT})
+find_package(Ramulator 2.1 CONFIG REQUIRED)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
-find_library(DRAMSIM3 dramsim3)
+set(RAMULATOR_CONFIG_PY ${CMAKE_CURRENT_SOURCE_DIR}/ramulator_config.py)
+set(RAMULATOR_CONFIG_YAML ${CMAKE_CURRENT_BINARY_DIR}/ramulator.yaml)
+add_custom_command(
+    OUTPUT ${RAMULATOR_CONFIG_YAML}
+    COMMAND ${Python3_EXECUTABLE} -m ramulator export
+            ${RAMULATOR_CONFIG_PY} -o ${RAMULATOR_CONFIG_YAML}
+    DEPENDS ${RAMULATOR_CONFIG_PY}
+    COMMENT "Exporting ActiveN Ramulator configuration"
+    VERBATIM
+)
+add_custom_target(gen_ramulator_config DEPENDS ${RAMULATOR_CONFIG_YAML})
 
 # ---------------------------------------------------------------------------
 # mimalloc global allocator (static override)
@@ -286,11 +298,11 @@ add_executable(sim_system
   src/system.cpp
   src/devices.cpp
 )
-add_dependencies(sim_system gen_system_headers gen_bootrom)
+add_dependencies(sim_system gen_system_headers gen_bootrom gen_ramulator_config)
 add_dependencies(soft_backend_lib gen_system_headers)
 target_link_libraries(sim_system PRIVATE
   soft_backend_lib
-  ${DRAMSIM3}
+  Ramulator::ramulator
 )
 target_compile_definitions(sim_system PRIVATE
   HARD_BACKEND_ENABLED=$<BOOL:${ENABLE_HARD_BACKEND}>

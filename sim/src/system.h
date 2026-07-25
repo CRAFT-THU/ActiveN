@@ -157,9 +157,10 @@ public:
   virtual bool printStats(uint64_t cycles, bool final) = 0;
 };
 
-struct DRAMsim3Config {
+struct RamulatorConfig {
   std::string configFile;
-  std::string workDir;
+  std::optional<std::string> statsDir;
+  double coreFreqGHz;
 };
 
 class VerilatedFstC;
@@ -170,7 +171,7 @@ class System {
 public:
   System(
     std::vector<std::string_view> dramInitFiles,
-    std::optional<DRAMsim3Config> dramTimingModel
+    std::optional<RamulatorConfig> ramulatorTimingModel
   );
   ~System();
 
