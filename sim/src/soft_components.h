@@ -174,14 +174,7 @@ class alignas(DESTRUCTIVE_INTERFERENCE_SIZE) FlitQueue {
   // We use a uint64_t as occupancy bitmask — N_DEPTH must be < 64
   static_assert(N_DEPTH < 64, "N_DEPTH must be < 64 (uint64_t bitmask limit)");
 
-  struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) Slot {
-    std::unique_ptr<T> value;
-  };
-
-  static_assert(alignof(Slot) >= DESTRUCTIVE_INTERFERENCE_SIZE);
-  static_assert(sizeof(Slot) % DESTRUCTIVE_INTERFERENCE_SIZE == 0);
-
-  Slot buffer[N_DEPTH];
+  std::unique_ptr<T> buffer[N_DEPTH];
   uint64_t occupied = 0;
 
   // Every cycle, the invoker should first peek & ask if it can enqueue,
@@ -198,7 +191,7 @@ public:
     uint64_t remaining = occupied & (occupied - 1);
     while (remaining != 0) {
       size_t idx = std::countr_zero(remaining);
-      if (buffer[idx].value->prio() < buffer[returning].value->prio()) {
+      if (buffer[idx]->prio() < buffer[returning]->prio()) {
         returning = idx;
       }
       remaining = remaining & (remaining - 1);
@@ -208,7 +201,7 @@ public:
   }
 
   const std::unique_ptr<T>& operator[](size_t idx) const {
-    return buffer[idx].value;
+    return buffer[idx];
   }
 
   size_t size() const {
@@ -235,18 +228,18 @@ public:
   std::unique_ptr<T> take(size_t idx) {
     if constexpr (ASSERTIONS_ENABLED) {
       if (!(occupied & (1ull << idx))) throw std::runtime_error("take slot is not occupied");
-      if (!buffer[idx].value) throw std::runtime_error("take slot was already moved");
+      if (!buffer[idx]) throw std::runtime_error("take slot was already moved");
     }
-    return std::move(buffer[idx].value);
+    return std::move(buffer[idx]);
   }
 
   void place(size_t idx, std::unique_ptr<T> value) {
     if constexpr (ASSERTIONS_ENABLED) {
       if (!value) throw std::runtime_error("placing a null value");
       if (occupied & (1ull << idx)) throw std::runtime_error("place slot is occupied");
-      if (buffer[idx].value) throw std::runtime_error("place slot already contains a value");
+      if (buffer[idx]) throw std::runtime_error("place slot already contains a value");
     }
-    buffer[idx].value = std::move(value);
+    buffer[idx] = std::move(value);
   }
 
   void commit(std::optional<size_t> deq, std::optional<size_t> enq) {

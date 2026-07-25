@@ -534,18 +534,15 @@ class DRAMIf : public MemIf {
   }
 
 public:
-  struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) PUResp {
+  struct PUResp {
     std::optional<std::pair<uint16_t, MemLine>> unicast;
     std::optional<BcastLine> bcast;
   };
 
-  struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) PUAccept {
+  struct PUAccept {
     bool unicast;
     bool broadcast;
   };
-
-  static_assert(alignof(PUResp) >= DESTRUCTIVE_INTERFERENCE_SIZE);
-  static_assert(alignof(PUAccept) >= DESTRUCTIVE_INTERFERENCE_SIZE);
 
   size_t numClusters() const {
     return (puEnd - puStart) / CLUSTER_SIZE;

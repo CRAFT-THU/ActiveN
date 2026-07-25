@@ -14,7 +14,13 @@ set(PGO_PROFILE_DIR "${CMAKE_BINARY_DIR}/pgo-profiles" CACHE STRING "Directory f
 option(USE_LTO "Enable ThinLTO" OFF)
 option(USE_BOLT "Apply BOLT post-link optimization (instrumentation mode)" ON)
 option(USE_MIMALLOC "Link mimalloc as the global memory allocator" ON)
+option(USE_ARCH_NATIVE "Optimize host code for the build machine" ON)
 option(ENABLE_HARD_BACKEND "Build the Verilated full-system hard backend" ON)
+
+if(USE_ARCH_NATIVE)
+  add_compile_options(-march=native)
+  message(STATUS "Host architecture optimization enabled (-march=native)")
+endif()
 
 if(PGO_GENERATE AND PGO_USE)
   message(FATAL_ERROR "Cannot enable both PGO_GENERATE and PGO_USE simultaneously")
