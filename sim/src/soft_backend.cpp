@@ -414,20 +414,26 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads)
     releaseResetAfter(10),
     topo(cfg.numPU, cfg.numMC),
     periph(0, 16, [&]() {
-      // Build the single config-ROM line matching RTL System.scala.
+      // Build width-aligned config-ROM lines matching RTL System.scala.
       std::unordered_map<uint32_t, MemLine> rom;
-      MemLine line{};
       uint32_t npu = static_cast<uint32_t>(cfg.numPU);
       uint32_t nmc = static_cast<uint32_t>(cfg.numMC);
       uint32_t ppm = nmc ? npu / nmc : 0;
       uint32_t lineShift = MEM_BUS_WIDTH_SIZE;
       uint64_t mcSize = cfg.core.mcSizes.empty() ? 0 : cfg.core.mcSizes[0];
-      std::memcpy(&line[0],  &npu, 4);
-      std::memcpy(&line[8],  &nmc, 4);
-      std::memcpy(&line[16], &ppm, 4);
-      std::memcpy(&line[24], &lineShift, 4);
-      std::memcpy(&line[32], &mcSize, 8);
-      rom[0x28000000u] = line;
+      auto storeField = [&rom](uint32_t offset, const auto &value) {
+        const size_t lineOffset = offset & MEM_ADDR_OFFSET_MASK;
+        if (lineOffset + sizeof(value) > MEM_BUS_WIDTH_B)
+          throw std::logic_error("Configuration ROM field crosses a memory line");
+        const uint32_t address = 0x28000000u + (offset & MEM_ADDR_ALIGN_MASK);
+        auto it = rom.try_emplace(address, MemLine{}).first;
+        std::memcpy(it->second.data() + lineOffset, &value, sizeof(value));
+      };
+      storeField(0, npu);
+      storeField(8, nmc);
+      storeField(16, ppm);
+      storeField(24, lineShift);
+      storeField(32, mcSize);
       return rom;
     }()),
     drams(),
@@ -591,30 +597,12 @@ static void presentCoreMem(soft_rtl &core, const soft_mem::DRAMIf::PUResp &resp)
     //   line(i).data       = soft.line[2*i + 1]
     //   line(i).idx || pu  = soft.line[2*i]   (idx upper, pu lower)
     const auto &raw = resp.bcast->line;
-    core.mem_broadcast_bits_line_0_data = raw[1];
-    core.mem_broadcast_bits_line_0_idx  = (uint16_t)(raw[0] >> 16);
-    core.mem_broadcast_bits_line_0_pu   = (uint16_t)(raw[0] & 0xFFFF);
-    core.mem_broadcast_bits_line_1_data = raw[3];
-    core.mem_broadcast_bits_line_1_idx  = (uint16_t)(raw[2] >> 16);
-    core.mem_broadcast_bits_line_1_pu   = (uint16_t)(raw[2] & 0xFFFF);
-    core.mem_broadcast_bits_line_2_data = raw[5];
-    core.mem_broadcast_bits_line_2_idx  = (uint16_t)(raw[4] >> 16);
-    core.mem_broadcast_bits_line_2_pu   = (uint16_t)(raw[4] & 0xFFFF);
-    core.mem_broadcast_bits_line_3_data = raw[7];
-    core.mem_broadcast_bits_line_3_idx  = (uint16_t)(raw[6] >> 16);
-    core.mem_broadcast_bits_line_3_pu   = (uint16_t)(raw[6] & 0xFFFF);
-    core.mem_broadcast_bits_line_4_data = raw[9];
-    core.mem_broadcast_bits_line_4_idx  = (uint16_t)(raw[8] >> 16);
-    core.mem_broadcast_bits_line_4_pu   = (uint16_t)(raw[8] & 0xFFFF);
-    core.mem_broadcast_bits_line_5_data = raw[11];
-    core.mem_broadcast_bits_line_5_idx  = (uint16_t)(raw[10] >> 16);
-    core.mem_broadcast_bits_line_5_pu   = (uint16_t)(raw[10] & 0xFFFF);
-    core.mem_broadcast_bits_line_6_data = raw[13];
-    core.mem_broadcast_bits_line_6_idx  = (uint16_t)(raw[12] >> 16);
-    core.mem_broadcast_bits_line_6_pu   = (uint16_t)(raw[12] & 0xFFFF);
-    core.mem_broadcast_bits_line_7_data = raw[15];
-    core.mem_broadcast_bits_line_7_idx  = (uint16_t)(raw[14] >> 16);
-    core.mem_broadcast_bits_line_7_pu   = (uint16_t)(raw[14] & 0xFFFF);
+#define BCAST_SLOT(i)                                                        \
+    core.mem_broadcast_bits_line_##i##_data = raw[2 * i + 1];                \
+    core.mem_broadcast_bits_line_##i##_idx = (uint16_t)(raw[2 * i] >> 16);  \
+    core.mem_broadcast_bits_line_##i##_pu = (uint16_t)(raw[2 * i] & 0xFFFF)
+    SYSTEM_BCAST_SLOT_ENTRIES
+#undef BCAST_SLOT
   }
 }
 

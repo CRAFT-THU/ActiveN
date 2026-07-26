@@ -385,15 +385,25 @@ class System(implicit val params: SystemParameters) extends Module {
   //   0x28000020: each MC's memory size (64-bit, little-endian)
   val pusPerMC = params.numPU / params.numMC
   val mcSize = coreParams.memCtrlSizes.head // all MCs have the same size
-  val configLine = BigInt(params.numPU) |
-    (BigInt(params.numMC) << 64) |
-    (BigInt(pusPerMC) << 128) |
-    (BigInt(busParams.lineAddrShift) << 192) |
-    (mcSize << 256)
-
-  val configROM = Map(
-    BigInt("28000000", 16) -> configLine,
+  val configBase = BigInt("28000000", 16)
+  val configLineBytes = coreParams.memBusWidth / 8
+  val configFields = Seq(
+    (0, 4, BigInt(params.numPU)),
+    (8, 4, BigInt(params.numMC)),
+    (16, 4, BigInt(pusPerMC)),
+    (24, 4, BigInt(busParams.lineAddrShift)),
+    (32, 8, mcSize),
   )
+  require(configFields.forall { case (offset, size, _) =>
+    offset % configLineBytes + size <= configLineBytes
+  }, "configuration ROM fields must not cross memory-line boundaries")
+  val configROM = configFields.groupBy(_._1 / configLineBytes).map { case (lineIdx, fields) =>
+    val contents = fields.foldLeft(BigInt(0)) { case (line, (offset, size, value)) =>
+      val fieldMask = (BigInt(1) << (size * 8)) - 1
+      line | ((value & fieldMask) << ((offset % configLineBytes) * 8))
+    }
+    configBase + lineIdx * configLineBytes -> contents
+  }
   val periphMemIf = Module(new PeripheralIf(16, configROM = configROM))
   periphMemIf.suggestName("memif_0")
   io.periph.req <> periphMemIf.mem.req

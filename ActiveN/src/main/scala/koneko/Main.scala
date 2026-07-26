@@ -4,7 +4,7 @@ import circt.stage.ChiselStage;
 import java.io.{File, PrintWriter}
 
 object Main extends App {
-  val param = CoreParameters()
+  val defaultParam = CoreParameters()
 
   def coreConfigJson(p: CoreParameters): ujson.Value = ujson.Obj(
     "initVec" -> s"0x${p.initVec.toString(16)}",
@@ -38,6 +38,7 @@ object Main extends App {
   var core: Boolean = false
   var pu: Option[Int] = None
   var mc: Option[Int] = None
+  var memBusWidth: Option[Int] = None
   var output: Option[String] = None
   var spliter = args.indexOf("--")
   val (mainArgs, otherArgs) = if (spliter >= 0) {
@@ -55,6 +56,7 @@ object Main extends App {
         println("  --system         Emit System with default config")
         println("  --pu=<N>         Emit System with N PUs")
         println("  --mc=<N>         Emit System with N MCs")
+        println("  --mem-bus-width=<bits>  Set the external memory bus width. Default: 512")
         println("  --output=<path>  Set output path for generated files. Default: ./generated/core or ./generated/system")
         sys.exit(0)
       }
@@ -71,6 +73,13 @@ object Main extends App {
         mc = a.stripPrefix("--mc=").toIntOption
         if (mc.isEmpty) {
           println(s"Invalid MC count: ${a.stripPrefix("--mc=")}")
+          sys.exit(1)
+        }
+      }
+      case a if a.startsWith("--mem-bus-width=") => {
+        memBusWidth = a.stripPrefix("--mem-bus-width=").toIntOption
+        if (memBusWidth.isEmpty) {
+          println(s"Invalid memory bus width: ${a.stripPrefix("--mem-bus-width=")}")
           sys.exit(1)
         }
       }
@@ -98,6 +107,10 @@ object Main extends App {
     println("Both --system and --core specified. Please specify only one.")
     sys.exit(1)
   }
+
+  val param = defaultParam.copy(
+    memBusWidth = memBusWidth.getOrElse(defaultParam.memBusWidth)
+  )
 
   val subdir = if (system) "system" else "core"
   val outputUnwrapped = if (output.isDefined) {

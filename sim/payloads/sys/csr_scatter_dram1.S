@@ -1,16 +1,17 @@
-  # CSR scatter test — dram.1 image (MC1 data)
+  # CSR scatter test image for every non-boot memory controller.
   #
-  # Layout: one 64-byte zero memory line + CSR1 data
-  # This gets assembled into a flat binary for dram.1.
+  # Layout: one zero memory line followed by the common CSR table. The runtime
+  # payload uses this same offset for MC1 through MC(N-1), and each MemIf
+  # filters the table to the PUs in its own zone.
+
+#ifndef MEM_LINE_BYTES
+#define MEM_LINE_BYTES 64
+#endif
 
   .section .text
 
-  # One zero memory line so CSR1 begins at offset 0x40.
-  .word 0, 0, 0, 0
-  .word 0, 0, 0, 0
-  .word 0, 0, 0, 0
-  .word 0, 0, 0, 0
+  # Keep offset zero empty so the table starts at one configured memory line.
+  .space MEM_LINE_BYTES
 
-  # CSR1 data starts at offset 0x40
 #include "csr_scatter_data.S"
-  CSR1
+  CSR_DATA

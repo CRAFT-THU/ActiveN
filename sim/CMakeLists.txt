@@ -101,8 +101,11 @@ find_package(verilator HINTS $ENV{VERILATOR_ROOT})
 find_package(Ramulator 2.1 CONFIG REQUIRED)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
-set(RAMULATOR_CONFIG_PY ${CMAKE_CURRENT_SOURCE_DIR}/ramulator_config.py)
+set(RAMULATOR_CONFIG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/ramulator-config)
+set(RAMULATOR_CONFIG_PY ${RAMULATOR_CONFIG_DIR}/hbm1-8ch.py)
+set(RAMULATOR_CONFIG_HBM2_PY ${RAMULATOR_CONFIG_DIR}/hbm2-1ch.py)
 set(RAMULATOR_CONFIG_YAML ${CMAKE_CURRENT_BINARY_DIR}/ramulator.yaml)
+set(RAMULATOR_CONFIG_HBM2_YAML ${CMAKE_CURRENT_BINARY_DIR}/ramulator-hbm2-1ch.yaml)
 add_custom_command(
     OUTPUT ${RAMULATOR_CONFIG_YAML}
     COMMAND ${Python3_EXECUTABLE} -m ramulator export
@@ -111,7 +114,18 @@ add_custom_command(
     COMMENT "Exporting ActiveN Ramulator configuration"
     VERBATIM
 )
-add_custom_target(gen_ramulator_config DEPENDS ${RAMULATOR_CONFIG_YAML})
+add_custom_command(
+    OUTPUT ${RAMULATOR_CONFIG_HBM2_YAML}
+    COMMAND ${Python3_EXECUTABLE} -m ramulator export
+            ${RAMULATOR_CONFIG_HBM2_PY} -o ${RAMULATOR_CONFIG_HBM2_YAML}
+    DEPENDS ${RAMULATOR_CONFIG_HBM2_PY}
+    COMMENT "Exporting one-channel HBM2 Ramulator configuration"
+    VERBATIM
+)
+add_custom_target(gen_ramulator_config DEPENDS
+    ${RAMULATOR_CONFIG_YAML}
+    ${RAMULATOR_CONFIG_HBM2_YAML}
+)
 
 # ---------------------------------------------------------------------------
 # mimalloc global allocator (static override)

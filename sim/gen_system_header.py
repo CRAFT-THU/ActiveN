@@ -35,6 +35,16 @@ with open(os.path.join(outdir, "system_config.h"), "w") as f:
     f.write(f"inline constexpr bool SYSTEM_USE_FPU = {'true' if core['useFPU'] else 'false'};\n")
     f.write(f"inline constexpr int SYSTEM_PIPE_CNT = {core['pipeCnt']};\n\n")
 
+    bcast_slots = core["memBusWidth"] // 64
+    f.write("// Broadcast-line accessors for the elaborated memory-line width\n")
+    f.write("#define SYSTEM_BCAST_SLOT_ENTRIES \\\n")
+    for i in range(bcast_slots):
+        f.write(f"    BCAST_SLOT({i});")
+        if i < bcast_slots - 1:
+            f.write(" \\")
+        f.write("\n")
+    f.write("\n")
+
     # PU core accessor for SPM preloading (legacy)
     f.write("// Verilator PU core accessors for SPM preloading\n")
     f.write("#define SYSTEM_PU_CASE_ENTRIES \\\n")

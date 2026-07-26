@@ -41,6 +41,9 @@ all-tests: $(ASM_BINS) $(C_BINS)
 # System-level tests (multicore, RV32I + custom AM instructions)
 NUM_PU ?= 16
 SNN_VERIFY_RESULT ?= 1
+CSR_NUM_PU ?= 64
+CSR_NUM_MC ?= 2
+MEM_LINE_BYTES ?= 64
 
 sys/pingpong_test.bin: sys/pingpong_test.S sys/linker_system.ld
 	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -o sys/pingpong_test.elf $<
@@ -58,16 +61,23 @@ sys/barrier_test.bin: sys/barrier_test.S sys/linker_system.ld
 	${PREFIX}gcc -mabi=ilp32 -march=rv32ia_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -o sys/barrier_test.elf $<
 	${PREFIX}objcopy -j .text -j .data -O binary sys/barrier_test.elf $@
 
-sys/csr_scatter_data.S: sys/gen_csr_data.py
-	python3 sys/gen_csr_data.py sys/csr_scatter_data.S
+.PHONY: force-csr-scatter-data
+force-csr-scatter-data:
+
+sys/csr_scatter_data.S: sys/gen_csr_data.py force-csr-scatter-data
+	python3 sys/gen_csr_data.py --num-pu ${CSR_NUM_PU} --line-bytes ${MEM_LINE_BYTES} sys/csr_scatter_data.S
 
 sys/csr_scatter_test.bin: sys/csr_scatter_test.S sys/csr_scatter_data.S sys/linker_system.ld
-	${PREFIX}gcc -mabi=ilp32 -march=rv32ima_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -Isys -O1 -o sys/csr_scatter_test.elf sys/csr_scatter_test.S
+	${PREFIX}gcc -mabi=ilp32 -march=rv32ima_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -Isys -O1 -DNUM_PU=${CSR_NUM_PU} -DNUM_MC=${CSR_NUM_MC} -DMEM_LINE_BYTES=${MEM_LINE_BYTES} -o sys/csr_scatter_test.elf sys/csr_scatter_test.S
 	${PREFIX}objcopy -j .text -j .data -O binary sys/csr_scatter_test.elf $@
 
 sys/csr_scatter_dram1.bin: sys/csr_scatter_dram1.S sys/csr_scatter_data.S sys/linker_system.ld
-	${PREFIX}gcc -mabi=ilp32 -march=rv32im_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -Isys -O1 -o sys/csr_scatter_dram1.elf sys/csr_scatter_dram1.S
+	${PREFIX}gcc -mabi=ilp32 -march=rv32im_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -Isys -O1 -DMEM_LINE_BYTES=${MEM_LINE_BYTES} -o sys/csr_scatter_dram1.elf sys/csr_scatter_dram1.S
 	${PREFIX}objcopy -j .text -j .data -O binary sys/csr_scatter_dram1.elf $@
+
+sys/config_rom_test.bin: sys/config_rom_test.S sys/linker_system.ld force-csr-scatter-data
+	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -DNUM_PU=${CSR_NUM_PU} -DNUM_MC=${CSR_NUM_MC} -DMEM_LINE_BYTES=${MEM_LINE_BYTES} -o sys/config_rom_test.elf $<
+	${PREFIX}objcopy -j .text -j .data -O binary sys/config_rom_test.elf $@
 
 sys/local_send_test.bin: sys/local_send_test.S sys/linker_system.ld
 	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -o sys/local_send_test.elf sys/local_send_test.S
@@ -85,7 +95,7 @@ sys/snn_cond.bin: sys/snn_cond.S sys/snn_main.S sys/snn_init.c sys/linker_system
 	${PREFIX}gcc -mabi=ilp32 -march=rv32imaf_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -DSNN_VERIFY_RESULT=${SNN_VERIFY_RESULT} -O1 -o sys/snn_cond.elf sys/snn_cond.S sys/snn_init.c
 	${PREFIX}objcopy -j .text -j .data -O binary sys/snn_cond.elf $@
 
-sys-tests: sys/pingpong_test.bin sys/sha256_concurrent.bin sys/spm_init.bin sys/barrier_test.bin sys/local_send_test.bin sys/random_noc_test.bin
+sys-tests: sys/pingpong_test.bin sys/sha256_concurrent.bin sys/spm_init.bin sys/barrier_test.bin sys/local_send_test.bin sys/random_noc_test.bin sys/config_rom_test.bin
 	@echo "All system tests built successfully"
 
 clean:

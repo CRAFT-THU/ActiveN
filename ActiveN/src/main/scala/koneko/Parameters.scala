@@ -15,7 +15,7 @@ case class CoreParameters(
   val pipeCnt: Int = 2,
 
   // Depth of the send queue
-  val sendQueueDepth: Int = 16,
+  val sendQueueDepth: Int = 32,
   // Depth of the shared message ingestion queue
   val msgQueueDepth: Int = 4,
   // Depth of each event queue
