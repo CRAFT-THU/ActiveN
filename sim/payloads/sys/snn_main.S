@@ -13,11 +13,11 @@
   #   Handler 0 (tag=0): termination control — leader collects phase reports (argcnt=1)
   #   Handler 1 (tag=1): spike — incoming synapse event (argcnt=2)
   #   Handler 2 (tag=2): termination ping — drain queued spike events, then pong (argcnt=0)
-  #   Handler 3 (tag=3): work  — self-scheduled work loop (argcnt=1, margin=num_mc+1, quota=1)
+  #   Handler 3 (tag=3): work  — self-scheduled work loop (argcnt=1, margin=max(num_mc+1, 4), quota=0)
   #
   # Scatter CSR uses handler_tag=1 (spike handler).
-  # Work handler has margin=num_mc+1 (room for scatter sends + self-yield)
-  # and quota=1 (yields after each neuron to let spikes run).
+  # Work handler reserves room for all scatter sends and the four slots needed
+  # to enqueue the lowest-priority completion message.
   #
   # Register assignments (s-registers, persistent across handlers):
   #   s0  = hartid (1-based)
@@ -269,11 +269,15 @@ install_runtime:
   li    a0, (1 << 3) | 0      # thread 0 only, argcnt=0
   csrw  0x712, a0             # hancfg (thread 0 only for now)
 
-  # Handler 3: work_update (argcnt=1, margin=num_mc+1, quota=0) — lowest priority
+  # Handler 3: work_update (argcnt=1, margin=max(num_mc+1, 4), quota=0) — lowest priority
   la    a0, work_update
   csrw  0x703, a0
   addi  a0, s5, 1
-  csrw  0x723, a0             # hanmargin: quota=0, margin=num_mc+1
+  li    t0, 4
+  bgeu  a0, t0, 1f
+  mv    a0, t0
+1:
+  csrw  0x723, a0             # hanmargin: quota=0, margin=max(num_mc+1, 4)
   li    a0, (1 << 3) | 1      # thread 0 only, argcnt=1
   csrw  0x713, a0             # hancfg (thread 0 only for now)
 
