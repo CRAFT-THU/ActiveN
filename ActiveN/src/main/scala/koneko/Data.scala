@@ -4,7 +4,7 @@ import chisel3._
 
 class MemReq extends Bundle {
   val addr = UInt(32.W)
-  val size = UInt(2.W) // 0 = byte, 1 = half-word, 2 = word
+  val size = UInt(4.W)
   val id = UInt(16.W)
   val wdata = UInt(32.W)
   val wbe = UInt(4.W)

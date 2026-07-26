@@ -27,32 +27,41 @@ case class MemBusParameters(
   def lineAddrShift: Int = log2Ceil(core.memBusWidth / 8)
 }
 
-object ScalarType extends ChiselEnum {
+object MemOp extends ChiselEnum {
   val Load = Value
   val Store = Value
   // TODO: AMO
 
-  def fromTag(tag: UInt): (Bool, ScalarType.Type) = {
+  def fromTag(tag: UInt): (Bool, MemOp.Type) = {
     // TODO: impl by decoder
     (
       tag(7, 0) === 0x00.U || tag(7, 0) === 0x01.U,
-      Mux(tag(7, 0) === 0x00.U, ScalarType.Load, ScalarType.Store)
+      Mux(tag(7, 0) === 0x00.U, MemOp.Load, MemOp.Store)
     )
   }
 }
 
-class ScalarPending extends Bundle {
-  val ty        = ScalarType()
-  val src       = UInt(16.W)
-  val id        = UInt(16.W)
+class MSHR extends Bundle {
+  val ty        = MemOp()
+
+  // Return status
+  val src       = UInt(16.W) // 0 = broadcast. TODO: this is bad for constant propagation & DCE
+  val id        = UInt(16.W) // Or return tag
+
   val address   = UInt(32.W)
-  val size      = UInt(4.W) // FIXME: ICache request size!
+  val size      = UInt(4.W)
+
+  // TODO: move these to a separate broadcast carried buffer
+  val carried = Vec(2, UInt(32.W)) // Extra data carried by the request, e.g. for broadcast
+
+  def isBroadcast: Bool = src === 0.U
 }
-object ScalarPending {
+
+object MSHR {
   // Check mem.md for encoding
-  def fromFlit(flit: Flit): (Bool, ScalarPending, UInt) = {
-    val p = Wire(new ScalarPending)
-    val (isScalar, ty) = ScalarType.fromTag(flit.tag)
+  def fromFlitAsScalar(flit: Flit): (Bool, MSHR, UInt) = {
+    val p = Wire(new MSHR)
+    val (isScalar, ty) = MemOp.fromTag(flit.tag)
     p.ty := ty
     p.src := flit.src
 
@@ -62,6 +71,8 @@ object ScalarPending {
     // Operand 1
     p.size := flit.data(1)(31, 16)
     p.id := flit.data(1)(15, 0)
+
+    p.carried := DontCare
 
     // Operand 2
     val data = flit.data(2)
@@ -85,28 +96,37 @@ object BulkType extends ChiselEnum {
   def isBroadcast(ty: BulkType.Type): Bool = ty === Scatter
 }
 
-class BulkPending extends Bundle {
+class BulkDispatcher extends Bundle {
   val ty = BulkType()
   val base = UInt(32.W) // Aligned, inclusive
   val end = UInt(32.W) // Aligned, exclusive
   val src = UInt(16.W)
   val tag = UInt(16.W)
 
-  val extras = Vec(2, UInt(32.W))
+  val carried = Vec(2, UInt(32.W))
 
-  val issueCnt = UInt(16.W) // Counting beats
-  val completedCnt = UInt(16.W)
+  def isAllocated(cnt: UInt)(implicit busParams: MemBusParameters): Bool = cnt === ((end >> busParams.lineAddrShift) - (base >> busParams.lineAddrShift))
+  def isAllocatedNext(cnt: UInt)(implicit busParams: MemBusParameters): Bool = (cnt + 1.U) === ((end >> busParams.lineAddrShift) - (base >> busParams.lineAddrShift))
+  def issueAddr(cnt: UInt)(implicit busParams: MemBusParameters) = base + (cnt << busParams.lineAddrShift)
+  def isEmpty: Bool = base === end
 
-  // FIXME: parametric beat size
-  def isFullyIssued(implicit busParams: MemBusParameters): Bool = issueCnt === ((end >> busParams.lineAddrShift) - (base >> busParams.lineAddrShift))
-  def isCompletedNext(implicit busParams: MemBusParameters): Bool = (completedCnt + 1.U) === ((end >> busParams.lineAddrShift) - (base >> busParams.lineAddrShift))
-  def canIssue(maxInflight: Int): Bool = issueCnt < completedCnt + maxInflight.U
-  def issueAddr(implicit busParams: MemBusParameters) = base + (issueCnt << busParams.lineAddrShift)
+  def dispatch(cnt: UInt)(implicit busParams: MemBusParameters): MSHR = {
+    val mshr = Wire(new MSHR)
+    mshr.ty := MemOp.Load
+    mshr.src := Mux(BulkType.isBroadcast(ty), 0.U, src)
+    mshr.id := tag
+    mshr.address := issueAddr(cnt)
+    mshr.size := busParams.lineAddrShift.U
+    mshr.carried := carried
+    mshr
+  }
+
+  def isBroadcast: Bool = BulkType.isBroadcast(ty)
 }
 
-object BulkPending {
-  def initFromFlit(flit: Flit)(implicit params: MemBusParameters): (Bool, BulkPending) = {
-    val p = Wire(new BulkPending)
+object BulkDispatcher {
+  def fromFlit(flit: Flit)(implicit params: MemBusParameters): (Bool, BulkDispatcher) = {
+    val p = Wire(new BulkDispatcher)
     p.src := flit.src
 
     val (isBulk, ty) = BulkType.fromTag(flit.tag)
@@ -116,11 +136,8 @@ object BulkPending {
     p.end := flit.data(0) + ((flit.data(1)(31, 16)) << sizeOffset) // length in beats
     p.tag := flit.data(1).apply(15, 0)
 
-    p.extras(0) := flit.data(2)
-    p.extras(1) := flit.data(3)
-
-    p.issueCnt := 0.U
-    p.completedCnt := 0.U
+    p.carried(0) := flit.data(2)
+    p.carried(1) := flit.data(3)
 
     (isBulk, p)
   }
@@ -148,114 +165,136 @@ class RingResp(implicit params: CoreParameters) extends Bundle {
 }
 
 // Base class for DRAMIf and MMIOIf, the former implements scatter & bulk access & local response egress, the latter implements config ROM.
-// scalarInflight is the maximum number or ordinary (non-bulk) memory requests
+// inflight is the maximum number of inflight memory requests, including scalar and bulk sub-requests.
 abstract class MemIf(
   mcIdx: Int,
-  scalarInflight: Int,
+  inflight: Int,
   numReq: Int,
+  hasExtraAlloc: Boolean,
 )(implicit busParams: MemBusParameters) extends Module {
-  assert(scalarInflight <= 32768)
-  implicit val coreParams: CoreParameters = busParams.core
+  require(inflight >= 2, "inflight must be at least 2")
+  assert(inflight <= (1 << busParams.extIdWidth), "inflight must be <= 2^extIdWidth")
+  final implicit val coreParams: CoreParameters = busParams.core
 
   // Common IO
-  val nocIn = IO(Vec(numReq, Flipped(Decoupled(new Flit))))
-  val nocOut = IO(Decoupled(new Flit))
+  final val nocIn = IO(Vec(numReq, Flipped(Decoupled(new Flit))))
+  final val nocOut = IO(Decoupled(new Flit))
 
-  val ringIn  = IO(Flipped(Decoupled(new RingResp)))
-  val ringOut = IO(Decoupled(new RingResp))
+  final val ringIn  = IO(Flipped(Decoupled(new RingResp)))
+  final val ringOut = IO(Decoupled(new RingResp))
 
-  val mem = IO(new Bundle {
+  final val mem = IO(new Bundle {
     val req  = Decoupled(new GlobalMemReq)
     val resp = Flipped(Valid(new GlobalMemResp))
   })
 
-  protected val flitArb = Module(new FlitArb(nocIn(0).bits.cloneType, numReq))
+  private val flitArb = Module(new FlitArb(nocIn(0).bits.cloneType, numReq))
   for (ci <- 0 until numReq) flitArb.io.in(ci) <> nocIn(ci)
-  protected val flit = flitArb.io.out
+  final protected val flit = flitArb.io.out
 
-  // Common scalar l/s states
-  protected val scalarAllocated = RegInit(VecInit.fill(scalarInflight)(false.B))
-  protected val scalarPendings  = Reg(Vec(scalarInflight, new ScalarPending))
-  protected val scalarIssued    = RegInit(VecInit.fill(scalarInflight)(false.B))
-  protected val scalarCompleted = RegInit(VecInit.fill(scalarInflight)(false.B))
-  protected val scalarBuffer    = Reg(Vec(scalarInflight, UInt(coreParams.memBusWidth.W)))
+  // Common MSHR states
+  final protected val allocated = RegInit(VecInit(Seq.fill(inflight)(false.B)))
+  private val mshrs     = Reg(Vec(inflight, new MSHR))
+  // Whether this request is issued
+  private val issued    = Reg(Vec(inflight, Bool()))
+  // Whether this request is fulfilled
+  private val fulfilled = Reg(Vec(inflight, Bool()))
   // Buffers either write data, or response data, or both (for AMO)
   // We cannot reduce this to 32 bit: ICache fetches whole lines, and AMOs
+  private val buffer    = Reg(Vec(inflight, UInt(coreParams.memBusWidth.W)))
 
-  // -- Scalar bus: request allocation & deallocation --
-  // This flit is accepted by the scalar request allcation logic
-  protected val scalarAcceptFlit = Wire(Bool())
+  // Allocation inputs
+  protected class Alloc extends Bundle {
+    val mshr = new MSHR
+    val data = UInt(coreParams.memBusWidth.W)
+  }
+  private val alloc = Wire(Decoupled(new Alloc))
+  final protected val allocExtra: Option[DecoupledIO[Alloc]] =
+    if (hasExtraAlloc) Some(Wire(Decoupled(new Alloc))) else None
+  final protected val bcstEject = Wire(Decoupled(new BcastLine))
+  // Unicast request deallocation happens on response being consumed by either ring or local resp port
+  // Only used in MemIf
+  private val ucstEject = Wire(Decoupled(new RingResp))
 
-  // Scalar allocation
-  private val (isScalar, parsedScalar, parsedData) = ScalarPending.fromFlit(flit.bits)
-
-  private val scalarAlloc = PriorityEncoderOH(scalarAllocated.map(a => !a))
-  private val scalarAllocValid = scalarAlloc.reduce(_ || _)
-  scalarAcceptFlit := isScalar && scalarAllocValid
-
-  when(flit.fire && isScalar) {
-    for(s <- 0 until scalarInflight) {
-      when(scalarAlloc(s)) {
-        scalarAllocated(s) := true.B
-        scalarPendings(s) := parsedScalar
-        scalarBuffer(s) := busParams.replicateScalar(parsedData)
-        scalarIssued(s) := false.B
-        scalarCompleted(s) := false.B
-      }
-    }
+  alloc.ready := !allocated.asUInt.andR // Not full
+  val allocIdx = PriorityEncoder(allocated.map(!_))
+  when(alloc.fire) {
+    mshrs(allocIdx) := alloc.bits.mshr
+    buffer(allocIdx) := alloc.bits.data
+    allocated(allocIdx) := true.B
+    fulfilled(allocIdx) := false.B
+    issued(allocIdx) := false.B
   }
 
-  // Scalar request deallocation happens on response being consumed by either ring or local resp port
-  // Used by subclasses
-  val scalarEject = Wire(Decoupled(new RingResp))
-  val scalarEjectSel = PriorityEncoderOH((scalarAllocated zip scalarCompleted).map { case (a, c) => a && c })
-  scalarEject.valid := VecInit(scalarEjectSel).asUInt.orR
-  scalarEject.bits.dst := Mux1H(scalarEjectSel, scalarPendings.map(_.src))
-  scalarEject.bits.id := Mux1H(scalarEjectSel, scalarPendings.map(_.id))
-  scalarEject.bits.data := Mux1H(scalarEjectSel, scalarBuffer)
-  when(scalarEject.fire) {
-    for(s <- 0 until scalarInflight) {
-      when(scalarEjectSel(s)) {
-        scalarAllocated(s) := false.B
-      }
-    }
+  val ucstMap = allocated.asUInt & fulfilled.asUInt & VecInit(mshrs.map(!_.isBroadcast)).asUInt
+  val ucstIdx = Common.rr(ucstMap, ucstEject.fire, "ucstIdx")
+  ucstEject.bits.dst := mshrs(ucstIdx).src
+  ucstEject.bits.id := mshrs(ucstIdx).id
+  ucstEject.bits.data := buffer(ucstIdx)
+  ucstEject.valid := ucstMap.orR
+  when(ucstEject.fire) {
+    allocated(ucstIdx) := false.B
   }
 
-  // Scalar request pathway
-  private val scalarReqArb = Module(new RRArbiter(new ScalarPending, scalarInflight))
-  private val scalarReqs = for (s <- 0 until scalarInflight) yield {
-    val r = scalarReqArb.io.in(s)
-    r.valid := scalarAllocated(s) && !scalarIssued(s)
-    r.bits := scalarPendings(s)
-    when(r.fire) {
-      scalarIssued(s) := true.B
-    }
+  val bcstMap = allocated.asUInt & fulfilled.asUInt & VecInit(mshrs.map(_.isBroadcast)).asUInt
+  val bcstIdx = Common.rr(bcstMap, bcstEject.fire, "bcstIdx")
+  bcstEject.bits.tag := mshrs(bcstIdx).id
+  bcstEject.bits.line := buffer(bcstIdx).asTypeOf((new BcastLine).line)
+  bcstEject.bits.carried := mshrs(bcstIdx).carried
+  bcstEject.valid := bcstMap.orR
+  when(bcstEject.fire) {
+    allocated(bcstIdx) := false.B
   }
-  private val scalarReqData = scalarBuffer(scalarReqArb.io.chosen)
 
-  protected val scalarReq = Wire(Decoupled(new GlobalMemReq))
-  scalarReq.valid := scalarReqArb.io.out.valid
-  scalarReqArb.io.out.ready := scalarReq.ready
-  scalarReq.bits.id := scalarReqArb.io.chosen // Zero extended slot idx, highest bit == 0 => scalar req
-  scalarReq.bits.addr := scalarReqArb.io.out.bits.address
-  scalarReq.bits.wdata := scalarReqData
-  scalarReq.bits.wbe := busParams.replicateScalar("b1111".U(4.W))
-  scalarReq.bits.size := scalarReqArb.io.out.bits.size
-  assert(!scalarReqArb.io.out.valid || scalarReqArb.io.out.bits.size <= busParams.lineAddrShift.U, "Unsupported scalar access size")
-  scalarReq.bits.write := scalarReqArb.io.out.bits.ty === ScalarType.Store // TODO: handle RMW for subline writes, or let's have a LLDC
+  // Scalar parsing and allocation
+  private val (isScalar, parsedScalar, parsedData) = MSHR.fromFlitAsScalar(flit.bits)
+  private val scalarAlloc = Wire(new Alloc)
+  scalarAlloc.mshr := parsedScalar
+  scalarAlloc.data := busParams.replicateScalar(parsedData)
+  final protected val scalarAcceptFlit = isScalar && alloc.ready
 
-  // Scalar response pathway
-  // Instantiated by subclasses
-  val scalarResp: ValidIO[GlobalMemResp]
-  when(scalarResp.valid) {
-    // TODO: explicitly slice, and assert that the extension is zero
-    scalarCompleted(scalarResp.bits.id) := true.B
-    // May overwrites wdata, but we're fine with that.
-    // When introducing AMO, this has to be fixed.
-    scalarBuffer(scalarResp.bits.id) := scalarResp.bits.rdata
+  // Subclasses can provide bulk-to-scalar allocation through allocExtra.
+  allocExtra match {
+    case Some(extra) =>
+      alloc.bits := Mux(isScalar && flit.valid, scalarAlloc, extra.bits)
+      alloc.valid := (isScalar && flit.valid) || extra.valid
+      extra.ready := alloc.ready && !(isScalar && flit.valid)
+    case None =>
+      alloc.bits := scalarAlloc
+      alloc.valid := isScalar && flit.valid
+  }
 
-    assert(scalarAllocated(scalarResp.bits.id), "Received response for non-allocated slot")
-    assert(!scalarCompleted(scalarResp.bits.id), "Received response for already completed slot")
+  // Outgoing request
+  final protected val req = Wire(Decoupled(new GlobalMemReq))
+  val issueMap = allocated.asUInt & ~issued.asUInt
+  val issueIdx = Common.rr(issueMap, req.fire, "issueIdx")
+  req.valid := issueMap.orR
+  req.bits.id := issueIdx
+  req.bits.addr := mshrs(issueIdx).address
+  req.bits.wdata := buffer(issueIdx)
+  req.bits.wbe := busParams.replicateScalar("b1111".U(4.W))
+  req.bits.size := mshrs(issueIdx).size
+  assert(!req.valid || req.bits.size <= busParams.lineAddrShift.U, "Unsupported scalar access size")
+  req.bits.write := mshrs(issueIdx).ty === MemOp.Store // TODO: handle RMW for subline writes, or let's have a LLDC
+  when(req.fire) {
+    issued(issueIdx) := true.B
+  }
+
+  // Incoming response
+  final protected val resp = Wire(Valid(new GlobalMemResp))
+  val respInRange = resp.bits.id < inflight.U
+  val respIdx = resp.bits.id(log2Ceil(inflight) - 1, 0)
+  when(resp.valid) {
+    assert(respInRange, "Received response ID outside the MSHR range")
+    when(respInRange) {
+      val issuedNow = req.fire && req.bits.id === resp.bits.id
+      assert(allocated(respIdx), "Received response for an unallocated MSHR")
+      assert(issued(respIdx) || issuedNow, "Received response for an unissued MSHR")
+      assert(!fulfilled(respIdx), "Received duplicate response for an MSHR")
+      fulfilled(respIdx) := true.B
+      // May overwrite wdata, but stores do not consume it after completion.
+      buffer(respIdx) := resp.bits.rdata
+    }
   }
 
   // Ring implementation
@@ -271,17 +310,16 @@ abstract class MemIf(
     (local, remote)
   }
 
-  val ringSend = Wire(Decoupled(new RingResp))
-  val ringFwdQueue = Module(new Queue(new RingResp, 2))
-  val ringSendGated = Wire(Decoupled(new RingResp))
+  final protected val (ringRecv, ringFwd) = splitLocal(ringIn)
+  final protected val (ucstLocal, ringSend) = splitLocal(ucstEject)
+
+  private val ringFwdQueue = Module(new Queue(new RingResp, 2))
+  private val ringSendGated = Wire(Decoupled(new RingResp))
   ringSendGated.bits := ringSend.bits
   ringSendGated.valid := ringSend.valid && ringFwdQueue.io.count === 0.U
   ringSend.ready := ringSendGated.ready && ringFwdQueue.io.count === 0.U
 
-  val (ringRecv, ringFwd) = splitLocal(ringIn)
-  val (scalarRecv, scalarSend) = splitLocal(scalarEject)
-
-  val ringPushArb = Module(new Arbiter(new RingResp, 2))
+  private val ringPushArb = Module(new Arbiter(new RingResp, 2))
   ringPushArb.io.in(0) <> ringFwd
   ringPushArb.io.in(1) <> ringSendGated
   ringFwdQueue.io.enq <> ringPushArb.io.out
@@ -294,9 +332,9 @@ abstract class MemIf(
     val tag = UInt(16.W)
     val cycles = UInt(16.W)
   }
-  val idleNotifier = RegInit(Common.invalid(new IdleNotifier))
-  val idleCycles = RegInit(0.U(16.W))
-  protected val idleCurrently = Wire(Bool())
+  private val idleNotifier = RegInit(Common.invalid(new IdleNotifier))
+  private val idleCycles = RegInit(0.U(16.W))
+  final protected val idleCurrently = Wire(Bool())
   idleCycles := MuxCase(idleCycles + 1.U, Seq(
     !idleCurrently -> 0.U,
     idleCycles.andR -> idleCycles
@@ -306,10 +344,10 @@ abstract class MemIf(
     val tag = UInt(16.W)
     val data = UInt(32.W)
   }
-  val idleReturn = RegInit(Common.invalid(new IdleReturn))
-  val isIdle = Seq(0xF0, 0xF1).map(_.U === flit.bits.tag(7, 0)).reduce(_ || _)
+  private val idleReturn = RegInit(Common.invalid(new IdleReturn))
+  private val isIdle = Seq(0xF0, 0xF1).map(_.U === flit.bits.tag(7, 0)).reduce(_ || _)
   // Idle return buffer have to be empty: all requests can generate it
-  protected val idleAcceptFlit = isIdle && !idleReturn.valid
+  final protected val idleAcceptFlit = isIdle && !idleReturn.valid
 
   // Fire idle notifier into idle return buffer
   when (idleNotifier.valid && !idleReturn.valid && idleCycles > idleNotifier.bits.cycles && !(flit.valid && isIdle)) {
@@ -344,7 +382,7 @@ abstract class MemIf(
     idleReturn.bits.data := Mux(idleNotifier.valid, 0.U, "hFFFFFFFF".U)
   }
 
-  val idleFlit = Wire(Decoupled(new Flit))
+  private val idleFlit = Wire(Decoupled(new Flit))
   idleFlit.bits.src := (0x8000 + mcIdx).U
   idleFlit.bits.dst := idleReturn.bits.tgt
   idleFlit.bits.tag := idleReturn.bits.tag
@@ -365,23 +403,24 @@ class DRAMIf(
   puStart: Int,     // First PU ID in zone (1-based, inclusive)
   puEnd: Int,       // Last PU ID in zone (1-based, inclusive)
   numClusters: Int, // Clusters in this zone
-  scalarInflight: Int,
-  bulkInflight: Int, // Number of inflight sub-line for the ONLY pending bulk request
-)(implicit busParams: MemBusParameters) extends MemIf(mcIdx, scalarInflight, numClusters) {
+  inflight: Int,
+)(implicit busParams: MemBusParameters) extends MemIf(mcIdx, inflight, numClusters, hasExtraAlloc = true) {
   require(mcIdx >= 1, "mcIdx must be >= 1 for DRAMIf")
   require(numClusters >= 1)
   require(puEnd >= puStart)
   require(puEnd - puStart + 1 == numClusters * 16, "PU IDs must map cleanly to clusters")
   require(puStart == (mcIdx - 1) * numClusters * 16 + 1,
     s"mcIdx ($mcIdx) must align with puStart ($puStart), expected ${(mcIdx - 1) * numClusters * 16 + 1}")
-  require(isPow2(bulkInflight), "bulkInflight must be a power of 2")
-
-  val bulkSubIdWidth = log2Ceil(bulkInflight)
-  require(bulkSubIdWidth + 1 <= 8, "bulk request ID must fit in 8 bits")
 
   // DRAMIf has response egress ports into local clusters
   val unicast = IO(Vec(numClusters, Valid(new RingResp)))
   val broadcast = IO(Vec(numClusters, Decoupled(new BcastLine)))
+
+  mem.req.valid := req.valid
+  mem.req.bits := req.bits
+  req.ready := mem.req.ready
+  resp.valid := mem.resp.valid
+  resp.bits := mem.resp.bits
 
   // DRAMIf-specific state for scatter/broadcast
   // Scatter: multi-read command (tag=0xFF02) followed by multiple beats of response data,
@@ -390,127 +429,68 @@ class DRAMIf(
   def isLocal(puId: UInt): Bool = puId >= puStart.U && puId <= puEnd.U
   def clusterOf(puId: UInt): UInt = (puId - puStart.U) >> 4
 
-  val bulkAllocated = RegInit(false.B)
-  val bulkPending = Reg(new BulkPending)
-  val bulkBuffer = Reg(Vec(bulkInflight, UInt(coreParams.memBusWidth.W))) // Buffer for the different bits of the ONLY pending bulk request
-  val bulkCompleted = RegInit(VecInit.fill(bulkInflight)(false.B))
-
-  // -- Bulk bus handling: allocation & dealloc --
-  // Also handles real bus connection
+  // TODO: make this queue length configurable
+  val bulkQueue = Module(new Queue(new BulkDispatcher, 2))
 
   // Alloc
-  val (isBulk, parsedBulk) = BulkPending.initFromFlit(flit.bits)
-  val bulkAcceptFlit = isBulk && !bulkAllocated
-  when(flit.fire && isBulk) {
-    assert(!bulkAllocated, "Received new bulk request while previous one is still pending")
-    assert(!bulkCompleted.asUInt.orR, "Bulk completed bits should be cleared when no bulk is pending")
-    bulkAllocated := true.B
-    bulkPending := parsedBulk
-  }
+  val (isBulk, parsedBulk) = BulkDispatcher.fromFlit(flit.bits)
+  bulkQueue.io.enq.valid := flit.valid && isBulk && !parsedBulk.isEmpty
+  bulkQueue.io.enq.bits := parsedBulk
+  val bulkAcceptFlit = isBulk && (bulkQueue.io.enq.ready || parsedBulk.isEmpty)
 
   flit.ready := scalarAcceptFlit || bulkAcceptFlit || idleAcceptFlit
 
-  // Bulk requests: scatter and bulk copy
-  // Highest bit == 1 => bulk req, rest is beat id
-  def bulkId(beat: UInt) = {
-    1.U(1.W) ## 0.U((7 - bulkSubIdWidth).W) ## beat(bulkSubIdWidth - 1, 0)
-  }
+  val bulkAlloc = allocExtra.get
+  val bulkCnt = RegInit(0.U((32 - busParams.lineAddrShift).W))
 
-  // FIXME: assert alignment
-  val bulkReq = Wire(Decoupled(new GlobalMemReq))
-  bulkReq.valid := bulkAllocated && !bulkPending.isFullyIssued && bulkPending.canIssue(bulkInflight)
-  bulkReq.bits.id := bulkId(bulkPending.issueCnt)
-  bulkReq.bits.addr := bulkPending.issueAddr
-  bulkReq.bits.wdata := DontCare // Right now we only do bulk loads
-  bulkReq.bits.wbe := 0.U
-  bulkReq.bits.size := busParams.lineAddrShift.U
-  bulkReq.bits.write := false.B
-  when(bulkReq.fire) {
-    bulkPending.issueCnt := bulkPending.issueCnt + 1.U
-    bulkCompleted(bulkPending.issueCnt) := false.B
-  }
-
-  // For DRAMIf, unicast req takes unconditional priority over scalar reqs, so we're using a plain Arbiter here
-  // TODO: do we also block scalarReq if bulkInflight is saturated?
-
-  val reqArb = Module(new Arbiter(new GlobalMemReq, 2))
-  reqArb.io.in(0) <> scalarReq
-  reqArb.io.in(1) <> bulkReq
-  mem.req <> reqArb.io.out
-
-  // Response handling
-  override lazy val scalarResp: ValidIO[GlobalMemResp] = Wire(Valid(new GlobalMemResp))
-  scalarResp.valid := mem.resp.valid && mem.resp.bits.id(7) === 0.U
-  scalarResp.bits := mem.resp.bits
-  val respIsBulk = mem.resp.valid && mem.resp.bits.id(7) === 1.U
-  val respBulkBeatId = mem.resp.bits.id(bulkSubIdWidth - 1, 0)
-  when(respIsBulk) {
-    bulkBuffer(respBulkBeatId) := mem.resp.bits.rdata
-    bulkCompleted(respBulkBeatId) := true.B
-  }
-
-  // Bulk completion state machine
-  // Each resp port has a decoupled state. The state machine steps if all resp port has accepted the current beat
-  // Need to check that complete counter did not outrun issue counter
-  val bulkRespValid = (
-    bulkAllocated
-    && bulkCompleted(bulkPending.completedCnt)
-    && bulkPending.completedCnt =/= bulkPending.issueCnt // TODO: we can use a shorter comparison
-  )
-  val bulkStep = Wire(Bool())
-  when(bulkStep) {
-    val bulkCompletedCntNext = bulkPending.completedCnt + 1.U
-    bulkPending.completedCnt := bulkCompletedCntNext
-    when(bulkPending.isCompletedNext) {
-      bulkAllocated := false.B
-    }
-  }
-
-  // Bulk unicast
-  val bulkUcstValid = bulkRespValid && !BulkType.isBroadcast(bulkPending.ty)
-  val bulkUcstEject = Wire(Decoupled(new RingResp))
-  bulkUcstEject.valid := bulkUcstValid
-  bulkUcstEject.bits.dst := bulkPending.src
-  bulkUcstEject.bits.id := bulkPending.tag
-  bulkUcstEject.bits.data := bulkBuffer(bulkPending.completedCnt)
-  val bulkUcstStep = bulkUcstEject.fire
+  // Guarantee that there is space for unicast requests, so we don't deadlock the system
+  val bcstInflight = RegInit(0.U(log2Ceil(inflight).W))
+  val BCST_BOUND = inflight / 2
+  val bcstBlocked = bcstInflight === BCST_BOUND.U && bulkQueue.io.deq.bits.isBroadcast
+  assert(bcstInflight <= BCST_BOUND.U, "bcstInflight exceeded BCST_BOUND")
+  bulkAlloc.valid := bulkQueue.io.deq.valid && !bcstBlocked
+  bulkAlloc.bits.mshr := bulkQueue.io.deq.bits.dispatch(bulkCnt)
+  bulkAlloc.bits.data := DontCare
+  val bulkCurDone = bulkQueue.io.deq.bits.isAllocatedNext(bulkCnt)
+  bulkQueue.io.deq.ready := bulkAlloc.ready && !bcstBlocked && bulkCurDone
+  bulkCnt := MuxCase(bulkCnt, Seq(
+    (bulkAlloc.fire && bulkCurDone) -> 0.U,
+    bulkAlloc.fire -> (bulkCnt + 1.U),
+  ))
 
   // Bulk Broadcast
-  val bcstValid = bulkRespValid && BulkType.isBroadcast(bulkPending.ty)
+  val bcstQueue = Module(new Queue(new BcastLine, 2))
+  // The queue holds a broadcast response stable while clusters accept it independently.
+  bcstQueue.io.enq <> bcstEject
   val bcstAccepted = RegInit(0.U(numClusters.W))
   val bcstAccept = Wire(Vec(numClusters, Bool()))
   val bcstAcceptedUpdated = bcstAccepted | bcstAccept.asUInt
   val bcstStep = bcstAcceptedUpdated.andR
+  bcstQueue.io.deq.ready := bcstStep
   bcstAccepted := Mux(bcstStep, 0.U(numClusters.W), bcstAcceptedUpdated)
   val bcstDists = for (ci <- 0 until numClusters) yield {
     val bcstDist = Wire(Decoupled(new BcastLine))
     bcstDist.suggestName(s"bcstDist_$ci")
-    // FIXME: gate by if any data lands in that distributor
-    bcstDist.valid := bcstValid && !bcstAccepted(ci)
-    bcstDist.bits.tag := bulkPending.tag
-    bcstDist.bits.line := bulkBuffer(bulkPending.completedCnt).asTypeOf((new BcastLine).line)
-    bcstDist.bits.carried := bulkPending.extras
+    // TODO: gate by if any data lands in that distributor
+    bcstDist.valid := bcstQueue.io.deq.valid && !bcstAccepted(ci)
+    bcstDist.bits := bcstQueue.io.deq.bits
     bcstAccept(ci) := bcstDist.fire
     bcstDist
   }
-
-  bulkStep := bcstStep || bulkUcstStep
-
-  val (bulkUcstRecv, bulkUcstSend) = splitLocal(bulkUcstEject)
-
-  // Arbitration for ring send:
-  // 1. scalarSend
-  // 2. bulkUcstSend
-  val scalarSendArb = Module(new Arbiter(new RingResp, 2))
-  scalarSendArb.io.in(0) <> scalarSend
-  scalarSendArb.io.in(1) <> bulkUcstSend
-  ringSend <> scalarSendArb.io.out
+  val bcstAlloc = bulkAlloc.fire && bulkQueue.io.deq.bits.isBroadcast
+  val bcstFree = bcstEject.fire
+  when(bcstAlloc && !bcstFree) {
+    assert(bcstInflight < BCST_BOUND.U, "Broadcast MSHR counter overflow")
+    bcstInflight := bcstInflight + 1.U
+  }.elsewhen(!bcstAlloc && bcstFree) {
+    assert(bcstInflight =/= 0.U, "Broadcast MSHR counter underflow")
+    bcstInflight := bcstInflight - 1.U
+  }
 
   // Arbitration for each resp port & ring egress:
   // 1. ringRecv (only for local resp)
   // 2. scalarEject
-  // 3. bulkUcstEject
-  // Braodcast now has a dedicated port
+  // Broadcast now has a dedicated port
   def localDist(in: DecoupledIO[RingResp], name: String): Seq[DecoupledIO[RingResp]] = {
     val clusterMask = for (ci <- 0 until numClusters) yield {
       clusterOf(in.bits.dst) === ci.U
@@ -518,7 +498,6 @@ class DRAMIf(
 
     when(in.valid) {
       assert(isLocal(in.bits.dst), cf"$name: Received non-local response with dst ${in.bits.dst}")
-      assert(PopCount(clusterMask) === 1.U, cf"$name: Received response with dst ${in.bits.dst} that matches none / multiple clusters")
     }
 
     val outs = for (ci <- 0 until numClusters) yield {
@@ -534,14 +513,12 @@ class DRAMIf(
   }
 
   val ringDist = localDist(ringRecv, "ringDist")
-  val scalarDist = localDist(scalarRecv, "scalarDist")
-  val bulkUcstDist = localDist(bulkUcstRecv, "bulkUcstDist")
+  val scalarDist = localDist(ucstLocal, "ucstLocal")
 
   for (ci <- 0 until numClusters) {
-    val arb = Module(new Arbiter(new RingResp, 3)).suggestName(s"distArb_$ci")
+    val arb = Module(new Arbiter(new RingResp, 2)).suggestName(s"distArb_$ci")
     arb.io.in(0) <> ringDist(ci)
     arb.io.in(1) <> scalarDist(ci)
-    arb.io.in(2) <> bulkUcstDist(ci)
 
     unicast(ci) := arb.io.out
     arb.io.out.ready := true.B
@@ -549,44 +526,43 @@ class DRAMIf(
     broadcast(ci) <> bcstDists(ci)
   }
 
-  idleCurrently := !scalarAllocated.asUInt.orR && !bulkAllocated
+  idleCurrently := !bulkQueue.io.deq.valid && !bcstQueue.io.deq.valid && !allocated.asUInt.orR
 }
 
 // No distributor, no scatter / bulk, can have configROM
 class PeripheralIf(
   externalInflight: Int,
   configROM: Map[BigInt, BigInt] = Map.empty,
-)(implicit busParams: MemBusParameters) extends MemIf(0, externalInflight, 1) {
-  override lazy val scalarResp: ValidIO[GlobalMemResp] = Wire(Valid(new GlobalMemResp))
+)(implicit busParams: MemBusParameters) extends MemIf(0, externalInflight, 1, hasExtraAlloc = false) {
 
   val addrMask = ~(busParams.core.memBusWidth / 8 - 1).U(32.W)
-  val configHits = configROM.map({ case (addr, data) => ((scalarReq.bits.addr & addrMask) === addr.U, data.U(busParams.core.memBusWidth.W)) }).toSeq
+  val configHits = configROM.map({ case (addr, data) => ((req.bits.addr & addrMask) === addr.U, data.U(busParams.core.memBusWidth.W)) }).toSeq
   val configHit = VecInit(configHits.map(_._1)).asUInt.orR
   val configReadout = Mux1H(configHits)
   val configGrant = !mem.resp.valid
   val configResp = Wire(Valid(new GlobalMemResp))
-  configResp.valid := scalarReq.valid && configHit && configGrant
-  configResp.bits.id := scalarReq.bits.id
+  configResp.valid := req.valid && configHit && configGrant
+  configResp.bits.id := req.bits.id
   configResp.bits.rdata := configReadout
 
-  mem.req.valid := scalarReq.valid && !configHit
-  mem.req.bits := scalarReq.bits
-  scalarReq.ready := Mux(configHit, configGrant, mem.req.ready)
+  mem.req.valid := req.valid && !configHit
+  mem.req.bits := req.bits
+  req.ready := Mux(configHit, configGrant, mem.req.ready)
 
   // Response arbitration
-  scalarResp.bits := Mux(mem.resp.valid, mem.resp.bits, configResp.bits)
-  scalarResp.valid := mem.resp.valid || configResp.valid
+  resp.bits := Mux(mem.resp.valid, mem.resp.bits, configResp.bits)
+  resp.valid := mem.resp.valid || configResp.valid
 
   // We don't have any local distributor
   def isLocal(puId: UInt): Bool = false.B
   ringRecv.ready := DontCare
   assert(!ringRecv.valid)
-  scalarRecv.ready := DontCare
-  assert(!scalarRecv.valid)
+  ucstLocal.ready := DontCare
+  assert(!ucstLocal.valid)
+  bcstEject.ready := DontCare
+  assert(!bcstEject.valid)
 
   flit.ready := scalarAcceptFlit || idleAcceptFlit
 
-  ringSend <> scalarSend
-
-  idleCurrently := !scalarAllocated.asUInt.orR
+  idleCurrently := !allocated.asUInt.orR
 }

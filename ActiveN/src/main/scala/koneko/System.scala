@@ -369,7 +369,7 @@ class System(implicit val params: SystemParameters) extends Module {
   val memIfs = topo.mcIds.zipWithIndex.map { case (mcId, mcIdx) =>
     val puStart = mcIdx * clustersPerMC * 16 + 1
     val puEnd   = (mcIdx + 1) * clustersPerMC * 16
-    val memIf = Module(new DRAMIf(mcIdx + 1, puStart, puEnd, clustersPerMC, 64, 16))
+    val memIf = Module(new DRAMIf(mcIdx + 1, puStart, puEnd, clustersPerMC, 64))
     memIf.suggestName(s"memif_${mcIdx + 1}")
     io.mem(mcIdx).req <> memIf.mem.req
     memIf.mem.resp := io.mem(mcIdx).resp

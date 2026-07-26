@@ -61,4 +61,16 @@ object Common {
     ret.valid := false.B
     ret
   }
+
+  def rr(input: UInt, take: Bool, name: String): UInt = {
+    val width = input.getWidth
+    val output = Wire(UInt(log2Ceil(width).W)).suggestName(name)
+
+    val last = RegEnable(output, 0.U, take).suggestName(s"${name}_last")
+    val filtered = Seq.tabulate(width) { i => i.U > last && input(i) }
+    val doubleSel = PriorityEncoderOH(filtered ++ input.asBools)
+    val sel = (0 until width).map(i => doubleSel(i) || doubleSel(i + width))
+    output := OHToUInt(VecInit(sel))
+    output
+  }
 }
