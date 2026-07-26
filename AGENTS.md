@@ -342,8 +342,13 @@ Rules:
 - Supply exactly one positional image per MC.
 - With `--hard`, `--pu`, `--mc`, and `--mc-size` must exactly match the
   compiled `System.config.json`.
-- Flat memory is the default. `--dram-config sim/mem.cfg --dram-log <dir>`
-  enables DRAMsim3 timing in the shared frontend.
+- Flat memory is the default. `--ramulator-config sim/build/ramulator.yaml`
+  enables Ramulator timing in the shared frontend; CMake exports that YAML
+  from `sim/ramulator_config.py`.
+- `--ramulator-stats <dir>` writes one YAML statistics file per MC and requires
+  `--ramulator-config`.
+- `--freq-ghz`/`-f` sets the core and NoC frequency in GHz and defaults to 1.
+  The frontend uses this value and Ramulator's `tCK` to schedule memory ticks.
 - `--trace --trace-start <cycle>` writes `trace.fst`.
 - `--log` enables periodic soft-backend statistics.
 
@@ -363,6 +368,8 @@ step all backends
 
 - `peek(K)` reads state after the previous posedge and presents memory requests.
   It must not consume frontend input or advance state.
+- With Ramulator enabled, request readiness is the direct result of Ramulator's
+  request submission API. The frontend must not queue rejected requests.
 - `stage(K)` supplies request readiness and responses, drives core inputs, and
   settles combinational/negedge behavior without committing registered state.
 - `step(K)` commits the posedge and all transfers resolved for cycle K.
@@ -561,8 +568,9 @@ needed.
   waveform, then cosim through completion.
 - **Datagen or SNN payloads**: rebuild datagen and payloads, regenerate images,
   run `spm_init`, then run the smallest relevant SNN case before the full case.
-- **Simulator frontend or DRAMsim3**: test flat memory first, then
-  `--dram-config sim/mem.cfg` if timing-model code changed.
+- **Simulator frontend or Ramulator**: test flat memory first, then use
+  `--ramulator-config sim/build/ramulator.yaml` if timing-model code changed.
+  Include a non-default `--freq-ghz` test when clock scheduling changed.
 
 After any uncore RTL modification, assume soft/hard cycle alignment may have
 changed until cosim proves otherwise.
