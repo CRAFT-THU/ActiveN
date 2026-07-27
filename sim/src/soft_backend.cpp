@@ -485,7 +485,7 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads)
   const size_t CLUSTER_PER_MC = PU_PER_MC / soft_mem::CLUSTER_SIZE;
   drams.reserve(cfg.numMC);
   for (size_t m = 0; m < cfg.numMC; ++m) {
-    drams.emplace_back(m + 1, CLUSTER_PER_MC, 64, 16, 2,
+    drams.emplace_back(m + 1, CLUSTER_PER_MC, 64, 2,
                        1 + m * PU_PER_MC,
                        1 + (m + 1) * PU_PER_MC);
   }
@@ -1116,14 +1116,14 @@ void SoftSystemBackend::accumulateStats() {
     }
   }
 
-  // DRAM inflight = scalar slots in use + 1 if a bulk is active.
+  // DRAM inflight includes shared MSHRs and buffered broadcast responses.
   uint64_t inflight_dram = 0;
   for (const auto &d : drams) {
-    inflight_dram += d.scalarInflightCount();
-    if (d.bulkActive()) ++inflight_dram;
+    inflight_dram += d.mshrInflightCount();
+    inflight_dram += d.bulkQueueOccupancy();
     inflight_dram += d.bcstQueueOccupancy();
   }
-  inflight_dram += periph.scalarInflightCount();
+  inflight_dram += periph.mshrInflightCount();
 
   // Response ring occupancy = number of valid slots on the ringbus.
   uint64_t inflight_resp = 0;

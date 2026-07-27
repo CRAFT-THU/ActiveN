@@ -19,17 +19,18 @@ namespace soft_mem {
 // DON'T CHANGE THIS, we us uint16_t as masks
 const size_t CLUSTER_SIZE = 16;
 
-// States for a pending scalar request
-struct ScalarRequest {
+struct MSHR {
   uint32_t addr;
   uint16_t src;
   uint16_t id;
-  // Wdata or rdata
   MemLine rwdata;
+  std::array<uint32_t, 2> carried;
   uint8_t size;
   bool write;
 
-  static ScalarRequest fromFlit(const Flit &f) {
+  bool isBroadcast() const noexcept { return src == 0; }
+
+  static MSHR fromScalarFlit(const Flit &f) {
     if constexpr (ASSERTIONS_ENABLED) {
       if ((f.tag & 0xFF) > 1) throw std::invalid_argument("Unknown scalar request type");
     }
@@ -38,11 +39,12 @@ struct ScalarRequest {
     std::array<uint32_t, MEM_BUS_WIDTH_B / 4> tmp;
     tmp.fill(f.data[2]);
 
-    return ScalarRequest {
+    return MSHR {
       .addr = f.data[0],
       .src = f.src,
       .id = (uint16_t) (f.data[1] & 0xFFFF),
       .rwdata = std::bit_cast<MemLine>(tmp),
+      .carried = {},
       .size = (uint8_t) (f.data[1] >> 16),
       .write = isWrite,
     };
@@ -55,99 +57,40 @@ struct BcastLine {
   std::array<uint32_t, 2> carried;
 };
 
-struct BulkRequest {
-  // TODO: supports bulk unicast, remember to update DRAMIf response pathway
+struct BulkDispatcher {
   uint32_t base;
-  size_t cnt;
-  size_t issueCnt = 0;
-  size_t retireCnt = 0;
-
-  size_t maxInflight = 0;
-
-  // Accessed as idx % maxInflight. Reset during allocation.
-  uint64_t recentResp = 0;
-
+  uint16_t count;
+  uint16_t src;
   uint16_t returnTag;
   std::array<uint32_t, 2> returnCarried;
+  bool broadcast;
 
-  static BulkRequest fromFlit(size_t maxInflight, const Flit &f) {
+  static BulkDispatcher fromFlit(const Flit &f) {
     if constexpr (ASSERTIONS_ENABLED) {
-      if (maxInflight > 64) throw std::invalid_argument("maxInflight too large");
-      if ((f.tag & 0xFF) != 0x10) throw std::invalid_argument("Unknown bulk request type");
+      const uint8_t tag = static_cast<uint8_t>(f.tag);
+      if (tag != 0x10 && tag != 0x11)
+        throw std::invalid_argument("Unknown bulk request type");
     }
     return {
       .base = f.data[0],
-      .cnt = (uint16_t) (f.data[1] >> 16),
-      .maxInflight = maxInflight,
+      .count = static_cast<uint16_t>(f.data[1] >> 16),
+      .src = f.src,
       .returnTag = (uint16_t) (f.data[1] & 0xFFFF),
-      .returnCarried = {f.data[2], f.data[3]}
+      .returnCarried = {f.data[2], f.data[3]},
+      .broadcast = static_cast<uint8_t>(f.tag) == 0x10,
     };
   }
 
-  std::optional<GlobalMemReq> req() const {
-    if (issueCnt == cnt) return std::nullopt;
-    if (issueCnt == maxInflight + retireCnt) return std::nullopt;
-    uint8_t slot = issueCnt % maxInflight;
-    return {{
-      .id = (uint8_t) (0x80 | slot),
+  MSHR dispatch(uint32_t offset) const noexcept {
+    return MSHR {
+      .addr = static_cast<uint32_t>(base + offset * MEM_BUS_WIDTH_B),
+      .src = static_cast<uint16_t>(broadcast ? 0 : src),
+      .id = returnTag,
+      .rwdata = {},
+      .carried = returnCarried,
       .size = MEM_BUS_WIDTH_SIZE,
-      .addr = (uint32_t) (base + issueCnt * MEM_BUS_WIDTH_B),
       .write = false,
-    }};
-  }
-
-  std::optional<BcastLine> peekBcastLine(const std::vector<MemLine> &buffer) const {
-    // Mirror RTL: bulkRespValid requires completedCnt != issueCnt
-    if (retireCnt == issueCnt) return std::nullopt;
-    size_t retireSlot = retireCnt % maxInflight;
-    if (recentResp & (1ULL << retireSlot)) {
-      return BcastLine {
-        .line = std::bit_cast<std::array<uint32_t, MEM_BUS_WIDTH_B / 4>>(buffer[retireSlot]),
-        .tag = returnTag,
-        .carried = returnCarried
-      };
-    }
-    return std::nullopt;
-  }
-
-  // TODO: broadcast -> distributor
-
-  void step(bool issued, bool retire, const GlobalMemResp *resp, std::vector<MemLine> &buffer) {
-    size_t oldIssueCnt = issueCnt;
-    if (issued) {
-      if constexpr (ASSERTIONS_ENABLED) {
-        if (issueCnt >= maxInflight + retireCnt || issueCnt >= cnt)
-          throw std::logic_error("issueCnt out of bounds");
-      }
-
-      size_t issueSlot = issueCnt % maxInflight;
-      recentResp &= ~(1ULL << issueSlot);
-      ++issueCnt;
-    }
-
-    if (retire) {
-      if constexpr (ASSERTIONS_ENABLED) {
-        if ((recentResp & (1ULL << (retireCnt % maxInflight))) == 0)
-          throw std::logic_error("retired without response");
-      }
-      ++retireCnt;
-      if constexpr (ASSERTIONS_ENABLED) {
-        if (retireCnt > oldIssueCnt)
-          throw std::logic_error("retireCnt out of bounds");
-      }
-    }
-
-    if (resp != nullptr) {
-      size_t respSlot = resp->id & 0x7F;
-      if constexpr (ASSERTIONS_ENABLED) {
-        if (respSlot >= maxInflight) throw std::logic_error("respSlot out of bounds");
-      }
-      buffer[respSlot] = resp->data;
-      if constexpr (ASSERTIONS_ENABLED) {
-        if (recentResp & (1ULL << respSlot)) throw std::logic_error("double response");
-      }
-      recentResp |= 1ULL << respSlot;
-    }
+    };
   }
 };
 
@@ -199,13 +142,15 @@ protected:
 
   size_t idx;
 
-  size_t scalarInflight;
-  std::vector<ScalarRequest> scalarPendings;
-  uint64_t scalarAllocated = 0;
-  uint64_t scalarSent = 0;
-  uint64_t scalarCompleted = 0;
+  size_t inflight;
+  std::vector<MSHR> mshrs;
+  uint64_t allocated = 0;
+  uint64_t issued = 0;
+  uint64_t fulfilled = 0;
   FlitArb reqArb;
-  FlitArb scalarIssueArb;
+  FlitArb issueArb;
+  FlitArb unicastArb;
+  FlitArb broadcastArb;
   std::optional<IdleNotifier> idleNotifier;
   std::optional<IdleReturn> idleReturn;
   uint16_t idleCycles = 0;
@@ -284,10 +229,12 @@ protected:
 public:
   MemIf(
     size_t idx,
-    size_t scalarInflight,
+    size_t inflight,
     size_t numReq
-  ) : idx(idx), scalarInflight(scalarInflight), scalarPendings(scalarInflight), reqArb(numReq), scalarIssueArb(scalarInflight) {
-    if (scalarInflight > 64) throw std::invalid_argument("scalarInflight must be <= 64");
+  ) : idx(idx), inflight(inflight), mshrs(inflight), reqArb(numReq),
+      issueArb(inflight), unicastArb(inflight), broadcastArb(inflight) {
+    if (inflight < 2 || inflight > 64)
+      throw std::invalid_argument("inflight must be between 2 and 64");
   }
 
   void resetIdle() noexcept {
@@ -297,86 +244,115 @@ public:
   }
 
   /*
-    * Scalar request state machine and generator
+    * Shared MSHR state machine and generator
     */
 
-  // Number of currently allocated scalar inflight slots.
-  size_t scalarInflightCount() const noexcept __attribute__((always_inline)) {
-    return std::popcount(scalarAllocated);
+  size_t mshrInflightCount() const noexcept __attribute__((always_inline)) {
+    return std::popcount(allocated);
   }
 
-  std::optional<uint8_t> scalarAllocSlot() const noexcept __attribute__((always_inline)) {
-    // Returns the lowest 0 in scalarAllocated, bounded by the configured
-    // inflight depth. Comparing against the fixed mask width (64) instead
-    // would hand out slot == scalarInflight once every real slot is taken,
-    // overflowing scalarPendings (e.g. the 16-slot peripheral at boot).
-    int r_one = std::countr_one(scalarAllocated);
-    if ((size_t) r_one >= scalarInflight) return std::nullopt;
+  std::optional<uint8_t> mshrAllocSlot() const noexcept __attribute__((always_inline)) {
+    const int r_one = std::countr_one(allocated);
+    if (static_cast<size_t>(r_one) >= inflight) return std::nullopt;
     return r_one;
   }
 
-  void scalarAllocCommit(uint8_t slot, ScalarRequest req) noexcept __attribute__((always_inline)) {
-    scalarAllocated |= (1ULL << slot);
-    scalarPendings[slot] = req;
+  void mshrAllocCommit(uint8_t slot, MSHR req) noexcept __attribute__((always_inline)) {
+    const uint64_t bit = 1ULL << slot;
+    if constexpr (ASSERTIONS_ENABLED) {
+      if (allocated & bit) throw std::logic_error("mshrAllocCommit: slot already allocated");
+    }
+    allocated |= bit;
+    issued &= ~bit;
+    fulfilled &= ~bit;
+    mshrs[slot] = req;
   }
 
-  void scalarDeallocCommit(uint8_t slot) noexcept __attribute__((always_inline)) {
-    uint64_t mask = ~(1ULL << slot);
-    scalarAllocated &= mask;
-    scalarSent &= mask;
-    scalarCompleted &= mask;
+  void mshrDeallocCommit(uint8_t slot) noexcept __attribute__((always_inline)) {
+    const uint64_t mask = ~(1ULL << slot);
+    allocated &= mask;
+    issued &= mask;
+    fulfilled &= mask;
   }
 
-  std::optional<uint8_t> scalarReqSlot() const noexcept __attribute__((always_inline)) {
-    // RR over allocated-but-not-yet-sent slots (matches RTL FlitArb).
-    uint64_t candidates = ~scalarSent & scalarAllocated;
+  std::optional<uint8_t> mshrReqSlot() const noexcept __attribute__((always_inline)) {
+    const uint64_t candidates = allocated & ~issued;
     if (candidates == 0) return std::nullopt;
-    return scalarIssueArb.peek([&](size_t i) -> std::optional<uint8_t> {
+    return issueArb.peek([&](size_t i) -> std::optional<uint8_t> {
       return (candidates & (1ULL << i)) ? std::optional<uint8_t>(0) : std::nullopt;
     });
   }
 
-  GlobalMemReq scalarReq(uint8_t slot) const noexcept __attribute__((always_inline)) {
+  GlobalMemReq mshrReq(uint8_t slot) const noexcept __attribute__((always_inline)) {
     return {
       .id = slot,
-      .size = scalarPendings[slot].size,
-      .addr = scalarPendings[slot].addr,
-      .wdata = scalarPendings[slot].rwdata,
+      .size = mshrs[slot].size,
+      .addr = mshrs[slot].addr,
+      .wdata = mshrs[slot].rwdata,
       .wbe = std::numeric_limits<mem_mask_t>::max(), // Always full write
-      .write = scalarPendings[slot].write,
+      .write = mshrs[slot].write,
     };
   }
 
-  void scalarReqCommit(uint8_t slot) __attribute__((always_inline)) {
+  void mshrReqCommit(uint8_t slot) __attribute__((always_inline)) {
+    const uint64_t bit = 1ULL << slot;
     if constexpr (ASSERTIONS_ENABLED) {
-      if((scalarAllocated & (1ULL << slot)) == 0) throw std::logic_error("scalarReqCommit: slot not yet allocated");
-      if((scalarSent & (1ULL << slot))) throw std::logic_error("scalarReqCommit: slot already committed");
+      if ((allocated & bit) == 0) throw std::logic_error("mshrReqCommit: slot not allocated");
+      if (issued & bit) throw std::logic_error("mshrReqCommit: slot already issued");
     }
-    scalarSent |= (1ULL << slot);
-    scalarIssueArb.commit(slot);
+    issued |= bit;
+    issueArb.commit(slot);
   }
 
-  void scalarRespAccept(const GlobalMemResp &resp) __attribute__((always_inline)) {
+  void mshrRespAccept(const GlobalMemResp &resp, std::optional<uint8_t> issuedNow = std::nullopt)
+      __attribute__((always_inline)) {
     if constexpr (ASSERTIONS_ENABLED) {
-      if (resp.id >= scalarInflight) throw std::logic_error("scalarRespAccept: invalid id");
+      if (resp.id >= inflight) throw std::logic_error("mshrRespAccept: invalid id");
     }
-    // TODO: implement AMO
-    scalarPendings[resp.id].rwdata = resp.data;
-    scalarCompleted |= (1ULL << resp.id);
+    const uint64_t bit = 1ULL << resp.id;
+    if constexpr (ASSERTIONS_ENABLED) {
+      if ((allocated & bit) == 0) throw std::logic_error("mshrRespAccept: slot not allocated");
+      if ((issued & bit) == 0 && issuedNow != resp.id)
+        throw std::logic_error("mshrRespAccept: slot not issued");
+      if (fulfilled & bit) throw std::logic_error("mshrRespAccept: duplicate response");
+    }
+    mshrs[resp.id].rwdata = resp.data;
+    fulfilled |= bit;
   }
 
-  std::optional<uint8_t> scalarReturnSlot() const noexcept __attribute__((always_inline)) {
-    if (scalarCompleted == 0) return std::nullopt;
-    // Select the lowest 1 bit in scalarCompleted
-    return std::countr_zero(scalarCompleted);
+  std::optional<uint8_t> mshrReturnSlot(bool broadcast) const noexcept
+      __attribute__((always_inline)) {
+    uint64_t candidates = allocated & fulfilled;
+    for (size_t slot = 0; slot < inflight; ++slot) {
+      if (mshrs[slot].isBroadcast() != broadcast)
+        candidates &= ~(1ULL << slot);
+    }
+    if (candidates == 0) return std::nullopt;
+    const auto &arb = broadcast ? broadcastArb : unicastArb;
+    return arb.peek([&](size_t i) -> std::optional<uint8_t> {
+      return (candidates & (1ULL << i)) ? std::optional<uint8_t>(0) : std::nullopt;
+    });
   }
 
-  RingResp scalarReturn(uint8_t slot) const __attribute__((always_inline)) {
+  RingResp mshrUnicast(uint8_t slot) const __attribute__((always_inline)) {
     return RingResp {
-      .tag = scalarPendings[slot].id,
-      .dst = scalarPendings[slot].src,
-      .data = scalarPendings[slot].rwdata,
+      .tag = mshrs[slot].id,
+      .dst = mshrs[slot].src,
+      .data = mshrs[slot].rwdata,
     };
+  }
+
+  BcastLine mshrBroadcast(uint8_t slot) const __attribute__((always_inline)) {
+    return BcastLine {
+      .line = std::bit_cast<std::array<uint32_t, MEM_BUS_WIDTH_B / 4>>(mshrs[slot].rwdata),
+      .tag = mshrs[slot].id,
+      .carried = mshrs[slot].carried,
+    };
+  }
+
+  void mshrReturnCommit(uint8_t slot, bool broadcast) __attribute__((always_inline)) {
+    (broadcast ? broadcastArb : unicastArb).commit(slot);
+    mshrDeallocCommit(slot);
   }
 
   /*
@@ -488,12 +464,10 @@ class DRAMIf : public MemIf {
   size_t puStart;
   size_t puEnd;
 
-  /*
-   * Bulk state machine
-   */
-  std::optional<BulkRequest> bulk = {};
-  std::vector<MemLine> bulkBuffer;
-  size_t bulkMaxInflight;
+  FixedLenQueue<BulkDispatcher> bulkQueue{2};
+  uint32_t bulkCount = 0;
+  size_t bcstInflight = 0;
+  FixedLenQueue<BcastLine> bcstEgressQueue{2};
   uint64_t bcstDistAccepted = 0;
 
   /*
@@ -510,24 +484,24 @@ class DRAMIf : public MemIf {
   struct UnicastRespPeek {
     // The local responses, if exists. Index is pu index - puStart
     std::optional<size_t> ringLocal = std::nullopt;
-    std::optional<size_t> scalarLocal = std::nullopt;
-    bool scalarRemote = false;
+    std::optional<size_t> mshrLocal = std::nullopt;
+    bool mshrRemote = false;
   };
 
   UnicastRespPeek unicastRespPeek(const RingResp *ingress) const __attribute__((always_inline)) {
     UnicastRespPeek peek;
     if (ingress) if (ingress->dst >= puStart && ingress->dst < puEnd) peek.ringLocal = ingress->dst - puStart;
-    if (auto slot = scalarReturnSlot()) {
-      auto resp = scalarReturn(*slot);
-      if (resp.dst >= puStart && resp.dst < puEnd) peek.scalarLocal = resp.dst - puStart;
-      else peek.scalarRemote = true;
+    if (auto slot = mshrReturnSlot(false)) {
+      auto resp = mshrUnicast(*slot);
+      if (resp.dst >= puStart && resp.dst < puEnd) peek.mshrLocal = resp.dst - puStart;
+      else peek.mshrRemote = true;
     }
 
     // Arbiter cascade
-    if (peek.ringLocal && peek.scalarLocal) {
+    if (peek.ringLocal && peek.mshrLocal) {
       size_t ringDist = *peek.ringLocal / CLUSTER_SIZE;
-      size_t scalarDist = *peek.scalarLocal / CLUSTER_SIZE;
-      if (ringDist == scalarDist) peek.scalarLocal = std::nullopt;
+      size_t mshrDist = *peek.mshrLocal / CLUSTER_SIZE;
+      if (ringDist == mshrDist) peek.mshrLocal = std::nullopt;
     }
 
     return peek;
@@ -548,12 +522,9 @@ public:
     return (puEnd - puStart) / CLUSTER_SIZE;
   }
 
-  // True iff a bulk request is currently in-flight (occupying the
-  // single bulk slot).
-  bool bulkActive() const noexcept { return bulk.has_value(); }
-  // Sum of pending broadcast lines across cluster distributor queues.
+  size_t bulkQueueOccupancy() const noexcept { return bulkQueue.size(); }
   size_t bcstQueueOccupancy() const noexcept {
-    size_t n = 0;
+    size_t n = bcstEgressQueue.size();
     for (const auto &q : bcstQueues) n += q.size();
     return n;
   }
@@ -561,18 +532,17 @@ public:
 protected:
   virtual bool nocCanAccept(const Flit &f) const override __attribute__((always_inline)) {
     if (isIdleRequest(f)) return idleCanAccept(f);
-    if (isBulkRequest(f)) return !bulk.has_value();
-    if (isScalarRequest(f)) return scalarAllocSlot().has_value();
+    if (isBulkRequest(f))
+      return static_cast<uint16_t>(f.data[1] >> 16) == 0 || !bulkQueue.full();
+    if (isScalarRequest(f)) return mshrAllocSlot().has_value();
     return false;
   }
 
 public:
-  DRAMIf(size_t memif_idx, size_t numReq, size_t scalarInflight, size_t bulkInflight, size_t bcstQueueCap, size_t puStart, size_t puEnd)
-    : MemIf(memif_idx, scalarInflight, numReq),
+  DRAMIf(size_t memif_idx, size_t numReq, size_t inflight, size_t bcstQueueCap, size_t puStart, size_t puEnd)
+    : MemIf(memif_idx, inflight, numReq),
       puStart(puStart),
       puEnd(puEnd),
-      bulkMaxInflight(bulkInflight),
-      bulkBuffer(bulkInflight),
       bcstQueueCap(bcstQueueCap),
       bcstPUAccepted(numClusters()),
       unicastPipes(numClusters()) {
@@ -633,10 +603,8 @@ public:
   };
 
   virtual std::optional<GlobalMemReq> peekMem() const override __attribute__((always_inline)) {
-    // Static priority is given to scalar requests
-    if (auto slot = MemIf::scalarReqSlot()) return MemIf::scalarReq(*slot);
-    else if (bulk) return bulk->req();
-    else return std::nullopt;
+    if (auto slot = MemIf::mshrReqSlot()) return MemIf::mshrReq(*slot);
+    return std::nullopt;
   }
 
   /*
@@ -657,35 +625,46 @@ public:
     }
 
     const Flit *acceptedFlit = flit ? &flit->first.get() : nullptr;
-    idleStep(scalarAllocated == 0 && !bulk.has_value(), acceptedFlit,
-             nocOutAccepted);
+    idleStep(allocated == 0 && bulkQueue.empty() && bcstEgressQueue.empty(),
+             acceptedFlit, nocOutAccepted);
 
-    // Remember allocation slots
-    auto scalarAlloc = scalarAllocSlot();
+    const auto allocSlot = mshrAllocSlot();
+    const auto issueSlot = mshrReqSlot();
+    const auto unicastSlot = mshrReturnSlot(false);
+    const auto broadcastSlot = mshrReturnSlot(true);
 
-    // Bulk completion happens before any potential de-queue in distributor, so we handle that first
-    bool bulkRetireOne = false;
-    bool bulkAcceptOne = false;
-    if (bulk) if (auto line = bulk->peekBcastLine(bulkBuffer)) {
-      // Iterate through all distributors
-      for (size_t dist = 0; dist < (puEnd - puStart) / CLUSTER_SIZE; ++dist)
-        if (!(bcstDistAccepted & (1ULL << dist)) && bcstQueues[dist].size() < bcstQueueCap) {
-          bcstQueues[dist].push(*line);
-          bcstDistAccepted |= 1ULL << dist;
-        }
+    const bool acceptedScalar = acceptedFlit && isScalarRequest(*acceptedFlit);
+    const bool acceptedBulk = acceptedFlit && isBulkRequest(*acceptedFlit) &&
+      static_cast<uint16_t>(acceptedFlit->data[1] >> 16) != 0;
 
-      // FIXME: may overflow here! assert that dist count < 64
-      if (bcstDistAccepted == ((1ULL << ((puEnd - puStart) / CLUSTER_SIZE)) - 1)) {
-        // Step to next bulk line
-        bcstDistAccepted = 0;
-        bulkRetireOne = true;
+    std::optional<BulkDispatcher> bulkHead;
+    if (auto head = bulkQueue.front()) bulkHead = head->get();
+    const bool bcstBlocked = bulkHead && bulkHead->broadcast &&
+      bcstInflight == inflight / 2;
+    const bool bulkAlloc = allocSlot && bulkHead && !acceptedScalar && !bcstBlocked;
+    const bool bulkDone = bulkAlloc && bulkCount + 1 == bulkHead->count;
+
+    std::optional<BcastLine> centralLine;
+    if (auto head = bcstEgressQueue.front()) centralLine = head->get();
+    uint64_t centralPushMask = 0;
+    if (centralLine) {
+      for (size_t dist = 0; dist < numClusters(); ++dist) {
+        if ((bcstDistAccepted & (1ULL << dist)) == 0 && !bcstQueues[dist].full())
+          centralPushMask |= 1ULL << dist;
       }
     }
+    const uint64_t allDists = numClusters() == 64
+      ? UINT64_MAX : ((1ULL << numClusters()) - 1);
+    const bool centralPop = centralLine &&
+      ((bcstDistAccepted | centralPushMask) == allDists);
+
+    const bool broadcastEject = broadcastSlot && !bcstEgressQueue.full();
+    std::optional<BcastLine> broadcastLine;
+    if (broadcastEject) broadcastLine = mshrBroadcast(*broadcastSlot);
 
     // Unicast completion & ringbus generation
     auto unicast = unicastRespPeek(ring.ingress ? ring.buffer : nullptr);
-    auto scalarRet = MemIf::scalarReturnSlot();
-    bool scalarDealloc = false;
+    bool unicastDealloc = false;
     for (auto &pipe : unicastPipes) pipe = std::nullopt;
 
     if (unicast.ringLocal) {
@@ -696,27 +675,25 @@ public:
       unicastPipes[dist] = *ring.buffer;
     }
 
-    if (unicast.scalarLocal) {
-      auto resp = MemIf::scalarReturn(*scalarRet);
-      size_t dist = *unicast.scalarLocal / CLUSTER_SIZE;
+    if (unicast.mshrLocal) {
+      auto resp = MemIf::mshrUnicast(*unicastSlot);
+      size_t dist = *unicast.mshrLocal / CLUSTER_SIZE;
       unicastPipes[dist] = resp;
-      scalarDealloc = true;
+      unicastDealloc = true;
     }
 
-    // Now that we're donw with incoming ring ejection, we can overwrite the buffer
+    // Now that we're done with incoming ring ejection, we can overwrite the buffer.
     // For ringbus generation, we check if we're allowed a injection
-    if (ring.canInject && unicast.scalarRemote) {
+    if (ring.canInject && unicast.mshrRemote) {
       *ring.injected = true;
-      *ring.buffer = MemIf::scalarReturn(*scalarRet);
-      scalarDealloc = true;
+      *ring.buffer = MemIf::mshrUnicast(*unicastSlot);
+      unicastDealloc = true;
     }
 
-    if (scalarDealloc) {
-      MemIf::scalarDeallocCommit(*scalarRet);
-    }
+    if (unicastDealloc) MemIf::mshrReturnCommit(*unicastSlot, false);
 
     // Distributor bcst acceptance
-    for (size_t dist = 0; dist < (puEnd - puStart) / CLUSTER_SIZE; ++dist) {
+    for (size_t dist = 0; dist < numClusters(); ++dist) {
       // Per dist handling
       uint16_t &bcstPUMask = bcstPUAccepted[dist];
       const uint16_t accepted = bcstAcceptMasks[dist];
@@ -742,56 +719,89 @@ public:
       }
     }
 
-    // External memory handling
-    // Crucially, this is after handling unicast & broadcast response generation, so
-    // that still used the state from the previous cycle
-    //
-    // If scalar has memory request, it's given priority
-    if (mem.reqAccepting && peekMem().has_value()) {
-      if (auto slot = MemIf::scalarReqSlot()) {
-        scalarReqCommit(*slot);
-      }
-      else if (bulk)
-        bulkAcceptOne = true;
-      else {
-        if constexpr (ASSERTIONS_ENABLED) {
-          throw std::logic_error("External memory accepted a ghost request");
+    // The central MemIf broadcast queue feeds each distributor independently.
+    // Its ready signals observe the distributor queues before this edge.
+    if (centralLine) {
+      for (size_t dist = 0; dist < numClusters(); ++dist) {
+        if (centralPushMask & (1ULL << dist)) {
+          const bool pushed = bcstQueues[dist].push(*centralLine);
+          if constexpr (ASSERTIONS_ENABLED) {
+            if (!pushed) throw std::logic_error("Distributor broadcast queue unexpectedly full");
+          }
         }
       }
     }
-
-    GlobalMemResp *bulkMemResp = nullptr;
-    if (mem.resp) {
-      if (mem.resp->id & 0x80) bulkMemResp = &*mem.resp;
-      else {
-        MemIf::scalarRespAccept(*mem.resp);
-      }
-    }
-
-    // Finally, steps bulk with generated control signals
-    if (bulk) {
-      bulk->step(bulkAcceptOne, bulkRetireOne, bulkMemResp, bulkBuffer);
-      if (bulk->retireCnt == bulk->cnt) bulk = std::nullopt;
-    } else if (bulkAcceptOne || bulkRetireOne || bulkMemResp != nullptr)
+    if (centralPop) {
+      const bool popped = bcstEgressQueue.pop();
       if constexpr (ASSERTIONS_ENABLED) {
-        throw std::logic_error("Bulk state mismatch");
+        if (!popped) throw std::logic_error("Central broadcast queue unexpectedly empty");
       }
+      bcstDistAccepted = 0;
+    } else {
+      bcstDistAccepted |= centralPushMask;
+    }
 
-    // Finally, allocations
+    // External memory handling
+    const bool issueFire = mem.reqAccepting && issueSlot.has_value();
+    if (issueFire) MemIf::mshrReqCommit(*issueSlot);
+    if (mem.resp) MemIf::mshrRespAccept(*mem.resp, issueFire ? issueSlot : std::nullopt);
+
+    if (broadcastEject) MemIf::mshrReturnCommit(*broadcastSlot, true);
+
+    if (acceptedScalar) {
+      if constexpr (ASSERTIONS_ENABLED) {
+        if (!allocSlot) throw std::logic_error("Received scalar request without a free MSHR");
+      }
+      MemIf::mshrAllocCommit(*allocSlot, MSHR::fromScalarFlit(*acceptedFlit));
+    } else if (bulkAlloc) {
+      MemIf::mshrAllocCommit(*allocSlot, bulkHead->dispatch(bulkCount));
+    }
+
+    if (bulkAlloc) {
+      if (bulkDone) {
+        const bool popped = bulkQueue.pop();
+        if constexpr (ASSERTIONS_ENABLED) {
+          if (!popped) throw std::logic_error("Bulk queue unexpectedly empty");
+        }
+        bulkCount = 0;
+      } else {
+        ++bulkCount;
+      }
+    }
+
+    if (acceptedBulk) {
+      const bool pushed = bulkQueue.push(BulkDispatcher::fromFlit(*acceptedFlit));
+      if constexpr (ASSERTIONS_ENABLED) {
+        if (!pushed) throw std::logic_error("Bulk queue unexpectedly full");
+      }
+    }
+
+    const bool broadcastAlloc = bulkAlloc && bulkHead->broadcast;
+    if (broadcastAlloc && !broadcastEject) {
+      if constexpr (ASSERTIONS_ENABLED) {
+        if (bcstInflight >= inflight / 2)
+          throw std::logic_error("Broadcast MSHR counter overflow");
+      }
+      ++bcstInflight;
+    } else if (!broadcastAlloc && broadcastEject) {
+      if constexpr (ASSERTIONS_ENABLED) {
+        if (bcstInflight == 0)
+          throw std::logic_error("Broadcast MSHR counter underflow");
+      }
+      --bcstInflight;
+    }
+
+    if (broadcastLine) {
+      const bool pushed = bcstEgressQueue.push(*broadcastLine);
+      if constexpr (ASSERTIONS_ENABLED) {
+        if (!pushed) throw std::logic_error("Central broadcast queue unexpectedly full");
+      }
+    }
+
     if (flit) {
-      const Flit &accepted = flit->first.get();
-      if (isBulkRequest(accepted)) {
-        if constexpr (ASSERTIONS_ENABLED) {
-          if (bulk.has_value()) throw std::logic_error("Received a bulk request while another bulk is in-flight");
-        }
-        bulk = BulkRequest::fromFlit(bulkMaxInflight, flit->first);
-      } else if (isScalarRequest(accepted)) {
-        if constexpr (ASSERTIONS_ENABLED) {
-          if (!scalarAlloc) throw std::logic_error("Received a scalar request while no slot is available");
-        }
-        scalarAllocCommit(*scalarAlloc, ScalarRequest::fromFlit(flit->first));
-      } else if constexpr (ASSERTIONS_ENABLED) {
-        if (!isIdleRequest(accepted))
+      if constexpr (ASSERTIONS_ENABLED) {
+        if (!isScalarRequest(*acceptedFlit) && !isBulkRequest(*acceptedFlit) &&
+            !isIdleRequest(*acceptedFlit))
           throw std::logic_error("Received unknown DRAMIf request tag");
       }
       nocAcceptCommit(flit->second);
@@ -811,7 +821,7 @@ class PeriphIf : public MemIf {
 protected:
   virtual bool nocCanAccept(const Flit &f) const override __attribute__((always_inline)) {
     if (isIdleRequest(f)) return idleCanAccept(f);
-    if (isScalarRequest(f)) return scalarAllocSlot().has_value();
+    if (isScalarRequest(f)) return mshrAllocSlot().has_value();
     return false;
   }
 
@@ -829,9 +839,9 @@ public:
   }
 
   virtual std::optional<GlobalMemReq> peekMem() const override __attribute__((always_inline)) {
-    auto slot = MemIf::scalarReqSlot();
+    auto slot = MemIf::mshrReqSlot();
     if (!slot) return std::nullopt;
-    auto req = MemIf::scalarReq(*slot);
+    auto req = MemIf::mshrReq(*slot);
     if (configROM.contains(req.addr & MEM_ADDR_ALIGN_MASK)) return std::nullopt;
     return req;
   };
@@ -845,10 +855,11 @@ public:
     *ring.injected = false;
 
     const Flit *acceptedFlit = flit ? &flit->first.get() : nullptr;
-    idleStep(scalarAllocated == 0, acceptedFlit, nocOutAccepted);
+    idleStep(allocated == 0, acceptedFlit, nocOutAccepted);
 
     // Remember alloc slots
-    auto scalarAlloc = scalarAllocSlot();
+    auto allocSlot = mshrAllocSlot();
+    auto issueSlot = mshrReqSlot();
 
     // Ring state machine
     // We have no local ejection, so always feed into the ring
@@ -856,11 +867,11 @@ public:
       if (ring.eject) throw std::logic_error("ring ejection at PeriphIf should never happen");
     }
     if (ring.canInject) {
-      auto slot = MemIf::scalarReturnSlot();
+      auto slot = MemIf::mshrReturnSlot(false);
       if (slot) {
-        *ring.buffer = MemIf::scalarReturn(*slot);
+        *ring.buffer = MemIf::mshrUnicast(*slot);
         *ring.injected = true;
-        MemIf::scalarDeallocCommit(*slot);
+        MemIf::mshrReturnCommit(*slot, false);
       }
     }
 
@@ -869,23 +880,24 @@ public:
     // Grant is given to potentially config ROM is external mem does not give a response
     bool romServed = false;
     if (mem.resp) // Contains resp
-      scalarRespAccept(*mem.resp);
-    else if (auto slot = MemIf::scalarReqSlot()) {
-      auto req = MemIf::scalarReq(*slot);
+      mshrRespAccept(*mem.resp,
+                     mem.reqAccepting && issueSlot ? issueSlot : std::nullopt);
+    else if (issueSlot) {
+      auto req = MemIf::mshrReq(*issueSlot);
       auto alignedAddr = req.addr & MEM_ADDR_ALIGN_MASK;
       if (configROM.contains(alignedAddr)) {
         romServed = true;
-        scalarRespAccept({
+        mshrRespAccept({
           .id = req.id,
           .data = configROM[alignedAddr]
-        });
+        }, issueSlot);
       }
     }
 
     // External memory request
     if (romServed || (mem.reqAccepting && peekMem().has_value())) {
-      if (auto slot = MemIf::scalarReqSlot())
-        scalarReqCommit(*slot);
+      if (issueSlot)
+        mshrReqCommit(*issueSlot);
       else {
         if constexpr (ASSERTIONS_ENABLED) {
           throw std::logic_error("External memory accepted a ghost request");
@@ -897,9 +909,9 @@ public:
       const Flit &accepted = flit->first.get();
       if (isScalarRequest(accepted)) {
         if constexpr (ASSERTIONS_ENABLED) {
-          if (!scalarAlloc) throw std::logic_error("Received a scalar request while no slot is available");
+          if (!allocSlot) throw std::logic_error("Received a scalar request while no slot is available");
         }
-        MemIf::scalarAllocCommit(*scalarAlloc, ScalarRequest::fromFlit(flit->first));
+        MemIf::mshrAllocCommit(*allocSlot, MSHR::fromScalarFlit(accepted));
       } else if constexpr (ASSERTIONS_ENABLED) {
         if (!isIdleRequest(accepted))
           throw std::logic_error("Received unknown PeripheralIf request tag");
