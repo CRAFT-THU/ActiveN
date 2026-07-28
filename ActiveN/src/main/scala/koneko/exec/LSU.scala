@@ -60,6 +60,10 @@ class LSU(implicit val param: CoreParameters) extends Module {
 
   val spm = Module(new SPM)
 
+  /* Response validness */
+  val respAc = mem.resp.valid && mem.resp.bits.id === 1.U
+  val respG = mem.resp.valid && mem.resp.bits.id === 0.U
+
   /* Async-copy state machine */
   val acOp = Reg(ACOps()) // This is unused for now.
   val acPending = RegInit(false.B) // Whether the async-copy request is not sent yet
@@ -79,7 +83,6 @@ class LSU(implicit val param: CoreParameters) extends Module {
   acmem.bits.wbe := DontCare
   acmem.bits.size := DontCare // Not used in bulk requests
   acmem.valid := acPending
-  val spmBulkWrite = mem.resp.valid && mem.resp.bits.id === 1.U
   val acNew = ac.start.valid && acRemaining === 0.U // Ignore new request if there is an ongoing one
   when (acNew) {
     acOp := ac.start.bits
@@ -90,7 +93,7 @@ class LSU(implicit val param: CoreParameters) extends Module {
   ))
   acRemaining := MuxCase(acRemaining, Seq(
     acNew -> (ac.len >> log2Ceil(param.memBusWidth / 8)),
-    spmBulkWrite -> (acRemaining - 1.U)
+    respAc -> (acRemaining - 1.U)
   ))
 
   val wmapped = Mux1H(Seq(
@@ -181,25 +184,24 @@ class LSU(implicit val param: CoreParameters) extends Module {
   //
   // It can also be busy if there is a bulk load response hitting us
   val spmBusy = (
-    RegNext(req.ready || !req.valid || spmBulkWrite) && !req.bits.write
-    || spmBulkWrite && (req.bits.write || req.bits.amo)
+    RegNext(req.ready || !req.valid || respAc) && !req.bits.write
+    || respAc && (req.bits.write || req.bits.amo)
   )
 
   val spmShortWe = MuxCase(0.U(4.W), Seq(
     (req.valid && isSPM && req.bits.write && (!req.bits.lrsc || reserved)) -> wbe,
-    RegNext(req.valid && !req.ready && !spmBulkWrite && isSPM && req.bits.amo) -> "b1111".U(4.W)
+    RegNext(req.valid && !req.ready && !respAc && isSPM && req.bits.amo) -> "b1111".U(4.W)
   ))
   val spmShortWdata = Mux(req.bits.amo, spmamoalu.written, wmapped)
   val spmBulkWriteAddr = (mem.resp.bits.ident << log2Ceil(param.memBusWidth / 8)) + (ac.sBase - 0x20000000.U)
-  spm.io.addr := Mux(spmBulkWrite, spmBulkWriteAddr, spmAlignedAddr)
-  spm.io.we := Mux(spmBulkWrite, Fill(param.memBusWidth / 8, 1.U(1.W)), spmShortWe << spmWordOffset)
+  spm.io.addr := Mux(respAc, spmBulkWriteAddr, spmAlignedAddr)
+  spm.io.we := Mux(respAc, Fill(param.memBusWidth / 8, 1.U(1.W)), spmShortWe << spmWordOffset)
   // Note: AMO necessarily takes two cycles, so if req.bits.atomic causes timing hazard,
   // we can RegNext here.
-  spm.io.wdata := Mux(spmBulkWrite, mem.resp.bits.data, Fill(param.memBusWidth / 32, spmShortWdata))
+  spm.io.wdata := Mux(respAc, mem.resp.bits.data, Fill(param.memBusWidth / 32, spmShortWdata))
 
   // --- Global memory path ---
   val memSent = RegInit(false.B)
-  val memGotResp = RegInit(false.B)
 
   val gmem = Wire(Decoupled(new MemReq))
   gmem.valid := req.valid && !isSPM && !memSent
@@ -216,35 +218,23 @@ class LSU(implicit val param: CoreParameters) extends Module {
   gmem.bits.bulkSize := DontCare
   gmem.bits.bulk := false.B
 
-  val memReqFired = gmem.fire
-  when(memReqFired) { memSent := true.B }
-  // Mem resp valid implies memSent && !memGotResp
-  assert(!mem.resp.valid || mem.resp.bits.id =/= 0.U || (memSent && !memGotResp), "Unexpected LSU memory response")
+  memSent := MuxCase(memSent, Seq(
+    gmem.fire -> true.B,
+    (req.fire && !isSPM) -> false.B
+  ))
+  // Mem resp valid implies memSent
+  // Response now never arrives on same cycle as the request, because we have a 1 cycle buffer in the Distributor unicast pathway
+  assert(!respG || memSent, "Unexpected LSU memory response")
 
   val reqArb = Module(new Arbiter(new MemReq, 2))
   reqArb.io.in(0) <> gmem
   reqArb.io.in(1) <> acmem
   mem.req <> reqArb.io.out
 
-  // Response may arrive on same cycle as the request (combinational path through crossbar/driver)
-  when(mem.resp.fire) {
-    // FIXME: do we really need this latch? Can the pipeline block us
-    memGotResp := mem.resp.bits.id === 0.U
-  }
-  val memRespLatch = RegEnable(gword, mem.resp.fire)
-
-  val globalDone = memGotResp || (mem.resp.fire && mem.resp.bits.id === 0.U)
-  val globalRdata = Mux(memGotResp, memRespLatch, gword)
-
-  when(req.fire && !isSPM) {
-    memSent := false.B
-    memGotResp := false.B
-  }
-
   // --- Ready and response mux ---
-  req.ready := Mux(isSPM, !spmBusy, globalDone)
+  req.ready := Mux(isSPM, !spmBusy, respG)
 
-  val rdata = Mux(isSPM, sword, globalRdata)
+  val rdata = Mux(isSPM, sword, gword)
 
   val rhalf = rdata.asTypeOf(Vec(2, UInt(16.W)))(req.bits.addr(1, 1))
   val rbyte = rdata.asTypeOf(Vec(4, UInt(8.W)))(req.bits.addr(1, 0))
