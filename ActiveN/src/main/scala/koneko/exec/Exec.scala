@@ -167,6 +167,16 @@ class Exec(implicit val param: CoreParameters) extends Module {
   lsu.req.bits.smsel := uop.smsel
   lsu.req.valid := valid && uop.isMem
 
+  val acGBase = RegInit(0.U(32.W))
+  val acSBase = RegInit(0.U(32.W))
+  val acLen = RegInit(0.U(32.W))
+  lsu.ac.gBase := acGBase
+  lsu.ac.sBase := acSBase
+  lsu.ac.len := acLen
+  // Default connection
+  lsu.ac.start.valid := false.B
+  lsu.ac.start.bits := DontCare
+
   // BIU & related AM connections
   val biu = Module(new BIU)
   biu.hartid := cfg.hartid(15, 0)
@@ -299,10 +309,26 @@ class Exec(implicit val param: CoreParameters) extends Module {
       margins(i) := Mux(marginNew > param.sendQueueDepth.U, param.sendQueueDepth.U, marginNew)
     }
   }
+  case class CSRGatedUInt(data: UInt, gate: Bool) extends CSR {
+    def read = data
+    def write(data: UInt) = when(gate) { this.data := data }
+  }
+  case class CSRAcCtrl(start: Valid[ACOps.Type], remaining: UInt) extends CSR {
+    def read = remaining
+    def write(data: UInt) = {
+      start.valid := true.B
+      // If we later introduced other AC ops, decode here
+      start.bits := ACOps.Load
+    }
+  }
 
   // CSR
   val csrmapping: Seq[(Int, CSR)] = Seq(
     0xF14 -> CSRUInt(cfg.hartid),
+    0x730 -> CSRAcCtrl(lsu.ac.start, lsu.ac.remaining),
+    0x731 -> CSRGatedUInt(acGBase, lsu.ac.remaining === 0.U),
+    0x732 -> CSRGatedUInt(acSBase, lsu.ac.remaining === 0.U),
+    0x733 -> CSRGatedUInt(acLen, lsu.ac.remaining === 0.U),
   ) ++ (
     for (i <- 0 until 16) yield (0x700 + i) -> CSRUInt(handlers(i))
   ) ++ (
@@ -316,13 +342,15 @@ class Exec(implicit val param: CoreParameters) extends Module {
   val csrIdx = uop.cimm(11, 0)
   csrUimmExt := uop.rs1
   val csrWraw = Mux(uop.funct3(2), csrUimmExt, rs1val)
+  // CSRR{S,C}[I]: immediate / rs1 = 0 skips write
+  val csrSkipWrite = (uop.funct3(1, 0) === 2.U || uop.funct3(1, 0) === 3.U) && uop.rs1 === 0.U
   for((i, c) <- csrwmapping) {
     val csrWdata = Mux1H(Seq(
       (uop.funct3(1, 0) === 1.U) -> csrWraw,
       (uop.funct3(1, 0) === 2.U) -> (csrWraw | c.read),
       (uop.funct3(1, 0) === 3.U) -> (c.read & (~csrWraw).asUInt),
     ))
-    when(valid && isCSR && i.U === csrIdx) {
+    when(valid && isCSR && i.U === csrIdx && !csrSkipWrite) {
       c.write(csrWdata)
     }
   }

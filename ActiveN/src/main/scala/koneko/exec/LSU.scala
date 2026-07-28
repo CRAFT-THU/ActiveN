@@ -7,13 +7,13 @@ import koneko._
 import koneko.bus.OutgoingFlit
 import koneko.bus.Encoder
 
+// Async copy operation
+object ACOps extends ChiselEnum {
+  val Load = Value
+}
+
 // LSU: routes accesses to SPM (local scratchpad) or global memory
 class LSU(implicit val param: CoreParameters) extends Module {
-  // Async copy operation
-  object ACOps extends ChiselEnum {
-    val Load = Value
-  }
-
   val req = IO(Flipped(Irrevocable(new Bundle {
     val addr = UInt(32.W)
 
