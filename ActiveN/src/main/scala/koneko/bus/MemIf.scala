@@ -430,7 +430,7 @@ class DRAMIf(
   def clusterOf(puId: UInt): UInt = (puId - puStart.U) >> 4
 
   // TODO: make this queue length configurable
-  val bulkQueue = Module(new Queue(new BulkDispatcher, 2))
+  val bulkQueue = Module(new Queue(new BulkDispatcher, 32))
 
   // Alloc
   val (isBulk, parsedBulk) = BulkDispatcher.fromFlit(flit.bits)
@@ -445,7 +445,8 @@ class DRAMIf(
 
   // Guarantee that there is space for unicast requests, so we don't deadlock the system
   val bcstInflight = RegInit(0.U(log2Ceil(inflight).W))
-  val BCST_BOUND = inflight / 2
+  require(inflight >= 64, "inflight must be at least 64 for DRAMIf to avoid deadlock")
+  val BCST_BOUND = inflight - 32
   val bcstBlocked = bcstInflight === BCST_BOUND.U && bulkQueue.io.deq.bits.isBroadcast
   assert(bcstInflight <= BCST_BOUND.U, "bcstInflight exceeded BCST_BOUND")
   bulkAlloc.valid := bulkQueue.io.deq.valid && !bcstBlocked

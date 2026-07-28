@@ -30,6 +30,10 @@
  *   -f, --freq-ghz N    Core and NoC frequency in GHz (default: 1)
  *   --ramulator-config PATH  Ramulator YAML configuration file
  *   --ramulator-stats DIR    Optional directory for per-MC statistics
+ *   --ramulator-stats-timer-only  Measure only while the workload timer is enabled
+ *   --noc-profile DIR  Write soft-backend congestion statistics
+ *   --noc-profile-start N  Start profiling at this cycle instead of timer start
+ *   --noc-profile-stop N   Stop profiling at this cycle instead of timer stop
  *   --trace             Enable FST tracing
  *   --log               Enable verbose logging
  *   --rng-seed N        RNG seed for peripheral device
@@ -191,6 +195,33 @@ struct RamulatorMC {
   unique_ptr<Ramulator::IMemorySystem> memory;
 };
 
+struct TimedMcStats {
+  uint64_t read_requests = 0;
+  uint64_t write_requests = 0;
+  uint64_t rejected_cycles = 0;
+  uint64_t read_completions = 0;
+  uint64_t write_completions = 0;
+  uint64_t latency_sum = 0;
+  uint64_t max_latency = 0;
+  uint64_t outstanding = 0;
+  uint64_t max_outstanding = 0;
+  uint64_t outstanding_sum = 0;
+  uint64_t outstanding_samples = 0;
+  optional<uint64_t> first_request_cycle;
+  optional<uint64_t> last_request_cycle;
+  optional<uint64_t> first_response_cycle;
+  optional<uint64_t> last_response_cycle;
+};
+
+struct TimedMemoryStats {
+  bool active = false;
+  bool started = false;
+  bool captured = false;
+  uint64_t start_cycle = 0;
+  uint64_t stop_cycle = 0;
+  vector<TimedMcStats> mc;
+};
+
 // ---- System implementation ----
 struct System::Impl {
   vector<unique_ptr<SystemBackend>> backends;
@@ -205,6 +236,10 @@ struct System::Impl {
   vector<RamulatorMC> ramulator_mcs;
   long double ramulator_tick_phase = 0.0L;
   long double ramulator_ticks_per_core_cycle = 1.0L;
+  uint64_t current_cycle = 0;
+  TimedMemoryStats timed_memory_stats;
+  bool ramulator_stats_written = false;
+  bool timer_stopped_this_cycle = false;
 
   // FST tracer (single dump per cycle between stage and step).
   VerilatedFstC *tracer = nullptr;
@@ -221,6 +256,7 @@ struct System::Impl {
     string configFile;
     optional<string> statsDir;
     double coreFreqGHz;
+    bool timerStatsOnly;
   };
   optional<StoredRamulatorConfig> ramulator_cfg;
 
@@ -263,13 +299,30 @@ struct System::Impl {
         1.0L / (static_cast<long double>(rcfg.coreFreqGHz) * tck_ns);
   }
 
-  bool submitRamulatorReq(int mc, const GlobalMemReq &req) {
+  bool submitRamulatorReq(int mc, const GlobalMemReq &req, uint64_t cycle) {
     auto access = mc_images[mc].prepare(req);
-    auto callback = [this, mc, resp = access.resp](Ramulator::Request &completed) {
+    const bool timed_request = timed_memory_stats.active;
+    const bool write = req.write;
+    auto callback = [this, mc, resp = access.resp, timed_request, write,
+                     submitted_cycle = cycle](Ramulator::Request &completed) {
       if (completed.ingress_id != resp.id) {
         throw runtime_error("Ramulator request ID changed before completion");
       }
       mc_states[mc].resp_queue.push_back(resp);
+      if (timed_request && timed_memory_stats.active) {
+        auto &stats = timed_memory_stats.mc[mc];
+        if (stats.outstanding == 0) {
+          throw logic_error("Timed memory outstanding counter underflow");
+        }
+        --stats.outstanding;
+        if (write) ++stats.write_completions;
+        else ++stats.read_completions;
+        const uint64_t latency = current_cycle - submitted_cycle;
+        stats.latency_sum += latency;
+        stats.max_latency = max(stats.max_latency, latency);
+        if (!stats.first_response_cycle) stats.first_response_cycle = current_cycle;
+        stats.last_response_cycle = current_cycle;
+      }
     };
     int type = req.write ? Ramulator::Request::Type::Write
                          : Ramulator::Request::Type::Read;
@@ -277,8 +330,137 @@ struct System::Impl {
         type, req.addr, -1, req.id, std::move(callback), MEM_BUS_WIDTH_B);
     if (accepted) {
       mc_images[mc].commitWrite(req, access);
+      if (timed_memory_stats.active) {
+        auto &stats = timed_memory_stats.mc[mc];
+        if (req.write) ++stats.write_requests;
+        else ++stats.read_requests;
+        ++stats.outstanding;
+        stats.max_outstanding = max(stats.max_outstanding, stats.outstanding);
+        if (!stats.first_request_cycle) stats.first_request_cycle = cycle;
+        stats.last_request_cycle = cycle;
+      }
     }
     return accepted;
+  }
+
+  void emitRamulatorStats() {
+    for (int i = 0; i < num_mc; ++i) {
+      auto &r = ramulator_mcs[i];
+      r.frontend->update_stats_recursive();
+      r.memory->update_stats_recursive();
+      if (ramulator_cfg->statsDir) {
+        filesystem::create_directories(*ramulator_cfg->statsDir);
+        ofstream stats(*ramulator_cfg->statsDir + "/mc" + to_string(i) + ".yaml");
+        if (!stats) throw runtime_error("Cannot open Ramulator statistics file");
+        r.frontend->print_stats(stats);
+        r.memory->print_stats(stats);
+      } else {
+        cerr << "[Ramulator MC " << i << "]" << endl;
+        r.frontend->print_stats(cerr);
+        r.memory->print_stats(cerr);
+      }
+    }
+    ramulator_stats_written = true;
+  }
+
+  void beginTimedMemoryStats(uint64_t cycle) {
+    if (!ramulator_cfg || !ramulator_cfg->timerStatsOnly ||
+        timed_memory_stats.started) return;
+    timed_memory_stats = TimedMemoryStats {
+      .active = true,
+      .started = true,
+      .start_cycle = cycle,
+      .mc = vector<TimedMcStats>(num_mc),
+    };
+    for (auto &r : ramulator_mcs) {
+      r.frontend->reset_stats_recursive();
+      r.memory->reset_stats_recursive();
+    }
+    cerr << "[Timed memory] Started at cycle " << cycle << endl;
+  }
+
+  void printTimedMemoryStats() const {
+    const uint64_t cycles = timed_memory_stats.stop_cycle -
+                            timed_memory_stats.start_cycle;
+    uint64_t reads = 0;
+    uint64_t writes = 0;
+    uint64_t completions = 0;
+    uint64_t rejected = 0;
+    uint64_t latency_sum = 0;
+    uint64_t max_latency = 0;
+    uint64_t outstanding = 0;
+    optional<uint64_t> last_request;
+    optional<uint64_t> last_response;
+    for (const auto &stats : timed_memory_stats.mc) {
+      reads += stats.read_requests;
+      writes += stats.write_requests;
+      completions += stats.read_completions + stats.write_completions;
+      rejected += stats.rejected_cycles;
+      latency_sum += stats.latency_sum;
+      max_latency = max(max_latency, stats.max_latency);
+      outstanding += stats.outstanding;
+      if (stats.last_request_cycle)
+        last_request = max(last_request.value_or(0), *stats.last_request_cycle);
+      if (stats.last_response_cycle)
+        last_response = max(last_response.value_or(0), *stats.last_response_cycle);
+    }
+    const double avg_latency = completions
+      ? static_cast<double>(latency_sum) / completions : 0.0;
+    const double bandwidth = cycles
+      ? static_cast<double>(reads + writes) * MEM_BUS_WIDTH_B /
+        cycles * ramulator_cfg->coreFreqGHz * 1000.0
+      : 0.0;
+    cerr << "[Timed memory] Cycles: " << cycles << endl;
+    cerr << "[Timed memory] Requests: reads=" << reads
+         << " writes=" << writes << " completed=" << completions
+         << " outstanding=" << outstanding
+         << " rejected_cycles=" << rejected << endl;
+    cerr << fixed << setprecision(3)
+         << "[Timed memory] Latency: avg=" << avg_latency
+         << " max=" << max_latency << " cycles" << endl
+         << "[Timed memory] Accepted bandwidth: " << bandwidth << " MB/s"
+         << defaultfloat << endl;
+    if (last_request) {
+      cerr << "[Timed memory] Last request: +"
+           << (*last_request - timed_memory_stats.start_cycle) << " cycles" << endl;
+    }
+    if (last_response) {
+      cerr << "[Timed memory] Last response: +"
+           << (*last_response - timed_memory_stats.start_cycle)
+           << " cycles, drain="
+           << (timed_memory_stats.stop_cycle - *last_response)
+           << " cycles" << endl;
+    }
+    for (int i = 0; i < num_mc; ++i) {
+      const auto &stats = timed_memory_stats.mc[i];
+      const uint64_t mc_completions = stats.read_completions +
+                                      stats.write_completions;
+      const double mc_latency = mc_completions
+        ? static_cast<double>(stats.latency_sum) / mc_completions : 0.0;
+      const double avg_outstanding = stats.outstanding_samples
+        ? static_cast<double>(stats.outstanding_sum) /
+          stats.outstanding_samples : 0.0;
+      cerr << fixed << setprecision(3)
+           << "[Timed memory MC " << i << "] reads=" << stats.read_requests
+           << " writes=" << stats.write_requests
+           << " completed=" << mc_completions
+           << " rejected_cycles=" << stats.rejected_cycles
+           << " latency_avg=" << mc_latency
+           << " latency_max=" << stats.max_latency
+           << " outstanding_avg=" << avg_outstanding
+           << " outstanding_max=" << stats.max_outstanding
+           << defaultfloat << endl;
+    }
+  }
+
+  void finishTimedMemoryStats(uint64_t cycle) {
+    if (!ramulator_cfg || !ramulator_cfg->timerStatsOnly ||
+        !timed_memory_stats.active) return;
+    timed_memory_stats.stop_cycle = cycle;
+    timed_memory_stats.active = false;
+    timed_memory_stats.captured = true;
+    emitRamulatorStats();
+    printTimedMemoryStats();
   }
 
   void serveFlatMemReq(int mc, const GlobalMemReq &req) {
@@ -310,7 +492,8 @@ struct System::Impl {
   }
 
   // Pop consumed responses and tick Ramulator
-  void tickMemory() {
+  void tickMemory(uint64_t cycle) {
+    current_cycle = cycle;
     periph.tick();
 
     if (use_ramulator) {
@@ -323,6 +506,12 @@ struct System::Impl {
       }
       if (ramulator_tick_phase < 0.0L) {
         ramulator_tick_phase = 0.0L;
+      }
+    }
+    if (timed_memory_stats.active) {
+      for (auto &stats : timed_memory_stats.mc) {
+        stats.outstanding_sum += stats.outstanding;
+        ++stats.outstanding_samples;
       }
     }
   }
@@ -426,20 +615,33 @@ struct System::Impl {
 
     // Serve requests (use backend 0's output as ground truth; cosim already verified equality).
     auto &out = per_backend_out[0];
+    const bool timer_was_enabled = periph.timer_enabled;
     if (out[0].req && bus_in[0].reqAccepting) {
       servePeriphReq(*out[0].req);
+    }
+    if (!timer_was_enabled && periph.timer_enabled) {
+      beginTimedMemoryStats(cycle);
+      for (auto &backend : backends) backend->timerStatsStart(cycle);
     }
     for (int mc = 0; mc < num_mc; ++mc) {
       int idx = mc + 1;
       if (use_ramulator) {
-        bus_in[idx].reqAccepting = out[idx].req
-            ? submitRamulatorReq(mc, *out[idx].req)
-            : true;
+        if (out[idx].req) {
+          bus_in[idx].reqAccepting = submitRamulatorReq(mc, *out[idx].req, cycle);
+          if (!bus_in[idx].reqAccepting && timed_memory_stats.active)
+            ++timed_memory_stats.mc[mc].rejected_cycles;
+        } else {
+          bus_in[idx].reqAccepting = true;
+        }
       } else {
         if (out[idx].req && bus_in[idx].reqAccepting) {
           serveFlatMemReq(mc, *out[idx].req);
         }
       }
+    }
+    if (timer_was_enabled && !periph.timer_enabled) {
+      finishTimedMemoryStats(cycle);
+      timer_stopped_this_cycle = true;
     }
   }
 };
@@ -455,7 +657,8 @@ System::System(
     impl_->ramulator_cfg = Impl::StoredRamulatorConfig{
       string(ramulatorTimingModel->configFile),
       ramulatorTimingModel->statsDir,
-      ramulatorTimingModel->coreFreqGHz
+      ramulatorTimingModel->coreFreqGHz,
+      ramulatorTimingModel->timerStatsOnly
     };
   }
 }
@@ -521,7 +724,7 @@ bool System::run(uint64_t maxCycles) {
     if (exiting) break;
 
     // Phase 2: tick frontend memory + build bus_in + serve presented requests.
-    impl_->tickMemory();
+    impl_->tickMemory(cycle);
     impl_->buildBusInAndServe(cycle);
 
     // Phase 3: stage all backends with the bus_in we just built.
@@ -534,6 +737,10 @@ bool System::run(uint64_t maxCycles) {
 
     // Phase 5: step all backends (commit posedge).
     for (auto &b : impl_->backends) b->step(cycle);
+    if (impl_->timer_stopped_this_cycle) {
+      for (auto &b : impl_->backends) b->timerStatsStop(cycle);
+      impl_->timer_stopped_this_cycle = false;
+    }
 
     // Count requests for heartbeat
     auto &out = impl_->per_backend_out[0];
@@ -575,21 +782,17 @@ bool System::run(uint64_t maxCycles) {
 
   // Print Ramulator stats
   if (impl_->use_ramulator) {
-    for (int i = 0; i < impl_->num_mc; ++i) {
-      auto &r = impl_->ramulator_mcs[i];
-      r.frontend->update_stats_recursive();
-      r.memory->update_stats_recursive();
-      if (impl_->ramulator_cfg->statsDir) {
-        filesystem::create_directories(*impl_->ramulator_cfg->statsDir);
-        ofstream stats(*impl_->ramulator_cfg->statsDir + "/mc" + to_string(i) + ".yaml");
-        if (!stats) throw runtime_error("Cannot open Ramulator statistics file");
-        r.frontend->print_stats(stats);
-        r.memory->print_stats(stats);
-      } else {
-        cerr << "[Ramulator MC " << i << "]" << endl;
-        r.frontend->print_stats(cerr);
-        r.memory->print_stats(cerr);
-      }
+    if (!impl_->ramulator_cfg->timerStatsOnly) {
+      impl_->emitRamulatorStats();
+    } else if (!impl_->ramulator_stats_written && impl_->timed_memory_stats.started) {
+      cerr << "[Timed memory] Timer did not stop; reporting the partial interval" << endl;
+      impl_->timed_memory_stats.stop_cycle = cycle;
+      impl_->emitRamulatorStats();
+      impl_->printTimedMemoryStats();
+    } else if (!impl_->timed_memory_stats.started) {
+      cerr << "[Timed memory] Timer was never enabled; no Ramulator statistics emitted" << endl;
+    }
+    for (auto &r : impl_->ramulator_mcs) {
       r.frontend->finalize();
       r.memory->finalize();
     }
@@ -633,6 +836,11 @@ int main(int argc, char **argv) {
   program.add_argument("--ramulator-stats")
     .help("Directory for per-MC Ramulator statistics");
 
+  program.add_argument("--ramulator-stats-timer-only")
+    .help("Measure Ramulator statistics only while the workload timer is enabled")
+    .default_value(false)
+    .implicit_value(true);
+
   program.add_argument("--trace")
     .help("Enable FST tracing")
     .default_value(false)
@@ -647,6 +855,17 @@ int main(int argc, char **argv) {
     .help("Enable verbose logging")
     .default_value(false)
     .implicit_value(true);
+
+  program.add_argument("--noc-profile")
+    .help("Directory for soft-backend congestion statistics");
+
+  program.add_argument("--noc-profile-start")
+    .help("First cycle for an explicit pre-timer congestion profile")
+    .scan<'u', uint64_t>();
+
+  program.add_argument("--noc-profile-stop")
+    .help("Last cycle for an explicit pre-timer congestion profile")
+    .scan<'u', uint64_t>();
 
   program.add_argument("--rng-seed")
     .help("RNG seed for peripheral device")
@@ -756,6 +975,28 @@ int main(int argc, char **argv) {
 
   // Logging is wired below on the soft backend instance (if used).
   bool enable_logging = program.get<bool>("--log");
+  auto noc_profile_dir = program.present<string>("--noc-profile");
+  auto noc_profile_start = program.present<uint64_t>("--noc-profile-start");
+  auto noc_profile_stop = program.present<uint64_t>("--noc-profile-stop");
+  if (noc_profile_dir && !use_soft) {
+    cerr << "Error: --noc-profile requires --soft" << endl;
+    return 1;
+  }
+  if ((noc_profile_start || noc_profile_stop) && !noc_profile_dir) {
+    cerr << "Error: --noc-profile-start and --noc-profile-stop require "
+            "--noc-profile" << endl;
+    return 1;
+  }
+  if (noc_profile_stop && !noc_profile_start) {
+    cerr << "Error: --noc-profile-stop requires --noc-profile-start" << endl;
+    return 1;
+  }
+  if (noc_profile_start && noc_profile_stop &&
+      *noc_profile_stop < *noc_profile_start) {
+    cerr << "Error: --noc-profile-stop must not precede --noc-profile-start"
+         << endl;
+    return 1;
+  }
 
   // Build init files list
   vector<string_view> dramInitFiles;
@@ -765,10 +1006,12 @@ int main(int argc, char **argv) {
   optional<RamulatorConfig> ramulator_cfg;
   if (auto cfg = program.present<string>("--ramulator-config")) {
     ramulator_cfg = RamulatorConfig{
-      *cfg, program.present<string>("--ramulator-stats"), core_freq_ghz
+      *cfg, program.present<string>("--ramulator-stats"), core_freq_ghz,
+      program.get<bool>("--ramulator-stats-timer-only")
     };
-  } else if (program.present<string>("--ramulator-stats")) {
-    cerr << "Error: --ramulator-stats requires --ramulator-config" << endl;
+  } else if (program.present<string>("--ramulator-stats") ||
+             program.get<bool>("--ramulator-stats-timer-only")) {
+    cerr << "Error: --ramulator-stats and --ramulator-stats-timer-only require --ramulator-config" << endl;
     return 1;
   }
 
@@ -823,6 +1066,8 @@ int main(int argc, char **argv) {
   if (use_soft) {
     auto soft = make_unique<SoftSystemBackend>(cli_cfg, soft_threads);
     soft->setLogging(enable_logging);
+    soft->setNocProfileDir(noc_profile_dir);
+    soft->setNocProfileWindow(noc_profile_start, noc_profile_stop);
     if (fst_tracer) soft->attachTrace(fst_tracer.get(), 0);
     system.addBackend(std::move(soft));
     cerr << "[Main] Soft backend enabled" << endl;

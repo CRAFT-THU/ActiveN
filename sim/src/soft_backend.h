@@ -273,6 +273,85 @@ class SoftSystemBackend : public SystemBackend {
   uint64_t last_periodic_cycle_ = 0;
   bool log_ = false;
 
+  struct NocLinkProfile {
+    uint64_t presented = 0;
+    uint64_t accepted = 0;
+    uint64_t blocked = 0;
+    uint64_t queue_occupancy_sum = 0;
+    uint64_t queue_full_cycles = 0;
+    uint64_t current_stall = 0;
+    uint64_t longest_stall = 0;
+    std::vector<uint64_t> blocked_by_mc;
+  };
+
+  struct NocRouterProfile {
+    uint64_t injection_presented = 0;
+    uint64_t injection_accepted = 0;
+    uint64_t injection_blocked = 0;
+    uint64_t current_injection_stall = 0;
+    uint64_t longest_injection_stall = 0;
+    uint64_t occupancy_sum = 0;
+    uint64_t full_input_queue_cycles = 0;
+    uint64_t max_occupancy = 0;
+  };
+
+  static constexpr size_t MSHR_HIST_SIZE = soft_mem::DRAM_MSHR_COUNT + 1;
+  struct NocMemifProfile {
+    std::array<uint64_t, MSHR_HIST_SIZE> allocated{};
+    std::array<uint64_t, MSHR_HIST_SIZE> unissued{};
+    std::array<uint64_t, MSHR_HIST_SIZE> issued_unfulfilled{};
+    std::array<uint64_t, MSHR_HIST_SIZE> fulfilled{};
+    std::array<uint64_t, MSHR_HIST_SIZE> broadcast{};
+    std::array<uint64_t, MSHR_HIST_SIZE> broadcast_queue{};
+    std::array<uint64_t, MSHR_HIST_SIZE> bulk_queue{};
+    uint64_t broadcast_blocked_cycles = 0;
+    uint64_t external_request_presented = 0;
+    uint64_t external_request_accepted = 0;
+    uint64_t external_response_accepted = 0;
+    uint64_t mshr_unicast_local_retired = 0;
+    uint64_t mshr_unicast_remote_injected = 0;
+    uint64_t ring_unicast_local_delivered = 0;
+    uint64_t broadcast_retired = 0;
+  };
+
+  struct NocCycleProfile {
+    uint64_t cycle = 0;
+    uint64_t router_flits = 0;
+    uint64_t full_input_queues = 0;
+    uint64_t links_presented = 0;
+    uint64_t links_accepted = 0;
+    uint64_t links_blocked = 0;
+    uint64_t injections_presented = 0;
+    uint64_t injections_accepted = 0;
+    uint64_t injections_blocked = 0;
+    uint64_t memif_arrivals = 0;
+    uint64_t max_router_flits = 0;
+    uint64_t total_mshrs = 0;
+    uint64_t broadcast_mshrs = 0;
+    uint64_t fulfilled_mshrs = 0;
+    uint64_t broadcast_queues = 0;
+    uint64_t broadcast_blocked_mcs = 0;
+    uint64_t external_requests_presented = 0;
+    uint64_t external_requests_accepted = 0;
+    uint64_t external_responses_accepted = 0;
+    uint64_t mshr_unicasts_local_retired = 0;
+    uint64_t mshr_unicasts_remote_injected = 0;
+    uint64_t ring_unicasts_local_delivered = 0;
+  };
+
+  std::optional<std::string> nocProfileDir_;
+  bool nocProfileActive_ = false;
+  bool nocProfileWritten_ = false;
+  uint64_t nocProfileStartCycle_ = 0;
+  uint64_t nocProfileStopCycle_ = 0;
+  std::optional<uint64_t> nocProfileManualStart_;
+  std::optional<uint64_t> nocProfileManualStop_;
+  std::vector<NocLinkProfile> nocLinkProfiles_;
+  std::vector<NocRouterProfile> nocRouterProfiles_;
+  std::vector<NocMemifProfile> nocMemifProfiles_;
+  std::array<uint64_t, ROUTER_Q_DEPTH + 1> nocQueueOccupancy_{};
+  std::vector<NocCycleProfile> nocCycleProfiles_;
+
   // Parallelism
   size_t numThreads = 8; // Overridden by the ctor's threads parameter.
 
@@ -382,7 +461,10 @@ class SoftSystemBackend : public SystemBackend {
   bool ringCanInject(size_t memifIdx) const;
 
   // Per-cycle stat accumulation. Called at the end of stage()/step().
-  void accumulateStats();
+  void accumulateStats(uint64_t cycle);
+  void accumulateNocProfile(uint64_t cycle);
+  void startNocProfile(uint64_t cycle);
+  void writeNocProfile();
 
   static uint64_t workProfileNowNs();
   bool workProfileSampleCycle(uint64_t cycle) const;
@@ -424,11 +506,21 @@ class SoftSystemBackend : public SystemBackend {
 
   void attachTrace(VerilatedFstC *tracer, int depth);
   void setLogging(bool enabled) { log_ = enabled; }
+  void setNocProfileDir(std::optional<std::string> dir) {
+    nocProfileDir_ = std::move(dir);
+  }
+  void setNocProfileWindow(std::optional<uint64_t> start,
+                           std::optional<uint64_t> stop) {
+    nocProfileManualStart_ = start;
+    nocProfileManualStop_ = stop;
+  }
 
   // SystemBackend interface
   SystemConfig config() const override;
   void peek(uint64_t cycle, std::vector<MemBusOut *> out) override;
   void stage(uint64_t cycle, const std::vector<MemBusIn> &in) override;
   void step(uint64_t cycle) override;
+  void timerStatsStart(uint64_t cycle) override;
+  void timerStatsStop(uint64_t cycle) override;
   bool printStats(uint64_t cycles, bool final) override;
 };

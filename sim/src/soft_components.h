@@ -133,7 +133,7 @@ public:
 
   // Returns index
   template <FlitArbInputs Inputs>
-  inline std::optional<uint8_t> peek(Inputs inputs) const __attribute__((always_inline)) {
+  [[gnu::always_inline]] inline std::optional<uint8_t> peek(Inputs inputs) const {
     // Look for first valid since nextGrant
     uint8_t i = _next_grant;
     std::optional<uint8_t> selected = std::nullopt;
@@ -368,5 +368,11 @@ public:
     size_t n = 0;
     for (auto &q : _input_queues) n += q.size();
     return n;
+  }
+
+  size_t numInputs() const noexcept { return _num_inputs; }
+
+  size_t inputQueueSize(size_t input) const {
+    return _input_queues.at(input).size();
   }
 };

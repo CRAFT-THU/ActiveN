@@ -18,6 +18,78 @@ namespace soft_mem {
 
 // DON'T CHANGE THIS, we us uint16_t as masks
 const size_t CLUSTER_SIZE = 16;
+inline constexpr size_t DRAM_MSHR_COUNT = 256;
+inline constexpr size_t DRAM_UNICAST_RESERVE = 32;
+inline constexpr size_t DRAM_BROADCAST_BOUND =
+    DRAM_MSHR_COUNT - DRAM_UNICAST_RESERVE;
+inline constexpr size_t DRAM_BULK_QUEUE_DEPTH = 32;
+
+class DynamicBitMask {
+  size_t bitCount;
+  std::vector<uint64_t> words;
+
+ public:
+  explicit DynamicBitMask(size_t bits)
+      : bitCount(bits), words((bits + 63) / 64, 0) {}
+
+  bool test(size_t bit) const noexcept {
+    return (words[bit / 64] & (uint64_t{1} << (bit % 64))) != 0;
+  }
+
+  void set(size_t bit) noexcept {
+    words[bit / 64] |= uint64_t{1} << (bit % 64);
+  }
+
+  void reset(size_t bit) noexcept {
+    words[bit / 64] &= ~(uint64_t{1} << (bit % 64));
+  }
+
+  bool none() const noexcept {
+    for (uint64_t word : words)
+      if (word != 0) return false;
+    return true;
+  }
+
+  size_t count() const noexcept {
+    size_t result = 0;
+    for (uint64_t word : words) result += std::popcount(word);
+    return result;
+  }
+
+  size_t countAnd(const DynamicBitMask &other) const noexcept {
+    size_t result = 0;
+    for (size_t i = 0; i < words.size(); ++i)
+      result += std::popcount(words[i] & other.words[i]);
+    return result;
+  }
+
+  size_t countAndNot(const DynamicBitMask &other) const noexcept {
+    size_t result = 0;
+    for (size_t i = 0; i < words.size(); ++i)
+      result += std::popcount(words[i] & ~other.words[i]);
+    return result;
+  }
+
+  size_t countAndAndNot(const DynamicBitMask &included,
+                        const DynamicBitMask &excluded) const noexcept {
+    size_t result = 0;
+    for (size_t i = 0; i < words.size(); ++i)
+      result += std::popcount(words[i] & included.words[i] &
+                              ~excluded.words[i]);
+    return result;
+  }
+
+  std::optional<uint8_t> firstZero() const noexcept {
+    for (size_t i = 0; i < words.size(); ++i) {
+      uint64_t candidates = ~words[i];
+      if (i + 1 == words.size() && bitCount % 64 != 0)
+        candidates &= (uint64_t{1} << (bitCount % 64)) - 1;
+      if (candidates != 0)
+        return static_cast<uint8_t>(i * 64 + std::countr_zero(candidates));
+    }
+    return std::nullopt;
+  }
+};
 
 struct MSHR {
   uint32_t addr;
@@ -144,9 +216,9 @@ protected:
 
   size_t inflight;
   std::vector<MSHR> mshrs;
-  uint64_t allocated = 0;
-  uint64_t issued = 0;
-  uint64_t fulfilled = 0;
+  DynamicBitMask allocated;
+  DynamicBitMask issued;
+  DynamicBitMask fulfilled;
   FlitArb reqArb;
   FlitArb issueArb;
   FlitArb unicastArb;
@@ -231,10 +303,11 @@ public:
     size_t idx,
     size_t inflight,
     size_t numReq
-  ) : idx(idx), inflight(inflight), mshrs(inflight), reqArb(numReq),
+  ) : idx(idx), inflight(inflight), mshrs(inflight), allocated(inflight),
+      issued(inflight), fulfilled(inflight), reqArb(numReq),
       issueArb(inflight), unicastArb(inflight), broadcastArb(inflight) {
-    if (inflight < 2 || inflight > 64)
-      throw std::invalid_argument("inflight must be between 2 and 64");
+    if (inflight < 2 || inflight > 256)
+      throw std::invalid_argument("inflight must be between 2 and 256");
   }
 
   void resetIdle() noexcept {
@@ -248,38 +321,46 @@ public:
     */
 
   size_t mshrInflightCount() const noexcept __attribute__((always_inline)) {
-    return std::popcount(allocated);
+    return allocated.count();
+  }
+
+  size_t mshrUnissuedCount() const noexcept {
+    return allocated.countAndNot(issued);
+  }
+
+  size_t mshrIssuedUnfulfilledCount() const noexcept {
+    return allocated.countAndAndNot(issued, fulfilled);
+  }
+
+  size_t mshrFulfilledCount() const noexcept {
+    return allocated.countAnd(fulfilled);
   }
 
   std::optional<uint8_t> mshrAllocSlot() const noexcept __attribute__((always_inline)) {
-    const int r_one = std::countr_one(allocated);
-    if (static_cast<size_t>(r_one) >= inflight) return std::nullopt;
-    return r_one;
+    return allocated.firstZero();
   }
 
   void mshrAllocCommit(uint8_t slot, MSHR req) noexcept __attribute__((always_inline)) {
-    const uint64_t bit = 1ULL << slot;
     if constexpr (ASSERTIONS_ENABLED) {
-      if (allocated & bit) throw std::logic_error("mshrAllocCommit: slot already allocated");
+      if (allocated.test(slot))
+        throw std::logic_error("mshrAllocCommit: slot already allocated");
     }
-    allocated |= bit;
-    issued &= ~bit;
-    fulfilled &= ~bit;
+    allocated.set(slot);
+    issued.reset(slot);
+    fulfilled.reset(slot);
     mshrs[slot] = req;
   }
 
   void mshrDeallocCommit(uint8_t slot) noexcept __attribute__((always_inline)) {
-    const uint64_t mask = ~(1ULL << slot);
-    allocated &= mask;
-    issued &= mask;
-    fulfilled &= mask;
+    allocated.reset(slot);
+    issued.reset(slot);
+    fulfilled.reset(slot);
   }
 
   std::optional<uint8_t> mshrReqSlot() const noexcept __attribute__((always_inline)) {
-    const uint64_t candidates = allocated & ~issued;
-    if (candidates == 0) return std::nullopt;
     return issueArb.peek([&](size_t i) -> std::optional<uint8_t> {
-      return (candidates & (1ULL << i)) ? std::optional<uint8_t>(0) : std::nullopt;
+      return allocated.test(i) && !issued.test(i)
+          ? std::optional<uint8_t>(0) : std::nullopt;
     });
   }
 
@@ -295,12 +376,13 @@ public:
   }
 
   void mshrReqCommit(uint8_t slot) __attribute__((always_inline)) {
-    const uint64_t bit = 1ULL << slot;
     if constexpr (ASSERTIONS_ENABLED) {
-      if ((allocated & bit) == 0) throw std::logic_error("mshrReqCommit: slot not allocated");
-      if (issued & bit) throw std::logic_error("mshrReqCommit: slot already issued");
+      if (!allocated.test(slot))
+        throw std::logic_error("mshrReqCommit: slot not allocated");
+      if (issued.test(slot))
+        throw std::logic_error("mshrReqCommit: slot already issued");
     }
-    issued |= bit;
+    issued.set(slot);
     issueArb.commit(slot);
   }
 
@@ -309,28 +391,25 @@ public:
     if constexpr (ASSERTIONS_ENABLED) {
       if (resp.id >= inflight) throw std::logic_error("mshrRespAccept: invalid id");
     }
-    const uint64_t bit = 1ULL << resp.id;
     if constexpr (ASSERTIONS_ENABLED) {
-      if ((allocated & bit) == 0) throw std::logic_error("mshrRespAccept: slot not allocated");
-      if ((issued & bit) == 0 && issuedNow != resp.id)
+      if (!allocated.test(resp.id))
+        throw std::logic_error("mshrRespAccept: slot not allocated");
+      if (!issued.test(resp.id) && issuedNow != resp.id)
         throw std::logic_error("mshrRespAccept: slot not issued");
-      if (fulfilled & bit) throw std::logic_error("mshrRespAccept: duplicate response");
+      if (fulfilled.test(resp.id))
+        throw std::logic_error("mshrRespAccept: duplicate response");
     }
     mshrs[resp.id].rwdata = resp.data;
-    fulfilled |= bit;
+    fulfilled.set(resp.id);
   }
 
   std::optional<uint8_t> mshrReturnSlot(bool broadcast) const noexcept
       __attribute__((always_inline)) {
-    uint64_t candidates = allocated & fulfilled;
-    for (size_t slot = 0; slot < inflight; ++slot) {
-      if (mshrs[slot].isBroadcast() != broadcast)
-        candidates &= ~(1ULL << slot);
-    }
-    if (candidates == 0) return std::nullopt;
     const auto &arb = broadcast ? broadcastArb : unicastArb;
     return arb.peek([&](size_t i) -> std::optional<uint8_t> {
-      return (candidates & (1ULL << i)) ? std::optional<uint8_t>(0) : std::nullopt;
+      return allocated.test(i) && fulfilled.test(i) &&
+                     mshrs[i].isBroadcast() == broadcast
+          ? std::optional<uint8_t>(0) : std::nullopt;
     });
   }
 
@@ -389,9 +468,8 @@ protected:
   virtual bool nocCanAccept(const Flit &f) const = 0;
 public:
   template<typename FI>
-  std::optional<uint8_t> nocAcceptMultiple(FI flits) const
-  requires(std::is_invocable_r_v<const Flit*, FI, size_t>)
-  __attribute__((always_inline)) {
+  [[gnu::always_inline]] std::optional<uint8_t> nocAcceptMultiple(FI flits) const
+  requires(std::is_invocable_r_v<const Flit*, FI, size_t>) {
     // Iterate through all request ports
     auto selected = reqArb.peek([&flits](size_t idx) __attribute__((always_inline)) -> std::optional<uint8_t> {
       const Flit *flit = flits(idx);
@@ -464,7 +542,7 @@ class DRAMIf : public MemIf {
   size_t puStart;
   size_t puEnd;
 
-  FixedLenQueue<BulkDispatcher> bulkQueue{2};
+  FixedLenQueue<BulkDispatcher> bulkQueue{DRAM_BULK_QUEUE_DEPTH};
   uint32_t bulkCount = 0;
   size_t bcstInflight = 0;
   FixedLenQueue<BcastLine> bcstEgressQueue{2};
@@ -480,6 +558,20 @@ class DRAMIf : public MemIf {
   std::vector<uint16_t> bcstPUAccepted;
   // Registered unicast output of each distributor.
   std::vector<std::optional<RingResp>> unicastPipes;
+
+ public:
+  struct CycleEvents {
+    bool externalRequestPresented = false;
+    bool externalRequestAccepted = false;
+    bool externalResponseAccepted = false;
+    bool mshrUnicastLocalRetired = false;
+    bool mshrUnicastRemoteInjected = false;
+    bool ringUnicastLocalDelivered = false;
+    bool broadcastRetired = false;
+  };
+
+ private:
+  CycleEvents lastCycleEvents;
 
   struct UnicastRespPeek {
     // The local responses, if exists. Index is pu index - puStart
@@ -523,10 +615,18 @@ public:
   }
 
   size_t bulkQueueOccupancy() const noexcept { return bulkQueue.size(); }
+  size_t broadcastInflightCount() const noexcept { return bcstInflight; }
+  const CycleEvents &cycleEvents() const noexcept { return lastCycleEvents; }
   size_t bcstQueueOccupancy() const noexcept {
     size_t n = bcstEgressQueue.size();
     for (const auto &q : bcstQueues) n += q.size();
     return n;
+  }
+
+  bool broadcastAllocationBlocked() const noexcept {
+    auto head = bulkQueue.front();
+    return head && head->get().broadcast &&
+           bcstInflight == DRAM_BROADCAST_BOUND;
   }
 
 protected:
@@ -539,8 +639,9 @@ protected:
   }
 
 public:
-  DRAMIf(size_t memif_idx, size_t numReq, size_t inflight, size_t bcstQueueCap, size_t puStart, size_t puEnd)
-    : MemIf(memif_idx, inflight, numReq),
+  DRAMIf(size_t memif_idx, size_t numReq, size_t bcstQueueCap,
+         size_t puStart, size_t puEnd)
+    : MemIf(memif_idx, DRAM_MSHR_COUNT, numReq),
       puStart(puStart),
       puEnd(puEnd),
       bcstQueueCap(bcstQueueCap),
@@ -617,6 +718,7 @@ public:
     const std::span<const uint16_t> &bcstAcceptMasks,
     bool nocOutAccepted
   ) __attribute__((always_inline)) {
+    lastCycleEvents = {};
     *ring.injected = false;
 
     if constexpr (ASSERTIONS_ENABLED) {
@@ -625,7 +727,7 @@ public:
     }
 
     const Flit *acceptedFlit = flit ? &flit->first.get() : nullptr;
-    idleStep(allocated == 0 && bulkQueue.empty() && bcstEgressQueue.empty(),
+    idleStep(allocated.none() && bulkQueue.empty() && bcstEgressQueue.empty(),
              acceptedFlit, nocOutAccepted);
 
     const auto allocSlot = mshrAllocSlot();
@@ -640,7 +742,7 @@ public:
     std::optional<BulkDispatcher> bulkHead;
     if (auto head = bulkQueue.front()) bulkHead = head->get();
     const bool bcstBlocked = bulkHead && bulkHead->broadcast &&
-      bcstInflight == inflight / 2;
+      bcstInflight == DRAM_BROADCAST_BOUND;
     const bool bulkAlloc = allocSlot && bulkHead && !acceptedScalar && !bcstBlocked;
     const bool bulkDone = bulkAlloc && bulkCount + 1 == bulkHead->count;
 
@@ -673,6 +775,7 @@ public:
       }
       size_t dist = *unicast.ringLocal / CLUSTER_SIZE;
       unicastPipes[dist] = *ring.buffer;
+      lastCycleEvents.ringUnicastLocalDelivered = true;
     }
 
     if (unicast.mshrLocal) {
@@ -680,6 +783,7 @@ public:
       size_t dist = *unicast.mshrLocal / CLUSTER_SIZE;
       unicastPipes[dist] = resp;
       unicastDealloc = true;
+      lastCycleEvents.mshrUnicastLocalRetired = true;
     }
 
     // Now that we're done with incoming ring ejection, we can overwrite the buffer.
@@ -688,6 +792,7 @@ public:
       *ring.injected = true;
       *ring.buffer = MemIf::mshrUnicast(*unicastSlot);
       unicastDealloc = true;
+      lastCycleEvents.mshrUnicastRemoteInjected = true;
     }
 
     if (unicastDealloc) MemIf::mshrReturnCommit(*unicastSlot, false);
@@ -743,10 +848,16 @@ public:
 
     // External memory handling
     const bool issueFire = mem.reqAccepting && issueSlot.has_value();
+    lastCycleEvents.externalRequestPresented = issueSlot.has_value();
+    lastCycleEvents.externalRequestAccepted = issueFire;
+    lastCycleEvents.externalResponseAccepted = mem.resp.has_value();
     if (issueFire) MemIf::mshrReqCommit(*issueSlot);
     if (mem.resp) MemIf::mshrRespAccept(*mem.resp, issueFire ? issueSlot : std::nullopt);
 
-    if (broadcastEject) MemIf::mshrReturnCommit(*broadcastSlot, true);
+    if (broadcastEject) {
+      lastCycleEvents.broadcastRetired = true;
+      MemIf::mshrReturnCommit(*broadcastSlot, true);
+    }
 
     if (acceptedScalar) {
       if constexpr (ASSERTIONS_ENABLED) {
@@ -779,7 +890,7 @@ public:
     const bool broadcastAlloc = bulkAlloc && bulkHead->broadcast;
     if (broadcastAlloc && !broadcastEject) {
       if constexpr (ASSERTIONS_ENABLED) {
-        if (bcstInflight >= inflight / 2)
+        if (bcstInflight >= DRAM_BROADCAST_BOUND)
           throw std::logic_error("Broadcast MSHR counter overflow");
       }
       ++bcstInflight;
@@ -855,7 +966,7 @@ public:
     *ring.injected = false;
 
     const Flit *acceptedFlit = flit ? &flit->first.get() : nullptr;
-    idleStep(allocated == 0, acceptedFlit, nocOutAccepted);
+    idleStep(allocated.none(), acceptedFlit, nocOutAccepted);
 
     // Remember alloc slots
     auto allocSlot = mshrAllocSlot();

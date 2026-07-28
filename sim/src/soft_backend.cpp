@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <optional>
@@ -485,7 +487,7 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads)
   const size_t CLUSTER_PER_MC = PU_PER_MC / soft_mem::CLUSTER_SIZE;
   drams.reserve(cfg.numMC);
   for (size_t m = 0; m < cfg.numMC; ++m) {
-    drams.emplace_back(m + 1, CLUSTER_PER_MC, 64, 2,
+    drams.emplace_back(m + 1, CLUSTER_PER_MC, 2,
                        1 + m * PU_PER_MC,
                        1 + (m + 1) * PU_PER_MC);
   }
@@ -843,7 +845,7 @@ void SoftSystemBackend::step(uint64_t cycle) {
     workProfileTimes[0].local_done[static_cast<size_t>(
         WorkProfilePhase::StepStart)] = workProfileNowNs();
   const uint64_t statsStart = profile ? workProfileNowNs() : 0;
-  accumulateStats();
+  accumulateStats(cycle);
   if (profile)
     workProfileRecordUnit(cycle, WorkProfilePhase::StepStart,
                           WorkProfileUnit::Stats, 0,
@@ -1064,7 +1066,7 @@ void SoftSystemBackend::stepCleanup(size_t threadId, bool profile) {
         workProfileNowNs() - cleanupStart;
 }
 
-void SoftSystemBackend::accumulateStats() {
+void SoftSystemBackend::accumulateStats(uint64_t cycle) {
   uint64_t hops = 0;
   uint64_t idle_lanes = 0;
   uint64_t blocked = 0;
@@ -1142,6 +1144,362 @@ void SoftSystemBackend::accumulateStats() {
   stats_.cur_inflight_messages = inflight_msgs;
   stats_.cur_inflight_dram     = inflight_dram;
   stats_.cur_inflight_resp     = inflight_resp;
+
+  if (nocProfileManualStart_ && !nocProfileActive_ && !nocProfileWritten_ &&
+      cycle >= *nocProfileManualStart_) {
+    startNocProfile(cycle);
+  }
+  if (nocProfileActive_) {
+    accumulateNocProfile(cycle);
+    if (nocProfileManualStop_ && cycle >= *nocProfileManualStop_) {
+      nocProfileStopCycle_ = cycle;
+      nocProfileActive_ = false;
+      writeNocProfile();
+    }
+  }
+}
+
+void SoftSystemBackend::startNocProfile(uint64_t cycle) {
+  if (!nocProfileDir_ || nocProfileActive_ || nocProfileWritten_) return;
+
+  nocProfileActive_ = true;
+  nocProfileStartCycle_ = cycle;
+  nocProfileStopCycle_ = 0;
+  nocLinkProfiles_.assign((cfg.numPU + 1) * 4, {});
+  for (auto &profile : nocLinkProfiles_)
+    profile.blocked_by_mc.assign(cfg.numMC, 0);
+  nocRouterProfiles_.assign(cfg.numPU + 1, {});
+  nocMemifProfiles_.assign(cfg.numMC, {});
+  nocQueueOccupancy_.fill(0);
+  nocCycleProfiles_.clear();
+  nocCycleProfiles_.reserve(1 << 17);
+  std::cerr << "[NoC profile] Starts at cycle " << nocProfileStartCycle_
+            << '\n';
+}
+
+void SoftSystemBackend::timerStatsStart(uint64_t cycle) {
+  if (nocProfileManualStart_) return;
+  // The peripheral starts counting on the cycle after the start write.
+  startNocProfile(cycle + 1);
+}
+
+void SoftSystemBackend::timerStatsStop(uint64_t cycle) {
+  if (!nocProfileActive_) return;
+  nocProfileStopCycle_ = cycle;
+  nocProfileActive_ = false;
+  writeNocProfile();
+}
+
+void SoftSystemBackend::accumulateNocProfile(uint64_t cycle) {
+  if (cycle < nocProfileStartCycle_) return;
+
+  NocCycleProfile sample{.cycle = cycle};
+
+  for (uint16_t dst = 1; dst <= cfg.numPU; ++dst) {
+    const auto &router = routers[dst];
+    auto &routerProfile = nocRouterProfiles_[dst];
+    const size_t occupancy = router.rt.totalFlits();
+    sample.router_flits += occupancy;
+    sample.max_router_flits = std::max(sample.max_router_flits,
+                                        static_cast<uint64_t>(occupancy));
+    routerProfile.occupancy_sum += occupancy;
+    routerProfile.max_occupancy = std::max(
+        routerProfile.max_occupancy, static_cast<uint64_t>(occupancy));
+
+    for (size_t input = 0; input < router.rt.numInputs(); ++input) {
+      const size_t queueOccupancy = router.rt.inputQueueSize(input);
+      ++nocQueueOccupancy_.at(queueOccupancy);
+      if (queueOccupancy == ROUTER_Q_DEPTH) {
+        ++sample.full_input_queues;
+        ++routerProfile.full_input_queue_cycles;
+      }
+    }
+
+    if (router.buf.core_inject_presenting) {
+      ++sample.injections_presented;
+      ++routerProfile.injection_presented;
+      if (router.buf.core_inject_accepting) {
+        ++sample.injections_accepted;
+        ++routerProfile.injection_accepted;
+        routerProfile.current_injection_stall = 0;
+      } else {
+        ++sample.injections_blocked;
+        ++routerProfile.injection_blocked;
+        ++routerProfile.current_injection_stall;
+        routerProfile.longest_injection_stall = std::max(
+            routerProfile.longest_injection_stall,
+            routerProfile.current_injection_stall);
+      }
+    } else {
+      routerProfile.current_injection_stall = 0;
+    }
+
+    for (size_t input = 0; input < router.links.num_forwards; ++input) {
+      const auto src = router.links.forwards[input]->first;
+      auto &link = nocLinkProfiles_[dst * 4 + input];
+      const size_t queueOccupancy = router.rt.inputQueueSize(input);
+      link.queue_occupancy_sum += queueOccupancy;
+      if (queueOccupancy == ROUTER_Q_DEPTH) ++link.queue_full_cycles;
+
+      const auto &token = router.buf.forward_presenting[input];
+      if (!token) {
+        link.current_stall = 0;
+        continue;
+      }
+
+      ++sample.links_presented;
+      ++link.presented;
+      if (router.buf.forward_accepting[input]) {
+        ++sample.links_accepted;
+        ++link.accepted;
+        link.current_stall = 0;
+      } else {
+        ++sample.links_blocked;
+        ++link.blocked;
+        ++link.current_stall;
+        link.longest_stall = std::max(link.longest_stall,
+                                      link.current_stall);
+        const Flit *flit = routers[src].rt.peek(*token);
+        if (flit && flit->dst >= 0x8001 &&
+            flit->dst < 0x8001 + cfg.numMC) {
+          ++link.blocked_by_mc[flit->dst - 0x8001];
+        }
+      }
+    }
+  }
+
+  for (const auto &accepted : memif_eject_accept)
+    if (accepted) ++sample.memif_arrivals;
+
+  auto recordHistogram = [](auto &histogram, size_t value) {
+    ++histogram.at(std::min(value, histogram.size() - 1));
+  };
+  for (size_t mc = 0; mc < cfg.numMC; ++mc) {
+    const auto &dram = drams[mc];
+    auto &profile = nocMemifProfiles_[mc];
+    const auto &events = dram.cycleEvents();
+    const size_t allocated = dram.mshrInflightCount();
+    const size_t broadcasts = dram.broadcastInflightCount();
+    const size_t fulfilled = dram.mshrFulfilledCount();
+    const size_t broadcastQueues = dram.bcstQueueOccupancy();
+    recordHistogram(profile.allocated, allocated);
+    recordHistogram(profile.unissued, dram.mshrUnissuedCount());
+    recordHistogram(profile.issued_unfulfilled,
+                    dram.mshrIssuedUnfulfilledCount());
+    recordHistogram(profile.fulfilled, fulfilled);
+    recordHistogram(profile.broadcast, broadcasts);
+    recordHistogram(profile.broadcast_queue, broadcastQueues);
+    recordHistogram(profile.bulk_queue, dram.bulkQueueOccupancy());
+    if (dram.broadcastAllocationBlocked()) {
+      ++profile.broadcast_blocked_cycles;
+      ++sample.broadcast_blocked_mcs;
+    }
+    sample.total_mshrs += allocated;
+    sample.broadcast_mshrs += broadcasts;
+    sample.fulfilled_mshrs += fulfilled;
+    sample.broadcast_queues += broadcastQueues;
+    profile.external_request_presented += events.externalRequestPresented;
+    profile.external_request_accepted += events.externalRequestAccepted;
+    profile.external_response_accepted += events.externalResponseAccepted;
+    profile.mshr_unicast_local_retired += events.mshrUnicastLocalRetired;
+    profile.mshr_unicast_remote_injected +=
+        events.mshrUnicastRemoteInjected;
+    profile.ring_unicast_local_delivered +=
+        events.ringUnicastLocalDelivered;
+    profile.broadcast_retired += events.broadcastRetired;
+    sample.external_requests_presented += events.externalRequestPresented;
+    sample.external_requests_accepted += events.externalRequestAccepted;
+    sample.external_responses_accepted += events.externalResponseAccepted;
+    sample.mshr_unicasts_local_retired += events.mshrUnicastLocalRetired;
+    sample.mshr_unicasts_remote_injected +=
+        events.mshrUnicastRemoteInjected;
+    sample.ring_unicasts_local_delivered +=
+        events.ringUnicastLocalDelivered;
+  }
+
+  nocCycleProfiles_.push_back(sample);
+}
+
+void SoftSystemBackend::writeNocProfile() {
+  if (!nocProfileDir_ || nocProfileWritten_) return;
+  namespace fs = std::filesystem;
+  fs::create_directories(*nocProfileDir_);
+  const uint64_t samples = nocCycleProfiles_.size();
+
+  std::ofstream cycles(*nocProfileDir_ + "/cycles.csv");
+  cycles << "cycle,router_flits,full_input_queues,links_presented,"
+            "links_accepted,links_blocked,injections_presented,"
+            "injections_accepted,injections_blocked,memif_arrivals,"
+            "max_router_flits,total_mshrs,broadcast_mshrs,fulfilled_mshrs,"
+            "broadcast_queues,broadcast_blocked_mcs,"
+            "external_requests_presented,external_requests_accepted,"
+            "external_responses_accepted,mshr_unicasts_local_retired,"
+            "mshr_unicasts_remote_injected,ring_unicasts_local_delivered\n";
+  for (const auto &s : nocCycleProfiles_) {
+    cycles << s.cycle << ',' << s.router_flits << ','
+           << s.full_input_queues << ',' << s.links_presented << ','
+           << s.links_accepted << ',' << s.links_blocked << ','
+           << s.injections_presented << ',' << s.injections_accepted << ','
+           << s.injections_blocked << ',' << s.memif_arrivals << ','
+           << s.max_router_flits << ',' << s.total_mshrs << ','
+           << s.broadcast_mshrs << ',' << s.fulfilled_mshrs << ','
+           << s.broadcast_queues << ',' << s.broadcast_blocked_mcs << ','
+           << s.external_requests_presented << ','
+           << s.external_requests_accepted << ','
+           << s.external_responses_accepted << ','
+           << s.mshr_unicasts_local_retired << ','
+           << s.mshr_unicasts_remote_injected << ','
+           << s.ring_unicasts_local_delivered << '\n';
+  }
+
+  std::ofstream links(*nocProfileDir_ + "/links.csv");
+  links << "src_pu,dst_pu,src_col,src_row,dst_col,dst_row,presented,"
+           "accepted,blocked,blocked_fraction,avg_dst_queue,"
+           "dst_queue_full_cycles,longest_stall";
+  for (size_t mc = 0; mc < cfg.numMC; ++mc) links << ",blocked_mc" << mc;
+  links << '\n';
+
+  uint64_t totalPresented = 0;
+  uint64_t totalAccepted = 0;
+  uint64_t totalBlocked = 0;
+  std::vector<std::pair<uint64_t, std::pair<uint16_t, uint16_t>>> hotspots;
+  std::vector<uint64_t> blockedByMc(cfg.numMC, 0);
+  for (uint16_t dst = 1; dst <= cfg.numPU; ++dst) {
+    const auto &router = routers[dst];
+    auto [dstCol, dstRow] = topo.pu_to_coord[dst];
+    for (size_t input = 0; input < router.links.num_forwards; ++input) {
+      const auto src = router.links.forwards[input]->first;
+      auto [srcCol, srcRow] = topo.pu_to_coord[src];
+      const auto &profile = nocLinkProfiles_[dst * 4 + input];
+      const double blockedFraction = profile.presented
+          ? static_cast<double>(profile.blocked) / profile.presented : 0.0;
+      const double avgQueue = samples
+          ? static_cast<double>(profile.queue_occupancy_sum) / samples : 0.0;
+      links << src << ',' << dst << ',' << srcCol << ',' << srcRow << ','
+            << dstCol << ',' << dstRow << ',' << profile.presented << ','
+            << profile.accepted << ',' << profile.blocked << ','
+            << blockedFraction << ',' << avgQueue << ','
+            << profile.queue_full_cycles << ',' << profile.longest_stall;
+      for (size_t mc = 0; mc < cfg.numMC; ++mc) {
+        links << ',' << profile.blocked_by_mc[mc];
+        blockedByMc[mc] += profile.blocked_by_mc[mc];
+      }
+      links << '\n';
+      totalPresented += profile.presented;
+      totalAccepted += profile.accepted;
+      totalBlocked += profile.blocked;
+      hotspots.push_back({profile.blocked, {src, dst}});
+    }
+  }
+
+  std::ofstream routersFile(*nocProfileDir_ + "/routers.csv");
+  routersFile << "pu,col,row,injection_presented,injection_accepted,"
+                 "injection_blocked,blocked_fraction,longest_injection_stall,"
+                 "avg_flits,max_flits,full_input_queue_cycles\n";
+  for (uint16_t pu = 1; pu <= cfg.numPU; ++pu) {
+    auto [col, row] = topo.pu_to_coord[pu];
+    const auto &profile = nocRouterProfiles_[pu];
+    const double blockedFraction = profile.injection_presented
+        ? static_cast<double>(profile.injection_blocked) /
+          profile.injection_presented : 0.0;
+    const double avgFlits = samples
+        ? static_cast<double>(profile.occupancy_sum) / samples : 0.0;
+    routersFile << pu << ',' << col << ',' << row << ','
+                << profile.injection_presented << ','
+                << profile.injection_accepted << ','
+                << profile.injection_blocked << ',' << blockedFraction << ','
+                << profile.longest_injection_stall << ',' << avgFlits << ','
+                << profile.max_occupancy << ','
+                << profile.full_input_queue_cycles << '\n';
+  }
+
+  std::ofstream queueHist(*nocProfileDir_ + "/queue_histogram.csv");
+  queueHist << "occupancy,samples\n";
+  for (size_t occupancy = 0; occupancy < nocQueueOccupancy_.size(); ++occupancy)
+    queueHist << occupancy << ',' << nocQueueOccupancy_[occupancy] << '\n';
+
+  std::ofstream memifHist(*nocProfileDir_ + "/memif_histograms.csv");
+  memifHist << "mc,metric,value,cycles\n";
+  auto emitHistogram = [&](size_t mc, const char *name, const auto &histogram) {
+    for (size_t value = 0; value < histogram.size(); ++value)
+      if (histogram[value])
+        memifHist << mc << ',' << name << ',' << value << ','
+                  << histogram[value] << '\n';
+  };
+  for (size_t mc = 0; mc < cfg.numMC; ++mc) {
+    const auto &profile = nocMemifProfiles_[mc];
+    emitHistogram(mc, "allocated", profile.allocated);
+    emitHistogram(mc, "unissued", profile.unissued);
+    emitHistogram(mc, "issued_unfulfilled", profile.issued_unfulfilled);
+    emitHistogram(mc, "fulfilled", profile.fulfilled);
+    emitHistogram(mc, "broadcast", profile.broadcast);
+    emitHistogram(mc, "broadcast_queue", profile.broadcast_queue);
+    emitHistogram(mc, "bulk_queue", profile.bulk_queue);
+  }
+
+  std::ofstream memifs(*nocProfileDir_ + "/memifs.csv");
+  memifs << "mc,broadcast_blocked_cycles,broadcast_blocked_fraction,"
+            "external_request_presented,external_request_accepted,"
+            "external_response_accepted,mshr_unicast_local_retired,"
+            "mshr_unicast_remote_injected,ring_unicast_local_delivered,"
+            "broadcast_retired\n";
+  for (size_t mc = 0; mc < cfg.numMC; ++mc) {
+    const auto blocked = nocMemifProfiles_[mc].broadcast_blocked_cycles;
+    const auto &profile = nocMemifProfiles_[mc];
+    memifs << mc << ',' << blocked << ','
+           << (samples ? static_cast<double>(blocked) / samples : 0.0) << ','
+           << profile.external_request_presented << ','
+           << profile.external_request_accepted << ','
+           << profile.external_response_accepted << ','
+           << profile.mshr_unicast_local_retired << ','
+           << profile.mshr_unicast_remote_injected << ','
+           << profile.ring_unicast_local_delivered << ','
+           << profile.broadcast_retired << '\n';
+  }
+
+  std::ofstream destinations(*nocProfileDir_ + "/blocked_destinations.csv");
+  destinations << "mc,blocked_link_cycles\n";
+  for (size_t mc = 0; mc < cfg.numMC; ++mc)
+    destinations << mc << ',' << blockedByMc[mc] << '\n';
+
+  std::sort(hotspots.begin(), hotspots.end(), std::greater<>());
+  const uint64_t topOne = hotspots.empty() ? 0 : hotspots.front().first;
+  uint64_t topFive = 0;
+  for (size_t i = 0; i < std::min<size_t>(5, hotspots.size()); ++i)
+    topFive += hotspots[i].first;
+  size_t linksFor90Percent = 0;
+  uint64_t cumulative = 0;
+  while (linksFor90Percent < hotspots.size() &&
+         cumulative * 10 < totalBlocked * 9) {
+    cumulative += hotspots[linksFor90Percent++].first;
+  }
+
+  std::ofstream summary(*nocProfileDir_ + "/summary.txt");
+  summary << "start_cycle=" << nocProfileStartCycle_ << '\n'
+          << "stop_cycle=" << nocProfileStopCycle_ << '\n'
+          << "samples=" << samples << '\n'
+          << "link_presented=" << totalPresented << '\n'
+          << "link_accepted=" << totalAccepted << '\n'
+          << "link_blocked=" << totalBlocked << '\n'
+          << "link_blocked_fraction="
+          << (totalPresented ? static_cast<double>(totalBlocked) /
+                               totalPresented : 0.0) << '\n'
+          << "top_link_blocked_share="
+          << (totalBlocked ? static_cast<double>(topOne) / totalBlocked : 0.0)
+          << '\n'
+          << "top_5_links_blocked_share="
+          << (totalBlocked ? static_cast<double>(topFive) / totalBlocked : 0.0)
+          << '\n'
+          << "links_for_90_percent_blocking=" << linksFor90Percent << '\n';
+  for (size_t i = 0; i < std::min<size_t>(20, hotspots.size()); ++i) {
+    summary << "hotspot_" << i << "_src=" << hotspots[i].second.first
+            << " dst=" << hotspots[i].second.second
+            << " blocked=" << hotspots[i].first << '\n';
+  }
+
+  nocProfileWritten_ = true;
+  std::cerr << "[NoC profile] Wrote " << samples << " samples to "
+            << *nocProfileDir_ << '\n';
 }
 
 void SoftSystemBackend::printWorkProfile() const {
@@ -1407,6 +1765,7 @@ void SoftSystemBackend::printWorkProfile() const {
 
 bool SoftSystemBackend::printStats(uint64_t cycles, bool final_print) {
   if (final_print) {
+    if (nocProfileActive_) timerStatsStop(cycles);
     double v_ms = verilator_ns_ / 1e6;
     double u_ms = uncore_ns_ / 1e6;
     double tot_ms = v_ms + u_ms;
