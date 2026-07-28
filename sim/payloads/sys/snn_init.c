@@ -33,10 +33,29 @@
 #define STOP_ADDR   0x40000000u
 #define PRINT_PORT  0x4000000Cu
 
+#define AC_CTRL_CSR  0x730
+#define AC_GBASE_CSR 0x731
+#define AC_SBASE_CSR 0x732
+#define AC_LEN_CSR   0x733
+#define MEM_LINE_SIZE 64u
+
 static inline unsigned int csrr_f14(void) {
     unsigned int id;
     __asm__ volatile ("csrr %0, 0xF14" : "=r"(id));
     return id;
+}
+
+static inline void async_copy(unsigned int src, unsigned int dst,
+                              unsigned int size) {
+    __asm__ volatile ("csrw 0x731, %0" :: "r"(src) : "memory");
+    __asm__ volatile ("csrw 0x732, %0" :: "r"(dst) : "memory");
+    __asm__ volatile ("csrw 0x733, %0" :: "r"(size) : "memory");
+    __asm__ volatile ("csrw 0x730, zero" ::: "memory");
+
+    unsigned int remaining;
+    do {
+        __asm__ volatile ("csrr %0, 0x730" : "=r"(remaining) :: "memory");
+    } while (remaining != 0);
 }
 
 static void halt(unsigned int code) {
@@ -61,13 +80,14 @@ unsigned int snn_init(void) {
     unsigned int data_offset = section[desc_idx * 2];      /* relative to section start */
     unsigned int data_size   = section[desc_idx * 2 + 1];
 
-    volatile unsigned int *src = (volatile unsigned int *)(DRAM_BASE + spm_init_offset + data_offset);
-    volatile unsigned int *dst = (volatile unsigned int *)SPM_BASE;
-    unsigned int nwords = data_size / 4;
+    unsigned int src = DRAM_BASE + spm_init_offset + data_offset;
 
-    /* Copy SPM image from DRAM */
-    for (unsigned int i = 0; i < nwords; i++)
-        dst[i] = src[i];
+    if ((src & (MEM_LINE_SIZE - 1)) != 0 ||
+        (data_size & (MEM_LINE_SIZE - 1)) != 0)
+        halt(0xbad30000u | hartid);
+
+    /* Copy the complete SPM image from DRAM. */
+    async_copy(src, SPM_BASE, data_size);
 
     /* Read metadata from tail */
     unsigned int nn_count = *(volatile unsigned int *)(SPM_BASE + SPM_SIZE - 4);

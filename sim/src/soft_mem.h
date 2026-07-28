@@ -154,12 +154,14 @@ struct BulkDispatcher {
   }
 
   MSHR dispatch(uint32_t offset) const noexcept {
+    auto carried = returnCarried;
+    if (!broadcast) carried[0] = offset;
     return MSHR {
       .addr = static_cast<uint32_t>(base + offset * MEM_BUS_WIDTH_B),
       .src = static_cast<uint16_t>(broadcast ? 0 : src),
       .id = returnTag,
       .rwdata = {},
-      .carried = returnCarried,
+      .carried = carried,
       .size = MEM_BUS_WIDTH_SIZE,
       .write = false,
     };
@@ -169,6 +171,7 @@ struct BulkDispatcher {
 struct RingResp {
   uint16_t tag;
   uint16_t dst; // PU, because ring bus will only carry unicast responses for now
+  uint16_t ident;
   MemLine data;
 };
 
@@ -417,6 +420,7 @@ public:
     return RingResp {
       .tag = mshrs[slot].id,
       .dst = mshrs[slot].src,
+      .ident = static_cast<uint16_t>(mshrs[slot].carried[0]),
       .data = mshrs[slot].rwdata,
     };
   }
@@ -601,7 +605,7 @@ class DRAMIf : public MemIf {
 
 public:
   struct PUResp {
-    std::optional<std::pair<uint16_t, MemLine>> unicast;
+    std::optional<RingResp> unicast;
     std::optional<BcastLine> bcast;
   };
 
@@ -684,7 +688,7 @@ public:
       uint8_t puSubidx = puDelta % CLUSTER_SIZE;
       const auto &unicast = unicastPipes[dist];
       if (unicast && unicast->dst == puStart + puDelta)
-        pus[rangeDelta].unicast = {unicast->tag, unicast->data};
+        pus[rangeDelta].unicast = *unicast;
       else
         pus[rangeDelta].unicast = std::nullopt;
 

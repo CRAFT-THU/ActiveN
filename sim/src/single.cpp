@@ -199,12 +199,14 @@ struct SingleCoreSim {
     if(mem_resps.empty()) {
       core->mem_unicast_valid = false;
       core->mem_unicast_bits_id = 0;
+      core->mem_unicast_bits_ident = 0;
       for (int i = 0; i < MEM_BUS_WORDS; i++) {
         core->mem_unicast_bits_data[i] = 0;
       }
     } else {
       core->mem_unicast_valid = true;
       core->mem_unicast_bits_id = mem_resps.front().id;
+      core->mem_unicast_bits_ident = 0;
       for (int i = 0; i < MEM_BUS_WORDS; i++) {
         core->mem_unicast_bits_data[i] = mem_resps.front().data[i];
       }

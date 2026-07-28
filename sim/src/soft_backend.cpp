@@ -577,11 +577,12 @@ __attribute__((always_inline))
 static void presentCoreMem(soft_rtl &core, const soft_mem::DRAMIf::PUResp &resp) {
   core.mem_unicast_valid = resp.unicast.has_value();
   if (resp.unicast.has_value()) {
-    core.mem_unicast_bits_id = resp.unicast->first;
+    core.mem_unicast_bits_id = resp.unicast->tag;
+    core.mem_unicast_bits_ident = resp.unicast->ident;
     // The Verilated wide value and MemLine have the same byte layout.
-    static_assert(sizeof(core.mem_unicast_bits_data) == sizeof(resp.unicast->second));
-    std::memcpy(&core.mem_unicast_bits_data, resp.unicast->second.data(),
-                sizeof(resp.unicast->second));
+    static_assert(sizeof(core.mem_unicast_bits_data) == sizeof(resp.unicast->data));
+    std::memcpy(&core.mem_unicast_bits_data, resp.unicast->data.data(),
+                sizeof(resp.unicast->data));
   }
 
   core.mem_broadcast_valid = resp.bcast.has_value();
