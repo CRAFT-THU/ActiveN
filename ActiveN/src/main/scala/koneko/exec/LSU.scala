@@ -4,9 +4,16 @@ import chisel3._
 import chisel3.util._
 
 import koneko._
+import koneko.bus.OutgoingFlit
+import koneko.bus.Encoder
 
 // LSU: routes accesses to SPM (local scratchpad) or global memory
 class LSU(implicit val param: CoreParameters) extends Module {
+  // Async copy operation
+  object ACOps extends ChiselEnum {
+    val Load = Value
+  }
+
   val req = IO(Flipped(Irrevocable(new Bundle {
     val addr = UInt(32.W)
 
@@ -27,11 +34,20 @@ class LSU(implicit val param: CoreParameters) extends Module {
     val smsel = UInt(param.pipeCnt.W)
   })))
 
+  // Async-copy to/from global memory configurations
+  val ac = IO(new Bundle {
+    val gBase = Input(UInt(32.W))
+    val sBase = Input(UInt(32.W))
+    val len = Input(UInt(32.W))
+    val start = Flipped(Valid(ACOps()))
+    val remaining = Output(UInt(16.W))
+  })
+
   // Asserts that write and AMO cannot both be asserted
   assert(!req.valid || !req.bits.write || !req.bits.amo, "AMO and write cannot both be true")
   // LR/SC only supports 32-bit
   assert(!req.valid || !req.bits.lrsc || req.bits.len.w)
-  // Widthes are mutually exclusive
+  // Widths are mutually exclusive
   assert(!req.valid || (req.bits.len.w.asUInt + req.bits.len.h.asUInt + req.bits.len.b.asUInt) === 1.U)
 
   val resp = IO(Output(UInt(32.W)))
@@ -44,16 +60,66 @@ class LSU(implicit val param: CoreParameters) extends Module {
 
   val spm = Module(new SPM)
 
+  /* Async-copy state machine */
+  val acOp = Reg(ACOps()) // This is unused for now.
+  val acPending = RegInit(false.B) // Whether the async-copy request is not sent yet
+  val acRemaining = RegInit(0.U(16.W))
+
+  ac.remaining := acRemaining
+
+  // TODO: avoid accessing peripheral with a bulk load
+  // TODO: fail on >= 2^16 lines
+  val acmem = Wire(Decoupled(new MemReq))
+  acmem.bits.id := 1.U
+  acmem.bits.addr := ac.gBase
+  acmem.bits.bulk := true.B
+  acmem.bits.bulkSize := ac.len >> log2Ceil(param.memBusWidth / 8)
+  acmem.bits.write := false.B
+  acmem.bits.wdata := DontCare
+  acmem.bits.wbe := DontCare
+  acmem.bits.size := DontCare // Not used in bulk requests
+  acmem.valid := acPending
+  val spmBulkWrite = mem.resp.valid && mem.resp.bits.id === 1.U
+  val acNew = ac.start.valid && acRemaining === 0.U // Ignore new request if there is an ongoing one
+  when (acNew) {
+    acOp := ac.start.bits
+  }
+  acPending := MuxCase(acPending, Seq(
+    acNew -> true.B,
+    acmem.fire -> false.B,
+  ))
+  acRemaining := MuxCase(acRemaining, Seq(
+    acNew -> (ac.len >> log2Ceil(param.memBusWidth / 8)),
+    spmBulkWrite -> (acRemaining - 1.U)
+  ))
+
   val wmapped = Mux1H(Seq(
     req.bits.len.w -> req.bits.wdata,
-    req.bits.len.h -> req.bits.wdata(15, 0) ## req.bits.wdata(15, 0),
-    req.bits.len.b -> req.bits.wdata(7, 0) ## req.bits.wdata(7, 0) ## req.bits.wdata(7, 0) ## req.bits.wdata(7, 0),
+    req.bits.len.h -> Fill(2, req.bits.wdata(15, 0)),
+    req.bits.len.b -> Fill(4, req.bits.wdata(7, 0)),
   ))
   val wbe = Mux1H(Seq(
     req.bits.len.w -> 0xF.U(4.W),
     req.bits.len.h -> (0x3.U(4.W) << (req.bits.addr(1, 1) * 2 .U)),
     req.bits.len.b -> (0x1.U(4.W) << req.bits.addr(1, 0)),
   ))
+
+
+  val alignedAddr = (req.bits.addr >> 2) ## 0.U(2.W)
+
+  // Extract word from wide response based on address within the beat
+  val wordsPerBeat = param.memBusWidth / 32
+  val beatAlignBits = log2Ceil(param.memBusWidth / 8)
+  val wordInBeat = alignedAddr(beatAlignBits - 1, 2) // word offset within the beat
+  def takeWord(resp: UInt): UInt = {
+    val respWords = Wire(Vec(wordsPerBeat, UInt(32.W)))
+    for (i <- 0 until wordsPerBeat) {
+      respWords(i) := resp((i + 1) * 32 - 1, i * 32)
+    }
+    respWords(wordInBeat)
+  }
+  val gword = takeWord(mem.resp.bits.data)
+  val sword = takeWord(spm.io.data)
 
   // Address space routing:
   //   0x20000000-0x3FFFFFFF: SPM (scratchpad)
@@ -62,9 +128,12 @@ class LSU(implicit val param: CoreParameters) extends Module {
   val isSPM = req.bits.addr >= 0x20000000.U && req.bits.addr < 0x40000000.U
   assert(!req.valid || req.bits.addr >= 0x20000000.U, "Access to address below 0x20000000")
 
+  // TODO: detect misaligned access
+
+  val OFFSET_WIDTH = log2Ceil(param.memBusWidth / 8)
   val spmAddr = req.bits.addr - 0x20000000.U
-  val spmAlignedAddr = (spmAddr >> 2) ## 0.U(2.W)
-  val alignedAddr = (req.bits.addr >> 2) ## 0.U(2.W)
+  val spmAlignedAddr = (spmAddr >> OFFSET_WIDTH) ## 0.U(OFFSET_WIDTH.W)
+  val spmWordOffset = spmAddr(OFFSET_WIDTH - 1, 2) ## 0.U(2.W)
 
   // Reserved (aligned) addresses & counter
   val spmReservedAddr = Reg(Vec(param.pipeCnt, UInt(32.W)))
@@ -87,69 +156,85 @@ class LSU(implicit val param: CoreParameters) extends Module {
     }
   }
   scFail := !reserved
-  assert(!req.valid || !isSPM || !req.bits.amo || req.ready, "SPM requests must finish within one cycle")
+  // assert(!req.valid || !isSPM || !req.bits.amo || req.ready, "SPM requests must finish within one cycle")
 
   // --- SPM path (2-cycle reads / AMO, 1-cycle writes) ---
   val spmamoalu = Module(new AMOALU32)
-  spmamoalu.orig := spm.io.data
+  spmamoalu.orig := sword
   spmamoalu.input := req.bits.wdata
   spmamoalu.funct5 := req.bits.funct5
 
-  // SPM might be busy: new request, not write (AMO or read)
-  //   RegNext(req.ready || !req.valid) is the "new request" condition.
+  // SPM might be busy, in the following conditions:
+  // 1. Bulk load response takes precedence if this is a write, a new load, or an AMO
+  // 2. A new request, not write (AMO or read), needs a response, so is busy this cycle
+  //   We also take into account the fact that the request may not be sent last cycle
+  //   RegNext(req.ready || !req.valid || spmBulkWrite) is the "new request or blocked" condition.
+  //
+  // This scheme should guarantee a retry of AMO if the second cycle is blocked by a bulk load.
+  // A read will not be retried because we did not block its second cycle
+  //
   // Actual busy signal should also consider req.valid and isSPM
   // But for generating req.ready, this is sufficient
-  val spmBusy = RegNext(req.ready || !req.valid) && !req.bits.write
+  //
+  // The semantics of LRSC + async copy is UB for now.
+  // TODO: fix this
+  //
+  // It can also be busy if there is a bulk load response hitting us
+  val spmBusy = (
+    RegNext(req.ready || !req.valid || spmBulkWrite) && !req.bits.write
+    || spmBulkWrite && (req.bits.write || req.bits.amo)
+  )
 
-  spm.io.addr := spmAlignedAddr
-  spm.io.we := MuxCase(0.U(4.W), Seq(
+  val spmShortWe = MuxCase(0.U(4.W), Seq(
     (req.valid && isSPM && req.bits.write && (!req.bits.lrsc || reserved)) -> wbe,
-    RegNext(req.valid && !req.ready && isSPM && req.bits.amo) -> "b1111".U(4.W)
+    RegNext(req.valid && !req.ready && !spmBulkWrite && isSPM && req.bits.amo) -> "b1111".U(4.W)
   ))
+  val spmShortWdata = Mux(req.bits.amo, spmamoalu.written, wmapped)
+  val spmBulkWriteAddr = (mem.resp.bits.ident << log2Ceil(param.memBusWidth / 8)) + (ac.sBase - 0x20000000.U)
+  spm.io.addr := Mux(spmBulkWrite, spmBulkWriteAddr, spmAlignedAddr)
+  spm.io.we := Mux(spmBulkWrite, Fill(param.memBusWidth / 8, 1.U(1.W)), spmShortWe << spmWordOffset)
   // Note: AMO necessarily takes two cycles, so if req.bits.atomic causes timing hazard,
   // we can RegNext here.
-  spm.io.wdata := Mux(req.bits.amo, spmamoalu.written, wmapped)
+  spm.io.wdata := Mux(spmBulkWrite, mem.resp.bits.data, Fill(param.memBusWidth / 32, spmShortWdata))
 
   // --- Global memory path ---
   val memSent = RegInit(false.B)
   val memGotResp = RegInit(false.B)
-  val memRdata = Reg(UInt(32.W))
 
-  mem.req.valid := req.valid && !isSPM && !memSent
-  mem.req.bits.addr := req.bits.addr // full address (byte offset needed for sub-word stores)
-  mem.req.bits.size := Mux1H(Seq(
+  val gmem = Wire(Decoupled(new MemReq))
+  gmem.valid := req.valid && !isSPM && !memSent
+  gmem.bits.addr := req.bits.addr // full address (byte offset needed for sub-word stores)
+  gmem.bits.size := Mux1H(Seq(
     req.bits.len.b -> 0.U(2.W),
     req.bits.len.h -> 1.U(2.W),
     req.bits.len.w -> 2.U(2.W),
   ))
-  mem.req.bits.id := 0.U
-  mem.req.bits.wdata := wmapped
-  mem.req.bits.wbe := Mux(req.bits.write, wbe, 0.U)
-  mem.req.bits.write := req.bits.write
+  gmem.bits.id := 0.U
+  gmem.bits.wdata := wmapped
+  gmem.bits.wbe := Mux(req.bits.write, wbe, 0.U)
+  gmem.bits.write := req.bits.write
+  gmem.bits.bulkSize := DontCare
+  gmem.bits.bulk := false.B
 
-  val memReqFired = mem.req.fire
+  val memReqFired = gmem.fire
   when(memReqFired) { memSent := true.B }
   // Mem resp valid implies memSent && !memGotResp
-  assert(!mem.resp.valid || (memSent && !memGotResp), "Unexpected LSU memory response")
+  assert(!mem.resp.valid || mem.resp.bits.id =/= 0.U || (memSent && !memGotResp), "Unexpected LSU memory response")
 
-  // Extract word from wide response based on address within the beat
-  val wordsPerBeat = param.memBusWidth / 32
-  val beatAlignBits = log2Ceil(param.memBusWidth / 8)
-  val wordInBeat = alignedAddr(beatAlignBits - 1, 2) // word offset within the beat
-  val respWords = Wire(Vec(wordsPerBeat, UInt(32.W)))
-  for (i <- 0 until wordsPerBeat) {
-    respWords(i) := mem.resp.bits.data((i + 1) * 32 - 1, i * 32)
-  }
-  val memRespWord = respWords(wordInBeat)
+  val reqArb = Module(new Arbiter(new MemReq, 2))
+  reqArb.io.in(0) <> gmem
+  reqArb.io.in(1) <> acmem
+  mem.req <> reqArb.io.out
 
   // Response may arrive on same cycle as the request (combinational path through crossbar/driver)
   when(mem.resp.fire) {
-    memGotResp := true.B
-    memRdata := memRespWord
+    // FIXME: do we really need this latch? Can the pipeline block us
+    memGotResp := mem.resp.bits.id === 0.U
   }
+  val memRespLatch = RegEnable(gword, mem.resp.fire)
 
-  val globalDone = memGotResp || mem.resp.fire
-  val globalRdata = Mux(mem.resp.fire && !memGotResp, memRespWord, memRdata)
+  val globalDone = memGotResp || (mem.resp.fire && mem.resp.bits.id === 0.U)
+  val globalRdata = Mux(memGotResp, memRespLatch, gword)
 
   when(req.fire && !isSPM) {
     memSent := false.B
@@ -159,7 +244,7 @@ class LSU(implicit val param: CoreParameters) extends Module {
   // --- Ready and response mux ---
   req.ready := Mux(isSPM, !spmBusy, globalDone)
 
-  val rdata = Mux(isSPM, spm.io.data, globalRdata)
+  val rdata = Mux(isSPM, sword, globalRdata)
 
   val rhalf = rdata.asTypeOf(Vec(2, UInt(16.W)))(req.bits.addr(1, 1))
   val rbyte = rdata.asTypeOf(Vec(4, UInt(8.W)))(req.bits.addr(1, 0))

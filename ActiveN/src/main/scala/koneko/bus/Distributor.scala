@@ -43,6 +43,7 @@ class Distributor(
   val unicast = Common.pipeValid(in.unicast)
   out.unicast.resp.id := unicast.bits.id
   out.unicast.resp.data := unicast.bits.data
+  out.unicast.resp.ident := unicast.bits.ident
   out.unicast.valids := Fill(16, unicast.valid) & UIntToOH(unicast.bits.dst - puStart.U, 16)
 
   // Single slot queue for broadcasts

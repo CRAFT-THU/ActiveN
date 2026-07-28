@@ -9,10 +9,14 @@ class MemReq extends Bundle {
   val wdata = UInt(32.W)
   val wbe = UInt(4.W)
   val write = Bool()
+
+  val bulk = Bool()
+  val bulkSize = UInt(16.W) // In memBusWidth
 }
 
 class MemResp(implicit val param: CoreParameters) extends Bundle {
   val id = UInt(16.W)
+  val ident = UInt(16.W) // Used in bulk transfer to identify the request
   val data = UInt(param.memBusWidth.W)
 }
 

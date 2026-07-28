@@ -117,7 +117,8 @@ class BulkDispatcher extends Bundle {
     mshr.id := tag
     mshr.address := issueAddr(cnt)
     mshr.size := busParams.lineAddrShift.U
-    mshr.carried := carried
+    mshr.carried(0) := Mux(BulkType.isBroadcast(ty), carried(0), cnt)
+    mshr.carried(1) := carried(1)
     mshr
   }
 
@@ -161,6 +162,7 @@ class GlobalMemResp(implicit params: MemBusParameters) extends Bundle {
 class RingResp(implicit params: CoreParameters) extends Bundle {
   val dst  = UInt(16.W)
   val id   = UInt(16.W)
+  val ident = UInt(16.W) // Used in bulk transfer to identify the request
   val data = UInt(params.memBusWidth.W)
 }
 
@@ -231,6 +233,7 @@ abstract class MemIf(
   ucstEject.bits.dst := mshrs(ucstIdx).src
   ucstEject.bits.id := mshrs(ucstIdx).id
   ucstEject.bits.data := buffer(ucstIdx)
+  ucstEject.bits.ident := mshrs(ucstIdx).carried(0)
   ucstEject.valid := ucstMap.orR
   when(ucstEject.fire) {
     allocated(ucstIdx) := false.B

@@ -35,7 +35,7 @@ We currently allocates the following events Tag for memory requests / responses.
 - 0x?11: Bulk load
   - operand[0]: the start of the row
   - operand[1][31:16]: the length of the access (in MEM_BEATS bytes)
-  - operand[1][15:0]: the return tag value (which is unicasted, potentially remotely)
+  - operand[1][15:0]: the request ID
 - 0x?F0: Register idle notification
   - operand[0][31:16]: After +1, the least amount of cycle the handler need to be idle for this to trigger (+ 1 so 0 does not result in a trivially triggering notifier, i.e., idleCycle > operand[0][31:16]). Note that the idle counter will saturate at 0xFFFF, so if operand[0][31:16] = 0xFFFF, then this notifier will never fire
   - operand[0][15:0]: the return tag value

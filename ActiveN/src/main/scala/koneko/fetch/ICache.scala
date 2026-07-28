@@ -158,6 +158,8 @@ class ICache(implicit val params: CoreParameters) extends Module {
   mem.req.bits.wbe := 0.U
   mem.req.bits.write := false.B
   mem.req.bits.wdata := DontCare
+  mem.req.bits.bulk := false.B // TODO: refill with bulk
+  mem.req.bits.bulkSize := DontCare
   mem.req.valid := needRefill && !s1reqSentForBeat
   // Asserted that a response implies needRefill
   assert(!mem.resp.valid || needRefill, "Unexpected ICache memory response")
