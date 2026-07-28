@@ -121,6 +121,7 @@ object Main extends App {
   }
 
   var chiselArgs = Array("--target-dir", outputUnwrapped) ++ otherArgs
+  val firtoolArgs = Array("--default-layer-specialization=enable")
 
   if (system) {
     if (pu.isEmpty || mc.isEmpty) {
@@ -130,10 +131,10 @@ object Main extends App {
     implicit val sysParam = SystemParameters(mc.get, pu.get, param.copy(
       memCtrlSizes = List.fill(mc.get)(param.memCtrlSizes.head)
     ))
-    ChiselStage.emitSystemVerilogFile(new System, chiselArgs)
+    ChiselStage.emitSystemVerilogFile(new System, chiselArgs, firtoolArgs)
     writeJson(s"$outputUnwrapped/System.config.json", systemConfigJson(sysParam))
   } else {
-    ChiselStage.emitSystemVerilogFile(new Core()(param), chiselArgs)
+    ChiselStage.emitSystemVerilogFile(new Core()(param), chiselArgs, firtoolArgs)
     writeJson(s"$outputUnwrapped/Core.config.json", coreConfigJson(param))
   }
 }
