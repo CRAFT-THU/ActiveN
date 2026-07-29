@@ -33,11 +33,13 @@
 #define STOP_ADDR   0x40000000u
 #define PRINT_PORT  0x4000000Cu
 
-#define AC_CTRL_CSR  0x730
-#define AC_GBASE_CSR 0x731
-#define AC_SBASE_CSR 0x732
-#define AC_LEN_CSR   0x733
-#define MEM_LINE_SIZE 64u
+#ifndef MEM_LINE_BYTES
+#define MEM_LINE_BYTES 64
+#endif
+
+_Static_assert(MEM_LINE_BYTES > 0 &&
+               (MEM_LINE_BYTES & (MEM_LINE_BYTES - 1)) == 0,
+               "MEM_LINE_BYTES must be a power of two");
 
 static inline unsigned int csrr_f14(void) {
     unsigned int id;
@@ -82,8 +84,8 @@ unsigned int snn_init(void) {
 
     unsigned int src = DRAM_BASE + spm_init_offset + data_offset;
 
-    if ((src & (MEM_LINE_SIZE - 1)) != 0 ||
-        (data_size & (MEM_LINE_SIZE - 1)) != 0)
+    if ((src & (MEM_LINE_BYTES - 1)) != 0 ||
+        (data_size & (MEM_LINE_BYTES - 1)) != 0)
         halt(0xbad30000u | hartid);
 
     /* Copy the complete SPM image from DRAM. */

@@ -4,8 +4,8 @@
   #   lw t0, addr → x5 = raw bits → f5 = float interpretation
   #
   # Boot sequence:
-  #   1. PU1 runs snn_init() for itself, then sends token to PU2, etc.
-  #   2. Each PU calls snn_init() when it receives the token, then reports ready.
+  #   1. Every PU runs snn_init() concurrently using async global-to-SPM copy.
+  #   2. Each non-leader PU reports ready after its copy and local init complete.
   #   3. PU1 waits for all ready, then sends "go" to all PUs.
   #   4. All PUs install runtime handlers and begin the simulation.
   #
