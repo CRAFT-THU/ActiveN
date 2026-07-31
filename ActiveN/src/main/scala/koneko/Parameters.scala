@@ -5,7 +5,7 @@ import chisel3.util._
 
 case class CoreParameters(
   val initVec: BigInt = BigInt("60000000", 16),
-  val i$Lines: Int = 16,
+  val i$Lines: Int = 32,
   val i$BlockSize: Int = 64,
   val i$Assoc: Int = 2,
   val memBusWidth: Int = 512,
