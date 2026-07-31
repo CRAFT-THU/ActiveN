@@ -63,7 +63,8 @@ The end of the SNN SPM contains a descriptor of the data:
   is repeated in every PU image so the leader can read its local copy.
 
 The words from end - 0x18 through end - 0x20 are reserved for runtime
-termination state and are initialized to zero by the image generators.
+termination state. The word at end - 0x28 tracks overlapped next-step
+preparation. These words are initialized to zero by the image generators.
 
 ## CSR synapse data format
 
@@ -93,23 +94,48 @@ ROM to obtain the request's memory-line count.
 
 ## Numerical verification and termination
 
-After every PU finishes its neuron update, the leader waits for all DRAM MemIfs
-to report the configured idle interval. It then sends a lowest-priority ping to
-every PU. Since spike handlers have higher priority, the ping handler runs only
-after locally queued spikes have drained.
+After each PU finishes its neuron update, completion is reduced through a
+binary tree over the 1-based PU IDs. For nonroot zero-based index `i`,
+`lowbit(i)` is the size of its subtree and subtracting that value from its
+1-based PU ID gives its parent. A node sends one message containing its complete
+subtree size after both its local update and all child subtrees complete. PU1
+therefore receives only the completed top-level subtrees rather than one report
+from every PU.
 
-Each ping handler quantizes the PU's final mutable neuron fields by multiplying
-them by 10.0 in FP32 and converting to a signed integer with round-to-nearest,
-ties-to-even. It XORs those words into a local checksum and returns the checksum
-in its pong. Current-based neurons include state and input; conductance neurons
-include g_e, g_i, and membrane potential. The leader XORs all pong values and
-compares the result with the expected checksum at end - 0x24. A checksum XOR
-difference of at most 15 is accepted to tolerate small FP accumulation-order
-differences.
+PU1 then passes an idle-notifier installation token through the first PU in
+each MC domain. A domain leader registers a notifier only with its local MemIf.
+When that MemIf reports the configured idle interval, the leader immediately
+starts one lowest-priority drain token around the contiguous PUs in its domain.
+Since spike handlers have higher priority, each drain-token handler runs after
+the spike events already queued at that PU. The last PU returns the token to its
+domain leader, which sends one completed-domain result to PU1.
+
+Each PU disables its spike handler before forwarding the drain token, then uses
+the lowest-priority local handler to begin adding its accumulated input to
+neuron state and clearing the accumulator for the next step. Once all domains
+report completion, PU1 starts the next step with a high-priority token. Each PU
+forwards that token, synchronously finishes any remaining preparation, and
+re-enables the spike handler. Spikes from PUs that start the next step earlier
+remain buffered at a later PU until its preparation is complete, so this
+transition needs no additional global barrier.
+
+The drain token also accumulates the optional numerical checksum. Each PU
+quantizes its final mutable neuron fields by multiplying them by 10.0 in FP32
+and converting to a signed integer with round-to-nearest, ties-to-even. It XORs
+those words into the token. Current-based neurons include state and input;
+conductance neurons include g_e, g_i, and membrane potential. PU1 XORs the
+completed-domain values and compares the result with the expected checksum at
+end - 0x24. A checksum XOR difference of at most 15 is accepted to tolerate
+small FP accumulation-order differences.
 
 Numerical verification is enabled by default. Performance payloads can compile
-it out while retaining the idle and ping/pong termination barrier with:
+it out while retaining the idle and domain-drain termination barrier with:
 
 ```sh
 make -B sys/snn_main.bin NUM_PU=64 SNN_VERIFY_RESULT=0
 ```
+
+The payload defaults to one warmup step followed by four timed steps. Override
+these compile-time counts with `SNN_WARMUP_STEPS` and `SNN_TIMED_STEPS`. When
+generating its DRAM image, pass their sum as datagen's `--runtime-steps` so its
+per-step firing counts and final checksum cover the same interval.

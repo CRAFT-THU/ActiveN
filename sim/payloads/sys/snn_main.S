@@ -5,19 +5,26 @@
   #
   # Boot sequence:
   #   1. Every PU runs snn_init() concurrently using async global-to-SPM copy.
-  #   2. Each non-leader PU reports ready after its copy and local init complete.
-  #   3. PU1 waits for all ready, then sends "go" to all PUs.
-  #   4. All PUs install runtime handlers and begin the simulation.
+  #   2. Every PU installs its runtime handlers.
+  #   3. Each non-leader PU reports ready after its copy and handler setup.
+  #   4. PU1 waits for all ready, then passes a start token through all PUs.
   #
   # Runtime handler assignments (lower index = higher priority):
-  #   Handler 0 (tag=0): termination control — leader collects phase reports (argcnt=1)
+  #   Handler 0 (tag=0): update-completion tree reduction (argcnt=1)
   #   Handler 1 (tag=1): spike — incoming synapse event (argcnt=2)
-  #   Handler 2 (tag=2): termination ping — drain queued spike events, then pong (argcnt=0)
+  #   Handler 2 (tag=2): domain-local drain token (argcnt=2)
   #   Handler 3 (tag=3): work  — self-scheduled work loop (argcnt=1, margin=max(num_mc+1, 4), quota=0)
+  #   Handler 4 (tag=4): thread-1 runtime setup (argcnt=0)
+  #   Handler 5 (tag=5): boot readiness and start token (argcnt=1)
+  #   Handler 6 (tag=6): idle-notifier installation chain (argcnt=1)
+  #   Handler 7 (tag=7): MemIf idle return (argcnt=1)
+  #   Handler 8 (tag=8): completed-domain reduction (argcnt=2)
+  #   Handler 9 (tag=9): boot-readiness reduction at PU1 (argcnt=0)
+  #   Handler 10 (tag=10): low-priority next-step preparation (argcnt=1)
   #
   # Scatter CSR uses handler_tag=1 (spike handler).
-  # Work handler reserves room for all scatter sends and the four slots needed
-  # to enqueue the lowest-priority completion message.
+  # Work handler reserves room for all scatter sends and its following
+  # self-schedule or completion-reduction message, with a minimum margin of 4.
   #
   # Register assignments (s-registers, persistent across handlers):
   #   s0  = hartid (1-based)
@@ -27,7 +34,10 @@
   #   s4  = decay factor (FP32), accessed as fs4
   #   s5  = num_mc
   #   s6  = num_pu
+  #   s8  = next neuron awaiting next-step preparation on thread 0 (current mode)
+  #   s9  = local preparation handler tag (current mode)
   #   s10 = log2(memory-line bytes)
+  #   s11 = zero-based simulation step on thread 0
   #
   # Current SPM layout per neuron (stride = 8 + 4*num_mc bytes):
   #   +0:  state (f32)
@@ -59,6 +69,24 @@
 #error "SNN_VERIFY_RESULT must be 0 or 1"
 #endif
 
+#ifndef SNN_WARMUP_STEPS
+#define SNN_WARMUP_STEPS 1
+#endif
+
+#ifndef SNN_TIMED_STEPS
+#define SNN_TIMED_STEPS 4
+#endif
+
+#if SNN_WARMUP_STEPS < 0
+#error "SNN_WARMUP_STEPS must be nonnegative"
+#endif
+
+#if SNN_TIMED_STEPS < 1
+#error "SNN_TIMED_STEPS must be positive"
+#endif
+
+#define SNN_TOTAL_STEPS (SNN_WARMUP_STEPS + SNN_TIMED_STEPS)
+
 #define SPM_BASE        0x20000000
 #define SPM_SIZE        16384
 #define SPM_END         (SPM_BASE + SPM_SIZE)
@@ -72,7 +100,12 @@
   /* Working memory below tail descriptor */
 #define SPM_COUNTER     (SPM_END - 0x18)
 #define SPM_RESULT_XOR  (SPM_END - 0x1C)
-#define SPM_PHASE       (SPM_END - 0x20)
+#define SPM_FIRED       (SPM_END - 0x20)
+#define SPM_PREP_STATE  (SPM_END - 0x28)
+
+#define PREP_DONE       0
+#define PREP_QUEUED     1
+#define PREP_RUNNING    2
 
 #define STOP_ADDR       0x40000000
 #define TIMER_ADDR      0x40000004
@@ -84,29 +117,34 @@
 #define SCATTER_RESP_TAG 0x401 /* prio=1, handler=1 (spike) */
 #define UPDATE_DONE_TAG 0xC00  /* prio=3, handler=0 */
 #define IDLE_REGISTER_TAG 0xCF0 /* prio=3, register idle notification */
-#define IDLE_RETURN_TAG 0x400  /* prio=1, handler=0 */
+#define IDLE_RETURN_TAG 0x407  /* prio=1, handler=7 */
 #define IDLE_GATE        0x100
 #define IDLE_REGISTER_DATA ((IDLE_GATE << 16) | IDLE_RETURN_TAG)
-#define PING_TAG        0xC02  /* prio=3, handler=2 */
-#define PONG_TAG        0x400  /* prio=1, handler=0 */
-
-#define PHASE_UPDATES   0
-#define PHASE_MC_IDLE   1
-#define PHASE_PONGS     2
+#define DRAIN_TAG       0xC02  /* prio=3, handler=2 */
+#define START_TAG       0x005  /* prio=0, handler=5 */
+#define READY_TAG       0xC09  /* prio=3, handler=9 */
+#define NOTIFY_TAG      0xC06  /* prio=3, handler=6 */
+#define DOMAIN_DONE_TAG 0xC08  /* prio=3, handler=8 */
+#define PREP_TAG        0x00A  /* local-only handler=10 */
 
 #define SNN_CHECKSUM_SCALE 0x41200000 /* 10.0f */
 #define SNN_CHECKSUM_TOL   15
 
 #ifdef CONDUCTANCE
+#define SPIKE_ARGC 3
 #define NN_ACCUM_OFFSET 0
 #define NN_V_OFFSET     8
 #define NN_META_OFFSET  12
 #define NN_CSR_OFFSET   16
 #else
+#define SPIKE_ARGC 2
 #define NN_ACCUM_OFFSET 4
 #define NN_V_OFFSET     0
 #define NN_CSR_OFFSET   8
 #endif
+
+#define SPIKE_CFG_DISABLED SPIKE_ARGC
+#define SPIKE_CFG_ENABLED  ((3 << 3) | SPIKE_ARGC)
 
   .macro SEND dst_reg, tag_reg
   .insn r 0x0B, 0x4, 0x0, x0, \dst_reg, \tag_reg
@@ -114,6 +152,19 @@
 
   .macro YIELD dst_reg, tag_reg
   .insn r 0x0B, 0x5, 0x0, x0, \dst_reg, \tag_reg
+  .endm
+
+  # PU and MC counts are powers of two. Compute num_pu / num_mc without the
+  # unsupported RISC-V division extension.
+  .macro DOMAIN_SIZE dst_reg, tmp_reg
+  mv    \dst_reg, s6
+  mv    \tmp_reg, s5
+.Ldomain_size_loop_\@:
+  srli  \tmp_reg, \tmp_reg, 1
+  beqz  \tmp_reg, .Ldomain_size_done_\@
+  srli  \dst_reg, \dst_reg, 1
+  j     .Ldomain_size_loop_\@
+.Ldomain_size_done_\@:
   .endm
 
   .section .text
@@ -133,45 +184,15 @@ _start:
   call  snn_init
   jal   ra, load_sregisters
 
-  # Install boot handler: tag0 = boot_go (thread 0 only, argcnt=1).
-  # hanmargin=0 (no sends). Handler armed by writing hancfg last.
-  csrw  0x720, zero           # hanmargin: quota=0, margin=0
-
-  # PU1 (leader): init counters first, then install handler
-  li    t0, 1
-  beq   s0, t0, leader_boot
-
-  # Non-leader: install handler, send "ready" to PU1, wfi
-  la    a0, boot_go
-  csrw  0x700, a0             # address
-  li    a0, (1 << 3) | 1      # thread 0 only, argcnt=1
-  csrw  0x710, a0             # hancfg (enables handler)
-
-  li    a0, 0                 # ready signal (a0=0)
-  li    t0, 1                 # dst = PU1
-  li    t1, 0xC00             # tag = 0, priority 3 (lowest)
-  SEND  t0, t1
-  j     do_wfi
-
-leader_boot:
-  # Init leader termination state
+  # Each PU owns one reduction counter in its local SPM.
   li    t0, SPM_COUNTER
   sw    zero, 0(t0)
   li    t0, SPM_RESULT_XOR
   sw    zero, 0(t0)
-  li    t0, SPM_PHASE
-  sw    zero, 0(t0)
-
-  # Install handler now that counters are zeroed
-  la    a0, boot_go
-  csrw  0x700, a0             # address
-  li    a0, (1 << 3) | 1      # thread 0 only, argcnt=1
-  csrw  0x710, a0             # hancfg (enables handler)
-
-  # If only 1 PU, go directly
-  li    t0, 1
-  beq   s6, t0, boot_all_ready
-  j     do_wfi
+  li    t0, SPM_PREP_STATE
+  li    t1, PREP_QUEUED       # step zero still needs synchronous preparation
+  sw    t1, 0(t0)
+  j     install_runtime
 
 thread1_start:
   csrr  s0, 0xF14
@@ -186,87 +207,31 @@ thread1_start:
   wfi
 
   #============================================================
-  # boot_go handler (tag=0, argcnt=1)
-  # a0=0: "ready" from non-leader PU
-  # a0=1: "go" signal (leader broadcasts to start runtime)
-  #============================================================
-  .globl boot_go
-boot_go:
-  bnez  a0, install_runtime
-
-  # Leader: count ready messages (atomic)
-  li    t0, SPM_COUNTER
-  li    t1, 1
-  amoadd.w t2, t1, (t0)       # old = t2, *t0 += 1
-  addi  t2, t2, 1             # t2 = new value
-
-  addi  t3, s6, -1            # need num_pu - 1 ready msgs
-  bne   t2, t3, do_wfi
-  # fall through
-
-boot_all_ready:
-  # Debug: leader reports all PUs ready
-  li    t0, PRINT_PORT
-  li    t1, 0xA110001         # "all ready" marker
-  sw    t1, 0(t0)
-
-  # Start timer
-  li    t0, TIMER_ADDR
-  li    t1, 1
-  sw    t1, 0(t0)
-
-  # Reset termination state for the update-completion phase
-  li    t0, SPM_COUNTER
-  sw    zero, 0(t0)
-  li    t0, SPM_RESULT_XOR
-  sw    zero, 0(t0)
-  li    t0, SPM_PHASE
-  li    t1, PHASE_UPDATES
-  sw    t1, 0(t0)
-
-  # Broadcast "go" to all other PUs
-  li    t3, 2
-boot_go_loop:
-  bgt   t3, s6, boot_go_self
-  li    a0, 1                 # a0=1 means "go"
-  mv    t0, t3
-  li    t1, 0                 # tag=0
-  SEND  t0, t1
-  addi  t3, t3, 1
-  j     boot_go_loop
-
-boot_go_self:
-  j     install_runtime
-
-  #============================================================
-  # install_runtime: set up handler CSRs and start simulation
+  # install_runtime: set up all handler CSRs before reporting ready
   #============================================================
 install_runtime:
-  # Handler 0: termination_control (argcnt=1, margin=0, quota=0) — highest priority
-  la    a0, termination_control
+  # Handler 0: update-completion reduction (argcnt=1, margin=2).
+  la    a0, termination_reduce
   csrw  0x700, a0
-  csrw  0x720, zero           # hanmargin: quota=0, margin=0
+  li    a0, 2
+  csrw  0x720, a0
   li    a0, (1 << 3) | 1      # thread 0 only, argcnt=1
   csrw  0x710, a0             # hancfg (thread 0 only for now)
 
-  # Handler 1: spike — second highest. Conductance mode also receives a2,
-  # the presynaptic E/I metadata carried by the scatter request.
+  # Handler 1: spike — second highest. It remains disabled until this PU has
+  # prepared its state for the first simulation step.
   la    a0, spike
   csrw  0x701, a0
   csrw  0x721, zero           # hanmargin: quota=0, margin=0
-#ifdef CONDUCTANCE
-  li    a0, (1 << 3) | 3      # thread 0 only, argcnt=3
-#else
-  li    a0, (1 << 3) | 2      # thread 0 only, argcnt=2
-#endif
-  csrw  0x711, a0             # hancfg (thread 0 only for now)
+  li    a0, SPIKE_CFG_DISABLED
+  csrw  0x711, a0
 
-  # Handler 2: termination_ping (argcnt=0, margin=1, quota=0)
-  la    a0, termination_ping
+  # Handler 2: domain-local drain token (argcnt=2, margin=1).
+  la    a0, termination_drain
   csrw  0x702, a0
   li    a0, 1
   csrw  0x722, a0             # hanmargin: quota=0, margin=1
-  li    a0, (1 << 3) | 0      # thread 0 only, argcnt=0
+  li    a0, (1 << 3) | 2      # thread 0 only, argcnt=2
   csrw  0x712, a0             # hancfg (thread 0 only for now)
 
   # Handler 3: work_update (argcnt=1, margin=max(num_mc+1, 4), quota=0) — lowest priority
@@ -281,14 +246,173 @@ install_runtime:
   li    a0, (1 << 3) | 1      # thread 0 only, argcnt=1
   csrw  0x713, a0             # hancfg (thread 0 only for now)
 
+  # Handler 5: boot ready/start token (argcnt=1, margin=0). Start tokens form
+  # a bounded priority-0 tree: each PU receives one token and only sends to its
+  # children, so blocking sends cannot form a dependency cycle.
+  la    a0, boot_control
+  csrw  0x705, a0
+  csrw  0x725, zero
+  li    a0, (1 << 3) | 1
+  csrw  0x715, a0
+
+  # Handler 6: notifier-installation chain (argcnt=1, margin=2).
+  la    a0, termination_install
+  csrw  0x706, a0
+  li    a0, 2
+  csrw  0x726, a0
+  li    a0, (1 << 3) | 1
+  csrw  0x716, a0
+
+  # Handler 7: MemIf idle return (argcnt=1, margin=1).
+  la    a0, termination_idle
+  csrw  0x707, a0
+  li    a0, 1
+  csrw  0x727, a0
+  li    a0, (1 << 3) | 1
+  csrw  0x717, a0
+
+  # Handler 8: completed-domain reduction at PU1 (argcnt=2, margin=1).
+  la    a0, termination_domain_done
+  csrw  0x708, a0
+  li    a0, 1
+  csrw  0x728, a0
+  li    a0, (1 << 3) | 2
+  csrw  0x718, a0
+
+  # Handler 9: boot-readiness reduction at PU1 (argcnt=0, margin=1).
+  la    a0, boot_ready
+  csrw  0x709, a0
+  li    a0, 1
+  csrw  0x729, a0
+  li    a0, (1 << 3) | 0
+  csrw  0x719, a0
+
+  # Handler 10: low-priority next-step preparation (argcnt=1, margin=0).
+  # Its index keeps every existing runtime handler ahead of it.
+  la    a0, prepare_next
+  csrw  0x70A, a0
+  csrw  0x72A, zero
+  li    a0, (1 << 3) | 1
+  csrw  0x71A, a0
+
   # Trigger spm_init_finished for thread 1 (local send, tag=4).
   # Thread 1 will call load_sregisters and then add itself to handlers 0-3.
   li    t1, 4
   SEND  zero, t1              # dst=x0 (local), tag=4
 
-  # Start: enter update phase directly (snn_init already did state+=input)
+  # Thread 1 sends the handler-5 prewarm event after its persistent registers
+  # and runtime handler masks are initialized. Receiving that event therefore
+  # proves that both hardware threads are ready.
+  j     do_wfi
+
+  #============================================================
+  # boot_control (tag=5, argcnt=1)
+  # a0=0: prewarm the start path, then report readiness
+  # a0=step+1: high-priority start token
+  #============================================================
+  .p2align 5
+boot_control:
+  beqz  a0, boot_prepared
+
+  addi  s11, a0, -1
+
+  # Reset this PU before forwarding the token. This prevents a child update
+  # completion from reaching its parent before the parent's counter is ready.
+  li    t0, SPM_COUNTER
+  sw    zero, 0(t0)
+  li    t0, SPM_FIRED
+  sw    zero, 0(t0)
+
+  # Build the broadcast tree over zero-based PU indices. The root starts at
+  # num_pu/2; every other node starts at lowbit(index)/2. Descending bits send
+  # the child with the largest remaining subtree first.
+  addi  t2, s0, -1
+  bnez  t2, boot_start_nonroot
+  srli  t3, s6, 1
+  j     boot_start_children
+
+boot_start_nonroot:
+  neg   t3, t2
+  and   t3, t2, t3
+  srli  t3, t3, 1
+
+boot_start_children:
+  beqz  t3, boot_prepare_state
+  or    t0, t2, t3
+  addi  t0, t0, 1
+  li    t1, START_TAG
+  SEND  t0, t1
+  srli  t3, t3, 1
+  j     boot_start_children
+
+boot_prepare_state:
+#ifndef CONDUCTANCE
+  # Finish any preparation that did not fit under the preceding drain/start
+  # interval before accepting a spike belonging to this step. A queued state
+  # means the low-priority handler never started, so resume from the base.
+  li    t0, SPM_PREP_STATE
+  lw    t1, 0(t0)
+  andi  t1, t1, 3
+  li    t2, PREP_QUEUED
+  beq   t1, t2, boot_prepare_from_base
+  mv    t3, s8
+  j     boot_prepare_loop
+boot_prepare_from_base:
+  li    t3, SPM_BASE
+boot_prepare_loop:
+  beq   t3, s1, boot_prepare_done
+  lw    t0, NN_V_OFFSET(t3)
+  lw    t1, NN_ACCUM_OFFSET(t3)
+  fadd.s f5, f5, f6
+  sw    t0, NN_V_OFFSET(t3)
+  sw    zero, NN_ACCUM_OFFSET(t3)
+  add   t3, t3, s2
+  j     boot_prepare_loop
+#endif
+
+boot_prepare_done:
+  mv    s8, s1                  # any preempted preparation event is now stale
+  li    t0, SPM_PREP_STATE
+  slli  t1, s11, 2
+  sw    t1, 0(t0)               # current step, PREP_DONE
+  li    t0, SPIKE_CFG_ENABLED
+  csrw  0x711, t0
   li    a0, SPM_BASE
   j     work_update
+
+boot_prepared:
+  li    t0, 1
+  beq   s0, t0, leader_prepared
+  li    t0, 1
+  li    t1, READY_TAG
+  YIELD t0, t1
+  j     do_wfi
+
+leader_prepared:
+  li    t0, 1
+  beq   s6, t0, boot_all_ready
+  j     do_wfi
+
+  #============================================================
+  # boot_ready (tag=9, argcnt=0)
+  #============================================================
+boot_ready:
+  li    t0, SPM_COUNTER
+  li    t1, 1
+  amoadd.w t2, t1, (t0)
+  addi  t2, t2, 1
+  addi  t3, s6, -1
+  bne   t2, t3, do_wfi
+
+boot_all_ready:
+#if SNN_WARMUP_STEPS == 0
+  li    t0, TIMER_ADDR
+  li    t1, 1
+  sw    t1, 0(t0)
+#endif
+
+  li    a0, 1
+  j     boot_control
 
 do_wfi:
   wfi
@@ -297,15 +421,18 @@ do_wfi:
   # spm_init_finished (tag=4, argcnt=0, thread 1 only)
   # Triggered by thread 0 after install_runtime. Sets up s-registers
   # from the already-initialized SPM and adds thread 1 to all runtime
-  # handler bitmasks, then enters the idle WFI loop.
+  # handler bitmasks, then enters the idle WFI loop. The spike handler remains
+  # disabled until the start token prepares this PU's state.
   #============================================================
 spm_init_finished:
   call  load_sregisters       # set s0-s6 from SPM tail + DRAM header
   li    a0, (1 << 4)          # bit 4 = thread 1
-  csrs  0x710, a0             # add thread 1 to handler 0 (termination control)
-  csrs  0x711, a0             # add thread 1 to handler 1 (spike)
-  csrs  0x712, a0             # add thread 1 to handler 2 (termination ping)
+  csrs  0x710, a0             # add thread 1 to handler 0 (completion reduction)
+  csrs  0x712, a0             # add thread 1 to handler 2 (domain drain)
   csrs  0x713, a0             # add thread 1 to handler 3 (work_update)
+  li    a0, 0
+  li    t1, START_TAG
+  YIELD zero, t1              # prewarm/report readiness on thread 0
   j     do_wfi
 
   #============================================================
@@ -314,9 +441,6 @@ spm_init_finished:
   #============================================================
   .globl spike
 spike:
-  bnez  s2, 1f
-  jal   ra, setup_regs
-1:
   mul   a0, a0, s2            # sub_idx * stride
   li    t0, SPM_BASE
   add   a0, a0, t0            # neuron address
@@ -336,24 +460,12 @@ spike_lrsc:
   wfi
 
   #------------------------------------------------------------
-  # work_update (tag=0, argcnt=1: a0=neuron_address)
+  # work_update (tag=3, argcnt=1: a0=neuron_address)
   # Entered directly from install_runtime or via self-yield.
   #------------------------------------------------------------
   .globl work_update
 work_update:
-  bnez  s2, 1f
-  jal   ra, setup_regs
-1:
   beq   a0, s1, work_update_done
-
-  # Debug: print a0 when at neuron 0 (start of each pass)
-  li    t0, SPM_BASE
-  bne   a0, t0, 2f
-  li    t0, PRINT_PORT
-  li    t1, 0xA0000000           # "work pass start" marker
-  or    t1, t1, s0               # | hartid
-  sw    t1, 0(t0)
-2:
 
 #ifdef CONDUCTANCE
   # Preserve the neuron pointer while the shared integer/FP a-registers are
@@ -429,6 +541,11 @@ conductance_fired:
   sw    zero, NN_V_OFFSET(a0)
 #endif
 
+  # Count fired neurons independently of which thread executes this handler.
+  li    t0, SPM_FIRED
+  li    t1, 1
+  amoadd.w zero, t1, (t0)
+
   # Preserve the source pointer and carry its E/I metadata to every response.
   mv    t0, a0
 #ifdef CONDUCTANCE
@@ -496,162 +613,314 @@ work_not_fired:
   j     do_wfi
 
 work_update_done:
-  # Debug: report this PU finished the firing loop
-  li    t0, PRINT_PORT
-  li    t1, 0xF1000000           # "firing done" marker
-  or    t1, t1, s0               # | hartid
-  sw    t1, 0(t0)
+  # Contribute this PU to its local completion subtree. Child reports may have
+  # arrived before local work completed, but the subtree cannot complete until
+  # this contribution is included.
+  li    a0, 1
+  j     termination_reduce
 
-  # Report update completion to the leader at the lowest NoC priority.
-  # Earlier priority-1 scatter requests leave this PU's send queue first.
-  li    a0, 0
-  li    t0, 1
+  #------------------------------------------------------------
+  # termination_reduce (tag=0, argcnt=1)
+  # Every nonroot node reports one accumulated subtree size to its parent.
+  # For zero-based index i, lowbit(i) is the node's subtree size and subtracting
+  # it from the 1-based hartid gives the parent hartid.
+  #------------------------------------------------------------
+  .globl termination_reduce
+termination_reduce:
+  li    t0, SPM_COUNTER
+  amoadd.w t2, a0, (t0)
+  add   t2, t2, a0             # new accumulated subtree size
+
+  li    t4, 1
+  beq   s0, t4, termination_root_expected
+  addi  t3, s0, -1             # zero-based PU index
+  neg   t4, t3
+  and   t3, t3, t4             # expected = lowbit(index)
+  j     termination_reduce_check
+
+termination_root_expected:
+  mv    t3, s6                  # root covers the complete tree
+
+termination_reduce_check:
+  bltu  t2, t3, do_wfi
+  bgtu  t2, t3, termination_fail
+
+  li    t4, 1
+  beq   s0, t4, termination_reduction_done
+
+  mv    a0, t3                  # report the complete subtree size
+  sub   t0, s0, t3              # parent hartid
   li    t1, UPDATE_DONE_TAG
   YIELD t0, t1
   j     do_wfi
 
+termination_reduction_done:
+  # Reuse the root counter for completed domains and initialize the checksum
+  # accumulator before any notifier can return.
+  li    t0, SPM_COUNTER
+  sw    zero, 0(t0)
+  li    t0, SPM_RESULT_XOR
+  sw    zero, 0(t0)
+
+  # PU1 is the leader of domain zero, so it installs that notifier directly.
+  li    a0, IDLE_REGISTER_DATA
+  li    t0, MC_DST_BASE
+  li    t1, IDLE_REGISTER_TAG
+  SEND  t0, t1
+
+  # Pass installation to the next domain leader. The token carries its
+  # zero-based domain index.
+  li    t3, 1
+  bgeu  t3, s5, do_wfi
+  DOMAIN_SIZE t4, t2            # PUs per MC domain
+  addi  t0, t4, 1               # first PU in domain one
+  mv    a0, t3
+  li    t1, NOTIFY_TAG
+  SEND  t0, t1
+  j     do_wfi
+
   #------------------------------------------------------------
-  # termination_ping (tag=2, argcnt=0)
-  # The ping is lowest priority, below queued spike events. Compute the local
-  # numerical checksum only after it schedules, then pong the leader at
-  # priority 1. Performance builds compile out the neuron scan.
+  # termination_install (tag=6, argcnt=1)
+  # a0 is this leader's zero-based MC/domain index.
   #------------------------------------------------------------
-termination_ping:
-  bnez  s2, 1f
-  jal   ra, setup_regs
-1:
-#if SNN_VERIFY_RESULT
-  li    t0, SPM_BASE
+termination_install:
+  mv    a2, a0
+  li    a0, IDLE_REGISTER_DATA
+  li    t0, MC_DST_BASE
+  add   t0, t0, a2
+  li    t1, IDLE_REGISTER_TAG
+  SEND  t0, t1
+
+  addi  a2, a2, 1
+  bgeu  a2, s5, do_wfi
+  DOMAIN_SIZE t2, t3
+  mul   t0, a2, t2
+  addi  t0, t0, 1               # first PU in the next domain
+  mv    a0, a2
+  li    t1, NOTIFY_TAG
+  SEND  t0, t1
+  j     do_wfi
+
+  #------------------------------------------------------------
+  # termination_idle (tag=7, argcnt=1)
+  # Start the local drain token immediately after this domain's MC reports
+  # success. The leader contributes its checksum before sending the token.
+  #------------------------------------------------------------
+termination_idle:
+  bnez  a0, termination_fail
+
+  # No old-step spike can remain ahead of this low-priority notification.
+  # Disable the handler before passing the drain token so next-step spikes are
+  # retained in its event queue until this PU has prepared the next state.
+  li    t0, SPIKE_CFG_DISABLED
+  csrw  0x711, t0
+
   li    a0, 0
+  call  termination_checksum
+
+  li    t0, SPM_FIRED
+  lw    a1, 0(t0)
+  li    t1, 1
+  bne   s0, t1, 1f
+  sw    zero, 0(t0)            # PU1 reuses this word for domain aggregation
+1:
+
+  DOMAIN_SIZE t2, t3
+  li    t3, 1
+  beq   t2, t3, termination_report_domain_prepare
+  addi  t0, s0, 1
+  li    t1, DRAIN_TAG
+  SEND  t0, t1
+  j     termination_schedule_prepare
+
+  #------------------------------------------------------------
+  # termination_drain (tag=2, argcnt=2)
+  # The lowest-priority token visits every nonleader PU in this MC domain and
+  # returns the accumulated checksum to the domain leader.
+  #------------------------------------------------------------
+termination_drain:
+  DOMAIN_SIZE t2, t3             # domain size
+  addi  t0, s0, -1
+  addi  t1, t2, -1
+  and   t1, t0, t1
+  beqz  t1, termination_report_domain
+
+  li    t0, SPIKE_CFG_DISABLED
+  csrw  0x711, t0
+  mv    a2, t2
+  call  termination_checksum
+  li    t0, SPM_FIRED
+  lw    t1, 0(t0)
+  add   a1, a1, t1
+
+  addi  t0, s0, -1
+  addi  t3, a2, -1
+  or    t3, t0, t3
+  addi  t3, t3, 1               # last hartid in this domain
+  bne   s0, t3, termination_drain_next
+  sub   t0, t3, a2
+  addi  t0, t0, 1               # wrap to this domain's leader
+  j     termination_drain_send
+
+termination_drain_next:
+  addi  t0, s0, 1
+
+termination_drain_send:
+  li    t1, DRAIN_TAG
+  SEND  t0, t1
+  j     termination_schedule_prepare
+
+termination_report_domain:
+  # Domain zero reports locally; every other domain sends one result to PU1.
+  li    t0, 1
+  bne   s0, t0, 1f
+  li    t0, 0
+1:
+  li    t1, DOMAIN_DONE_TAG
+  YIELD t0, t1
+  j     do_wfi
+
+termination_report_domain_prepare:
+  # A single-PU domain has no returning token, so report without yielding and
+  # then start its preparation just like a multi-PU domain leader.
+  li    t0, 1
+  bne   s0, t0, 1f
+  li    t0, 0
+1:
+  li    t1, DOMAIN_DONE_TAG
+  SEND  t0, t1
+  # fall through
+
+termination_schedule_prepare:
+#ifndef CONDUCTANCE
+  # The state word carries the current step above its two phase bits, so this
+  # works even when the drain handler was scheduled on thread 1.
+  li    t0, SPM_PREP_STATE
+  lw    t2, 0(t0)
+  srli  t3, t2, 2
+  addi  t3, t3, 1
+  li    t4, SNN_TOTAL_STEPS
+  bgeu  t3, t4, do_wfi
+  andi  t2, t2, -4
+  ori   a0, t2, PREP_QUEUED
+  sw    a0, 0(t0)
+  YIELD zero, s9
+#endif
+  j     do_wfi
+
+  #------------------------------------------------------------
+  # prepare_next (tag=10, argcnt=1)
+  # Prepare one neuron, then yield so all runtime control and start handlers
+  # can run promptly. A stale generation performs no work.
+  #------------------------------------------------------------
+prepare_next:
+#ifndef CONDUCTANCE
+  li    t0, SPM_PREP_STATE
+  lw    t1, 0(t0)
+  bne   a0, t1, do_wfi         # preempted event from an older step
+
+  andi  t2, a0, 3
+  li    t3, PREP_QUEUED
+  bne   t2, t3, prepare_next_running
+  li    s8, SPM_BASE
+  andi  a0, a0, -4
+  ori   a0, a0, PREP_RUNNING
+  sw    a0, 0(t0)
+
+prepare_next_running:
+  beq   s8, s1, do_wfi
+  lw    t0, NN_V_OFFSET(s8)
+  lw    t1, NN_ACCUM_OFFSET(s8)
+  fadd.s f5, f5, f6
+  sw    t0, NN_V_OFFSET(s8)
+  sw    zero, NN_ACCUM_OFFSET(s8)
+  add   s8, s8, s2
+  bne   s8, s1, 1f
+  li    t0, SPM_PREP_STATE
+  andi  t1, a0, -4
+  sw    t1, 0(t0)               # current step, PREP_DONE
+  j     do_wfi
+1:
+  YIELD zero, s9
+#endif
+  j     do_wfi
+
+  #------------------------------------------------------------
+  # Fold this PU's numerical checksum into the accumulator in a0.
+  # Performance builds compile out the neuron scan.
+  #------------------------------------------------------------
+termination_checksum:
+#if SNN_VERIFY_RESULT
+  mv    a3, a0
+  li    t0, SPM_BASE
   li    t2, SNN_CHECKSUM_SCALE
 termination_checksum_loop:
-  beq   t0, s1, termination_pong
+  beq   t0, s1, termination_checksum_done
 
   lw    t1, 0(t0)
   fmul.s f6, f6, f7, rne
   fcvt.w.s t1, f6, rne
-  xor   a0, a0, t1
+  xor   a3, a3, t1
 
   lw    t1, 4(t0)
   fmul.s f6, f6, f7, rne
   fcvt.w.s t1, f6, rne
-  xor   a0, a0, t1
+  xor   a3, a3, t1
 
 #ifdef CONDUCTANCE
   lw    t1, 8(t0)
   fmul.s f6, f6, f7, rne
   fcvt.w.s t1, f6, rne
-  xor   a0, a0, t1
+  xor   a3, a3, t1
 #endif
 
   add   t0, t0, s2
   j     termination_checksum_loop
-#else
-  li    a0, 0
+
+termination_checksum_done:
+  mv    a0, a3
 #endif
+  ret
 
-termination_pong:
-  li    t0, 1
-  li    t1, PONG_TAG
-  YIELD t0, t1
-  j     do_wfi
-
-  #============================================================
-  # termination_control (tag=0, argcnt=1)
-  # Phase 0: count PU update-completion reports.
-  # Phase 1: count successful DRAM MemIf idle notifications.
-  # Phase 2: accumulate PU checksums and stop the workload.
-  #============================================================
-  .globl termination_control
-termination_control:
-  bnez  s2, 1f
-  jal   ra, setup_regs
-1:
-  li    t0, SPM_PHASE
-  lw    t1, 0(t0)
-  beqz  t1, termination_updates
-  li    t2, PHASE_MC_IDLE
-  beq   t1, t2, termination_mc_idle
-  li    t2, PHASE_PONGS
-  beq   t1, t2, termination_pongs
-  j     termination_fail
-
-termination_updates:
-  li    t0, SPM_COUNTER
+  #------------------------------------------------------------
+  # termination_domain_done (tag=8, argcnt=2)
+  # PU1 combines one result per MC domain and advances the simulation.
+  #------------------------------------------------------------
+termination_domain_done:
   li    t1, 1
-  amoadd.w t2, t1, (t0)       # old = t2, *t0 += 1
-  addi  t2, t2, 1             # t2 = new value
-  bne   t2, s6, do_wfi
-
-  # All PUs completed their neuron updates. Reset the shared counter and move
-  # to the MC-idle phase before sending any registrations, so an early return
-  # cannot be interpreted as another update report.
   li    t0, SPM_COUNTER
-  sw    zero, 0(t0)
-  li    t0, SPM_PHASE
-  li    t1, PHASE_MC_IDLE
-  sw    t1, 0(t0)
-
-  # Register one accumulated-idle notifier on each DRAM MC. The peripheral
-  # MemIf at destination 0x8000 is intentionally excluded.
-  li    t3, 0
-  li    t4, MC_DST_BASE
-termination_register_loop:
-  beq   t3, s5, do_wfi
-  li    a0, IDLE_REGISTER_DATA
-  li    t1, IDLE_REGISTER_TAG
-  SEND  t4, t1
-  addi  t3, t3, 1
-  addi  t4, t4, 1
-  j     termination_register_loop
-
-termination_mc_idle:
-  # A nonzero result is a registration rejection, not an idle notification.
-  bnez  a0, termination_fail
-
-  li    t0, SPM_COUNTER
-  li    t1, 1
   amoadd.w t2, t1, (t0)
   addi  t2, t2, 1
-  bne   t2, s5, do_wfi
 
-  # All DRAM MCs have idled. Enter the pong phase before emitting pings and
-  # reset the final result accumulator.
-  li    t0, SPM_COUNTER
-  sw    zero, 0(t0)
-#if SNN_VERIFY_RESULT
-  li    t0, SPM_RESULT_XOR
-  sw    zero, 0(t0)
-#endif
-  li    t0, SPM_PHASE
-  li    t1, PHASE_PONGS
-  sw    t1, 0(t0)
-
-  # Send a lowest-priority ping to every PU, including the leader itself.
-  li    t3, 1
-termination_ping_loop:
-  bgt   t3, s6, do_wfi
-  li    a0, 0
-  mv    t0, t3
-  li    t1, PING_TAG
-  SEND  t0, t1
-  addi  t3, t3, 1
-  j     termination_ping_loop
-
-termination_pongs:
 #if SNN_VERIFY_RESULT
   li    t0, SPM_RESULT_XOR
   amoxor.w zero, a0, (t0)
 #endif
+  li    t0, SPM_FIRED
+  amoadd.w zero, a1, (t0)
+  bne   t2, s5, do_wfi
 
-  li    t0, SPM_COUNTER
+  # Every domain has drained and reported. Emit one firing count per step.
+  li    t0, SPM_FIRED
+  lw    t1, 0(t0)
+  li    t0, PRINT_PORT
+  sw    t1, 0(t0)
+
+  addi  t2, s11, 1
+  li    t3, SNN_TOTAL_STEPS
+  beq   t2, t3, termination_all_steps_done
+
+  # The timer begins immediately before preparation of the first timed step.
+  li    t3, SNN_WARMUP_STEPS
+  bne   t2, t3, 1f
+  li    t0, TIMER_ADDR
   li    t1, 1
-  amoadd.w t2, t1, (t0)
-  addi  t2, t2, 1
-  bne   t2, s6, do_wfi
+  sw    t1, 0(t0)
+1:
+  addi  a0, t2, 1
+  j     boot_control
 
-  # All PUs drained their events and ponged. Stop the timer before reporting
-  # or checking the numerical result.
+termination_all_steps_done:
   li    t0, TIMER_ADDR
   sw    zero, 0(t0)
 
@@ -720,6 +989,8 @@ setup_regs:
   lw    s6, 12(t0)            # num_pu
   li    t0, CONFIG_ROM_ADDR
   lw    s10, 24(t0)           # log2(memory-line bytes)
+  li    s8, SPM_BASE
+  li    s9, PREP_TAG
   ret
 
   #============================================================

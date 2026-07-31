@@ -2,8 +2,8 @@
  * SNN initialization — C implementation
  *
  * Called from snn_main.S after stack setup.
- * Reads the SPM init descriptor from DRAM, copies neuron data to SPM,
- * and runs the current-based init loop (state += input, clear input).
+ * Reads the SPM init descriptor from DRAM and copies neuron data to SPM.
+ * Runtime timestep preparation consumes the copied input accumulator.
  * Conductance images already contain their pre-simulated ge/gi/v state.
  *
  * Returns hartid.
@@ -91,35 +91,11 @@ unsigned int snn_init(void) {
     /* Copy the complete SPM image from DRAM. */
     async_copy(src, SPM_BASE, data_size);
 
-    /* Read metadata from tail */
-    unsigned int nn_count = *(volatile unsigned int *)(SPM_BASE + SPM_SIZE - 4);
+    /* Validate metadata needed by the assembly runtime. */
     unsigned int stride   = *(volatile unsigned int *)(SPM_BASE + SPM_SIZE - 8);
 
     if (stride == 0)
         halt(0xbad20000u | hartid);
-
-#ifndef CONDUCTANCE
-    /* Init loop: state += input, clear input */
-    unsigned int nn_end = SPM_BASE + nn_count * stride;
-    for (unsigned int addr = SPM_BASE; addr < nn_end; addr += stride) {
-        volatile unsigned int *st = (volatile unsigned int *)addr;
-        volatile unsigned int *input = (volatile unsigned int *)(addr + 4);
-        unsigned int s = *st;
-        unsigned int inp = *input;
-        unsigned int result;
-        __asm__ volatile (
-            "mv t0, %1\n\t"
-            "mv t1, %2\n\t"
-            "fadd.s f5, f5, f6\n\t"
-            "mv %0, t0\n\t"
-            : "=r"(result)
-            : "r"(s), "r"(inp)
-            : "t0", "t1"
-        );
-        *st = result;
-        *input = 0;
-    }
-#endif
 
     return hartid;
 }

@@ -82,6 +82,10 @@ struct Args {
     #[clap(short, long, default_value = "100")]
     pre_simulate: usize,
 
+    /// Number of hardware-equivalent steps to simulate after the dumped snapshot.
+    #[clap(long, default_value = "1")]
+    runtime_steps: usize,
+
     #[clap(long, default_value = "0.1")]
     tau: f32,
 
@@ -138,6 +142,48 @@ struct Core {
     neurons: Vec<Neuron>,
 }
 
+fn simulate_round(
+    cores: &mut [Core],
+    core_nn_cnt: &[usize],
+    threshold: f32,
+    decay: f32,
+    keep_external_input: bool,
+    mut captured_inputs: Option<&mut [Vec<f32>]>,
+) -> (usize, u64) {
+    for core in cores.iter_mut() {
+        for neuron in core.neurons.iter_mut() {
+            neuron.state += neuron.input;
+            neuron.input = if keep_external_input { neuron.inj } else { 0.0 };
+        }
+    }
+
+    let mut fired = 0;
+    let mut deliveries = 0;
+    for core_idx in 0..cores.len() {
+        print!(".");
+        for neuron_idx in 0..core_nn_cnt[core_idx] {
+            if cores[core_idx].neurons[neuron_idx].state > threshold {
+                cores[core_idx].neurons[neuron_idx].state = 0.0;
+                fired += 1;
+
+                let neighbours = cores[core_idx].neurons[neuron_idx].neigh.clone();
+                for neighbour in neighbours {
+                    let target_core = neighbour.core as usize;
+                    let target_neuron = neighbour.neuron as usize;
+                    cores[target_core].neurons[target_neuron].input += neighbour.weight;
+                    if let Some(inputs) = captured_inputs.as_deref_mut() {
+                        inputs[target_core][target_neuron] += neighbour.weight;
+                        deliveries += 1;
+                    }
+                }
+            } else {
+                cores[core_idx].neurons[neuron_idx].state *= decay;
+            }
+        }
+    }
+    (fired, deliveries)
+}
+
 /// Encode a RISC-V JAL x0, offset instruction (unconditional jump).
 /// Panics if offset is out of range (±1MiB) or not 2-byte aligned.
 fn encode_jal_x0(offset: i32) -> u32 {
@@ -175,8 +221,8 @@ fn dump<R: Rng>(
     let words_per_neuron = 2 + num_mc;
     let bytes_per_neuron = words_per_neuron * 4;
 
-    // Tail plus runtime/checksum words through end-0x24.
-    let spm_tail_bytes: usize = 36;
+    // Tail plus runtime/checksum/preparation words through end-0x28.
+    let spm_tail_bytes: usize = 40;
 
     // Read text binary if provided
     let text_data = if let Some(text_path) = text {
@@ -536,6 +582,13 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("--mem-line-width must be a power of two at least 64 bits");
     }
 
+    if args.pre_simulate == 0 {
+        anyhow::bail!("--pre-simulate must be at least 1");
+    }
+    if args.runtime_steps == 0 {
+        anyhow::bail!("--runtime-steps must be at least 1");
+    }
+
     if args.sudoku {
         assert_eq!(args.tot_neuron % (9 * 9 * 9), 0);
     }
@@ -807,50 +860,54 @@ fn main() -> anyhow::Result<()> {
         .collect();
     let mut final_round_spike_deliveries = 0u64;
 
-    // Simulate
-    for i in 0..args.pre_simulate {
+    // Pre-simulate through the state immediately before the dumped runtime
+    // snapshot. These rounds retain the generator's external input current.
+    for i in 0..args.pre_simulate - 1 {
         println!("Round {}...", i);
 
-        if i == args.pre_simulate - 1 {
-            if args.dump.is_some() || args.dump_genn.is_some() {
-                dump_snapshot = Some(cores.clone());
-            }
-        }
-
-        let mut fired = 0;
-        // Add input
-        for c in cores.iter_mut() {
-            for n in c.neurons.iter_mut() {
-                n.state += n.input;
-                n.input = n.inj
-            }
-        }
-
-        for c in 0..args.core_cnt {
-            print!(".");
-            for n in 0..core_nn_cnt[c] {
-                if cores[c].neurons[n].state > args.threshold {
-                    cores[c].neurons[n].state = 0f32;
-                    fired += 1;
-
-                    for neigh in 0..cores[c].neurons[n].neigh.len() {
-                        let neigh = cores[c].neurons[n].neigh[neigh].clone();
-                        cores[neigh.core as usize].neurons[neigh.neuron as usize].input +=
-                            neigh.weight;
-                        if i == args.pre_simulate - 1 {
-                            final_round_spike_inputs[neigh.core as usize]
-                                [neigh.neuron as usize] += neigh.weight;
-                            final_round_spike_deliveries += 1;
-                        }
-                    }
-                } else {
-                    cores[c].neurons[n].state *= e_neg_tau;
-                }
-            }
-        }
+        let (fired, _) = simulate_round(
+            &mut cores,
+            &core_nn_cnt,
+            args.threshold,
+            e_neg_tau,
+            true,
+            None,
+        );
 
         println!(
             "\nRound {}, firing rate {} ({})",
+            i,
+            fired as f64 / args.tot_neuron as f64,
+            fired
+        );
+    }
+
+    if args.dump.is_some() || args.dump_genn.is_some() {
+        dump_snapshot = Some(cores.clone());
+    }
+
+    // Runtime rounds match the payload: consume the accumulated input at the
+    // start of each step, then clear it before collecting new spike deliveries.
+    for i in 0..args.runtime_steps {
+        println!("Runtime round {}...", i);
+        let capture = if i + 1 == args.runtime_steps {
+            Some(final_round_spike_inputs.as_mut_slice())
+        } else {
+            None
+        };
+        let (fired, deliveries) = simulate_round(
+            &mut cores,
+            &core_nn_cnt,
+            args.threshold,
+            e_neg_tau,
+            false,
+            capture,
+        );
+        if i + 1 == args.runtime_steps {
+            final_round_spike_deliveries = deliveries;
+        }
+        println!(
+            "\nRuntime round {}, firing rate {} ({})",
             i,
             fired as f64 / args.tot_neuron as f64,
             fired
@@ -872,10 +929,21 @@ fn main() -> anyhow::Result<()> {
 
     if let Some(ref snapshot) = dump_snapshot {
         if let Some(ref p) = args.dump {
-            let mut dump_shuffle_rng = args.dump_shuffle_seed.map(|seed| Xoshiro256PlusPlus::seed_from_u64(seed));
-            dump(p, snapshot, args.num_mc, args.spm_size, args.text.as_ref(), e_neg_tau,
-                 args.threshold, expected_checksum, args.mem_line_width,
-                 dump_shuffle_rng.as_mut())?;
+            let mut dump_shuffle_rng = args
+                .dump_shuffle_seed
+                .map(Xoshiro256PlusPlus::seed_from_u64);
+            dump(
+                p,
+                snapshot,
+                args.num_mc,
+                args.spm_size,
+                args.text.as_ref(),
+                e_neg_tau,
+                args.threshold,
+                expected_checksum,
+                args.mem_line_width,
+                dump_shuffle_rng.as_mut(),
+            )?;
         }
 
         if let Some(ref p) = args.dump_genn {
