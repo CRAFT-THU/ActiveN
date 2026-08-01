@@ -51,6 +51,7 @@ class LSU(implicit val param: CoreParameters) extends Module {
   assert(!req.valid || (req.bits.len.w.asUInt + req.bits.len.h.asUInt + req.bits.len.b.asUInt) === 1.U)
 
   val resp = IO(Output(UInt(32.W)))
+  val delayed = IO(Output(Bool()))
   val scFail = IO(Output(Bool()))
 
   val mem = IO(new Bundle {
@@ -113,16 +114,18 @@ class LSU(implicit val param: CoreParameters) extends Module {
   // Extract word from wide response based on address within the beat
   val wordsPerBeat = param.memBusWidth / 32
   val beatAlignBits = log2Ceil(param.memBusWidth / 8)
-  val wordInBeat = alignedAddr(beatAlignBits - 1, 2) // word offset within the beat
-  def takeWord(resp: UInt): UInt = {
+  def takeWord(resp: UInt, addr: UInt): UInt = {
+    val wordInBeat = addr(beatAlignBits - 1, 2) // word offset within the beat
     val respWords = Wire(Vec(wordsPerBeat, UInt(32.W)))
     for (i <- 0 until wordsPerBeat) {
       respWords(i) := resp((i + 1) * 32 - 1, i * 32)
     }
     respWords(wordInBeat)
   }
-  val gword = takeWord(mem.resp.bits.data)
-  val sword = takeWord(spm.io.data)
+  val gword = takeWord(mem.resp.bits.data, alignedAddr)
+  val sword = takeWord(spm.io.data, alignedAddr)
+  // Delayed sword, used for SPM load responses
+  val dsword = takeWord(spm.io.data, RegNext(alignedAddr))
 
   // Address space routing:
   //   0x20000000-0x3FFFFFFF: SPM (scratchpad)
@@ -168,10 +171,14 @@ class LSU(implicit val param: CoreParameters) extends Module {
   spmamoalu.funct5 := req.bits.funct5
 
   // SPM might be busy, in the following conditions:
-  // 1. Bulk load response takes precedence if this is a write, a new load, or an AMO
-  // 2. A new request, not write (AMO or read), needs a response, so is busy this cycle
-  //   We also take into account the fact that the request may not be sent last cycle
-  //   RegNext(req.ready || !req.valid || spmBulkWrite) is the "new request or blocked" condition.
+  // 1. Async copy response takes precedence
+  // 2. A new AMO request is busy this cycle.
+  //   AMO is different from both store and loads.
+  //   - For stores, if current cycle is not preempted by an async copy, then it will be written, so we can proceed
+  //   - For loads, if current cycle is not preempted by an async copy, then the data will be returned next cycle.
+  //     Loads are now handled like delayed instructions
+  //   We also take into account the fact that the request may not be sent last cycle, and AMO may need replaying
+  //   RegNext(req.ready || !req.valid || respAc) is the "new request or blocked previously" condition.
   //
   // This scheme should guarantee a retry of AMO if the second cycle is blocked by a bulk load.
   // A read will not be retried because we did not block its second cycle
@@ -182,11 +189,22 @@ class LSU(implicit val param: CoreParameters) extends Module {
   // The semantics of LRSC + async copy is UB for now.
   // TODO: fix this
   //
-  // It can also be busy if there is a bulk load response hitting us
+  // == Delayed read response
+  //
+  // We deliberately do not block SPM read response. It's now handled like a delayed instruction.
+  //
+  // We argue that the resp port will never have a structural hazard because of this:
+  // - If the next cycle we get any SPM request, then that request itself won't utilize the resp port at that cycle.
+  //   - If the next cycle we get a SPM load, then that load itself will be a delayed instruction, which will occupy resp
+  //     only the cycle even after.
+  //   - If the next cycle we get a SPM store, then SPM stores won't need resp port.
+  //   - If the next cycle we get a SPM AMO, then it will operate like a load + store
+  // - If the next cycle we get any global request, global requests is guaranteed to take at least one cycle
   val spmBusy = (
-    RegNext(req.ready || !req.valid || respAc) && !req.bits.write
-    || respAc && (req.bits.write || req.bits.amo)
+    RegNext(req.ready || !req.valid || respAc) && req.bits.amo
+    || respAc
   )
+  delayed := isSPM && !req.bits.amo && !req.bits.write
 
   val spmShortWe = MuxCase(0.U(4.W), Seq(
     (req.valid && isSPM && req.bits.write && (!req.bits.lrsc || reserved)) -> wbe,
@@ -234,14 +252,20 @@ class LSU(implicit val param: CoreParameters) extends Module {
   // --- Ready and response mux ---
   req.ready := Mux(isSPM, !spmBusy, respG)
 
-  val rdata = Mux(isSPM, sword, gword)
+  // We use req info from last cycle to map output data because:
+  // 1. SPM loads / AMO's address matches the one given last cycle
+  // 2. Global memory responses takes at least two cycles
+  val rdata = Mux(isSPM || RegNext(delayed), dsword, gword)
+  val daddr = RegNext(req.bits.addr(1, 0))
+  val drsext = RegNext(req.bits.rsext)
+  val dlen = RegNext(req.bits.len)
 
-  val rhalf = rdata.asTypeOf(Vec(2, UInt(16.W)))(req.bits.addr(1, 1))
-  val rbyte = rdata.asTypeOf(Vec(4, UInt(8.W)))(req.bits.addr(1, 0))
+  val rhalf = rdata.asTypeOf(Vec(2, UInt(16.W)))(daddr(1, 1))
+  val rbyte = rdata.asTypeOf(Vec(4, UInt(8.W)))(daddr(1, 0))
   val rmapped = Mux1H(Seq(
-    req.bits.len.w -> rdata,
-    req.bits.len.h -> VecInit(Seq.fill(16)(req.bits.rsext && rhalf(15))).asUInt ## rhalf,
-    req.bits.len.b -> VecInit(Seq.fill(24)(req.bits.rsext && rbyte(7))).asUInt ## rbyte,
+    dlen.w -> rdata,
+    dlen.h -> VecInit(Seq.fill(16)(drsext && rhalf(15))).asUInt ## rhalf,
+    dlen.b -> VecInit(Seq.fill(24)(drsext && rbyte(7))).asUInt ## rbyte,
   ))
   resp := rmapped
 }

@@ -82,7 +82,9 @@ class Exec(implicit val param: CoreParameters) extends Module {
   val rs1val = RegEnable(Mux1H(issueSel, regfiles.map(_.read(0).value)), s0step)
   val rs2val = RegEnable(Mux1H(issueSel, regfiles.map(_.read(1).value)), s0step)
   val directval = RegEnable(Mux1H(issueSel, regfiles.map(r => VecInit(r.msgDirect.map(_.rdata)))), s0step)
-  val delayed = RegEnable(s0delayed, s0step)
+  // We also ask s1 about instructions that's decided to be delayed during execution
+  val dynDelayed = Wire(Bool())
+  val delayed = RegEnable(s0delayed, s0step) || dynDelayed
 
   ext.working := valid
 
@@ -379,8 +381,10 @@ class Exec(implicit val param: CoreParameters) extends Module {
   val delayedUop = RegNext(uop)
   val delayedIsMul = RegNext(uop.rdalu)
   val delayedIsFP = RegNext(uop.isFP)
+  val delayedIsLd = RegNext(uop.isMem && lsu.delayed)
   var delayedRdsrc = Seq(
     delayedIsMul -> mulval,
+    delayedIsLd -> lsu.resp,
   )
 
   if(param.useFPU) {
@@ -429,6 +433,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
   }
 
   // Scheduling
+  dynDelayed := uop.isMem && lsu.delayed
   s0step := !valid || s1done
   busy := eidlings | (Fill(param.pipeCnt, valid && (!s1done || delayed)) & uop.smsel)
 }
