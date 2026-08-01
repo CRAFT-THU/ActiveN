@@ -6,6 +6,7 @@
  */
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -23,6 +24,7 @@
 #include "soft_backend.h"
 #include "soft_components.h"
 #include "soft_mem.h"
+#include "soft_verilated/soft_rtl___024root.h"
 
 using namespace std;
 
@@ -1171,6 +1173,7 @@ void SoftSystemBackend::startNocProfile(uint64_t cycle) {
     profile.blocked_by_mc.assign(cfg.numMC, 0);
   nocRouterProfiles_.assign(cfg.numPU + 1, {});
   nocMemifProfiles_.assign(cfg.numMC, {});
+  nocPuProfiles_.assign(cfg.numPU + 1, {});
   nocQueueOccupancy_.fill(0);
   nocCycleProfiles_.clear();
   nocCycleProfiles_.reserve(1 << 17);
@@ -1195,6 +1198,64 @@ void SoftSystemBackend::accumulateNocProfile(uint64_t cycle) {
   if (cycle < nocProfileStartCycle_) return;
 
   NocCycleProfile sample{.cycle = cycle};
+
+  static_assert(SYSTEM_PIPE_CNT > 0 && SYSTEM_PIPE_CNT <= 8);
+  constexpr unsigned allIdleMask = (1U << SYSTEM_PIPE_CNT) - 1;
+  constexpr size_t spikeQueueDepth = 16;
+
+  for (uint16_t pu = 1; pu <= cfg.numPU; ++pu) {
+    const auto *root = cores[pu]->rootp;
+    const unsigned idlings = root->Core__DOT__exec__DOT__idlings & allIdleMask;
+    const unsigned activeThreads = SYSTEM_PIPE_CNT - std::popcount(idlings);
+    const bool active = activeThreads != 0;
+    const bool executing = root->Core__DOT__exec__DOT__valid;
+    const bool stalled = executing && !root->Core__DOT__exec__DOT__s0step;
+    const bool retired = executing && root->Core__DOT__exec__DOT__s0step;
+    const bool isSC = root->Core__DOT__exec__DOT__uop_memIsAtomic
+        && ((root->Core__DOT__exec__DOT__uop_funct7 >> 2) & 0x1f) == 3;
+    const bool scAttempt = retired && isSC;
+    const bool scFailure = scAttempt
+        && !root->Core__DOT__exec__DOT__lsu__DOT__reserved;
+
+    const size_t enq = root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__enq_ptr_value;
+    const size_t deq = root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__deq_ptr_value;
+    const bool maybeFull = root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__maybe_full;
+    const size_t spikeQueueOccupancy = enq == deq
+        ? (maybeFull ? spikeQueueDepth : 0)
+        : ((enq - deq) & (spikeQueueDepth - 1));
+
+    sample.active_pus += active;
+    sample.active_threads += activeThreads;
+    sample.executing_pus += executing;
+    sample.stalled_pus += stalled;
+    sample.retired_instructions += retired;
+    sample.sc_attempts += scAttempt;
+    sample.sc_failures += scFailure;
+    sample.spike_queue_entries += spikeQueueOccupancy;
+    sample.spike_queue_nonempty_pus += spikeQueueOccupancy != 0;
+    sample.spike_queue_full_pus += spikeQueueOccupancy == spikeQueueDepth;
+    sample.idle_pus_with_spikes += !active && spikeQueueOccupancy != 0;
+
+    auto &profile = nocPuProfiles_[pu];
+    profile.active_cycles += active;
+    profile.active_thread_cycles += activeThreads;
+    profile.one_active_thread_cycles += activeThreads == 1;
+    profile.two_active_thread_cycles += activeThreads == 2;
+    profile.executing_cycles += executing;
+    profile.stalled_cycles += stalled;
+    profile.retired_instructions += retired;
+    profile.sc_attempts += scAttempt;
+    profile.sc_failures += scFailure;
+    profile.spike_queue_occupancy_sum += spikeQueueOccupancy;
+    profile.spike_queue_empty_cycles += spikeQueueOccupancy == 0;
+    profile.spike_queue_full_cycles += spikeQueueOccupancy == spikeQueueDepth;
+    profile.idle_with_spikes_cycles += !active && spikeQueueOccupancy != 0;
+    profile.spike_enqueues += root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__do_enq;
+    profile.spike_dequeues += root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__unnamedblk1__DOT__do_deq;
+    profile.max_spike_queue_occupancy = std::max(
+        profile.max_spike_queue_occupancy,
+        static_cast<uint64_t>(spikeQueueOccupancy));
+  }
 
   for (uint16_t dst = 1; dst <= cfg.numPU; ++dst) {
     const auto &router = routers[dst];
@@ -1335,7 +1396,11 @@ void SoftSystemBackend::writeNocProfile() {
             "broadcast_queues,broadcast_blocked_mcs,"
             "external_requests_presented,external_requests_accepted,"
             "external_responses_accepted,mshr_unicasts_local_retired,"
-            "mshr_unicasts_remote_injected,ring_unicasts_local_delivered\n";
+            "mshr_unicasts_remote_injected,ring_unicasts_local_delivered,"
+            "active_pus,active_threads,executing_pus,stalled_pus,"
+            "retired_instructions,sc_attempts,sc_failures,"
+            "spike_queue_entries,spike_queue_nonempty_pus,"
+            "spike_queue_full_pus,idle_pus_with_spikes\n";
   for (const auto &s : nocCycleProfiles_) {
     cycles << s.cycle << ',' << s.router_flits << ','
            << s.full_input_queues << ',' << s.links_presented << ','
@@ -1350,7 +1415,51 @@ void SoftSystemBackend::writeNocProfile() {
            << s.external_responses_accepted << ','
            << s.mshr_unicasts_local_retired << ','
            << s.mshr_unicasts_remote_injected << ','
-           << s.ring_unicasts_local_delivered << '\n';
+           << s.ring_unicasts_local_delivered << ','
+           << s.active_pus << ',' << s.active_threads << ','
+           << s.executing_pus << ',' << s.stalled_pus << ','
+           << s.retired_instructions << ',' << s.sc_attempts << ','
+           << s.sc_failures << ','
+           << s.spike_queue_entries << ',' << s.spike_queue_nonempty_pus << ','
+           << s.spike_queue_full_pus << ',' << s.idle_pus_with_spikes << '\n';
+  }
+
+  std::ofstream pusFile(*nocProfileDir_ + "/pus.csv");
+  pusFile << "pu,col,row,active_cycles,active_fraction,active_thread_cycles,"
+             "thread_utilization,one_active_thread_cycles,"
+             "two_active_thread_cycles,executing_cycles,executing_fraction,"
+             "stalled_cycles,retired_instructions,sc_attempts,sc_failures,"
+             "avg_spike_queue,max_spike_queue,"
+             "spike_queue_empty_cycles,spike_queue_full_cycles,"
+             "idle_with_spikes_cycles,spike_enqueues,spike_dequeues\n";
+  for (uint16_t pu = 1; pu <= cfg.numPU; ++pu) {
+    const auto [col, row] = topo.pu_to_coord[pu];
+    const auto &profile = nocPuProfiles_[pu];
+    const double activeFraction = samples
+        ? static_cast<double>(profile.active_cycles) / samples : 0.0;
+    const double threadUtilization = samples
+        ? static_cast<double>(profile.active_thread_cycles) /
+              (samples * SYSTEM_PIPE_CNT)
+        : 0.0;
+    const double executingFraction = samples
+        ? static_cast<double>(profile.executing_cycles) / samples : 0.0;
+    const double avgSpikeQueue = samples
+        ? static_cast<double>(profile.spike_queue_occupancy_sum) / samples
+        : 0.0;
+    pusFile << pu << ',' << col << ',' << row << ','
+            << profile.active_cycles << ',' << activeFraction << ','
+            << profile.active_thread_cycles << ',' << threadUtilization << ','
+            << profile.one_active_thread_cycles << ','
+            << profile.two_active_thread_cycles << ','
+            << profile.executing_cycles << ',' << executingFraction << ','
+            << profile.stalled_cycles << ',' << profile.retired_instructions
+            << ',' << profile.sc_attempts << ',' << profile.sc_failures << ','
+            << avgSpikeQueue << ','
+            << profile.max_spike_queue_occupancy << ','
+            << profile.spike_queue_empty_cycles << ','
+            << profile.spike_queue_full_cycles << ','
+            << profile.idle_with_spikes_cycles << ','
+            << profile.spike_enqueues << ',' << profile.spike_dequeues << '\n';
   }
 
   std::ofstream links(*nocProfileDir_ + "/links.csv");
@@ -1479,6 +1588,8 @@ void SoftSystemBackend::writeNocProfile() {
   summary << "start_cycle=" << nocProfileStartCycle_ << '\n'
           << "stop_cycle=" << nocProfileStopCycle_ << '\n'
           << "samples=" << samples << '\n'
+          << "num_pus=" << cfg.numPU << '\n'
+          << "pipe_count=" << SYSTEM_PIPE_CNT << '\n'
           << "link_presented=" << totalPresented << '\n'
           << "link_accepted=" << totalAccepted << '\n'
           << "link_blocked=" << totalBlocked << '\n'
@@ -1492,6 +1603,36 @@ void SoftSystemBackend::writeNocProfile() {
           << (totalBlocked ? static_cast<double>(topFive) / totalBlocked : 0.0)
           << '\n'
           << "links_for_90_percent_blocking=" << linksFor90Percent << '\n';
+  uint64_t activePuCycles = 0;
+  uint64_t activeThreadCycles = 0;
+  uint64_t executingPuCycles = 0;
+  uint64_t idleWithSpikesCycles = 0;
+  for (const auto &sample : nocCycleProfiles_) {
+    activePuCycles += sample.active_pus;
+    activeThreadCycles += sample.active_threads;
+    executingPuCycles += sample.executing_pus;
+    idleWithSpikesCycles += sample.idle_pus_with_spikes;
+  }
+  const uint64_t puSlots = samples * cfg.numPU;
+  const uint64_t threadSlots = puSlots * SYSTEM_PIPE_CNT;
+  summary << "pu_utilization="
+          << (puSlots ? static_cast<double>(activePuCycles) / puSlots : 0.0)
+          << '\n'
+          << "thread_utilization="
+          << (threadSlots
+                  ? static_cast<double>(activeThreadCycles) / threadSlots
+                  : 0.0)
+          << '\n'
+          << "execute_utilization="
+          << (puSlots
+                  ? static_cast<double>(executingPuCycles) / puSlots
+                  : 0.0)
+          << '\n'
+          << "idle_with_spikes_fraction="
+          << (puSlots
+                  ? static_cast<double>(idleWithSpikesCycles) / puSlots
+                  : 0.0)
+          << '\n';
   for (size_t i = 0; i < std::min<size_t>(20, hotspots.size()); ++i) {
     summary << "hotspot_" << i << "_src=" << hotspots[i].second.first
             << " dst=" << hotspots[i].second.second

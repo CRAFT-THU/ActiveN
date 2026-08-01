@@ -337,6 +337,36 @@ class SoftSystemBackend : public SystemBackend {
     uint64_t mshr_unicasts_local_retired = 0;
     uint64_t mshr_unicasts_remote_injected = 0;
     uint64_t ring_unicasts_local_delivered = 0;
+    uint64_t active_pus = 0;
+    uint64_t active_threads = 0;
+    uint64_t executing_pus = 0;
+    uint64_t stalled_pus = 0;
+    uint64_t retired_instructions = 0;
+    uint64_t sc_attempts = 0;
+    uint64_t sc_failures = 0;
+    uint64_t spike_queue_entries = 0;
+    uint64_t spike_queue_nonempty_pus = 0;
+    uint64_t spike_queue_full_pus = 0;
+    uint64_t idle_pus_with_spikes = 0;
+  };
+
+  struct NocPuProfile {
+    uint64_t active_cycles = 0;
+    uint64_t active_thread_cycles = 0;
+    uint64_t one_active_thread_cycles = 0;
+    uint64_t two_active_thread_cycles = 0;
+    uint64_t executing_cycles = 0;
+    uint64_t stalled_cycles = 0;
+    uint64_t retired_instructions = 0;
+    uint64_t sc_attempts = 0;
+    uint64_t sc_failures = 0;
+    uint64_t spike_queue_occupancy_sum = 0;
+    uint64_t spike_queue_empty_cycles = 0;
+    uint64_t spike_queue_full_cycles = 0;
+    uint64_t idle_with_spikes_cycles = 0;
+    uint64_t spike_enqueues = 0;
+    uint64_t spike_dequeues = 0;
+    uint64_t max_spike_queue_occupancy = 0;
   };
 
   std::optional<std::string> nocProfileDir_;
@@ -349,6 +379,7 @@ class SoftSystemBackend : public SystemBackend {
   std::vector<NocLinkProfile> nocLinkProfiles_;
   std::vector<NocRouterProfile> nocRouterProfiles_;
   std::vector<NocMemifProfile> nocMemifProfiles_;
+  std::vector<NocPuProfile> nocPuProfiles_;
   std::array<uint64_t, ROUTER_Q_DEPTH + 1> nocQueueOccupancy_{};
   std::vector<NocCycleProfile> nocCycleProfiles_;
 

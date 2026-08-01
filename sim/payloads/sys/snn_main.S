@@ -12,7 +12,7 @@
   # Runtime handler assignments (lower index = higher priority):
   #   Handler 0 (tag=0): update-completion tree reduction (argcnt=1)
   #   Handler 1 (tag=1): spike — incoming synapse event (argcnt=2)
-  #   Handler 2 (tag=2): domain-local drain token (argcnt=2)
+  #   Handler 2 (tag=2): domain-local drain protocol (argcnt=3)
   #   Handler 3 (tag=3): work  — self-scheduled work loop (argcnt=1, margin=max(num_mc+1, 4), quota=0)
   #   Handler 4 (tag=4): thread-1 runtime setup (argcnt=0)
   #   Handler 5 (tag=5): boot readiness and start token (argcnt=1)
@@ -21,6 +21,7 @@
   #   Handler 8 (tag=8): completed-domain reduction (argcnt=2)
   #   Handler 9 (tag=9): boot-readiness reduction at PU1 (argcnt=0)
   #   Handler 10 (tag=10): low-priority next-step preparation (argcnt=1)
+  #   Handler 11 (tag=11): final-preparation tree reduction (argcnt=1)
   #
   # Scatter CSR uses handler_tag=1 (spike handler).
   # Work handler reserves room for all scatter sends and its following
@@ -52,10 +53,11 @@
   # SPM tail descriptor (end of 16KB SPM):
   #   end - 0x04: neuron count
   #   end - 0x08: stride bytes
-  #   end - 0x0C: type (0 = FP32 LIF)
+  #   end - 0x0C: type during initialization, then packed drain counters
   #   end - 0x10: threshold (FP32)
   #   end - 0x14: decay factor (FP32)
   #   end - 0x24: expected post-timestep checksum
+  #   end - 0x28: domain-size marker (high 16 bits) and preparation state
 
 #ifndef NUM_PU
 #define NUM_PU 64
@@ -77,6 +79,13 @@
 #define SNN_TIMED_STEPS 4
 #endif
 
+#define SNN_DRAIN_REVERSE 1
+#define SNN_DRAIN_TREE    2
+
+#ifndef SNN_DRAIN_MODE
+#define SNN_DRAIN_MODE SNN_DRAIN_REVERSE
+#endif
+
 #if SNN_WARMUP_STEPS < 0
 #error "SNN_WARMUP_STEPS must be nonnegative"
 #endif
@@ -85,7 +94,15 @@
 #error "SNN_TIMED_STEPS must be positive"
 #endif
 
+#if SNN_DRAIN_MODE != SNN_DRAIN_REVERSE && SNN_DRAIN_MODE != SNN_DRAIN_TREE
+#error "SNN_DRAIN_MODE must be SNN_DRAIN_REVERSE (1) or SNN_DRAIN_TREE (2)"
+#endif
+
 #define SNN_TOTAL_STEPS (SNN_WARMUP_STEPS + SNN_TIMED_STEPS)
+
+#if SNN_TOTAL_STEPS > 16383
+#error "SNN total steps must fit beside the preparation phase in 16 bits"
+#endif
 
 #define SPM_BASE        0x20000000
 #define SPM_SIZE        16384
@@ -102,6 +119,7 @@
 #define SPM_RESULT_XOR  (SPM_END - 0x1C)
 #define SPM_FIRED       (SPM_END - 0x20)
 #define SPM_PREP_STATE  (SPM_END - 0x28)
+#define SPM_DRAIN_COUNTER (SPM_END - 0x0C)
 
 #define PREP_DONE       0
 #define PREP_QUEUED     1
@@ -126,6 +144,7 @@
 #define NOTIFY_TAG      0xC06  /* prio=3, handler=6 */
 #define DOMAIN_DONE_TAG 0xC08  /* prio=3, handler=8 */
 #define PREP_TAG        0x00A  /* local-only handler=10 */
+#define PREP_DONE_TAG   0xC0B  /* prio=3, handler=11 */
 
 #define SNN_CHECKSUM_SCALE 0x41200000 /* 10.0f */
 #define SNN_CHECKSUM_TOL   15
@@ -167,6 +186,12 @@
 .Ldomain_size_done_\@:
   .endm
 
+  .macro LOAD_DOMAIN_MARKER dst_reg, tmp_reg
+  li    \tmp_reg, SPM_PREP_STATE
+  lw    \dst_reg, 0(\tmp_reg)
+  srli  \dst_reg, \dst_reg, 16
+  .endm
+
   .section .text
   .globl _start
 
@@ -184,14 +209,26 @@ _start:
   call  snn_init
   jal   ra, load_sregisters
 
+  # Cache the MC-domain role once. Aligned domain leaders keep the domain size;
+  # ordinary members keep zero for handler selection and topology arithmetic.
+  DOMAIN_SIZE t1, t2
+  addi  t2, s0, -1
+  addi  t3, t1, -1
+  and   t2, t2, t3
+  seqz  t2, t2
+  neg   t2, t2
+  and   t1, t1, t2
   # Each PU owns one reduction counter in its local SPM.
   li    t0, SPM_COUNTER
   sw    zero, 0(t0)
   li    t0, SPM_RESULT_XOR
   sw    zero, 0(t0)
   li    t0, SPM_PREP_STATE
-  li    t1, PREP_QUEUED       # step zero still needs synchronous preparation
+  slli  t1, t1, 16
+  ori   t1, t1, PREP_QUEUED   # step zero still needs synchronous preparation
   sw    t1, 0(t0)
+  li    t0, SPM_DRAIN_COUNTER
+  sw    zero, 0(t0)
   j     install_runtime
 
 thread1_start:
@@ -226,12 +263,40 @@ install_runtime:
   li    a0, SPIKE_CFG_DISABLED
   csrw  0x711, a0
 
-  # Handler 2: domain-local drain token (argcnt=2, margin=1).
-  la    a0, termination_drain
+  # Handler 2: selected domain-local drain protocol (argcnt=3). Reverse-chain
+  # leaders use a distinct return handler; tree roots reserve one queue entry
+  # per child in their maximum fanout.
+  LOAD_DOMAIN_MARKER t1, t0
+#if SNN_DRAIN_MODE == SNN_DRAIN_REVERSE
+  beqz  t1, 2f
+  la    a0, termination_reverse_return
+  j     3f
+2:
+  la    a0, termination_reverse_member
+  j     3f
+#else
+  la    a0, termination_tree
+#endif
+3:
   csrw  0x702, a0
   li    a0, 1
+#if SNN_DRAIN_MODE == SNN_DRAIN_TREE
+  mv    t2, t1
+  bnez  t2, 1f
+  addi  t2, s0, -1
+  neg   t3, t2
+  and   t2, t2, t3
+1:
+  srli  t2, t2, 1
+  beqz  t2, 2f
+  addi  a0, a0, 1
+  j     1b
+2:
+  csrw  0x722, a0             # hanmargin: quota=0, margin=tree fanout + 1
+#else
   csrw  0x722, a0             # hanmargin: quota=0, margin=1
-  li    a0, (1 << 3) | 2      # thread 0 only, argcnt=2
+#endif
+  li    a0, (1 << 3) | 3      # thread 0 only, argcnt=3
   csrw  0x712, a0             # hancfg (thread 0 only for now)
 
   # Handler 3: work_update (argcnt=1, margin=max(num_mc+1, 4), quota=0) — lowest priority
@@ -295,6 +360,14 @@ install_runtime:
   li    a0, (1 << 3) | 1
   csrw  0x71A, a0
 
+  # Handler 11: final-preparation reduction (argcnt=1, margin=1).
+  la    a0, termination_prepare_reduce
+  csrw  0x70B, a0
+  li    a0, 1
+  csrw  0x72B, a0
+  li    a0, (1 << 3) | 1
+  csrw  0x71B, a0
+
   # Trigger spm_init_finished for thread 1 (local send, tag=4).
   # Thread 1 will call load_sregisters and then add itself to handlers 0-3.
   li    t1, 4
@@ -321,6 +394,10 @@ boot_control:
   li    t0, SPM_COUNTER
   sw    zero, 0(t0)
   li    t0, SPM_FIRED
+  sw    zero, 0(t0)
+  li    t0, SPM_RESULT_XOR
+  sw    zero, 0(t0)
+  li    t0, SPM_DRAIN_COUNTER
   sw    zero, 0(t0)
 
   # Build the broadcast tree over zero-based PU indices. The root starts at
@@ -373,7 +450,11 @@ boot_prepare_loop:
 boot_prepare_done:
   mv    s8, s1                  # any preempted preparation event is now stale
   li    t0, SPM_PREP_STATE
+  lw    t2, 0(t0)
+  srli  t2, t2, 16
+  slli  t2, t2, 16
   slli  t1, s11, 2
+  or    t1, t1, t2
   sw    t1, 0(t0)               # current step, PREP_DONE
   li    t0, SPIKE_CFG_ENABLED
   csrw  0x711, t0
@@ -669,10 +750,10 @@ termination_reduction_done:
   SEND  t0, t1
 
   # Pass installation to the next domain leader. The token carries its
-  # zero-based domain index.
+  # zero-based domain index; the cached size removes division from this path.
   li    t3, 1
   bgeu  t3, s5, do_wfi
-  DOMAIN_SIZE t4, t2            # PUs per MC domain
+  LOAD_DOMAIN_MARKER t4, t2
   addi  t0, t4, 1               # first PU in domain one
   mv    a0, t3
   li    t1, NOTIFY_TAG
@@ -693,9 +774,8 @@ termination_install:
 
   addi  a2, a2, 1
   bgeu  a2, s5, do_wfi
-  DOMAIN_SIZE t2, t3
-  mul   t0, a2, t2
-  addi  t0, t0, 1               # first PU in the next domain
+  LOAD_DOMAIN_MARKER t2, t0
+  add   t0, s0, t2               # first PU in the next domain
   mv    a0, a2
   li    t1, NOTIFY_TAG
   SEND  t0, t1
@@ -720,55 +800,181 @@ termination_idle:
 
   li    t0, SPM_FIRED
   lw    a1, 0(t0)
-  li    t1, 1
-  bne   s0, t1, 1f
+  li    a2, 0
+
+#if SNN_DRAIN_MODE == SNN_DRAIN_REVERSE
+  # Reverse chain: the leader starts at the largest PU ID, after which every
+  # member unconditionally forwards to the preceding PU.
+  li    t2, 1
+  bne   s0, t2, 1f
   sw    zero, 0(t0)            # PU1 reuses this word for domain aggregation
 1:
-
-  DOMAIN_SIZE t2, t3
+  LOAD_DOMAIN_MARKER t2, t0
   li    t3, 1
   beq   t2, t3, termination_report_domain_prepare
-  addi  t0, s0, 1
+  add   t0, s0, t2
+  addi  t0, t0, -1
   li    t1, DRAIN_TAG
   SEND  t0, t1
   j     termination_schedule_prepare
+#else
+  j     termination_tree_begin
+#endif
 
+#if SNN_DRAIN_MODE == SNN_DRAIN_REVERSE
   #------------------------------------------------------------
-  # termination_drain (tag=2, argcnt=2)
-  # The lowest-priority token visits every nonleader PU in this MC domain and
-  # returns the accumulated checksum to the domain leader.
+  # Reverse-chain drain handlers (tag=2, argcnt=3)
   #------------------------------------------------------------
-termination_drain:
-  DOMAIN_SIZE t2, t3             # domain size
-  addi  t0, s0, -1
-  addi  t1, t2, -1
-  and   t1, t0, t1
-  beqz  t1, termination_report_domain
-
+termination_reverse_member:
   li    t0, SPIKE_CFG_DISABLED
   csrw  0x711, t0
-  mv    a2, t2
   call  termination_checksum
   li    t0, SPM_FIRED
   lw    t1, 0(t0)
   add   a1, a1, t1
 
   addi  t0, s0, -1
-  addi  t3, a2, -1
-  or    t3, t0, t3
-  addi  t3, t3, 1               # last hartid in this domain
-  bne   s0, t3, termination_drain_next
-  sub   t0, t3, a2
-  addi  t0, t0, 1               # wrap to this domain's leader
-  j     termination_drain_send
-
-termination_drain_next:
-  addi  t0, s0, 1
-
-termination_drain_send:
   li    t1, DRAIN_TAG
   SEND  t0, t1
   j     termination_schedule_prepare
+
+termination_reverse_return:
+  # The leader already contributed before launching the chain.
+  j     termination_report_domain
+#else
+  #------------------------------------------------------------
+  # Tree drain handler (tag=2, argcnt=3)
+  # a2=0 is a downward notification; a2>0 is an upward subtree result.
+  #------------------------------------------------------------
+termination_tree:
+  beqz  a2, termination_tree_down
+
+  li    t0, SPM_RESULT_XOR
+  amoxor.w zero, a0, (t0)
+  li    t0, SPM_FIRED
+  amoadd.w zero, a1, (t0)
+  li    t0, SPM_DRAIN_COUNTER
+  amoadd.w t2, a2, (t0)
+  add   t2, t2, a2
+  j     termination_tree_check_up
+
+termination_tree_begin:
+  # The idle handler already disabled spikes, computed this leader's checksum,
+  # and loaded its local firing count.
+  li    t0, SPM_RESULT_XOR
+  amoxor.w zero, a0, (t0)
+  j     termination_tree_fanout
+
+termination_tree_down:
+  li    t0, SPIKE_CFG_DISABLED
+  csrw  0x711, t0
+  li    a0, 0
+  call  termination_checksum
+  li    t0, SPM_RESULT_XOR
+  amoxor.w zero, a0, (t0)
+
+termination_tree_fanout:
+  # Domain leaders seed domain_size/2. Other nodes seed lowbit(index)/2;
+  # aligned power-of-two domains make the global index arithmetic local.
+  LOAD_DOMAIN_MARKER t3, t0
+  bnez  t3, 1f
+  addi  t2, s0, -1
+  neg   t3, t2
+  and   t3, t2, t3
+1:
+  srli  t3, t3, 1
+  addi  t2, s0, -1
+2:
+  beqz  t3, 3f
+  or    t0, t2, t3
+  addi  t0, t0, 1
+  li    a0, 0
+  li    a1, 0
+  li    a2, 0
+  li    t1, DRAIN_TAG
+  SEND  t0, t1
+  srli  t3, t3, 1
+  j     2b
+3:
+  li    t0, SPM_DRAIN_COUNTER
+  li    t1, 1
+  amoadd.w t2, t1, (t0)
+  addi  t2, t2, 1
+  slli  t2, t2, 16
+  srli  t2, t2, 16
+  j     termination_tree_check_down
+
+termination_tree_check_up:
+  slli  t2, t2, 16
+  srli  t2, t2, 16
+  li    t4, 1
+  beq   s0, t4, 1f
+  addi  t3, s0, -1
+  neg   t4, t3
+  and   t3, t3, t4
+  j     2f
+1:
+  mv    t3, s6
+2:
+  bltu  t2, t3, do_wfi
+  bgtu  t2, t3, termination_fail
+  j     termination_tree_complete_up
+
+termination_tree_check_down:
+  li    t4, 1
+  beq   s0, t4, 1f
+  addi  t3, s0, -1
+  neg   t4, t3
+  and   t3, t3, t4
+  j     2f
+1:
+  mv    t3, s6
+2:
+  bltu  t2, t3, termination_schedule_prepare
+  bgtu  t2, t3, termination_fail
+
+  # A leaf can complete while processing its downward notification. Send its
+  # result before starting low-priority preparation.
+  li    t4, 1
+  beq   s0, t4, termination_tree_root_down
+  li    t0, SPM_RESULT_XOR
+  lw    a0, 0(t0)
+  li    t0, SPM_FIRED
+  lw    a1, 0(t0)
+  mv    a2, t3
+  sub   t0, s0, t3
+  li    t1, DRAIN_TAG
+  SEND  t0, t1
+  j     termination_schedule_prepare
+
+termination_tree_root_down:
+  # This is reachable only for a one-PU system/domain tree.
+  j     termination_tree_root_complete
+
+termination_tree_complete_up:
+  li    t4, 1
+  beq   s0, t4, termination_tree_root_complete
+  li    t0, SPM_RESULT_XOR
+  lw    a0, 0(t0)
+  li    t0, SPM_FIRED
+  lw    a1, 0(t0)
+  mv    a2, t3
+  sub   t0, s0, t3
+  li    t1, DRAIN_TAG
+  SEND  t0, t1
+  j     do_wfi
+
+termination_tree_root_complete:
+  # Step state such as s11 is owned by thread 0. Hand completion to the
+  # thread-0-only domain handler instead of using whichever thread ran tag 2.
+  li    t0, SPM_RESULT_XOR
+  lw    a0, 0(t0)
+  li    t0, SPM_FIRED
+  lw    a1, 0(t0)
+  li    t1, DOMAIN_DONE_TAG
+  YIELD zero, t1
+  j     do_wfi
+#endif
 
 termination_report_domain:
   # Domain zero reports locally; every other domain sends one result to PU1.
@@ -797,13 +1003,17 @@ termination_schedule_prepare:
   # works even when the drain handler was scheduled on thread 1.
   li    t0, SPM_PREP_STATE
   lw    t2, 0(t0)
-  srli  t3, t2, 2
+  srli  t5, t2, 16
+  slli  t5, t5, 16
+  slli  t3, t2, 16
+  srli  t3, t3, 18
   addi  t3, t3, 1
   li    t4, SNN_TOTAL_STEPS
-  bgeu  t3, t4, do_wfi
-  andi  t2, t2, -4
+  bgtu  t3, t4, do_wfi
+  slli  t2, t3, 2
   ori   a0, t2, PREP_QUEUED
-  sw    a0, 0(t0)
+  or    t2, a0, t5
+  sw    t2, 0(t0)
   YIELD zero, s9
 #endif
   j     do_wfi
@@ -817,7 +1027,9 @@ prepare_next:
 #ifndef CONDUCTANCE
   li    t0, SPM_PREP_STATE
   lw    t1, 0(t0)
-  bne   a0, t1, do_wfi         # preempted event from an older step
+  slli  t2, t1, 16
+  srli  t2, t2, 16
+  bne   a0, t2, do_wfi         # preempted event from an older step
 
   andi  t2, a0, 3
   li    t3, PREP_QUEUED
@@ -825,7 +1037,10 @@ prepare_next:
   li    s8, SPM_BASE
   andi  a0, a0, -4
   ori   a0, a0, PREP_RUNNING
-  sw    a0, 0(t0)
+  srli  t2, t1, 16
+  slli  t2, t2, 16
+  or    t2, t2, a0
+  sw    t2, 0(t0)
 
 prepare_next_running:
   beq   s8, s1, do_wfi
@@ -838,12 +1053,58 @@ prepare_next_running:
   bne   s8, s1, 1f
   li    t0, SPM_PREP_STATE
   andi  t1, a0, -4
-  sw    t1, 0(t0)               # current step, PREP_DONE
-  j     do_wfi
+  lw    t2, 0(t0)
+  srli  t2, t2, 16
+  slli  t2, t2, 16
+  or    t2, t2, t1
+  sw    t2, 0(t0)               # current step, PREP_DONE
+  srli  t1, t1, 2
+  li    t2, SNN_TOTAL_STEPS
+  bne   t1, t2, do_wfi
+  li    a0, 1
+  j     termination_prepare_reduce
 1:
   YIELD zero, s9
 #endif
   j     do_wfi
+
+  #------------------------------------------------------------
+  # termination_prepare_reduce (tag=11, argcnt=1)
+  # The high half of SPM_DRAIN_COUNTER holds final-preparation progress, so
+  # reports may race safely with the low-half tree drain counter.
+  #------------------------------------------------------------
+termination_prepare_reduce:
+  slli  t1, a0, 16
+  li    t0, SPM_DRAIN_COUNTER
+  amoadd.w t2, t1, (t0)
+  add   t2, t2, t1
+  srli  t2, t2, 16
+
+  li    t4, 1
+  beq   s0, t4, 1f
+  addi  t3, s0, -1
+  neg   t4, t3
+  and   t3, t3, t4
+  j     2f
+1:
+  mv    t3, s6
+2:
+  bltu  t2, t3, do_wfi
+  bgtu  t2, t3, termination_fail
+  li    t4, 1
+  beq   s0, t4, termination_prepare_root_done
+
+  mv    a0, t3
+  sub   t0, s0, t3
+  li    t1, PREP_DONE_TAG
+  YIELD t0, t1
+  j     do_wfi
+
+termination_prepare_root_done:
+  li    t0, SPM_COUNTER
+  lw    t1, 0(t0)
+  bne   t1, s5, do_wfi
+  j     termination_all_steps_done
 
   #------------------------------------------------------------
   # Fold this PU's numerical checksum into the accumulator in a0.
@@ -887,6 +1148,13 @@ termination_checksum_done:
   # PU1 combines one result per MC domain and advances the simulation.
   #------------------------------------------------------------
 termination_domain_done:
+#if SNN_DRAIN_MODE == SNN_DRAIN_TREE
+  # The tree already combined all domains; publish completion for the final
+  # preparation rendezvous before advancing the thread-0 step state.
+  li    t0, SPM_COUNTER
+  sw    s5, 0(t0)
+  j     termination_step_complete
+#else
   li    t1, 1
   li    t0, SPM_COUNTER
   amoadd.w t2, t1, (t0)
@@ -899,7 +1167,9 @@ termination_domain_done:
   li    t0, SPM_FIRED
   amoadd.w zero, a1, (t0)
   bne   t2, s5, do_wfi
+#endif
 
+termination_step_complete:
   # Every domain has drained and reported. Emit one firing count per step.
   li    t0, SPM_FIRED
   lw    t1, 0(t0)
@@ -908,15 +1178,29 @@ termination_domain_done:
 
   addi  t2, s11, 1
   li    t3, SNN_TOTAL_STEPS
-  beq   t2, t3, termination_all_steps_done
+  bne   t2, t3, 1f
+
+  # The final step includes its complete state preparation. Its reduction can
+  # finish before or after the drain protocol, so either side completes only
+  # after observing the other side's counter.
+#ifdef CONDUCTANCE
+  j     termination_all_steps_done
+#else
+  li    t0, SPM_DRAIN_COUNTER
+  lw    t1, 0(t0)
+  srli  t1, t1, 16
+  bne   t1, s6, do_wfi
+  j     termination_all_steps_done
+#endif
+1:
 
   # The timer begins immediately before preparation of the first timed step.
   li    t3, SNN_WARMUP_STEPS
-  bne   t2, t3, 1f
+  bne   t2, t3, 2f
   li    t0, TIMER_ADDR
   li    t1, 1
   sw    t1, 0(t0)
-1:
+2:
   addi  a0, t2, 1
   j     boot_control
 

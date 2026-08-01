@@ -52,7 +52,7 @@ The list is terminated by a dummy neuron state: the starts is the end of the syn
 The end of the SNN SPM contains a descriptor of the data:
 - end - 0x4 (4 bytes): the total number of neurons in this PU (not including the dummy neuron at the end)
 - end - 0x8 (4 bytes): the size of each neuron state (8 + 4 * numMC bytes for type 0; 16 + 4 * numMC bytes for type 1)
-- end - 0xC (4 bytes): the type of neurons:
+- end - 0xC (4 bytes): the type of neurons during initialization:
   - 0x0: current-based FP32 LIF neurons.
   - 0x1: conductance-based FP32 LIF neurons.
 - Before that: neuron group specific data.
@@ -63,8 +63,11 @@ The end of the SNN SPM contains a descriptor of the data:
   is repeated in every PU image so the leader can read its local copy.
 
 The words from end - 0x18 through end - 0x20 are reserved for runtime
-termination state. The word at end - 0x28 tracks overlapped next-step
-preparation. These words are initialized to zero by the image generators.
+termination state. After initialization, the type word at end - 0x0C is reused
+for packed drain/final-preparation counters. The word at end - 0x28 stores the
+MC-domain-size marker in its high 16 bits and tracks overlapped next-step
+preparation in its low 16 bits. These runtime fields are initialized by the
+payload before use.
 
 ## CSR synapse data format
 
@@ -103,12 +106,16 @@ therefore receives only the completed top-level subtrees rather than one report
 from every PU.
 
 PU1 then passes an idle-notifier installation token through the first PU in
-each MC domain. A domain leader registers a notifier only with its local MemIf.
-When that MemIf reports the configured idle interval, the leader immediately
-starts one lowest-priority drain token around the contiguous PUs in its domain.
-Since spike handlers have higher priority, each drain-token handler runs after
-the spike events already queued at that PU. The last PU returns the token to its
-domain leader, which sends one completed-domain result to PU1.
+each MC domain. Domain size is computed once during initialization and cached
+only on those leaders. A domain leader registers a notifier only with its local
+MemIf. When that MemIf reports the configured idle interval, the leader starts
+the selected lowest-priority drain protocol. The default `SNN_DRAIN_MODE=1`
+uses a reverse daisy chain whose ordinary PUs unconditionally forward to the
+preceding PU. `SNN_DRAIN_MODE=2` broadcasts and collects over aligned local
+trees before continuing collection over the corresponding subleader tree.
+Only the selected implementation is emitted into the payload. Since spike
+handlers have higher priority, either drain protocol runs only after the spike
+events already queued at each visited PU.
 
 Each PU disables its spike handler before forwarding the drain token, then uses
 the lowest-priority local handler to begin adding its accumulated input to
@@ -119,7 +126,7 @@ re-enables the spike handler. Spikes from PUs that start the next step earlier
 remain buffered at a later PU until its preparation is complete, so this
 transition needs no additional global barrier.
 
-The drain token also accumulates the optional numerical checksum. Each PU
+The drain protocol also accumulates the optional numerical checksum. Each PU
 quantizes its final mutable neuron fields by multiplying them by 10.0 in FP32
 and converting to a signed integer with round-to-nearest, ties-to-even. It XORs
 those words into the token. Current-based neurons include state and input;
@@ -127,6 +134,11 @@ conductance neurons include g_e, g_i, and membrane potential. PU1 XORs the
 completed-domain values and compares the result with the expected checksum at
 end - 0x24. A checksum XOR difference of at most 15 is accepted to tolerate
 small FP accumulation-order differences.
+
+For current-based neurons, the final timed step also performs the following
+state preparation before the timer stops. A separate tree reduction occupies
+the high 16 bits of the packed drain counter, allowing preparation completion
+and asynchronous domain draining to overlap without corrupting either count.
 
 Numerical verification is enabled by default. Performance payloads can compile
 it out while retaining the idle and domain-drain termination barrier with:

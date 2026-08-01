@@ -43,6 +43,7 @@ NUM_PU ?= 16
 SNN_VERIFY_RESULT ?= 1
 SNN_WARMUP_STEPS ?= 1
 SNN_TIMED_STEPS ?= 4
+SNN_DRAIN_MODE ?= 1
 CSR_NUM_PU ?= 64
 CSR_NUM_MC ?= 2
 MEM_LINE_BYTES ?= 64
@@ -90,11 +91,11 @@ sys/random_noc_test.bin: sys/random_noc_test.S sys/linker_system.ld
 	${PREFIX}objcopy -j .text -j .data -O binary sys/random_noc_test.elf $@
 
 sys/snn_main.bin: sys/snn_main.S sys/snn_init.c sys/linker_system.ld
-	${PREFIX}gcc -mabi=ilp32 -march=rv32imaf_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -DSNN_VERIFY_RESULT=${SNN_VERIFY_RESULT} -DSNN_WARMUP_STEPS=${SNN_WARMUP_STEPS} -DSNN_TIMED_STEPS=${SNN_TIMED_STEPS} -DMEM_LINE_BYTES=${MEM_LINE_BYTES} -O1 -o sys/snn_main.elf sys/snn_main.S sys/snn_init.c
+	${PREFIX}gcc -mabi=ilp32 -march=rv32imaf_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -DSNN_VERIFY_RESULT=${SNN_VERIFY_RESULT} -DSNN_WARMUP_STEPS=${SNN_WARMUP_STEPS} -DSNN_TIMED_STEPS=${SNN_TIMED_STEPS} -DSNN_DRAIN_MODE=${SNN_DRAIN_MODE} -DMEM_LINE_BYTES=${MEM_LINE_BYTES} -O1 -o sys/snn_main.elf sys/snn_main.S sys/snn_init.c
 	${PREFIX}objcopy -j .text -j .data -O binary sys/snn_main.elf $@
 
 sys/snn_cond.bin: sys/snn_cond.S sys/snn_main.S sys/snn_init.c sys/linker_system.ld
-	${PREFIX}gcc -mabi=ilp32 -march=rv32imaf_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -DSNN_VERIFY_RESULT=${SNN_VERIFY_RESULT} -DSNN_WARMUP_STEPS=0 -DSNN_TIMED_STEPS=1 -DMEM_LINE_BYTES=${MEM_LINE_BYTES} -O1 -o sys/snn_cond.elf sys/snn_cond.S sys/snn_init.c
+	${PREFIX}gcc -mabi=ilp32 -march=rv32imaf_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -DSNN_VERIFY_RESULT=${SNN_VERIFY_RESULT} -DSNN_WARMUP_STEPS=0 -DSNN_TIMED_STEPS=1 -DSNN_DRAIN_MODE=${SNN_DRAIN_MODE} -DMEM_LINE_BYTES=${MEM_LINE_BYTES} -O1 -o sys/snn_cond.elf sys/snn_cond.S sys/snn_init.c
 	${PREFIX}objcopy -j .text -j .data -O binary sys/snn_cond.elf $@
 
 sys-tests: sys/pingpong_test.bin sys/sha256_concurrent.bin sys/spm_init.bin sys/barrier_test.bin sys/local_send_test.bin sys/random_noc_test.bin sys/config_rom_test.bin
