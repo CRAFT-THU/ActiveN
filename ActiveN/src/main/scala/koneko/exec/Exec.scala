@@ -212,17 +212,45 @@ class Exec(implicit val param: CoreParameters) extends Module {
   biu.ext.out <> ext.out
   biu.bcast <> bcast
 
+  // Idling management
+  // Next cycle idlings
+  val idlings = RegInit(0.U(param.pipeCnt.W))
+  ext.idlings := idlings
+  assert(!valid || ((idlings.asUInt & uop.smsel) === 0.U)) // Active instruction must come from active thread
+
+  val liveQuotas = RegInit(VecInit(Seq.fill(param.pipeCnt)(0.U(log2Ceil(param.sendQueueDepth + 1).W))))
+  val liveQuotaSum = liveQuotas.zip(idlings.asBools).map({ case (quota, idle) => Mux(idle, 0.U, quota) }).reduce(_ +& _)
+  assert(liveQuotaSum <= param.sendQueueDepth.U)
+  biu.liveQuota := liveQuotaSum
+  biu.margins := margins
+
+  // Assert that WFI never reaches exec stage
+  assert(!valid || !uop.isWFI, "WFI should be handled in decode stage")
+  val sendIsYield = valid && uop.isAM && uop.funct3(0)
+  val msgIsLocal = rs1val === 0.U
+  val msgLocalTag = alu2(11, 0)
+  val msgLocalHandler = alu2(3, 0)
+  val sendFastPath = (
+    msgIsLocal // Is a local send
+    && sendIsYield // Is a yield send
+    && (enmasks(msgLocalHandler) & uop.smsel).orR // Target handler is enabled on this thread
+    && (margins(msgLocalHandler) +& biu.sqcnt +& liveQuotaSum <= param.sendQueueDepth.U) // Target is schedulable
+    && !VecInit(Seq.tabulate(16)({ i => biu.schedulables(i) && (enmasks(i) & uop.smsel).orR })).asUInt.orR
+      // No other pending messages that may be scheduled here
+  )
+
   // Message port connections
   biu.msg.bits.dst := rs1val
   biu.msg.bits.data := directval
-  biu.msg.bits.tag := alu2(11, 0) // Reuse alu2imm for decode
-  val msgIsLocal = rs1val === 0.U
-  biu.push.bits.handler := alu2(3, 0)
+  biu.msg.bits.tag := msgLocalTag // Reuse alu2imm for decode
+  biu.push.bits.handler := msgLocalHandler
   biu.push.bits.regs := directval
 
   // FIXME: quota check. See targetQuotaSufficient below
+  // We don't need to quota check send-yields: they don't consume any send queue space, and semantically
+  // immeidately executes a new handler.
   biu.msg.valid := valid && uop.isAM && !msgIsLocal
-  biu.push.valid := valid && uop.isAM && msgIsLocal
+  biu.push.valid := valid && uop.isAM && msgIsLocal && !sendFastPath
 
   // We use fire here because there is a chance of insufficient quota
   // so valid is not necessarily true
@@ -238,28 +266,13 @@ class Exec(implicit val param: CoreParameters) extends Module {
   // TODO: what's this?
   // assert(!(valid && uop.isAM && biu.msg.fire) || s0step)
 
-  // Idling management
-  // Next cycle idlings
-  val idlings = RegInit(0.U(param.pipeCnt.W))
-  ext.idlings := idlings
-  assert(!valid || ((idlings.asUInt & uop.smsel) === 0.U)) // Active instruction must come from active thread
-
-  val liveQuotas = RegInit(VecInit(Seq.fill(param.pipeCnt)(0.U(log2Ceil(param.sendQueueDepth + 1).W))))
-  val liveQuotaSum = liveQuotas.zip(idlings.asBools).map({ case (quota, idle) => Mux(idle, 0.U, quota) }).reduce(_ +& _)
-  assert(liveQuotaSum <= param.sendQueueDepth.U)
-  biu.liveQuota := liveQuotaSum
-
-  biu.margins := margins
-
-  // Assert that WFI never reaches exec stage
-  assert(!valid || !uop.isWFI, "WFI should be handled in decode stage")
-  val isYield = valid && uop.isAM && uop.funct3(0)
   // If the next instruction is fetched and is WFI
   //
   // Ignores:
   // 1. Ignore WFI that's being branched, excluding biuBrs to avoid combinatorial loop
   // 2. Ignore WFI if we're blocked
   // 3. Ignore WFI if we're a CSR instruction, because they can change BIU-related CSRs
+  // 4. We also gate fast path local sends
   // TODO: later: CSR should be a hard branch, so this will no longer to depend on isCSR
   //
   // Additionally, we need to be careful around writebacks: RegFile should guarantee that
@@ -268,11 +281,12 @@ class Exec(implicit val param: CoreParameters) extends Module {
     d.valid && d.bits.isWFI
       && !rvBrs(i).valid
       && !(!s0step && uop.smsel(i))
-      && !(valid && isCSR && uop.smsel(i))
+      && !(valid && uop.isCSR && uop.smsel(i))
+      && !(sendFastPath && uop.smsel(i))
   )})).asUInt
   // Effectively schedulable threads **RIGHT NOW**
   // failed nonblocking yield does not constitute a candidate
-  val eyield = isYield && biuAccepted
+  val eyield = sendIsYield && biuAccepted
   val eidlings = idlings | (Fill(param.pipeCnt, s0step && eyield) & uop.smsel) | nextWFIs
   assert(!eyield || s0step, "effectivelyYield -> s0step")
 
@@ -282,6 +296,8 @@ class Exec(implicit val param: CoreParameters) extends Module {
   assert((biu.sched.wakeup & biu.accepting) === biu.sched.wakeup)
   // scheduled mask has at most 1 bit set
   assert(PopCount(biu.sched.wakeup) <= 1.U)
+  // If we are a local send yield taking fast path, we must not be woken up by the scheduler
+  assert(!sendFastPath || !(uop.smsel & biu.accepting).orR, "fast path local send yield must not be woken up by scheduler")
 
   // Branches caused by AM
   val biuBrs = Wire(Vec(param.pipeCnt, Valid(UInt(4.W))))
@@ -289,8 +305,8 @@ class Exec(implicit val param: CoreParameters) extends Module {
   // We handle idlings by continously branching to an address
   // FIXME: nonlocal yield may become idle. Also need to branch. Also: WFI is the same
   for (i <- 0 until param.pipeCnt) {
-    biuBrs(i).valid := biu.sched.wakeup(i)
-    biuBrs(i).bits := biu.sched.handler
+    biuBrs(i).valid := biu.sched.wakeup(i) || (sendFastPath && uop.smsel(i))
+    biuBrs(i).bits := Mux(sendFastPath && uop.smsel(i), msgLocalHandler, biu.sched.handler)
   }
 
   // Sending quota decrement
@@ -326,6 +342,10 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
     when(scheduled) {
       liveQuotas(i) := quotas(biu.sched.handler)
+    }
+
+    when(sendFastPath && uop.smsel(i)) {
+      liveQuotas(i) := quotas(msgLocalHandler)
     }
   }
 
@@ -384,7 +404,6 @@ class Exec(implicit val param: CoreParameters) extends Module {
     for (i <- 0 until 16) yield (0x720 + i) -> CSRQuotaMargin(i)
   )
   val csrwmapping = csrmapping.filter({ e => (e._1 >> 10) != 3 })
-  val isCSR = uop.isSystem && uop.funct3(1, 0) =/= 0.U
   val csrUimmExt = Wire(UInt(32.W))
   val csrIdx = uop.cimm(11, 0)
   csrUimmExt := uop.rs1
@@ -397,7 +416,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
       (uop.funct3(1, 0) === 2.U) -> (csrWraw | c.read),
       (uop.funct3(1, 0) === 3.U) -> (c.read & (~csrWraw).asUInt),
     ))
-    when(valid && isCSR && i.U === csrIdx && !csrSkipWrite) {
+    when(valid && uop.isCSR && i.U === csrIdx && !csrSkipWrite) {
       c.write(csrWdata)
     }
   }
@@ -419,7 +438,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
     uop.rdlui -> uop.immU,
     uop.rdauipc -> (uop.immU + uop.pc),
     uop.isMem -> Mux(uop.isSC, lsu.scFail, lsu.resp),
-    uop.isAM -> Mux(biuAccepted, 1.U, 0.U),
+    uop.isAM -> Mux(biuAccepted || sendFastPath, 1.U, 0.U),
     uop.isSystem -> csrRdata, // Only CSR here
   )
 
@@ -457,7 +476,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   var s1donesrc = Seq(
     uop.isMem -> lsu.req.ready,
-    uop.isAM -> (biuAccepted && !uop.funct3(1)),
+    uop.isAM -> ((biuAccepted && !uop.funct3(1)) || sendFastPath), // Fast-path send never blocks
   )
 
   s1done := MuxCase(true.B, s1donesrc)

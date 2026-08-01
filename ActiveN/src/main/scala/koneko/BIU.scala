@@ -50,6 +50,15 @@ class BIU(implicit val param: CoreParameters) extends Module {
   val bcast = IO(Flipped(Decoupled(new BcastLine)))
   val hartid = IO(Input(UInt(16.W)))
 
+  // Is there any message schedulable to a handler?
+  // Used to determine whether to take self send+yield fast path
+  val schedulables = IO(Output(Vec(16, Bool())))
+
+  // Send queue count
+  val sqcnt = IO(Output(UInt(log2Ceil(param.sendQueueDepth + 1).W)))
+
+  // Send queue
+
   //////////////////////////
   // Sending
   //////////////////////////
@@ -57,6 +66,7 @@ class BIU(implicit val param: CoreParameters) extends Module {
   val sendQueue = Module(new FlitQueue(new OutgoingFlit, param.sendQueueDepth, 4))
   sendQueue.enq <> msg
   ext.out <> sendQueue.deq
+  sqcnt := sendQueue.count
 
   //////////////////////////
   // Receiving
@@ -115,10 +125,11 @@ class BIU(implicit val param: CoreParameters) extends Module {
   val scheduleArb = Module(new Arbiter(Vec(4, UInt(32.W)), 16)).suggestName("scheduleArb")
   for (i <- 0 until 16) {
     val enabled = (enmasks(i) & accepting).orR
-    val marginSatisfied = sendQueue.count + margins(i) + liveQuota <= param.sendQueueDepth.U
+    val marginSatisfied = sendQueue.count +& margins(i) +& liveQuota <= param.sendQueueDepth.U
     val schedulable = enabled && marginSatisfied
     val gated = evQueues(i).io.deq.gatedBy(schedulable).suggestName(s"gated_$i")
     scheduleArb.io.in(i) <> gated
+    schedulables(i) := marginSatisfied && evQueues(i).io.deq.valid
   }
   val scheduled = scheduleArb.io.chosen
   sched.handler := scheduleArb.io.chosen

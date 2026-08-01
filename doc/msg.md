@@ -47,13 +47,14 @@ Message sending / receiving behaves like a direct RPC call to a function with ma
 
 Message sending instruction has two forms: a R-type form and an I-type form.
 
-The R-type form takes two arguments: rs1 is the destination of the message, and rs2 is the tag. Tag will be truncated to 12-bit, and destination will be truncated to exactly 16-bit. There is one special values for the destination: 0, which stands for local PU.
+The R-type form takes two arguments: rs1 is the destination of the message, and rs2 is the tag. Tag will be truncated to 12-bit, and destination will be truncated to exactly 16-bit. There is one special values for the destination: 0, which stands for local PU (with special semantics, see below).
 
 The I-type form statically gives the tag, and only take rs1 (the destination).
 
 The funct3 field of the instruction encode other special meanings:
 - Bit 0: If set, marks this send as a "yield" send. Semantically, it's equivalent to executing a WFI immediately after **successfully** sending the message. Specifically, if there is a lower-priority message, it will be scheduled, and the outgoing message will be placed in the event queue.
-  A special optimization is that if the destination is 0 (this does not include using the local PU ID, only 0), and there is no pending message, then the handler will be immediately scheduled during the same cycle, and the message will not be put into the event queue.
+  A special optimization is that if the destination is 0 (this does not include using the local PU ID, only 0), and there is no schedulable message on this thread (disabled handlers or insufficient margins), then the handler will be immediately scheduled during the same cycle, and the message will not be put into the event queue.
+  It also has the special semantics that it does not consume any quota, so if its condition is matched, it will always succeed.
 - Bit 1: If bit 1 is set, marks this send as a "non-blocking" send. If if there is not enough quota (live quota === 0), the instruction will fail. See the section below.
 
 Memnomic for the instruction: `send{.yield}{.nb} rd, dest, tag` and `sendi{.yield}{.nb} rd, dest`.
