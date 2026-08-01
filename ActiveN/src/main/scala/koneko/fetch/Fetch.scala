@@ -14,18 +14,19 @@ class Fetch(implicit val params: CoreParameters) extends Module {
     val br = Vec(params.pipeCnt, Flipped(Valid(UInt(32.W))))
   })
   val decoded = IO(Vec(params.pipeCnt, Decoupled(new uOp)))
-  val busy = IO(Input(UInt(params.pipeCnt.W)))
+  val nidlings = IO(Input(UInt(params.pipeCnt.W)))
 
   // PC Control
   val step = WireDefault(false.B)
 
   val pcs = RegInit(VecInit(Seq.fill(params.pipeCnt)(params.initVec.U(32.W))))
+  val fpcs = for (i <- 0 until params.pipeCnt) yield Mux(ctrl.br(i).valid, ctrl.br(i).bits, pcs(i))
   val fetchable = Wire(UInt(params.pipeCnt.W))
   val sel = PriorityEncoderOH(fetchable)
-  for(((pc, b), fetch) <- (pcs.zip(ctrl.br).zip(sel.asBools))) {
-    pc := Mux(b.valid, b.bits, pc + Mux(fetch && step, 4.U, 0.U))
+  for(((pc, fpc), fetch) <- (pcs.zip(fpcs).zip(sel.asBools))) {
+    pc := fpc + Mux(fetch && step, 4.U, 0.U)
   }
-  val selpc = Mux1H(sel.asBools, pcs)
+  val selpc = Mux1H(sel.asBools, fpcs)
 
   // Latch last sent SMSel.
   val sentSmsel = RegInit(0.U(params.pipeCnt.W))
@@ -73,15 +74,20 @@ class Fetch(implicit val params: CoreParameters) extends Module {
   assert(!((sentSmsel & VecInit(held).asUInt).orR), "Thread that holds a instruction must not have sent a fetch")
 
   // Fetchable threads do not:
-  // 1. branch at the same cycle
+  // 1. Is busy
   // 2. it's holding register is being filled this step
   // 3. have a held instruction and it's not being vacated this cycle
   // Since if the thread already holds a instruction, the last cycle must not have
   // fetched from that thread
+  //
   // 2 + 3 = there is a pending fetched instruction that's not consumed by downstream
+  //
+  // If a thread is branching, we unconditionally allow it to fetch
   fetchable := ~VecInit.tabulate(params.pipeCnt)(i =>
-    ctrl.br(i).valid
-    || busy(i)
-    || ((sentSmsel(i) || held(i)) && !decoded(i).ready)
+    (nidlings(i) || ((sentSmsel(i) || held(i)) && !decoded(i).ready)) && !ctrl.br(i).valid
   ).asUInt
+
+  for (i <- 0 until params.pipeCnt) {
+    assert(!nidlings(i) || !ctrl.br(i).valid, "Thread that is busy must not be branching")
+  }
 }

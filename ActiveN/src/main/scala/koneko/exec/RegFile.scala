@@ -56,7 +56,7 @@ class RegFile(val smtid: Int) extends Module {
   // Direct connections, has precedence over write ports
   for ((d, i) <- msgDirect.zipWithIndex) {
     val target = regs(i + 10)
-    d.rdata := target
+    d.rdata := Mux(write.en && write.num === (i + 10).U, write.value, target)
     when(d.wen) {
       target := d.wdata
     }

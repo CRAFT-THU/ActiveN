@@ -14,7 +14,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
   val dec = IO(Flipped(
       Vec(param.pipeCnt, Decoupled(new uOp))
   ))
-  val busy = IO(Output(UInt(param.pipeCnt.W)))
+  val nidlings = IO(Output(UInt(param.pipeCnt.W)))
   val brs = IO(Output(Vec(param.pipeCnt, Valid(UInt(32.W)))))
   val ext = IO(new Bundle {
     val out = Decoupled(new Bundle {
@@ -63,11 +63,9 @@ class Exec(implicit val param: CoreParameters) extends Module {
   val s0uops = dec.map(_.bits)
   // TODO: remove isWFI is we can be sure that s1 always either count us in eidlings or branches
   // it currently does not hold because of CSR
+  val busy = Wire(UInt(param.pipeCnt.W))
   val issuable = for (i <- 0 until param.pipeCnt) yield dec(i).valid && !dec(i).bits.isWFI && !busy(i) && !brs(i).valid
   val issueSel = PriorityEncoderOH(issuable)
-
-  // We know that whenever a branch happens, the next instruction must be a bubble for that thread
-  for (i <- 0 until param.pipeCnt) assert(!RegNext(brs(i).valid) || !dec(i).valid, "Thread branched next cycle must not have a valid instruction")
 
   // Output consumed
   val s0step = Wire(Bool())
@@ -331,13 +329,14 @@ class Exec(implicit val param: CoreParameters) extends Module {
   // We delay the writing of registers by one cycle, because it necessarily branched this cycle
   // And we want to be sure that the writes take effect after the instruction that may be in s1 right now
   // and is delayed
-  idlings := eidlings & ~biu.sched.wakeup
+  nidlings := eidlings & ~biu.sched.wakeup
+  idlings := nidlings
   for (i <- 0 until param.pipeCnt) {
     val scheduled = biu.sched.wakeup(i)
     for (j <- 0 until 4) {
       // Local sends skips writing registers, only handles remote sends here
-      regfiles(i).msgDirect(j).wdata := RegNext(biu.sched.regs(j))
-      regfiles(i).msgDirect(j).wen := RegNext(scheduled && argcnts(biu.sched.handler) > j.U)
+      regfiles(i).msgDirect(j).wdata := biu.sched.regs(j)
+      regfiles(i).msgDirect(j).wen := scheduled && argcnts(biu.sched.handler) > j.U
     }
 
     when(scheduled) {
@@ -348,6 +347,8 @@ class Exec(implicit val param: CoreParameters) extends Module {
       liveQuotas(i) := quotas(msgLocalHandler)
     }
   }
+  // Will the delayed instruction's wb be suppressed next cycle?
+  val suppressed = (biu.sched.wakeup & uop.smsel).orR && argcnts(biu.sched.handler) > uop.rd - 10.U
 
   sealed trait CSR {
     def read: UInt
@@ -461,7 +462,8 @@ class Exec(implicit val param: CoreParameters) extends Module {
   val rdval = Mux1H(rdsrc)
   val delayedRdval = Mux1H(delayedRdsrc)
 
-  val delayedSent = RegNext(delayed && valid && s1done)
+  // We gate on suppression here.
+  val delayedSent = RegNext(delayed && valid && s1done && !suppressed)
 
   assert(!delayedSent || !delayedUop.rdignore) // Delayed sent -> uop have meaningful rd
   assert(!(delayedSent && valid) || delayedUop.smsel =/= uop.smsel) // When delayed sent, rd cannot be the same
