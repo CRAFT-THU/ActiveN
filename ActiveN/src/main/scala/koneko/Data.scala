@@ -64,4 +64,5 @@ class uOp(implicit val param: CoreParameters) extends Bundle {
   def funct5 = funct7(6, 2)
   def isLR = memIsAtomic && funct5 === "b00010".U(5.W)
   def isSC = memIsAtomic && funct5 === "b00011".U(5.W)
+  def isWFI = isSystem && funct3 === 0.U && rs2 === 5.U
 }

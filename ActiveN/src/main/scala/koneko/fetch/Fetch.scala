@@ -61,7 +61,7 @@ class Fetch(implicit val params: CoreParameters) extends Module {
       // dec is not ready, write into holding register
       (sentSmsel(idx) && step) -> true.B,
     ))
-    dec.valid := d || (sentSmsel(idx) && step && !VecInit(ctrl.br.zip(sentSmsel.asBools).map({ case (b, s) => b.valid && s })).asUInt.orR)
+    dec.valid := d || (sentSmsel(idx) && step)
     dec.bits := Mux(d, holding(idx), decode.decoded)
   }
   for((d, h) <- held.zip(holding)) {

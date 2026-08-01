@@ -7,6 +7,10 @@ import koneko._
 import koneko.bus._
 
 class Exec(implicit val param: CoreParameters) extends Module {
+  // Decoded instructions
+  // dec(i).valid ONLY represents that whether ICache or the holding register contain a instruction this cycle
+  // it does not gate against branches.
+  // Exec is expected to gate against branches itself.
   val dec = IO(Flipped(
       Vec(param.pipeCnt, Decoupled(new uOp))
   ))
@@ -57,8 +61,13 @@ class Exec(implicit val param: CoreParameters) extends Module {
   //////////////////////////
 
   val s0uops = dec.map(_.bits)
-  val issuable = dec.map(_.valid).zip(busy.asBools).map({ case (v, b) => v && !b })
+  // TODO: remove isWFI is we can be sure that s1 always either count us in eidlings or branches
+  // it currently does not hold because of CSR
+  val issuable = for (i <- 0 until param.pipeCnt) yield dec(i).valid && !dec(i).bits.isWFI && !busy(i) && !brs(i).valid
   val issueSel = PriorityEncoderOH(issuable)
+
+  // We know that whenever a branch happens, the next instruction must be a bubble for that thread
+  for (i <- 0 until param.pipeCnt) assert(!RegNext(brs(i).valid) || !dec(i).valid, "Thread branched next cycle must not have a valid instruction")
 
   // Output consumed
   val s0step = Wire(Bool())
@@ -85,6 +94,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
   // We also ask s1 about instructions that's decided to be delayed during execution
   val dynDelayed = Wire(Bool())
   val delayed = RegEnable(s0delayed, s0step) || dynDelayed
+  val s1done = Wire(Bool())
 
   ext.working := valid
 
@@ -151,6 +161,21 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
     Some(fpu)
   } else None
+
+  // Non-biu branches: used to gate against WFI
+  val brfire = Mux1H(Seq(
+    (uop.funct3 === "b000".U) -> eq,
+    (uop.funct3 === "b001".U) -> !eq,
+    (uop.funct3 === "b100".U) -> lt,
+    (uop.funct3 === "b101".U) -> !lt,
+    (uop.funct3 === "b110".U) -> ltu,
+    (uop.funct3 === "b111".U) -> !ltu,
+  ))
+  val rvBrs = Wire(Vec(param.pipeCnt, new Valid(UInt(32.W))))
+  for(i <- 0 until param.pipeCnt) {
+    rvBrs(i).bits := (added >> 1) ## 0.U(1.W)
+    rvBrs(i).valid := uop.smsel(i) && (valid && ((uop.isBr && brfire) || uop.isJump))
+  }
 
   // LSU
   val lsu = Module(new LSU)
@@ -226,14 +251,30 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   biu.margins := margins
 
+  // Assert that WFI never reaches exec stage
+  assert(!valid || !uop.isWFI, "WFI should be handled in decode stage")
   val isYield = valid && uop.isAM && uop.funct3(0)
-  val isWFI = valid && uop.isSystem && uop.funct3 === 0.U && uop.rs2 === 5.U
+  // If the next instruction is fetched and is WFI
+  //
+  // Ignores:
+  // 1. Ignore WFI that's being branched, excluding biuBrs to avoid combinatorial loop
+  // 2. Ignore WFI if we're blocked
+  // 3. Ignore WFI if we're a CSR instruction, because they can change BIU-related CSRs
+  // TODO: later: CSR should be a hard branch, so this will no longer to depend on isCSR
+  //
+  // Additionally, we need to be careful around writebacks: RegFile should guarantee that
+  // handler writes takes precedence over delayed writebacks
+  val nextWFIs = VecInit(dec.zipWithIndex.map({ case (d, i) => (
+    d.valid && d.bits.isWFI
+      && !rvBrs(i).valid
+      && !(!s0step && uop.smsel(i))
+      && !(valid && isCSR && uop.smsel(i))
+  )})).asUInt
   // Effectively schedulable threads **RIGHT NOW**
   // failed nonblocking yield does not constitute a candidate
-  val effectivelyYield = isYield && biuAccepted || isWFI
-  val eidlings = idlings | (Fill(param.pipeCnt, s0step && (isYield && biuAccepted || isWFI)) & uop.smsel)
-  assert(!effectivelyYield || s0step, "effectivelyYield -> s0step")
-  assert(s0step || eidlings === idlings, "eidlings can only differ from idlings when s0step")
+  val eyield = isYield && biuAccepted
+  val eidlings = idlings | (Fill(param.pipeCnt, s0step && eyield) & uop.smsel) | nextWFIs
+  assert(!eyield || s0step, "effectivelyYield -> s0step")
 
   biu.enmasks := enmasks
   biu.accepting := eidlings
@@ -270,13 +311,17 @@ class Exec(implicit val param: CoreParameters) extends Module {
   // only clear wakeup thread when there is something to schedule
   //
   // Explicitly using the last-connected-wins semantics of Chisel
+  //
+  // We delay the writing of registers by one cycle, because it necessarily branched this cycle
+  // And we want to be sure that the writes take effect after the instruction that may be in s1 right now
+  // and is delayed
   idlings := eidlings & ~biu.sched.wakeup
   for (i <- 0 until param.pipeCnt) {
     val scheduled = biu.sched.wakeup(i)
     for (j <- 0 until 4) {
       // Local sends skips writing registers, only handles remote sends here
-      regfiles(i).msgDirect(j).wdata := biu.sched.regs(j)
-      regfiles(i).msgDirect(j).wen := scheduled && argcnts(biu.sched.handler) > j.U
+      regfiles(i).msgDirect(j).wdata := RegNext(biu.sched.regs(j))
+      regfiles(i).msgDirect(j).wen := RegNext(scheduled && argcnts(biu.sched.handler) > j.U)
     }
 
     when(scheduled) {
@@ -378,6 +423,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
     uop.isSystem -> csrRdata, // Only CSR here
   )
 
+  // Delayed instruction writebacks
   val delayedUop = RegNext(uop)
   val delayedIsMul = RegNext(uop.rdalu)
   val delayedIsFP = RegNext(uop.isFP)
@@ -396,9 +442,8 @@ class Exec(implicit val param: CoreParameters) extends Module {
   val rdval = Mux1H(rdsrc)
   val delayedRdval = Mux1H(delayedRdsrc)
 
-  val delayedSent = RegNext(delayed && valid)
+  val delayedSent = RegNext(delayed && valid && s1done)
 
-  assert(!delayed || s0step) // Delayed -> s0step
   assert(!delayedSent || !delayedUop.rdignore) // Delayed sent -> uop have meaningful rd
   assert(!(delayedSent && valid) || delayedUop.smsel =/= uop.smsel) // When delayed sent, rd cannot be the same
 
@@ -415,21 +460,11 @@ class Exec(implicit val param: CoreParameters) extends Module {
     uop.isAM -> (biuAccepted && !uop.funct3(1)),
   )
 
-  val s1done = MuxCase(true.B, s1donesrc)
+  s1done := MuxCase(true.B, s1donesrc)
 
-  // Branching
-  val brfire = Mux1H(Seq(
-    (uop.funct3 === "b000".U) -> eq,
-    (uop.funct3 === "b001".U) -> !eq,
-    (uop.funct3 === "b100".U) -> lt,
-    (uop.funct3 === "b101".U) -> !lt,
-    (uop.funct3 === "b110".U) -> ltu,
-    (uop.funct3 === "b111".U) -> !ltu,
-  ))
-
-  for(((br, biuBr), idx) <- brs.zip(biuBrs).zipWithIndex) {
-    br.bits := Mux(biuBr.valid, handlers(biuBr.bits), (added >> 1) ## 0.U(1.W))
-    br.valid := biuBr.valid || uop.smsel(idx) && (valid && ((uop.isBr && brfire) || uop.isJump))
+  for(i <- 0 until param.pipeCnt) {
+    brs(i).bits := Mux(biuBrs(i).valid, handlers(biuBrs(i).bits), rvBrs(i).bits)
+    brs(i).valid := biuBrs(i).valid || rvBrs(i).valid
   }
 
   // Scheduling
