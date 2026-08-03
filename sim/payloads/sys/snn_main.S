@@ -173,6 +173,14 @@
   .insn r 0x0B, 0x5, 0x0, x0, \dst_reg, \tag_reg
   .endm
 
+  .macro SENDI dst_reg, tag_imm
+  .insn i 0x2B, 0x4, x0, \dst_reg, \tag_imm
+  .endm
+
+  .macro YIELDI dst_reg, tag_imm
+  .insn i 0x2B, 0x5, x0, \dst_reg, \tag_imm
+  .endm
+
   # PU and MC counts are powers of two. Compute num_pu / num_mc without the
   # unsupported RISC-V division extension.
   .macro DOMAIN_SIZE dst_reg, tmp_reg
@@ -635,47 +643,36 @@ conductance_fired:
   li    a2, 0                 # current-based neurons are excitatory by ABI
 #endif
   li    a3, 0
-  li    t3, 0                 # mc index
+  addi  t2, t0, NN_CSR_OFFSET # current neuron's first csr_start
+  add   t3, t2, s2            # next neuron's first csr_start
   li    t4, MC_DST_BASE       # mc dst
+  add   t5, t4, s5            # one-past-last mc dst
 scatter_loop:
-  beq   t3, s5, scatter_done
+  lw    a0, 0(t2)             # csr_start (MC-local)
+  lw    t6, 0(t3)             # csr_end from the next neuron
 
-  # csr_start: at neuron + NN_CSR_OFFSET + 4*mc_idx
-  slli  t2, t3, 2
-  addi  t2, t2, NN_CSR_OFFSET
-  add   t2, t0, t2
-  lw    t5, 0(t2)             # csr_start (MC-local)
-
-  # csr_end: next neuron's same field
-  add   t2, t2, s2
-  lw    t6, 0(t2)             # csr_end
-
-  beq   t5, t6, scatter_next  # no synapses
+  beq   a0, t6, scatter_next  # no synapses
 
   # length in memory lines = (end - start) >> line-byte shift
-  sub   t1, t6, t5
+  sub   t1, t6, a0
   srl   t1, t1, s10
 
   # Build scatter payload: a0=csr_start, a1=(beats<<16)|handler_tag(=1)
-  mv    a0, t5                # a0 = csr_start
   slli  a1, t1, 16
   ori   a1, a1, SCATTER_RESP_TAG # prio=1, handler_tag=1 (spike)
 
-  li    t1, SCATTER_TAG
-  SEND  t4, t1
-
-  mv    a0, t0                # restore neuron pointer
+  SENDI t4, SCATTER_TAG
 
 scatter_next:
-  addi  t3, t3, 1
+  addi  t2, t2, 4
+  addi  t3, t3, 4
   addi  t4, t4, 1
-  j     scatter_loop
+  bne   t4, t5, scatter_loop
 
 scatter_done:
   # Advance to next neuron (after firing)
-  add   a0, a0, s2
-  li    t1, 3                 # tag = 3 (work_update)
-  YIELD zero, t1
+  add   a0, t0, s2
+  YIELDI zero, 3              # tag = 3 (work_update)
   j     do_wfi
 
 work_not_fired:
@@ -689,8 +686,7 @@ work_not_fired:
 
   # Advance
   add   a0, a0, s2
-  li    t1, 3                 # tag = 3 (work_update)
-  YIELD zero, t1
+  YIELDI zero, 3              # tag = 3 (work_update)
   j     do_wfi
 
 work_update_done:
