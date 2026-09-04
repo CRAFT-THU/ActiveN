@@ -24,6 +24,10 @@ case class CoreParameters(
   val bcastQueueDepth: Int = 8,
 ) {
   require(scratchpadSize % 4 == 0)
+  require(i$Assoc >= 1 && isPow2(i$Assoc),
+    "I-cache associativity must be a positive power of two")
+  require(i$Lines >= i$Assoc && isPow2(i$Lines) && i$Lines % i$Assoc == 0,
+    "I-cache line count must be a power-of-two multiple of associativity")
   require(memBusWidth >= 64 && isPow2(memBusWidth), "memBusWidth must be a power of 2 and >= 64")
   require(i$BlockSize >= memBusWidth / 8, "I-cache block must contain at least one memory line")
   require(i$BlockSize % (memBusWidth / 8) == 0, "I-cache block size must be a multiple of the memory line size")

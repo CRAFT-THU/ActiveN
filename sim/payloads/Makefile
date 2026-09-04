@@ -1,4 +1,4 @@
-.PHONY: clean all-tests legacy-bins
+.PHONY: clean all-tests legacy-bins force-mnist-train
 
 default: sys/snn_main.bin
 
@@ -47,6 +47,23 @@ SNN_DRAIN_MODE ?= 1
 CSR_NUM_PU ?= 64
 CSR_NUM_MC ?= 2
 MEM_LINE_BYTES ?= 64
+MNIST_ARCH := rv32ima_zfinx_zicsr
+MNIST_CFLAGS := -O3 -fomit-frame-pointer -ffp-contract=off -fno-jump-tables
+MNIST_RULE ?= three-trace
+MNIST_RULE_ID := $(if $(filter one-trace,$(MNIST_RULE)),1,$(if $(filter two-trace,$(MNIST_RULE)),2,$(if $(filter three-trace,$(MNIST_RULE)),3,)))
+ifeq ($(MNIST_RULE_ID),)
+$(error MNIST_RULE must be one-trace, two-trace, or three-trace)
+endif
+MNIST_RECURRENT_MODE ?= tree
+MNIST_RECURRENT_MODE_ID := $(if $(filter scatter,$(MNIST_RECURRENT_MODE)),0,$(if $(filter tree,$(MNIST_RECURRENT_MODE)),1,$(if $(filter tree-aggregate,$(MNIST_RECURRENT_MODE)),2,)))
+ifeq ($(MNIST_RECURRENT_MODE_ID),)
+$(error MNIST_RECURRENT_MODE must be scatter, tree, or tree-aggregate)
+endif
+MNIST_TRACE_BUNDLE ?= 0
+ifeq ($(filter 0 1,$(MNIST_TRACE_BUNDLE)),)
+$(error MNIST_TRACE_BUNDLE must be 0 or 1)
+endif
+MNIST_DEFINES := -DMNIST_RULE=$(MNIST_RULE_ID) -DMNIST_RECURRENT_MODE=$(MNIST_RECURRENT_MODE_ID) -DMNIST_TRACE_BUNDLE=$(MNIST_TRACE_BUNDLE)
 
 sys/pingpong_test.bin: sys/pingpong_test.S sys/linker_system.ld
 	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -o sys/pingpong_test.elf $<
@@ -97,6 +114,12 @@ sys/snn_main.bin: sys/snn_main.S sys/snn_init.c sys/linker_system.ld
 sys/snn_cond.bin: sys/snn_cond.S sys/snn_main.S sys/snn_init.c sys/linker_system.ld
 	${PREFIX}gcc -mabi=ilp32 -march=rv32imaf_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -DSNN_VERIFY_RESULT=${SNN_VERIFY_RESULT} -DSNN_WARMUP_STEPS=0 -DSNN_TIMED_STEPS=1 -DSNN_DRAIN_MODE=${SNN_DRAIN_MODE} -DMEM_LINE_BYTES=${MEM_LINE_BYTES} -O1 -o sys/snn_cond.elf sys/snn_cond.S sys/snn_init.c
 	${PREFIX}objcopy -j .text -j .data -O binary sys/snn_cond.elf $@
+
+sys/mnist_train.bin: force-mnist-train sys/mnist_train.S sys/snn_init.c sys/linker_mnist_train.ld
+	${PREFIX}gcc -mabi=ilp32 -march=$(MNIST_ARCH) -nostdlib -nostartfiles -Wl,-T,sys/linker_mnist_train.ld -Isys -DMEM_LINE_BYTES=32 -DMNIST_TRAIN=1 $(MNIST_DEFINES) $(MNIST_CFLAGS) -o sys/mnist_train.elf sys/mnist_train.S sys/snn_init.c
+	${PREFIX}objcopy --wildcard -j .text -j '.rodata*' -j '.srodata*' -j .data -O binary sys/mnist_train.elf $@
+
+force-mnist-train:
 
 sys-tests: sys/pingpong_test.bin sys/sha256_concurrent.bin sys/spm_init.bin sys/barrier_test.bin sys/local_send_test.bin sys/random_noc_test.bin sys/config_rom_test.bin
 	@echo "All system tests built successfully"

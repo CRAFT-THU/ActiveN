@@ -95,8 +95,13 @@ unsigned int snn_init(void) {
     /* Validate metadata needed by the assembly runtime. */
     unsigned int stride   = *(volatile unsigned int *)(SPM_BASE + SPM_SIZE - 8);
 
+    /* Hybrid MNIST training uses a fixed header instead of legacy stride records. */
+#ifndef MNIST_TRAIN
     if (stride == 0)
         halt(0xbad20000u | hartid);
+#else
+    (void)stride;
+#endif
 
     return hartid;
 }

@@ -37,6 +37,14 @@ using namespace std;
 // snapshotted by PhaseTimer.
 static thread_local uint64_t g_soft_verilator_ns = 0;
 
+static bool softTimerMnistActivityEnabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("SOFT_TIMER_MNIST_ACTIVITY");
+    return value != nullptr && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+
 // ===========================================================================
 // Topology
 // ===========================================================================
@@ -194,6 +202,20 @@ SoftSystemBackend::Stat SoftSystemBackend::Stat::operator-(const Stat &o) const 
   r.total_hops          = total_hops          - o.total_hops;
   r.total_injections    = total_injections    - o.total_injections;
   r.total_mem_requests  = total_mem_requests  - o.total_mem_requests;
+  r.unicast_mem_requests =
+      unicast_mem_requests - o.unicast_mem_requests;
+  r.icache_accesses     = icache_accesses     - o.icache_accesses;
+  r.icache_line_fills   = icache_line_fills   - o.icache_line_fills;
+  r.icache_stall_core_cycles =
+      icache_stall_core_cycles - o.icache_stall_core_cycles;
+  r.mnist_feedforward_messages =
+      mnist_feedforward_messages - o.mnist_feedforward_messages;
+  r.mnist_trace_messages =
+      mnist_trace_messages - o.mnist_trace_messages;
+  r.mnist_post_fired_trace_messages =
+      mnist_post_fired_trace_messages - o.mnist_post_fired_trace_messages;
+  r.mnist_inhibitory_spikes =
+      mnist_inhibitory_spikes - o.mnist_inhibitory_spikes;
   r.idle_lane_cycles    = idle_lane_cycles    - o.idle_lane_cycles;
   r.idle_core_cycles    = idle_core_cycles    - o.idle_core_cycles;
   r.blocked_structural  = blocked_structural  - o.blocked_structural;
@@ -217,6 +239,8 @@ void SoftSystemBackend::Stat::print(uint64_t cycles) const {
             << " (avg " << avg(total_injections) << "/cyc)\n";
   std::cerr << "  mem_requests:   " << total_mem_requests
             << " (avg " << avg(total_mem_requests) << "/cyc)\n";
+  std::cerr << "  unicast_mem_requests: " << unicast_mem_requests << '\n';
+  printIcache(cycles, SYSTEM_NUM_PU);
   std::cerr << "  idle_lanes:     " << idle_lane_cycles
             << " (avg " << avg(idle_lane_cycles) << "/cyc)\n";
   std::cerr << "  idle_cores:     " << idle_core_cycles
@@ -232,6 +256,24 @@ void SoftSystemBackend::Stat::print(uint64_t cycles) const {
   std::cerr << "  inflight_resp:  " << inflight_resp_sum
             << " (avg " << avg(inflight_resp_sum)
             << "/cyc, cur " << cur_inflight_resp << ")\n";
+}
+
+void SoftSystemBackend::Stat::printIcache(uint64_t cycles,
+                                          uint64_t numPUs) const {
+  const double missRate = icache_accesses
+      ? 100.0 * static_cast<double>(icache_line_fills) / icache_accesses
+      : 0.0;
+  const double stallShare = cycles && numPUs
+      ? 100.0 * static_cast<double>(icache_stall_core_cycles) /
+            (cycles * numPUs)
+      : 0.0;
+  std::cerr << std::fixed << std::setprecision(5)
+            << "  icache_accesses: " << icache_accesses << '\n'
+            << "  icache_fills:    " << icache_line_fills
+            << " (miss rate " << missRate << "%)\n"
+            << "  icache_stalls:   " << icache_stall_core_cycles
+            << " core-cycles (" << stallShare << "% of PU cycles)\n"
+            << std::setprecision(2);
 }
 
 SoftSystemBackend::PhaseTimer::PhaseTimer(SoftSystemBackend &o)
@@ -1070,16 +1112,40 @@ void SoftSystemBackend::stepCleanup(size_t threadId, bool profile) {
 }
 
 void SoftSystemBackend::accumulateStats(uint64_t cycle) {
+  static const bool traceTimerUnicast = [] {
+    const char *value = std::getenv("SOFT_TIMER_UNICAST_TRACE");
+    return value != nullptr && std::strcmp(value, "0") != 0;
+  }();
   uint64_t hops = 0;
   uint64_t idle_lanes = 0;
   uint64_t blocked = 0;
   uint64_t injections = 0;
   uint64_t mem_reqs = 0;
+  uint64_t unicast_mem_reqs = 0;
   uint64_t inflight_msgs = 0;
   uint64_t idle_cores = 0;
+  uint64_t icache_accesses = 0;
+  uint64_t icache_line_fills = 0;
+  uint64_t icache_stalls = 0;
+  uint64_t mnist_feedforward_messages = 0;
+  uint64_t mnist_trace_messages = 0;
+  uint64_t mnist_post_fired_trace_messages = 0;
+  uint64_t mnist_inhibitory_spikes = 0;
 
   for (uint16_t i = 1; i <= cfg.numPU; ++i) {
     const auto &r = routers[i];
+    const auto *root = cores[i]->rootp;
+    const bool icacheHit =
+        root->Core__DOT__fetch__DOT__icache__DOT__s1hitmap_0 ||
+        root->Core__DOT__fetch__DOT__icache__DOT__s1hitWay;
+    const bool icacheValid =
+        root->Core__DOT__fetch__DOT__icache__DOT__s1valid;
+    const bool refillCompleted =
+        root->Core__DOT__fetch__DOT__icache__DOT__s1refillCompleted;
+    if (icacheValid && (icacheHit || refillCompleted)) ++icache_accesses;
+    if (root->Core__DOT__fetch__DOT__icache__DOT__s1refillComplete)
+      ++icache_line_fills;
+    if (icacheValid && !icacheHit && !refillCompleted) ++icache_stalls;
     // Inflight router messages = total queued flits across all input
     // queues of every router.
     inflight_msgs += r.rt.totalFlits();
@@ -1094,7 +1160,23 @@ void SoftSystemBackend::accumulateStats(uint64_t cycle) {
       }
     }
     // Core eject: flit delivered to the local PU.
-    if (r.buf.core_eject_presenting && r.buf.core_eject_accepting) ++hops;
+    if (r.buf.core_eject_presenting && r.buf.core_eject_accepting) {
+      ++hops;
+      if (softTimerMnistActivityEnabled()) {
+        const Flit *flit = r.rt.peek(*r.buf.core_eject_presenting);
+        if (flit != nullptr && flit->tag == 0xc02) {
+          ++mnist_feedforward_messages;
+        } else if (flit != nullptr && flit->tag == 0x804) {
+          ++mnist_trace_messages;
+          if ((flit->data[0] & (1U << 18)) != 0)
+            ++mnist_post_fired_trace_messages;
+        } else if (flit != nullptr && flit->tag == 0x409 &&
+                   flit->dst == 1 && flit->data[0] == 4) {
+          // The phase-4 reduction packs its inhibitory count in bits 9:0.
+          mnist_inhibitory_spikes += flit->data[2] & 0x3ffU;
+        }
+      }
+    }
     // Each incoming forward link corresponds one-to-one with a mesh egress
     // lane, so destination-owned decisions can count the same global totals.
     for (size_t o = 0; o < r.links.num_forwards; ++o) {
@@ -1114,10 +1196,30 @@ void SoftSystemBackend::accumulateStats(uint64_t cycle) {
 
   // Memif eject (from router into memif) counts as a memory request
   // arriving at the memif this cycle.
-  for (auto &a : memif_eject_accept) {
-    if (a) {
-      ++hops;
-      ++mem_reqs;
+  for (size_t memifIdx = 0; memifIdx < memif_eject_accept.size(); ++memifIdx) {
+    const auto &accepted = memif_eject_accept[memifIdx];
+    if (!accepted) continue;
+    ++hops;
+    ++mem_reqs;
+    if (memifIdx == 0) continue;
+
+    const uint8_t port = *accepted;
+    const auto &token = memif_eject[memifIdx][port].token;
+    if (!token) continue;
+    const uint16_t pu = topo.memif_req_at[memifIdx][port];
+    const Flit *flit = routers[pu].rt.peek(*token);
+    if (!flit) continue;
+    const uint8_t requestClass = static_cast<uint8_t>(flit->tag);
+    if (requestClass == 0x00 || requestClass == 0x01 ||
+        requestClass == 0x11) {
+      ++unicast_mem_reqs;
+      if (traceTimerUnicast && timer_stats_active_) {
+        std::cerr << "[Soft timer unicast] cycle=" << cycle
+                  << " pu=" << flit->src
+                  << " class=0x" << std::hex
+                  << static_cast<unsigned>(requestClass)
+                  << " addr=0x" << flit->data[0] << std::dec << '\n';
+      }
     }
   }
 
@@ -1138,6 +1240,15 @@ void SoftSystemBackend::accumulateStats(uint64_t cycle) {
   stats_.total_hops          += hops;
   stats_.total_injections    += injections;
   stats_.total_mem_requests  += mem_reqs;
+  stats_.unicast_mem_requests += unicast_mem_reqs;
+  stats_.icache_accesses     += icache_accesses;
+  stats_.icache_line_fills   += icache_line_fills;
+  stats_.icache_stall_core_cycles += icache_stalls;
+  stats_.mnist_feedforward_messages += mnist_feedforward_messages;
+  stats_.mnist_trace_messages += mnist_trace_messages;
+  stats_.mnist_post_fired_trace_messages +=
+      mnist_post_fired_trace_messages;
+  stats_.mnist_inhibitory_spikes += mnist_inhibitory_spikes;
   stats_.idle_lane_cycles    += idle_lanes;
   stats_.idle_core_cycles    += idle_cores;
   stats_.blocked_structural  += blocked;
@@ -1147,6 +1258,12 @@ void SoftSystemBackend::accumulateStats(uint64_t cycle) {
   stats_.cur_inflight_messages = inflight_msgs;
   stats_.cur_inflight_dram     = inflight_dram;
   stats_.cur_inflight_resp     = inflight_resp;
+
+  if (timer_stats_start_pending_ && cycle >= timer_stats_start_cycle_) {
+    timer_stats_baseline_ = stats_;
+    timer_stats_start_pending_ = false;
+    timer_stats_active_ = true;
+  }
 
   if (nocProfileManualStart_ && !nocProfileActive_ && !nocProfileWritten_ &&
       cycle >= *nocProfileManualStart_) {
@@ -1182,16 +1299,43 @@ void SoftSystemBackend::startNocProfile(uint64_t cycle) {
 }
 
 void SoftSystemBackend::timerStatsStart(uint64_t cycle) {
-  if (nocProfileManualStart_) return;
-  // The peripheral starts counting on the cycle after the start write.
-  startNocProfile(cycle + 1);
+  timer_stats_start_cycle_ = cycle;
+  timer_stats_start_pending_ = true;
+  if (!nocProfileManualStart_) {
+    // The peripheral starts counting on the cycle after the start write.
+    startNocProfile(cycle + 1);
+  }
 }
 
 void SoftSystemBackend::timerStatsStop(uint64_t cycle) {
-  if (!nocProfileActive_) return;
-  nocProfileStopCycle_ = cycle;
-  nocProfileActive_ = false;
-  writeNocProfile();
+  if (timer_stats_active_) {
+    const uint64_t span = cycle - timer_stats_start_cycle_;
+    const Stat interval = stats_ - timer_stats_baseline_;
+    ++timer_stats_intervals_;
+    std::cerr << "[Soft] Timer interval " << timer_stats_intervals_
+              << " (cycles " << (timer_stats_start_cycle_ + 1) << ".."
+              << cycle << ", span=" << span << "):\n";
+    std::cerr << "  unicast_mem_requests: "
+              << interval.unicast_mem_requests << '\n';
+    interval.printIcache(span, cfg.numPU);
+    if (softTimerMnistActivityEnabled()) {
+      std::cerr << "  mnist_feedforward_messages: "
+                << interval.mnist_feedforward_messages << '\n';
+      std::cerr << "  mnist_trace_messages: "
+                << interval.mnist_trace_messages << '\n';
+      std::cerr << "  mnist_post_fired_trace_messages: "
+                << interval.mnist_post_fired_trace_messages << '\n';
+      std::cerr << "  mnist_inhibitory_spikes: "
+                << interval.mnist_inhibitory_spikes << '\n';
+    }
+    timer_stats_active_ = false;
+  }
+  timer_stats_start_pending_ = false;
+  if (nocProfileActive_) {
+    nocProfileStopCycle_ = cycle;
+    nocProfileActive_ = false;
+    writeNocProfile();
+  }
 }
 
 void SoftSystemBackend::accumulateNocProfile(uint64_t cycle) {

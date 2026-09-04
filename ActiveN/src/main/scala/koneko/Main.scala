@@ -38,6 +38,7 @@ object Main extends App {
   var core: Boolean = false
   var pu: Option[Int] = None
   var mc: Option[Int] = None
+  var iCacheLines: Option[Int] = None
   var memBusWidth: Option[Int] = None
   var output: Option[String] = None
   var spliter = args.indexOf("--")
@@ -56,6 +57,7 @@ object Main extends App {
         println("  --system         Emit System with default config")
         println("  --pu=<N>         Emit System with N PUs")
         println("  --mc=<N>         Emit System with N MCs")
+        println("  --icache-lines=<N>  Set I-cache line count. Default: 32")
         println("  --mem-bus-width=<bits>  Set the external memory bus width. Default: 512")
         println("  --output=<path>  Set output path for generated files. Default: ./generated/core or ./generated/system")
         sys.exit(0)
@@ -73,6 +75,13 @@ object Main extends App {
         mc = a.stripPrefix("--mc=").toIntOption
         if (mc.isEmpty) {
           println(s"Invalid MC count: ${a.stripPrefix("--mc=")}")
+          sys.exit(1)
+        }
+      }
+      case a if a.startsWith("--icache-lines=") => {
+        iCacheLines = a.stripPrefix("--icache-lines=").toIntOption
+        if (iCacheLines.isEmpty) {
+          println(s"Invalid I-cache line count: ${a.stripPrefix("--icache-lines=")}")
           sys.exit(1)
         }
       }
@@ -109,6 +118,7 @@ object Main extends App {
   }
 
   val param = defaultParam.copy(
+    i$Lines = iCacheLines.getOrElse(defaultParam.i$Lines),
     memBusWidth = memBusWidth.getOrElse(defaultParam.memBusWidth)
   )
 

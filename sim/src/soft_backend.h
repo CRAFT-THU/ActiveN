@@ -158,6 +158,14 @@ class SoftSystemBackend : public SystemBackend {
     uint64_t total_hops = 0;
     uint64_t total_injections = 0;
     uint64_t total_mem_requests = 0;
+    uint64_t unicast_mem_requests = 0;
+    uint64_t icache_accesses = 0;
+    uint64_t icache_line_fills = 0;
+    uint64_t icache_stall_core_cycles = 0;
+    uint64_t mnist_feedforward_messages = 0;
+    uint64_t mnist_trace_messages = 0;
+    uint64_t mnist_post_fired_trace_messages = 0;
+    uint64_t mnist_inhibitory_spikes = 0;
     uint64_t idle_lane_cycles = 0;
     uint64_t idle_core_cycles = 0;
     uint64_t blocked_structural = 0;
@@ -172,6 +180,7 @@ class SoftSystemBackend : public SystemBackend {
 
     Stat operator-(const Stat &o) const;
     void print(uint64_t cycles) const;
+    void printIcache(uint64_t cycles, uint64_t numPUs) const;
   };
 
  private:
@@ -271,6 +280,11 @@ class SoftSystemBackend : public SystemBackend {
   Stat stats_;
   Stat last_periodic_;
   uint64_t last_periodic_cycle_ = 0;
+  Stat timer_stats_baseline_;
+  uint64_t timer_stats_start_cycle_ = 0;
+  uint64_t timer_stats_intervals_ = 0;
+  bool timer_stats_start_pending_ = false;
+  bool timer_stats_active_ = false;
   bool log_ = false;
 
   struct NocLinkProfile {
