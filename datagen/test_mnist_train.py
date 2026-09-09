@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+import random
 import struct
 from types import SimpleNamespace
 
@@ -62,15 +63,91 @@ def reference_fifth_root(value: float) -> float:
     return f32_mul(f32_mul(estimate, remainder_scale), exponent_scale)
 
 
+def reference_two_trace_fifth_root(
+    value: float, quadratic: bool = True, seed: str = "bit", folded: bool = True,
+) -> float:
+    """FP32 operation oracle; accuracy is checked against independent roots."""
+    if value <= 0.0:
+        return 0.0
+    bits = mnist_train.f32_bits(value)
+    exponent_adjustment = 0
+    if bits < 0x02000000:
+        value = f32_mul(value, 2.0 ** 100)
+        bits = mnist_train.f32_bits(value)
+        exponent_adjustment = 20 << 23
+    if seed == "lut":
+        exponent = mnist_train.f32(2.0 ** (-((bits >> 23) - 127) / 5.0))
+        mantissa = mnist_train.f32((1.0 + (((bits >> 16) & 127) + 0.5) / 128.0) ** -0.2)
+        inverse = f32_mul(exponent, mantissa)
+        center, base = 14.0 / 9.0, 7.0 / 9.0
+    else:
+        seed_bits = 0x4C2BAC89 - ((bits * 0x33333333) >> 32)
+        inverse = struct.unpack("<f", struct.pack("<I", seed_bits))[0]
+        fifth = f32_mul(value, 0.2)
+        for _ in range(1 if quadratic else 2):
+            squared = f32_mul(inverse, inverse)
+            fourth = f32_mul(squared, squared)
+            inverse = f32_sub(
+                f32_mul(1.20148 if quadratic else 1.2, inverse),
+                f32_mul(f32_mul(fifth, squared), fourth)
+            )
+        center, base = 1.555575, 0.7777622219500002
+    squared = f32_mul(inverse, inverse)
+    estimate = f32_mul(value, f32_mul(squared, squared))
+    product = f32_mul(estimate, inverse)
+    if folded and quadratic:
+        difference = f32_sub(product, center)
+        estimate = f32_mul(estimate, f32_add(base, f32_mul(
+            0.72, f32_mul(difference, difference))))
+    else:
+        residual = f32_sub(1.0, product)
+        if quadratic:
+            linear = 0.8 if seed == "lut" else 0.800028
+            correction = f32_mul(
+                estimate, f32_mul(residual, f32_add(linear, f32_mul(0.72, residual)))
+            )
+        else:
+            correction = f32_mul(f32_mul(estimate, 0.8), residual)
+        estimate = f32_add(estimate, correction)
+    result = mnist_train.f32_bits(estimate) - exponent_adjustment
+    return struct.unpack("<f", struct.pack("<I", result))[0]
+
+class FifthRootAccuracyTests(unittest.TestCase):
+    def test_two_trace_root_against_high_precision_reference(self) -> None:
+        # FP64 is independent of the sequence of rounded FP32 operations above.
+        # Include every exponent boundary, the normalization branch, subnormals,
+        # the two worst cases from the exhaustive sweep, and a fixed random set.
+        bits = [1, 0x007FFFFF, 0x7F7FFFFF, 0x416778C2, 0x40A8CFB8, 0x414D90C1]
+        bits += [base + delta for base in range(0x00800000, 0x7F800000, 0x00800000)
+                 for delta in (-1, 0, 1)]
+        rng = random.Random(19260817)
+        bits += [rng.randrange(1, 0x7F800000) for _ in range(1024)]
+        for word in bits:
+            value = struct.unpack("<f", struct.pack("<I", word))[0]
+            expected = mnist_train.f32_bits(value ** 0.2)
+            for seed in ("bit", "lut"):
+                actual = mnist_train.f32_bits(reference_two_trace_fifth_root(value, seed=seed))
+                self.assertLessEqual(abs(actual - expected), 4, (seed, hex(word)))
+
+    def test_two_trace_root_nonpositive_values(self) -> None:
+        for value in (0.0, -0.0, -1.0):
+            for seed in ("bit", "lut"):
+                self.assertEqual(mnist_train.f32_bits(reference_two_trace_fifth_root(value, seed=seed)), 0)
+
+
 def reference_first_step_checksums(
     post_fired_column: int | None = None,
     post_fired_columns: tuple[int, ...] = (),
+    input_intensity: float = 2.0,
+    quadratic_root: bool = True,
+    root_seed: str = "bit",
+    folded_root: bool = True,
 ) -> list[int]:
     fired_posts = set(post_fired_columns)
     if post_fired_column is not None:
         fired_posts.add(post_fired_column)
     pixels = [((index * 73 + 19) ^ (index >> 2)) & 0xFF for index in range(784)]
-    fired = set(mnist_train.predict_input_spikes(pixels, 2.0, 0x19260817))
+    fired = set(mnist_train.predict_input_spikes(pixels, input_intensity, 0x19260817))
     weights = mnist_train.initial_weights(19260817, 78.0)
     pre_decay = mnist_train.f32(0.9875778005)
     post1_decay = mnist_train.f32(0.9875778005)
@@ -126,7 +203,7 @@ def reference_first_step_checksums(
                                 weight,
                                 f32_mul(
                                     f32_mul(mnist_train.f32(0.0001), post1),
-                                    reference_fifth_root(weight),
+                                    reference_two_trace_fifth_root(weight, quadratic_root, root_seed, folded_root),
                                 ),
                             ),
                         )
@@ -145,8 +222,8 @@ def reference_first_step_checksums(
                                                 mnist_train.f32(0.4),
                                             ),
                                         ),
-                                        reference_fifth_root(
-                                            f32_sub(1.0, weight)
+                                        reference_two_trace_fifth_root(
+                                            f32_sub(1.0, weight), quadratic_root, root_seed, folded_root
                                         ),
                                     ),
                                 ),
@@ -262,6 +339,37 @@ class MnistTrainGeneratorTest(unittest.TestCase):
         self.assertEqual(exc_locations[0][0], neuron_pus[0])
         self.assertEqual(exc_locations[-1][0], neuron_pus[-1])
 
+    def test_two_trace_lut_preserves_network_state_and_both_stacks(self) -> None:
+        args = self.args(self.payload)
+        args.rule = "two-trace"
+        args.input_pus = 288
+        args.horizontal_partition = "full-8"
+        args.horizontal_replica_stride = 3
+        original_images, original = mnist_train.make_images(args)
+        args.fifth_root_seed = "lut"
+        images, manifest = mnist_train.make_images(args)
+        start = mnist_train.FIFTH_ROOT_LUT_OFFSET
+        end = start + mnist_train.FIFTH_ROOT_LUT_BYTES
+        self.assertEqual(manifest["max_spm_bytes"], end)
+        self.assertLess(end, mnist_train.STACK0_BASE)
+        for pu in range(512):
+            old = self.spm(original_images, original, pu)
+            new = self.spm(images, manifest, pu)
+            self.assertEqual(new[:start], old[:start])
+            self.assertEqual(new[end:], old[end:])
+            if manifest["per_pu"][pu]["inputs"]:
+                self.assertEqual(new[start:end], mnist_train.fifth_root_lut())
+            else:
+                self.assertEqual(new, old)
+
+    def test_two_trace_lut_rejects_overlapping_weight_storage(self) -> None:
+        args = self.args(self.payload)
+        args.rule = "two-trace"
+        args.input_pus = 160
+        args.fifth_root_seed = "lut"
+        with self.assertRaisesRegex(ValueError, "overlaps the fifth-root LUT"):
+            mnist_train.make_images(args)
+
     def test_neurons_fill_complete_mc_broadcast_ranges(self) -> None:
         for neuron_pu_count, expected_zones in (
             (128, [5, 6, 8, 15]),
@@ -327,6 +435,13 @@ class MnistTrainGeneratorTest(unittest.TestCase):
                  for pu in input_pus]
         self.assertLess(max(loads), min(loads) * 1.02)
 
+    def test_runtime_poisson_cutoff_preserves_nonzero_state_comparison(self) -> None:
+        for threshold in (0, 1, 2, 0x7FFFFFFF, 0xFFFFFFFE, 0xFFFFFFFF):
+            cutoff = mnist_train.poisson_runtime_cutoff(threshold)
+            for state in (1, 2, 0x7FFFFFFE, 0xFFFFFFFE, 0xFFFFFFFF):
+                expected = threshold == 0xFFFFFFFF or state < threshold
+                self.assertEqual(cutoff >= state, expected)
+
     def test_dense_layout_fits_each_pu(self) -> None:
         self.assertEqual(self.dense["feedforward_bytes"], 784 * 400 * 4)
         self.assertEqual(self.dense["feedforward_weight_slots_per_row"], 400)
@@ -334,7 +449,7 @@ class MnistTrainGeneratorTest(unittest.TestCase):
         self.assertEqual(
             self.dense["feedforward_physical_weight_bytes"], 784 * 400 * 4
         )
-        self.assertLessEqual(self.dense["max_spm_bytes"], 7800)
+        self.assertLessEqual(self.dense["max_spm_bytes"], 7808)
         self.assertGreaterEqual(self.dense["min_spm_free_bytes"], 8500)
         self.assertTrue(
             all(item["bytes"] <= mnist_train.STACK0_BASE
@@ -445,6 +560,13 @@ class MnistTrainGeneratorTest(unittest.TestCase):
             neuron_spm = self.spm(
                 self.dense_images, self.dense, neuron_pus[rank]
             )
+            reduce_parent, = struct.unpack_from("<I", neuron_spm, 252)
+            neuron_pu = neuron_pus[rank]
+            self.assertEqual(
+                reduce_parent,
+                0 if neuron_pu == 0
+                else neuron_pu - (neuron_pu & -neuron_pu) + 1,
+            )
             header = struct.unpack_from("<6I", neuron_spm, 268)
             self.assertNotEqual(header[2], 0)
             self.assertEqual(header[3], 0)
@@ -455,12 +577,16 @@ class MnistTrainGeneratorTest(unittest.TestCase):
             expected = input_pus[rotation:] + input_pus[:rotation]
             self.assertEqual(destinations, tuple(pu + 1 for pu in expected))
             self.assertEqual(set(destinations), {pu + 1 for pu in input_pus})
-            fired_vector, observed_mask, observed_vector, observed_count = (
+            fired_vector, reduce_expected, observed_vector, observed_count = (
                 struct.unpack_from("<4I", neuron_spm, 296)
             )
             self.assertEqual(fired_vector, 0)
-            self.assertNotEqual(observed_mask, 0)
-            self.assertEqual(observed_vector, observed_mask + 64)
+            self.assertEqual(
+                reduce_expected,
+                self.args(self.payload).pu_count
+                if neuron_pu == 0 else neuron_pu & -neuron_pu,
+            )
+            self.assertNotEqual(observed_vector, 0)
             self.assertEqual(observed_count, 0)
             self.assertGreaterEqual(
                 len(neuron_spm), observed_vector + len(input_pus) * 2
@@ -487,14 +613,28 @@ class MnistTrainGeneratorTest(unittest.TestCase):
             mnist_train.TRACE_DESTINATION_STRIDE,
         )
 
-        input_spm = self.spm(self.dense_images, self.dense, input_pus[0])
-        fired_vector, observed_mask, observed_vector, observed_count = (
+        input_pu = input_pus[0]
+        input_spm = self.spm(self.dense_images, self.dense, input_pu)
+        reduce_parent, = struct.unpack_from("<I", input_spm, 252)
+        self.assertEqual(
+            reduce_parent,
+            0 if input_pu == 0 else input_pu - (input_pu & -input_pu) + 1,
+        )
+        fired_vector, reduce_expected, observed_vector, observed_count = (
             struct.unpack_from("<4I", input_spm, 296)
         )
         input_count, = struct.unpack_from("<I", input_spm, 24)
         self.assertNotEqual(fired_vector, 0)
-        self.assertEqual((observed_mask, observed_vector, observed_count), (0, 0, 0))
-        self.assertGreaterEqual(len(input_spm), fired_vector + input_count * 4)
+        self.assertEqual(
+            reduce_expected,
+            self.args(self.payload).pu_count
+            if input_pu == 0 else input_pu & -input_pu,
+        )
+        self.assertEqual((observed_vector, observed_count), (0, 0))
+        self.assertGreaterEqual(
+            len(input_spm),
+            fired_vector + input_count * mnist_train.FIRED_VECTOR_RECORD_SIZE,
+        )
 
     def test_full_horizontal_partition_owns_every_synapse_once(self) -> None:
         args = self.args(self.payload)
@@ -575,7 +715,9 @@ class MnistTrainGeneratorTest(unittest.TestCase):
                       for pixel in pixels]
         for input_index, owners in enumerate(manifest["input_owners"]):
             for owner in owners:
-                expected_frame[(owner["pu"], owner["local"])] = thresholds[input_index]
+                expected_frame[(owner["pu"], owner["local"])] = (
+                    mnist_train.poisson_runtime_cutoff(thresholds[input_index])
+                )
         actual_frame = {}
         for mc, (start, lines) in enumerate(
             zip(manifest["frame_starts"], manifest["frame_lines"])
@@ -674,6 +816,206 @@ class MnistTrainGeneratorTest(unittest.TestCase):
                     slots.append(slot)
             self.assertEqual(sorted(slots), list(range(100)))
 
+    def test_eight_way_horizontal_partition_uses_compact_rows(self) -> None:
+        args = self.args(self.payload)
+        args.horizontal_partition = "full-8"
+        images, manifest = mnist_train.make_images(args)
+        self.assertEqual(manifest["horizontal_group_count"], 8)
+        self.assertEqual(manifest["physical_input_record_count"], 8 * 784)
+        self.assertEqual(manifest["feedforward_weight_slots_per_row"], 50)
+        self.assertEqual(manifest["feedforward_padding_slots"], 0)
+        self.assertEqual(
+            manifest["feedforward_physical_weight_bytes"], 784 * 400 * 4
+        )
+        self.assertEqual(
+            [len(group) for group in manifest["input_owner_groups"]], [36] * 8
+        )
+        self.assertEqual(
+            [len(group) for group in manifest["neuron_groups"]], [28] * 8
+        )
+        self.assertEqual(
+            {item["inputs"] for item in manifest["per_pu"] if item["inputs"]},
+            {21, 22},
+        )
+        self.assertEqual(manifest["reverse_trace_max_messages_per_step"], 14400)
+        self.assertLess(manifest["max_spm_bytes"], mnist_train.STACK0_BASE)
+        for input_owners in manifest["input_owners"]:
+            self.assertEqual(
+                len({(int(owner["pu"]) - 1) // 32 for owner in input_owners}), 1
+            )
+
+        for zone in manifest["neuron_mc_zones"]:
+            zone_members = set(range(zone * 32 + 1, (zone + 1) * 32 + 1))
+            self.assertEqual(
+                [len(zone_members & set(group)) for group in manifest["neuron_groups"]],
+                [4] * 8,
+            )
+
+        input_index = 143
+        owners = sorted(
+            manifest["input_owners"][input_index],
+            key=lambda owner: owner["group_mask"],
+        )
+        self.assertEqual(
+            [owner["group_mask"] for owner in owners], [1 << group for group in range(8)]
+        )
+        self.assertEqual(
+            [owner["primary"] for owner in owners], [True] + [False] * 7
+        )
+        self.assertEqual([owner["post_count"] for owner in owners], [50] * 8)
+        rows = []
+        for group, owner in enumerate(owners):
+            spm = self.spm(images, manifest, owner["pu"] - 1)
+            input_offset, = struct.unpack_from("<I", spm, 28)
+            record = struct.unpack_from(
+                "<IIfIIII", spm,
+                input_offset + owner["local"] * mnist_train.INPUT_RECORD_SIZE,
+            )
+            self.assertEqual(record[6], 50)
+            rows.append(struct.unpack_from("<50I", spm, record[5]))
+            horizontal_header = struct.unpack_from("<9I", spm, 312)
+            self.assertEqual(horizontal_header[:4], (288, 28, 50, 1))
+            self.assertEqual(horizontal_header[4:8], (1 << group, 0, group, 50))
+        physical = sorted(value for row in rows for value in row)
+        logical = sorted(
+            mnist_train.f32_bits(value)
+            for value in mnist_train.initial_weights(args.weight_seed, 78.0)[
+                input_index * 400:(input_index + 1) * 400
+            ]
+        )
+        self.assertEqual(physical, logical)
+
+        for group_index, group in enumerate(manifest["neuron_groups"]):
+            slots = []
+            for pu_number in group:
+                spm = self.spm(images, manifest, pu_number - 1)
+                exc_count, exc_offset = struct.unpack_from("<2I", spm, 32)
+                neuron_group, = struct.unpack_from("<I", spm, 336)
+                self.assertEqual(neuron_group, group_index)
+                for local in range(exc_count):
+                    slot, = struct.unpack_from(
+                        "<I", spm,
+                        exc_offset + local * mnist_train.EXC_RECORD_SIZE + 32,
+                    )
+                    slots.append(slot)
+            self.assertEqual(sorted(slots), list(range(50)))
+
+    def test_eight_way_horizontal_partition_supports_256_256_split(self) -> None:
+        args = self.args(self.payload)
+        args.horizontal_partition = "full-8"
+        args.neuron_pus = 256
+        images, manifest = mnist_train.make_images(args)
+
+        self.assertEqual(manifest["input_pu_count"], 256)
+        self.assertEqual(manifest["neuron_pu_count"], 256)
+        self.assertEqual(
+            [len(group) for group in manifest["input_owner_groups"]], [32] * 8
+        )
+        self.assertEqual(
+            [len(group) for group in manifest["neuron_groups"]], [32] * 8
+        )
+        self.assertEqual(
+            {item["inputs"] for item in manifest["per_pu"] if item["inputs"]},
+            {24, 25},
+        )
+        self.assertEqual(
+            {item["excitatory"] for item in manifest["per_pu"]
+             if item["excitatory"]},
+            {1, 2},
+        )
+        self.assertEqual(manifest["feedforward_weight_slots_per_row"], 50)
+        self.assertEqual(manifest["reverse_trace_max_messages_per_step"], 12800)
+        self.assertLess(manifest["max_spm_bytes"], mnist_train.STACK0_BASE)
+        self.assertEqual(len(images), 16)
+
+    def test_sixteen_way_horizontal_partition_uses_compact_rows(self) -> None:
+        args = self.args(self.payload)
+        args.horizontal_partition = "full-16"
+        images, manifest = mnist_train.make_images(args)
+        self.assertEqual(manifest["horizontal_group_count"], 16)
+        self.assertEqual(manifest["input_pu_count"], 288)
+        self.assertEqual(manifest["neuron_pu_count"], 224)
+        self.assertEqual(manifest["physical_input_record_count"], 16 * 784)
+        self.assertEqual(manifest["feedforward_weight_slots_per_row"], 25)
+        self.assertEqual(manifest["feedforward_padding_slots_per_row"], 0)
+        self.assertEqual(manifest["feedforward_padding_slots"], 0)
+        self.assertEqual(
+            manifest["feedforward_physical_weight_bytes"], 784 * 400 * 4
+        )
+        self.assertEqual(
+            [len(group) for group in manifest["input_owner_groups"]], [18] * 16
+        )
+        self.assertEqual(
+            [len(group) for group in manifest["neuron_groups"]], [14] * 16
+        )
+        self.assertEqual(
+            {item["inputs"] for item in manifest["per_pu"] if item["inputs"]},
+            {43, 44},
+        )
+        self.assertEqual(manifest["reverse_trace_max_messages_per_step"], 7200)
+        self.assertLess(manifest["max_spm_bytes"], mnist_train.STACK0_BASE)
+        for input_owners in manifest["input_owners"]:
+            self.assertEqual(
+                len({(int(owner["pu"]) - 1) // 32 for owner in input_owners}), 1
+            )
+
+        for zone in manifest["neuron_mc_zones"]:
+            zone_members = set(range(zone * 32 + 1, (zone + 1) * 32 + 1))
+            self.assertEqual(
+                [len(zone_members & set(group)) for group in manifest["neuron_groups"]],
+                [2] * 16,
+            )
+
+        input_index = 143
+        owners = sorted(
+            manifest["input_owners"][input_index],
+            key=lambda owner: owner["group_mask"],
+        )
+        self.assertEqual(
+            [owner["group_mask"] for owner in owners],
+            [1 << group for group in range(16)],
+        )
+        self.assertEqual(
+            [owner["primary"] for owner in owners], [True] + [False] * 15
+        )
+        self.assertEqual([owner["post_count"] for owner in owners], [25] * 16)
+        rows = []
+        for group, owner in enumerate(owners):
+            spm = self.spm(images, manifest, owner["pu"] - 1)
+            input_offset, = struct.unpack_from("<I", spm, 28)
+            record = struct.unpack_from(
+                "<IIfIIII", spm,
+                input_offset + owner["local"] * mnist_train.INPUT_RECORD_SIZE,
+            )
+            self.assertEqual(record[6], 25)
+            rows.append(struct.unpack_from("<25I", spm, record[5]))
+            horizontal_header = struct.unpack_from("<9I", spm, 312)
+            self.assertEqual(horizontal_header[:4], (288, 14, 25, 1))
+            self.assertEqual(horizontal_header[4:8], (1 << group, 0, group, 25))
+        physical = sorted(value for row in rows for value in row)
+        logical = sorted(
+            mnist_train.f32_bits(value)
+            for value in mnist_train.initial_weights(args.weight_seed, 78.0)[
+                input_index * 400:(input_index + 1) * 400
+            ]
+        )
+        self.assertEqual(physical, logical)
+
+        for group_index, group in enumerate(manifest["neuron_groups"]):
+            slots = []
+            for pu_number in group:
+                spm = self.spm(images, manifest, pu_number - 1)
+                exc_count, exc_offset = struct.unpack_from("<2I", spm, 32)
+                neuron_group, = struct.unpack_from("<I", spm, 336)
+                self.assertEqual(neuron_group, group_index)
+                for local in range(exc_count):
+                    slot, = struct.unpack_from(
+                        "<I", spm,
+                        exc_offset + local * mnist_train.EXC_RECORD_SIZE + 32,
+                    )
+                    slots.append(slot)
+            self.assertEqual(sorted(slots), list(range(25)))
+
     def test_partial_horizontal_partition_uses_every_available_input_pu(self) -> None:
         args = self.args(self.payload)
         args.horizontal_partition = "hot-partial"
@@ -715,6 +1057,24 @@ class MnistTrainGeneratorTest(unittest.TestCase):
             [float(783 - index) for index in range(784)], input_pus, 512, "full-4"
         )
         self.assertEqual(first4, second4)
+        first8, _, _ = mnist_train.horizontal_input_placement(
+            [float(index) for index in range(784)], input_pus, 512, "full-8"
+        )
+        second8, _, _ = mnist_train.horizontal_input_placement(
+            [float(783 - index) for index in range(784)], input_pus, 512, "full-8"
+        )
+        self.assertEqual(first8, second8)
+        adjacent8, _, _ = mnist_train.horizontal_input_placement(
+            [float(index) for index in range(784)], input_pus, 512, "full-8", 0
+        )
+        self.assertNotEqual(first8, adjacent8)
+        first16, _, _ = mnist_train.horizontal_input_placement(
+            [float(index) for index in range(784)], input_pus, 512, "full-16"
+        )
+        second16, _, _ = mnist_train.horizontal_input_placement(
+            [float(783 - index) for index in range(784)], input_pus, 512, "full-16"
+        )
+        self.assertEqual(first16, second16)
 
     def test_deterministic_frame_spikes(self) -> None:
         pixels = [((index * 73 + 19) ^ (index >> 2)) & 0xFF for index in range(784)]
@@ -785,16 +1145,24 @@ class MnistTrainGeneratorTest(unittest.TestCase):
             [0x032674CA, 0x02EB6E72, 0x0239BEC0],
         )
 
+    def test_fired_vector_bounds_have_reserved_zeroed_header_words(self) -> None:
+        self.assertEqual(mnist_train.SPM_HEADER_SIZE, 368)
+        self.assertEqual(mnist_train.MAGIC, 0x4D543131)
+        for pu in self.dense["input_pus"]:
+            spm = self.spm(self.dense_images, self.dense, pu - 1)
+            self.assertEqual(struct.unpack_from("<2I", spm, 360), (0, 0))
+            self.assertGreaterEqual(struct.unpack_from("<I", spm, 28)[0], 368)
+
     def test_same_step_pre_and_post_weight_checksums_for_all_rules(self) -> None:
         self.assertEqual(
             reference_first_step_checksums(post_fired_column=1),
-            [0x0561F569, 0x04AC8FFC, 0x0480E684],
+            [0x0561F569, 0x04AC8FF3, 0x0480E684],
         )
 
     def test_two_same_step_posts_weight_checksums_for_all_rules(self) -> None:
         self.assertEqual(
             reference_first_step_checksums(post_fired_columns=(0, 224)),
-            [0x0400DB44, 0x05CBE328, 0x07851CB3],
+            [0x0400DB44, 0x05CBE32A, 0x07851CB3],
         )
 
     def test_colocated_same_step_posts_weight_checksums_for_all_rules(self) -> None:
@@ -807,7 +1175,7 @@ class MnistTrainGeneratorTest(unittest.TestCase):
         self.assertNotEqual(locations[2][1], locations[3][1])
         self.assertEqual(
             reference_first_step_checksums(post_fired_columns=(2, 3)),
-            [0x049C8764, 0x05506233, 0x0409FC8F],
+            [0x049C8764, 0x05506231, 0x0409FC8F],
         )
 
     def test_sixteen_step_three_trace_checksum_without_posts(self) -> None:

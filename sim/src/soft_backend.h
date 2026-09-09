@@ -330,6 +330,7 @@ class SoftSystemBackend : public SystemBackend {
 
   struct NocCycleProfile {
     uint64_t cycle = 0;
+    uint8_t mnist_phase = 0;
     uint64_t router_flits = 0;
     uint64_t full_input_queues = 0;
     uint64_t links_presented = 0;
@@ -396,6 +397,7 @@ class SoftSystemBackend : public SystemBackend {
   std::vector<NocPuProfile> nocPuProfiles_;
   std::array<uint64_t, ROUTER_Q_DEPTH + 1> nocQueueOccupancy_{};
   std::vector<NocCycleProfile> nocCycleProfiles_;
+  uint8_t currentMnistPhase_ = 0;
 
   // Parallelism
   size_t numThreads = 8; // Overridden by the ctor's threads parameter.

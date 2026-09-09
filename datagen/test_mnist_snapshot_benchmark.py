@@ -2,12 +2,96 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import mnist_snapshot_benchmark as benchmark
 
 
 class SnapshotBenchmarkTest(unittest.TestCase):
+    @staticmethod
+    def case_args(directory: Path) -> dict:
+        return dict(
+            repository=directory, generator=directory / "generator.py",
+            output=directory, payload=directory / "payload.bin",
+            simulator=directory / "simulator", warmup_steps=4, timed_steps=12,
+            max_cycles=3000000, soft_threads=8, input_pus=288, neuron_pus=224,
+            horizontal_partition="full-8", horizontal_replica_stride=3,
+            feedforward_destination_stride=167, trace_destination_stride=83,
+            labels=[0],
+        )
+
+    def test_generator_receives_selected_rule(self) -> None:
+        for rule in ("one-trace", "two-trace", "three-trace"):
+            with self.subTest(rule=rule), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                with mock.patch.object(benchmark, "run_logged", return_value=(1, 0)) as run:
+                    with self.assertRaisesRegex(RuntimeError, "image generation failed"):
+                        benchmark.benchmark_one(
+                            root / "snapshot_000.npz", rule=rule,
+                            **self.case_args(root),
+                        )
+                command = run.call_args.args[0]
+                self.assertEqual(command[command.index("--rule") + 1], rule)
+
+    def test_cached_result_rejects_different_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case = root / "snapshot_000"
+            case.mkdir()
+            (case / "result.json").write_text(json.dumps({"rule": "two-trace"}))
+            with self.assertRaisesRegex(ValueError, "wrong STDP rule"):
+                benchmark.benchmark_one(
+                    root / "snapshot_000.npz", **self.case_args(root)
+                )
+
+    def test_cached_legacy_result_is_three_trace_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case = root / "snapshot_000"
+            case.mkdir()
+            (case / "result.json").write_text(json.dumps({"intervals": []}))
+            self.assertEqual(
+                benchmark.benchmark_one(
+                    root / "snapshot_000.npz", **self.case_args(root)
+                )["intervals"], [],
+            )
+            with self.assertRaisesRegex(ValueError, "wrong STDP rule"):
+                benchmark.benchmark_one(
+                    root / "snapshot_000.npz", rule="one-trace",
+                    **self.case_args(root),
+                )
+
+    def test_cached_image_rejects_different_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "snapshot_000" / "image"
+            image.mkdir(parents=True)
+            (image / "manifest.json").write_text(json.dumps({"rule": "three-trace"}))
+            for mc in range(16):
+                (image / f"dram.{mc}").touch()
+            with self.assertRaisesRegex(ValueError, "wrong STDP rule"):
+                benchmark.benchmark_one(
+                    root / "snapshot_000.npz", rule="one-trace",
+                    **self.case_args(root),
+                )
+
+    def test_summary_rejects_mixed_rules(self) -> None:
+        with self.assertRaisesRegex(ValueError, "different STDP rules"):
+            benchmark.make_summary(
+                [{"rule": "two-trace"}], SimpleNamespace(rule="one-trace")
+            )
+
+    def test_rule_cli(self) -> None:
+        for rule in ("one-trace", "two-trace", "three-trace"):
+            with self.subTest(rule=rule), mock.patch(
+                "sys.argv", ["benchmark", "--snapshots", ".", "--output", ".",
+                             "--rule", rule],
+            ):
+                self.assertEqual(benchmark.parse_args().rule, rule)
+
     def test_timer_parser_ignores_final_cumulative_stats(self) -> None:
         log = """\
 [Soft] Timer interval 1 (cycles 101..200, span=100):

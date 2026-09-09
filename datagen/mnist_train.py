@@ -19,30 +19,47 @@ N_INPUT = 784
 N_EXC = 400
 N_INH = 400
 SPM_SIZE = 16 * 1024
-SPM_HEADER_SIZE = 356
+SPM_HEADER_SIZE = 368
 MAX_MC = 16
 DRAM_HEADER_SIZE = 16
 SPM_DESCRIPTOR_SIZE = 8
-MAGIC = 0x4D543036
+MAGIC = 0x4D543131
 
 RULES = {"one-trace": 1, "two-trace": 2, "three-trace": 3}
 RECURRENT_MODES = {"scatter": 0, "tree": 1, "tree-aggregate": 2}
 PLACEMENT_POLICIES = ("edge", "near", "balanced")
 INPUT_ASSIGNMENTS = ("contiguous", "rate-balanced")
-HORIZONTAL_PARTITIONS = ("none", "hot-partial", "full", "full-4")
+FULL_HORIZONTAL_GROUP_COUNTS = {
+    "full": 2,
+    "full-4": 4,
+    "full-8": 8,
+    "full-16": 16,
+}
+HORIZONTAL_PARTITIONS = ("none", "hot-partial", *FULL_HORIZONTAL_GROUP_COUNTS)
 TRACE_DESTINATION_STRIDE = 83
 FEEDFORWARD_DESTINATION_STRIDE = 167
+HORIZONTAL_REPLICA_STRIDE = 3
 TRACE_SLOT_NONE = 0x1FF
 INPUT_RECORD_SIZE = 28
 EXC_RECORD_SIZE = 36
 INH_RECORD_SIZE = 148
 WEIGHT_RECORD_SIZE = 4
 EXC_TARGET_RECORD_SIZE = 4
+FIRED_VECTOR_RECORD_SIZE = 8
 STACK_SIZE = 2 * 1024
 STACK0_BASE = 0x3000
 STACK0_TOP = STACK0_BASE + STACK_SIZE
 STACK1_BASE = STACK0_TOP
 STACK1_TOP = STACK1_BASE + STACK_SIZE
+FIFTH_ROOT_LUT_OFFSET = 0x2000
+FIFTH_ROOT_LUT_BYTES = (256 + 128) * 4
+
+
+def fifth_root_lut() -> bytes:
+    """FP32 exponent factors and midpoint reciprocal-fifth-root mantissas."""
+    values = [2.0 ** (-(exponent - 127) / 5.0) for exponent in range(256)]
+    values += [(1.0 + (index + 0.5) / 128.0) ** -0.2 for index in range(128)]
+    return struct.pack("<384f", *values)
 
 INPUT_GROUP_0 = 1
 INPUT_GROUP_1 = 2
@@ -355,6 +372,15 @@ def poisson_threshold(pixel: int, intensity: float) -> int:
     return min(int(probability * 4294967296.0), 0xFFFFFFFE)
 
 
+def poisson_runtime_cutoff(threshold: int) -> int:
+    """Encode `state < threshold` as `state <= cutoff` for nonzero RNGs."""
+    if not 0 <= threshold <= 0xFFFFFFFF:
+        raise ValueError("Poisson threshold must be uint32")
+    if threshold == 0 or threshold == 0xFFFFFFFF:
+        return threshold
+    return threshold - 1
+
+
 def predict_input_spikes(pixels: list[int], intensity: float,
                          poisson_seed: int) -> list[int]:
     thresholds = [poisson_threshold(pixel, intensity) for pixel in pixels]
@@ -622,19 +648,26 @@ def horizontal_input_placement(
     input_pus: list[int],
     pu_count: int,
     mode: str,
+    replica_stride: int = HORIZONTAL_REPLICA_STRIDE,
 ) -> tuple[list[list[InputCopy]], dict[int, int], list[list[int]]]:
     """Build physical input records and homogeneous per-PU target ownership."""
-    if len(input_pus) != 288:
-        raise ValueError("horizontal partitioning requires all 288 non-neuron PUs")
+    if not input_pus:
+        raise ValueError("horizontal partitioning requires input PUs")
     assigned: list[list[InputCopy]] = [[] for _ in range(pu_count)]
-    if mode in ("full", "full-4"):
-        group_count = 4 if mode == "full-4" else 2
+    if mode in FULL_HORIZONTAL_GROUP_COUNTS:
+        group_count = FULL_HORIZONTAL_GROUP_COUNTS[mode]
         owner_groups = interleaved_zone_groups(input_pus, group_count)
         roles: dict[int, int] = {}
         for group, owners in enumerate(owner_groups):
             group_mask = 1 << group
+            owners_per_zone = 32 // group_count
+            assignment_owners = []
+            for start in range(0, len(owners), owners_per_zone):
+                zone_owners = owners[start:start + owners_per_zone]
+                shift = group * replica_stride % owners_per_zone
+                assignment_owners.extend(zone_owners[shift:] + zone_owners[:shift])
             merge_copy_assignments(assigned, assign_input_copies(
-                range(N_INPUT), scores, owners,
+                range(N_INPUT), scores, assignment_owners,
                 pu_count=pu_count, group_mask=group_mask,
                 primary=group == 0, replicated=True, rate_balanced=False,
             ))
@@ -829,7 +862,7 @@ def pack_spm_header(
     recurrent_mode: int,
     feedforward_start_rank: int,
     fired_vector_offset: int,
-    observed_mask_offset: int,
+    reduce_expected: int,
     observed_vector_offset: int,
     physical_input_pu_count: int,
     target_count_per_segment: int,
@@ -841,14 +874,18 @@ def pack_spm_header(
     owned_post_count: int,
 ) -> None:
     values = [
-        MAGIC, rule, pu, pu_count, mc_count, line_shift,
+        MAGIC, rule, pu + 1, pu_count, mc_count, line_shift,
         input_count, input_offset, exc_count, exc_offset,
         inh_count, inh_offset, weight_count, weight_offset,
     ]
     struct.pack_into("<14I", spm, 0, *values)
     struct.pack_into("<16I", spm, 56, *(frame_starts + [0] * (MAX_MC - mc_count)))
     struct.pack_into("<16I", spm, 120, *(frame_lines + [0] * (MAX_MC - mc_count)))
-    struct.pack_into("<4fI", spm, 236, weight_max, potentiation_rate, 0.0001, 0.4, 0)
+    reduce_parent = 0 if pu == 0 else pu - (pu & -pu) + 1
+    struct.pack_into(
+        "<4fI", spm, 236,
+        weight_max, potentiation_rate, 0.0001, 0.4, reduce_parent,
+    )
     struct.pack_into("<2I", spm, 256, warmup_steps, timed_steps)
     struct.pack_into(
         "<7I", spm, 268,
@@ -857,7 +894,7 @@ def pack_spm_header(
     )
     struct.pack_into(
         "<4I", spm, 296,
-        fired_vector_offset, observed_mask_offset, observed_vector_offset, 0,
+        fired_vector_offset, reduce_expected, observed_vector_offset, 0,
     )
     struct.pack_into(
         "<9I", spm, 312,
@@ -865,8 +902,10 @@ def pack_spm_header(
         posts_per_segment, target_segment_count, input_group_mask,
         first_weight_slot, neuron_group, owned_post_count, 0,
     )
-    # Runtime-only neuron-SMT join value and high reduction word.
-    struct.pack_into("<2I", spm, 348, 0, 0)
+    # Runtime-only phase-local SMT join value and reduction words.
+    struct.pack_into("<3I", spm, 348, 0, 0, 0)
+    # Validated absolute fired-vector bounds, published once per phase.
+    struct.pack_into("<2I", spm, 360, 0, 0)
 
 
 def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
@@ -888,10 +927,18 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
         theta = None
 
     horizontal_partition = getattr(args, "horizontal_partition", "none")
+    horizontal_replica_stride = getattr(
+        args, "horizontal_replica_stride", HORIZONTAL_REPLICA_STRIDE
+    )
+    feedforward_destination_stride = getattr(
+        args, "feedforward_destination_stride", FEEDFORWARD_DESTINATION_STRIDE
+    )
+    if horizontal_replica_stride < 0:
+        raise ValueError("horizontal replica stride must be nonnegative")
+    if feedforward_destination_stride < 0:
+        raise ValueError("feedforward destination stride must be nonnegative")
     if horizontal_partition not in HORIZONTAL_PARTITIONS:
         raise ValueError(f"unknown horizontal partition mode {horizontal_partition!r}")
-    if horizontal_partition != "none" and args.neuron_pus != 224:
-        raise ValueError("horizontal partitioning currently requires 224 neuron PUs")
     if horizontal_partition != "none" and args.trace_bundle:
         raise ValueError("horizontal partitioning currently requires unbundled traces")
     physical_input_pu_count = (
@@ -933,7 +980,9 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
         input_group_by_pu = {pu: INPUT_GROUP_BOTH for pu in input_pus}
         trace_input_groups = [input_pus, input_pus]
     else:
-        horizontal_group_count = 4 if horizontal_partition == "full-4" else 2
+        horizontal_group_count = FULL_HORIZONTAL_GROUP_COUNTS.get(
+            horizontal_partition, 2
+        )
         exc_per_pu, exc_locations, neuron_groups, neuron_group_by_pu = (
             horizontal_neuron_placement(
                 neuron_pus, args.pu_count, horizontal_group_count,
@@ -943,6 +992,7 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
         input_per_pu, input_group_by_pu, trace_input_groups = (
             horizontal_input_placement(
                 placement_scores, input_pus, args.pu_count, horizontal_partition,
+                horizontal_replica_stride,
             )
         )
         input_locations = [(-1, -1)] * N_INPUT
@@ -983,7 +1033,7 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
                 f"index {target_local}"
             )
         exc_by_pu[target_pu].append((column, target_local))
-    compact_weight_rows = horizontal_partition == "full-4"
+    compact_weight_rows = horizontal_partition in ("full-4", "full-8", "full-16")
     weight_slots_per_row = N_EXC // horizontal_group_count if compact_weight_rows else N_EXC
     exc_weight_slots = [TRACE_SLOT_NONE] * N_EXC
     exc_target_groups: list[list[int]] = []
@@ -1039,7 +1089,8 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
     for pu, copies in enumerate(input_per_pu):
         for local, copy in enumerate(copies):
             frame_rows[pu // pus_per_mc].extend(struct.pack(
-                "<HHI", pu + 1, local, thresholds[copy.input_index],
+                "<HHI", pu + 1, local,
+                poisson_runtime_cutoff(thresholds[copy.input_index]),
             ))
 
     frame_starts, frame_lines = [], []
@@ -1057,6 +1108,7 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
         if horizontal_partition == "none":
             local_target_groups = exc_target_groups if input_per_pu[pu] else []
             posts_per_segment = N_EXC
+            first_group = 0
             first_weight_slot = 0
         else:
             local_target_groups = [
@@ -1078,7 +1130,9 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
         )
         target_segment_count = len(local_target_groups)
         owned_post_count = posts_per_segment * target_segment_count
-        neuron_group = neuron_group_by_pu.get(pu, 0)
+        # The field identifies the owned column group on both sides.  Compact
+        # layouts use it to select their packed firing-count field directly.
+        neuron_group = neuron_group_by_pu.get(pu, first_group)
         trace_destinations = (
             trace_input_groups[neuron_group] if exc_per_pu[pu] else []
         )
@@ -1097,7 +1151,8 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
             align_up(after_exc_targets, 4) if input_per_pu[pu] else 0
         )
         after_fired_vector = (
-            fired_vector_offset + len(input_per_pu[pu]) * 4
+            fired_vector_offset
+            + len(input_per_pu[pu]) * FIRED_VECTOR_RECORD_SIZE
             if input_per_pu[pu] else after_exc_targets
         )
         input_dest_offset = (
@@ -1107,26 +1162,35 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
             input_dest_offset + len(trace_destinations) * 2
             if exc_per_pu[pu] else after_fired_vector
         )
-        observed_mask_offset = (
-            align_up(after_input_dest, 4) if exc_per_pu[pu] else 0
-        )
-        observed_mask_bytes = ((args.pu_count + 31) // 32) * 4
+        # Feedforward senders mark exactly one message per active source PU, so
+        # the single-threaded receiver can append source IDs without a bitset.
+        observed_mask_bytes = 0
         observed_vector_offset = (
-            observed_mask_offset + observed_mask_bytes
+            align_up(after_input_dest, 2)
             if exc_per_pu[pu] else 0
         )
         required = (
             observed_vector_offset + len(input_pus) * 2
             if exc_per_pu[pu] else after_input_dest
         )
+        use_root_lut = getattr(args, "fifth_root_seed", "bit") == "lut"
+        if use_root_lut and args.rule != "two-trace":
+            raise ValueError("the fifth-root LUT is specific to two-trace training")
+        root_lut_bytes = FIFTH_ROOT_LUT_BYTES if use_root_lut and input_per_pu[pu] else 0
+        if root_lut_bytes:
+            if required > FIFTH_ROOT_LUT_OFFSET:
+                raise ValueError(f"PU {pu + 1} data overlaps the fifth-root LUT")
+            required = FIFTH_ROOT_LUT_OFFSET + root_lut_bytes
         if required > STACK0_BASE:
             raise ValueError(
                 f"PU {pu + 1} layout ends at {required}, overlapping the first "
                 f"SMT stack at {STACK0_BASE}"
             )
         spm = bytearray(SPM_SIZE)
+        if root_lut_bytes:
+            spm[FIFTH_ROOT_LUT_OFFSET:required] = fifth_root_lut()
         feedforward_start_rank = (
-            input_role_ranks[pu] * FEEDFORWARD_DESTINATION_STRIDE
+            input_role_ranks[pu] * feedforward_destination_stride
         ) % target_count_per_segment if input_per_pu[pu] else 0
         pack_spm_header(
             spm, rule=RULES[args.rule], pu=pu, pu_count=args.pu_count,
@@ -1147,7 +1211,7 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
             recurrent_mode=RECURRENT_MODES[args.recurrent_mode],
             feedforward_start_rank=feedforward_start_rank,
             fired_vector_offset=fired_vector_offset,
-            observed_mask_offset=observed_mask_offset,
+            reduce_expected=(args.pu_count if pu == 0 else pu & -pu),
             observed_vector_offset=observed_vector_offset,
             physical_input_pu_count=len(input_pus),
             target_count_per_segment=target_count_per_segment,
@@ -1274,13 +1338,15 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
                 len(trace_destinations) * 2 if exc_per_pu[pu] else 0
             ),
             "fired_vector_bytes": (
-                len(input_per_pu[pu]) * 4 if input_per_pu[pu] else 0
+                len(input_per_pu[pu]) * FIRED_VECTOR_RECORD_SIZE
+                if input_per_pu[pu] else 0
             ),
             "observed_mask_bytes": observed_mask_bytes if exc_per_pu[pu] else 0,
             "observed_vector_bytes": (
                 len(input_pus) * 2 if exc_per_pu[pu] else 0
             ),
             "bytes": required,
+            "fifth_root_lut_bytes": root_lut_bytes,
             "free_bytes": SPM_SIZE - required,
             "input_group_mask": input_group_mask,
             "neuron_group": neuron_group if exc_per_pu[pu] else None,
@@ -1377,20 +1443,21 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
     if padding_slots_per_row.is_integer():
         padding_slots_per_row = int(padding_slots_per_row)
     manifest = {
-        "schema": "activen-mnist-training-v10",
+        "schema": "activen-mnist-training-v12",
         "rule": args.rule,
         "topology": "dense-grouped",
         "placement_policy": args.placement_policy,
         "neuron_zone_policy": args.neuron_zone_policy,
         "input_assignment": (
             args.input_assignment if horizontal_partition == "none"
-            else "index-cyclic" if horizontal_partition in ("full", "full-4")
+            else "index-cyclic" if horizontal_partition in FULL_HORIZONTAL_GROUP_COUNTS
             else "rate-balanced-hot-partial"
         ),
         "horizontal_partition": horizontal_partition,
         "horizontal_group_count": horizontal_group_count,
+        "horizontal_replica_stride": horizontal_replica_stride,
         "feedforward_destination_order": "input-pu-cyclic",
-        "feedforward_destination_stride": FEEDFORWARD_DESTINATION_STRIDE,
+        "feedforward_destination_stride": feedforward_destination_stride,
         "trace_destination_order": "neuron-pu-cyclic",
         "trace_destination_stride": trace_destination_stride,
         "trace_bundle": args.trace_bundle,
@@ -1449,6 +1516,7 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
         "potentiation_rate": potentiation_rate,
         "three_trace_potentiation_order": "f32(f32(eta_plus * post2) * effective_pre)",
         "max_spm_bytes": max(item["bytes"] for item in usage),
+        "fifth_root_seed": getattr(args, "fifth_root_seed", "bit"),
         "min_spm_free_bytes": min(item["free_bytes"] for item in usage),
         "frame_starts": frame_starts,
         "frame_lines": frame_lines,
@@ -1467,6 +1535,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mc-count", type=int, default=16)
     parser.add_argument("--mem-line-width", type=int, default=256)
     parser.add_argument("--rule", choices=tuple(RULES), default="three-trace")
+    parser.add_argument("--fifth-root-seed", choices=("bit", "lut"), default="bit",
+                        help="must match the two-trace payload's MNIST_FIFTH_ROOT_SEED build option")
     parser.add_argument("--input-pus", type=int, default=196)
     parser.add_argument("--neuron-pus", type=int, default=224)
     parser.add_argument(
@@ -1481,7 +1551,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--horizontal-partition", choices=HORIZONTAL_PARTITIONS, default="none",
-        help="split selected or all dense input rows into two or four owners",
+        help="split selected or all dense input rows across column groups",
+    )
+    parser.add_argument(
+        "--horizontal-replica-stride", type=int,
+        default=HORIZONTAL_REPLICA_STRIDE,
+        help="rotate replicas within each MC zone by this owner-rank stride",
     )
     parser.add_argument(
         "--recurrent-mode", choices=tuple(RECURRENT_MODES), default="tree"
@@ -1489,6 +1564,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--trace-destination-stride", type=int,
         default=TRACE_DESTINATION_STRIDE,
+    )
+    parser.add_argument(
+        "--feedforward-destination-stride", type=int,
+        default=FEEDFORWARD_DESTINATION_STRIDE,
     )
     parser.add_argument("--trace-bundle", action="store_true")
     parser.add_argument("--weight-seed", type=int, default=19260817)

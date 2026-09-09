@@ -63,7 +63,36 @@ MNIST_TRACE_BUNDLE ?= 0
 ifeq ($(filter 0 1,$(MNIST_TRACE_BUNDLE)),)
 $(error MNIST_TRACE_BUNDLE must be 0 or 1)
 endif
-MNIST_DEFINES := -DMNIST_RULE=$(MNIST_RULE_ID) -DMNIST_RECURRENT_MODE=$(MNIST_RECURRENT_MODE_ID) -DMNIST_TRACE_BUNDLE=$(MNIST_TRACE_BUNDLE)
+MNIST_PARALLEL_INPUT_PREPARE ?= 1
+ifeq ($(filter 0 1,$(MNIST_PARALLEL_INPUT_PREPARE)),)
+$(error MNIST_PARALLEL_INPUT_PREPARE must be 0 or 1)
+endif
+# 0: legacy phase-start loop, 1: parallel neuron phase, 2: fused preparation.
+MNIST_INPUT_DECAY_MODE ?= 1
+ifeq ($(filter 0 1 2,$(MNIST_INPUT_DECAY_MODE)),)
+$(error MNIST_INPUT_DECAY_MODE must be 0, 1, or 2)
+endif
+MNIST_FUSE_NEURON_UPDATE ?= 1
+ifeq ($(filter 0 1,$(MNIST_FUSE_NEURON_UPDATE)),)
+$(error MNIST_FUSE_NEURON_UPDATE must be 0 or 1)
+endif
+MNIST_PIPELINE_INPUT_PREPARE ?= 1
+ifeq ($(filter 0 1,$(MNIST_PIPELINE_INPUT_PREPARE)),)
+$(error MNIST_PIPELINE_INPUT_PREPARE must be 0 or 1)
+endif
+MNIST_HORIZONTAL_GROUP_COUNT ?= 4
+ifeq ($(filter 4 8 16,$(MNIST_HORIZONTAL_GROUP_COUNT)),)
+$(error MNIST_HORIZONTAL_GROUP_COUNT must be 4, 8, or 16)
+endif
+MNIST_FIFTH_ROOT_SEED ?= bit
+ifeq ($(MNIST_FIFTH_ROOT_SEED),bit)
+MNIST_FIFTH_ROOT_LUT := 0
+else ifeq ($(MNIST_FIFTH_ROOT_SEED),lut)
+MNIST_FIFTH_ROOT_LUT := 1
+else
+$(error MNIST_FIFTH_ROOT_SEED must be bit or lut)
+endif
+MNIST_DEFINES := -DMNIST_RULE=$(MNIST_RULE_ID) -DMNIST_RECURRENT_MODE=$(MNIST_RECURRENT_MODE_ID) -DMNIST_TRACE_BUNDLE=$(MNIST_TRACE_BUNDLE) -DMNIST_PARALLEL_INPUT_PREPARE=$(MNIST_PARALLEL_INPUT_PREPARE) -DMNIST_INPUT_DECAY_MODE=$(MNIST_INPUT_DECAY_MODE) -DMNIST_FUSE_NEURON_UPDATE=$(MNIST_FUSE_NEURON_UPDATE) -DMNIST_PIPELINE_INPUT_PREPARE=$(MNIST_PIPELINE_INPUT_PREPARE) -DMNIST_HORIZONTAL_GROUP_COUNT=$(MNIST_HORIZONTAL_GROUP_COUNT) -DMNIST_FIFTH_ROOT_LUT=$(MNIST_FIFTH_ROOT_LUT)
 
 sys/pingpong_test.bin: sys/pingpong_test.S sys/linker_system.ld
 	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -o sys/pingpong_test.elf $<
@@ -115,7 +144,7 @@ sys/snn_cond.bin: sys/snn_cond.S sys/snn_main.S sys/snn_init.c sys/linker_system
 	${PREFIX}gcc -mabi=ilp32 -march=rv32imaf_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -DSNN_VERIFY_RESULT=${SNN_VERIFY_RESULT} -DSNN_WARMUP_STEPS=0 -DSNN_TIMED_STEPS=1 -DSNN_DRAIN_MODE=${SNN_DRAIN_MODE} -DMEM_LINE_BYTES=${MEM_LINE_BYTES} -O1 -o sys/snn_cond.elf sys/snn_cond.S sys/snn_init.c
 	${PREFIX}objcopy -j .text -j .data -O binary sys/snn_cond.elf $@
 
-sys/mnist_train.bin: force-mnist-train sys/mnist_train.S sys/snn_init.c sys/linker_mnist_train.ld
+sys/mnist_train.bin: force-mnist-train sys/mnist_train.S sys/mnist_fifth_root.inc sys/mnist_fifth_root_config.inc sys/snn_init.c sys/linker_mnist_train.ld
 	${PREFIX}gcc -mabi=ilp32 -march=$(MNIST_ARCH) -nostdlib -nostartfiles -Wl,-T,sys/linker_mnist_train.ld -Isys -DMEM_LINE_BYTES=32 -DMNIST_TRAIN=1 $(MNIST_DEFINES) $(MNIST_CFLAGS) -o sys/mnist_train.elf sys/mnist_train.S sys/snn_init.c
 	${PREFIX}objcopy --wildcard -j .text -j '.rodata*' -j '.srodata*' -j .data -O binary sys/mnist_train.elf $@
 

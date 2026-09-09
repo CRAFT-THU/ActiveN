@@ -222,7 +222,11 @@ def benchmark_one(
     input_pus: int,
     neuron_pus: int,
     horizontal_partition: str,
+    horizontal_replica_stride: int,
+    feedforward_destination_stride: int,
+    trace_destination_stride: int,
     labels: list[int],
+    rule: str = "three-trace",
 ) -> dict[str, Any]:
     index_match = re.search(r"(\d+)$", snapshot.stem)
     if index_match is None:
@@ -234,6 +238,8 @@ def benchmark_one(
     if result_path.is_file():
         with result_path.open(encoding="ascii") as stream:
             result = json.load(stream)
+        if result.get("rule", "three-trace") != rule:
+            raise ValueError(f"cached result has the wrong STDP rule: {result_path}")
         if normalize_result_activity(result):
             atomic_json(result_path, result)
         return result
@@ -255,7 +261,7 @@ def benchmark_one(
             "--runtime-snapshot",
             str(snapshot),
             "--rule",
-            "three-trace",
+            rule,
             "--input-pus",
             str(input_pus),
             "--neuron-pus",
@@ -268,6 +274,12 @@ def benchmark_one(
             "rate-balanced",
             "--horizontal-partition",
             horizontal_partition,
+            "--horizontal-replica-stride",
+            str(horizontal_replica_stride),
+            "--feedforward-destination-stride",
+            str(feedforward_destination_stride),
+            "--trace-destination-stride",
+            str(trace_destination_stride),
             "--recurrent-mode",
             "tree",
             "--warmup-steps",
@@ -283,8 +295,17 @@ def benchmark_one(
 
     with manifest_path.open(encoding="ascii") as stream:
         manifest = json.load(stream)
+    if manifest.get("rule") != rule:
+        raise ValueError(f"cached image has the wrong STDP rule: {image}")
     if manifest.get("horizontal_partition", "none") != horizontal_partition:
         raise ValueError(f"cached image has the wrong partition mode: {image}")
+    if manifest.get("horizontal_replica_stride", 0) != horizontal_replica_stride:
+        raise ValueError(f"cached image has the wrong replica stride: {image}")
+    if (manifest.get("feedforward_destination_stride")
+            != feedforward_destination_stride):
+        raise ValueError(f"cached image has the wrong feedforward stride: {image}")
+    if manifest.get("trace_destination_stride") != trace_destination_stride:
+        raise ValueError(f"cached image has the wrong trace stride: {image}")
     reverse_group_sizes = {
         len(group) for group in manifest.get("input_owner_groups", [])
     }
@@ -347,7 +368,11 @@ def benchmark_one(
         "phase_tick": metadata["phase_tick"],
         "frame_index": frame_index,
         "digit": digit,
+        "rule": rule,
         "horizontal_partition": horizontal_partition,
+        "horizontal_replica_stride": horizontal_replica_stride,
+        "feedforward_destination_stride": feedforward_destination_stride,
+        "trace_destination_stride": trace_destination_stride,
         "wall_seconds": wall_seconds,
         **parsed,
     }
@@ -544,6 +569,8 @@ def summarize_input_load(
 
 
 def make_summary(results: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, Any]:
+    if any(result.get("rule", "three-trace") != args.rule for result in results):
+        raise ValueError("cannot summarize results from different STDP rules")
     intervals = [item for result in results for item in result["intervals"]]
 
     def group(predicate: Any) -> dict[str, Any]:
@@ -563,6 +590,8 @@ def make_summary(results: list[dict[str, Any]], args: argparse.Namespace) -> dic
                 tuple(manifest["neuron_pus"]),
                 manifest["input_assignment"],
                 manifest.get("horizontal_partition", "none"),
+                manifest["feedforward_destination_stride"],
+                manifest["trace_destination_stride"],
                 tuple(
                     tuple(
                         (
@@ -652,6 +681,7 @@ def make_summary(results: list[dict[str, Any]], args: argparse.Namespace) -> dic
         provenance["selection_sha256"] = sha256_file(selection)
     return {
         "schema": "activen-mnist-snapshot-benchmark-v1",
+        "rule": args.rule,
         "provenance": provenance,
         "snapshot_count": len(results),
         "presentation_snapshot_count": sum(
@@ -663,6 +693,9 @@ def make_summary(results: list[dict[str, Any]], args: argparse.Namespace) -> dic
         "soft_threads_per_simulator": args.soft_threads,
         "parallel_simulators": args.jobs,
         "horizontal_partition": args.horizontal_partition,
+        "horizontal_replica_stride": args.horizontal_replica_stride,
+        "feedforward_destination_stride": args.feedforward_destination_stride,
+        "trace_destination_stride": args.trace_destination_stride,
         "mapping_identical_across_snapshots": len(placement_signatures) == 1,
         "all_intervals_strictly_hot": all(
             item["strictly_hot"] for item in intervals
@@ -701,6 +734,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--snapshots", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
+        "--rule", choices=("one-trace", "two-trace", "three-trace"),
+        default="three-trace",
+    )
+    parser.add_argument(
         "--generator", type=Path,
         default=repository / "datagen" / "mnist_train.py",
     )
@@ -721,9 +758,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--neuron-pus", type=int, default=224)
     parser.add_argument(
         "--horizontal-partition",
-        choices=("none", "hot-partial", "full", "full-4"),
+        choices=("none", "hot-partial", "full", "full-4", "full-8", "full-16"),
         default="none",
     )
+    parser.add_argument("--horizontal-replica-stride", type=int, default=3)
+    parser.add_argument("--feedforward-destination-stride", type=int, default=167)
+    parser.add_argument("--trace-destination-stride", type=int, default=83)
     parser.add_argument(
         "--labels", type=Path,
         default=repository.parent / "stdp-experiments" / "data" / "mnist" /
@@ -743,6 +783,12 @@ def main() -> None:
     args.labels = args.labels.resolve()
     if args.jobs <= 0 or args.soft_threads <= 0:
         raise SystemExit("--jobs and --soft-threads must be positive")
+    if args.horizontal_replica_stride < 0:
+        raise SystemExit("--horizontal-replica-stride must be nonnegative")
+    if args.feedforward_destination_stride < 0:
+        raise SystemExit("--feedforward-destination-stride must be nonnegative")
+    if args.trace_destination_stride < 0:
+        raise SystemExit("--trace-destination-stride must be nonnegative")
     if args.snapshot_limit is not None and args.snapshot_limit <= 0:
         raise SystemExit("--snapshot-limit must be positive")
     if args.jobs * args.soft_threads > (os.cpu_count() or 1):
@@ -778,7 +824,11 @@ def main() -> None:
                 input_pus=args.input_pus,
                 neuron_pus=args.neuron_pus,
                 horizontal_partition=args.horizontal_partition,
+                horizontal_replica_stride=args.horizontal_replica_stride,
+                feedforward_destination_stride=args.feedforward_destination_stride,
+                trace_destination_stride=args.trace_destination_stride,
                 labels=labels,
+                rule=args.rule,
             ): snapshot
             for snapshot in snapshots
         }

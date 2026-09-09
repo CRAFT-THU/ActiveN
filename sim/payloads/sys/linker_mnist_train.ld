@@ -10,8 +10,13 @@ MEMORY {
 SECTIONS {
   . = 0x80000010;
 
-  .text : {
-    *(.text .text.*)
+  /* Datagen places the first instruction immediately after its 16-byte header.
+   * Keep that entry fixed even when an internal R_RISCV_ALIGN requests a cache
+   * boundary; the RISC-V linker relaxes its padding using the final address.
+   */
+  .text ORIGIN(ram) : SUBALIGN(4) {
+    *(.text)
+    *(.text.*)
   } >ram
 
   .data : {
@@ -38,4 +43,5 @@ SECTIONS {
   }
 
   ASSERT(SIZEOF(.text) <= 8192, "MNIST text exceeds the 8 KiB I-cache")
+  ASSERT(_start == ORIGIN(ram), "MNIST entry moved past its boot header")
 }

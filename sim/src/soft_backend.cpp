@@ -45,6 +45,14 @@ static bool softTimerMnistActivityEnabled() {
   return enabled;
 }
 
+static bool softMnistPhaseLogEnabled() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("SOFT_MNIST_PHASE_LOG");
+    return value != nullptr && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+
 // ===========================================================================
 // Topology
 // ===========================================================================
@@ -1155,6 +1163,18 @@ void SoftSystemBackend::accumulateStats(uint64_t cycle) {
       if (r.buf.core_inject_accepting) {
         ++hops;
         ++injections;
+        if (i == 1 && (nocProfileDir_ || softMnistPhaseLogEnabled())) {
+          const Flit flit = peekCoreInjectFlit(*cores[i], i);
+          if (flit.tag == 0x00a && flit.data[0] >= 2 && flit.data[0] <= 6) {
+            currentMnistPhase_ = static_cast<uint8_t>(flit.data[0]);
+            if (softMnistPhaseLogEnabled()) {
+              std::cerr << "[Soft] MNIST phase start cycle=" << cycle
+                        << " phase=" << flit.data[0]
+                        << " low=" << flit.data[1]
+                        << " high=" << flit.data[2] << '\n';
+            }
+          }
+        }
       } else {
         ++blocked;
       }
@@ -1166,13 +1186,29 @@ void SoftSystemBackend::accumulateStats(uint64_t cycle) {
         const Flit *flit = r.rt.peek(*r.buf.core_eject_presenting);
         if (flit != nullptr && flit->tag == 0xc02) {
           ++mnist_feedforward_messages;
+          if (softMnistPhaseLogEnabled()) {
+            const auto &spm = root->Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
+            const uint32_t phase = spm[188 / 32][(188 % 32) / 4];
+            if (phase != 2 && phase != 3 && phase != 5) {
+              std::cerr << "[Soft] invalid MNIST feedforward cycle=" << cycle
+                        << " dst=" << i << " src=" << flit->src
+                        << " phase=" << phase
+                        << " expected=" << spm[200 / 32][(200 % 32) / 4]
+                        << " received=" << spm[204 / 32][(204 % 32) / 4]
+                        << " done=" << spm[208 / 32][(208 % 32) / 4]
+                        << '\n';
+            }
+          }
         } else if (flit != nullptr && flit->tag == 0x804) {
           ++mnist_trace_messages;
-          if ((flit->data[0] & (1U << 18)) != 0)
+          // Bundled payloads use bits 18/19; optimized unbundled payloads use
+          // the sign bit so their receiver can test it with one branch.
+          if ((flit->data[0] & ((1U << 18) | (1U << 31))) != 0)
             ++mnist_post_fired_trace_messages;
         } else if (flit != nullptr && flit->tag == 0x409 &&
-                   flit->dst == 1 && flit->data[0] == 4) {
-          // The phase-4 reduction packs its inhibitory count in bits 9:0.
+                   flit->dst == 1 &&
+                   (flit->data[0] == 3 || flit->data[0] == 4)) {
+          // Fused phase 3 or legacy phase 4 packs this count in bits 9:0.
           mnist_inhibitory_spikes += flit->data[2] & 0x3ffU;
         }
       }
@@ -1341,7 +1377,10 @@ void SoftSystemBackend::timerStatsStop(uint64_t cycle) {
 void SoftSystemBackend::accumulateNocProfile(uint64_t cycle) {
   if (cycle < nocProfileStartCycle_) return;
 
-  NocCycleProfile sample{.cycle = cycle};
+  NocCycleProfile sample{
+    .cycle = cycle,
+    .mnist_phase = currentMnistPhase_,
+  };
 
   static_assert(SYSTEM_PIPE_CNT > 0 && SYSTEM_PIPE_CNT <= 8);
   constexpr unsigned allIdleMask = (1U << SYSTEM_PIPE_CNT) - 1;
@@ -1533,7 +1572,7 @@ void SoftSystemBackend::writeNocProfile() {
   const uint64_t samples = nocCycleProfiles_.size();
 
   std::ofstream cycles(*nocProfileDir_ + "/cycles.csv");
-  cycles << "cycle,router_flits,full_input_queues,links_presented,"
+  cycles << "cycle,mnist_phase,router_flits,full_input_queues,links_presented,"
             "links_accepted,links_blocked,injections_presented,"
             "injections_accepted,injections_blocked,memif_arrivals,"
             "max_router_flits,total_mshrs,broadcast_mshrs,fulfilled_mshrs,"
@@ -1546,7 +1585,8 @@ void SoftSystemBackend::writeNocProfile() {
             "spike_queue_entries,spike_queue_nonempty_pus,"
             "spike_queue_full_pus,idle_pus_with_spikes\n";
   for (const auto &s : nocCycleProfiles_) {
-    cycles << s.cycle << ',' << s.router_flits << ','
+    cycles << s.cycle << ',' << static_cast<unsigned>(s.mnist_phase) << ','
+           << s.router_flits << ','
            << s.full_input_queues << ',' << s.links_presented << ','
            << s.links_accepted << ',' << s.links_blocked << ','
            << s.injections_presented << ',' << s.injections_accepted << ','
