@@ -86,22 +86,22 @@ with capacity for all 288 input PUs.
 For the selected `N=288`, `M=224`, `full-8` layout, a fullest input PU uses:
 
 ```text
-header                         368 bytes
+header                         392 bytes
 22 input records               616 bytes
 22 * 50 FP32 weights         4,400 bytes
 28 target descriptors          112 bytes
 22 fired-vector records
   * 8 bytes                    176 bytes
-total                         5,672 bytes
+total                         5,696 bytes
 ```
 
-The first SMT stack begins at byte `0x3000` (12,288), leaving 6,616 bytes
+The first SMT stack begins at byte `0x3000` (12,288), leaving 6,592 bytes
 between the fullest selected layout and stack 0. Thread 0's 2 KiB stack occupies
 `0x3000-0x37ff`. Thread 1 has a reserved downward-growing range at
 `0x3800-0x3fff`, but no thread-1 handler or initializer uses the stack. The
 generator checks every PU and rejects a layout that reaches byte `0x3000`.
 
-A two-neuron PU uses at most 1,376 bytes. This includes 72 bytes of universal
+A two-neuron PU uses at most 1,408 bytes. This includes 72 bytes of universal
 input destinations and a 576-byte observed-source vector. The current direct
 source-mark protocol requires no observed-source bitmask.
 
@@ -118,7 +118,7 @@ actual 784 inputs, still below aggregate capacity. The dense runtime needs only
 FP32 weights because the compact slot is implicit, cutting this to 1,254,400
 bytes. Aggregate capacity alone is not sufficient evidence; the generator's
 per-PU check against `0x3000` is the binding safety check. The selected manifest
-reports `max_spm_bytes=5672` and `min_spm_free_bytes=10712`, where the latter is
+reports `max_spm_bytes=5696` and `min_spm_free_bytes=10688`, where the latter is
 measured to the 16 KiB SPM end and includes the reserved stack region.
 
 DRAM contains the executable and one-time SPM initialization image. At runtime
@@ -127,7 +127,7 @@ fixed I-to-E CSR rows. No trainable weight is fetched from or written to DRAM.
 
 ### Runtime header ABI
 
-The current 368-byte header uses magic `MT11` (`0x4d543131`) and the generated
+The current 392-byte header uses magic `MT12` (`0x4d543132`) and the generated
 manifest schema is `activen-mnist-training-v12`. The phase-tree fields most
 relevant to the runtime are:
 
@@ -142,6 +142,11 @@ relevant to the runtime are:
 | 356 | reduction extra word | Full-16-only packed accumulator |
 | 360 | fired-vector begin | Validated absolute start pointer for reverse updates |
 | 364 | fired-vector end | Absolute one-past-end pointer for the current fired list |
+| 368 | first input count | Number of records in the first contiguous SMT range |
+| 372 | second input count | Number of records in the second contiguous SMT range |
+| 376 | second input begin | Absolute start of the second input range |
+| 380 | input end | Absolute one-past-end pointer for all local input records |
+| 384 | second vector begin | Absolute start of the second SMT fired-vector segment |
 
 For PU1 the expected subtree size is 512; for other PUs it is the least
 significant set bit of `PU_ID - 1`. The phase-start handler loads it into the
@@ -434,13 +439,15 @@ backpressure, gives these hot-path costs:
   estimates of 22/28 cycles are not measurements of the current handler;
 - inactive reverse receiver: one full post update followed by its completion
   AMO; nonfiring posts are not delivered there;
-- unbundled three-trace depression with exactly one local fired input: 13
+- unbundled three-trace depression with exactly one local fired input: 12
   retired instructions on the common path, including completion handling.
 
 Firing-post scans and two-trace fifth-root evaluation are longer because they
-perform the required per-synapse arithmetic. Two-trace now uses the table-free
-Newton implementation described in the 2026-09-09 section below; one-trace
-retains the polynomial.
+perform the required per-synapse arithmetic. One- and two-trace share the
+table-free reciprocal-root seed, Newton refinement and completed-square final
+correction described below. The old polynomial has been removed. One-trace
+loads the constants once per firing-post message; two-trace retains them across
+the reverse phase because presynaptic firing also requires root evaluation.
 
 ## Validation
 
@@ -2142,10 +2149,11 @@ variant comparison is `full-lut-vs-bit.json`, all under the experiment
 directory above. `final-audit.json` records the independent checks and the
 common hot-step comparisons.
 
-### Remaining optimization opportunities
+### Opportunities identified before consolidation
 
-The current priorities exclude additional placement sweeps, firing-rate-based
-assignment, and fixed-local-neuron-count handlers.
+The following review motivated the consolidation below. It excludes additional
+placement sweeps, firing-rate-based assignment, and fixed-local-neuron-count
+handlers; items implemented by the consolidation are no longer outstanding.
 
 1. Profile instruction issue, SPM stalls, and caller overhead in the current
    receive handlers. Root constants are now cached and both normal helpers
@@ -2173,3 +2181,214 @@ assignment, and fixed-local-neuron-count handlers.
    replacing it with a direct jump is not automatically a meaningful saving.
    Any such change must preserve thread ownership, quota guarantees, and the
    global gate before next-step spike delivery.
+
+## Shared dense one-/two-/three-trace implementation (2026-09-09)
+
+Experiment directory: `copilot/tmp/mnist-dense-consolidated-20260909`.
+This pass consolidates the maintained unbundled assembly runtime. The selected
+population remains 784 inputs and 400 excitatory/inhibitory pairs, with the
+same 288/224 PU split and eight-way partition of every input. Population growth
+is deferred. Explicit I-to-E rows remain in DRAM in scatter mode; the measured
+tree mode continues to reduce inhibitory firing counts.
+
+The changes are independent of input firing statistics and do not introduce
+fixed-local-count receiver specializations:
+
+1. One- and two-trace now call the same fifth-root helper, including the optional
+   LUT seed. The old one-trace polynomial is removed. The selected bit helper
+   has exactly the same instruction bytes as the previously validated cached
+   two-trace helper: 24 instructions on the normal positive path, with the
+   same tiny-positive scaling and nonpositive-to-zero behavior. One-trace
+   initializes its constants only when a firing-post message arrives, once
+   for all local rows in that handler. Two-trace keeps its phase-cached constants.
+2. The firing-post row loop contains the update directly, eliminating a
+   per-row call/return pair. One-/two-trace share the potentiation code, and
+   bounds/rates are loaded outside the row loop. The two-trace fired-vector
+   loop loads its upper bound once, and its single-fired-input entry no longer
+   calls a separate depression wrapper. All receiver paths use `fmax.s` and
+   `fmin.s` for clipping, including an upper clamp in the direct single-pre path.
+   Depression is still clamped before same-step potentiation. The reducer's
+   persistent `ra` is preserved; the cached pre target reuses the dead post flag.
+3. One-trace skips both unused postsynaptic trace decays and trace loads for
+   messages. Two-trace skips the unused second postsynaptic trace. Their state
+   record slots remain reserved for layout compatibility, but are not learning
+   inputs. Three-trace retains both trace updates.
+4. The image generator writes immutable contiguous SMT input ranges and the
+   second fired-vector segment pointer. Preparation, decay, join, and the
+   firing-post scan reuse them. This costs 24 header bytes and needs no work
+   allocation AMO. Neuron-pair integration shares its conductance constants
+   across E and I; the E half-step and I full-step decay factors have identical
+   FP32 bits. In the separate-decay configuration, thread 1 restores two-trace
+   root constants after decay, eliminating its redundant preparation restore.
+5. Historical NOP padding is removed. The phase reducer, root-control entry,
+   and shared numerical helper use explicit cache-line alignment. The common
+   three-trace single-pre receiver is also aligned and falls through directly
+   into its completion counter and local WFI. The general trace decoder occupies
+   a separate text section. Caching the three-trace weight maximum in each SMT
+   thread's otherwise-unused `sp` avoids a per-message bound load; the common
+   path takes 12 instructions including completion and WFI and fits one line.
+   These changes remove an extra first-use fill and branch overhead observed
+   in the initial consolidation candidate. The linker
+   still checks the fixed boot entry and the 8 KiB text limit. No runtime
+   handler uses stack memory, and both original 2 KiB stack reservations remain.
+
+The new image magic is `MT12`; old images must be regenerated. The fullest
+input PU uses 5,696 bytes, leaving 6,592 bytes before the first stack. The
+one-/two-/three-trace binaries are 6,044 / 6,648 / 6,312 bytes, respectively,
+versus 6,536 / 6,940 / 6,584 bytes before this pass. All include the unchanged
+compiled startup initializer and fit the existing 8 KiB instruction cache.
+
+Validation uses the FP32 operation oracle, including forced postsynaptic firing,
+colocated simultaneous posts, and a 781-fired-input stress case for all three
+rules. Root arithmetic is byte-identical to the already tested helper; the
+one-trace checksum change is expected from replacing its old polynomial.
+The native benchmark keeps each rule's original 100-snapshot corpus and baseline:
+one-trace 2,649.2558, cached-bit two-trace 4,726.7442, and three-trace 3,281.5825
+cycles per timestep. The corpora are paired within each rule, not across rules:
+one/two use their separately trained 0k–30k trajectories, while three uses its
+existing 30k–40k trajectory. Each case has four warm-up and twelve timed 0.5-ms
+steps. At most two simulators run concurrently, each with eight host workers;
+BLAS/OpenMP/MKL helpers are capped at one.
+
+The full run exposed an existing clipping inconsistency at two-trace snapshot
+033. Normalization can leave weights above 1.0; this snapshot contains 66 such
+weights. The old single-fired-input handler applied only the lower bound, while
+the general fired-vector handler and GeNN apply both bounds. Consolidation now
+applies both bounds in either receiver. After sixteen steps, one final weight
+differs: the new checksum is `0x0e753951`, versus `0x0e758cbc` before. A separate
+FP32 replay reproduces both checksums exactly by changing only that clipping
+rule. The benchmark therefore retains the correction and requires an explicit
+reference replay for any additional two-/three-trace checksum discrepancy;
+unexplained differences still fail the run. This is a numerical correctness
+fix, not fifth-root approximation error. The first full run's stopped status
+and provenance are preserved under `clipping-control/`; the resumed run uses
+the same payloads and revalidates the completed cases.
+
+The resumed run also found this same issue at snapshot 056, where two final
+weights differ. Independent sixteen-step FP32 replays reproduce both the old
+and new checksums for snapshots 033 and 056. In 033, input 661 to E134 finishes
+at 1.0 instead of 1.0055519342. In 056, input 295 to E172 and input 352 to E172
+finish at 1.0 instead of 1.0020955801 and 1.0004249811. An isolated simulator
+control for 033 restores the old checksum by removing only the new single-pre
+upper clamp. No other two-/three-trace checksum exception occurred.
+
+### Completed full-corpus results
+
+All 300 cases completed successfully on 2026-09-09 at 13:39:59 UTC. Each rule
+has 100 snapshots, comprising 70 presentation and 30 rest snapshots, and 1,200
+timed steps. These are 0.5-ms simulator timesteps, not complete digit
+presentations. The table includes every timed interval after the four-step
+warm-up, including first-use instruction fills; no slow cases were discarded.
+
+| Rule | Previous cycles/step | Consolidated cycles/step | Reduction | Throughput ratio |
+| --- | ---: | ---: | ---: | ---: |
+| One-trace | 2,649.2558 | 2,585.8050 | 2.395% | 1.0245x |
+| Two-trace, cached bit seed | 4,726.7442 | 4,579.4992 | 3.115% | 1.0322x |
+| Three-trace | 3,281.5825 | 3,181.3217 | 3.055% | 1.0315x |
+
+The two-trace comparison uses the previous winning cached-bit implementation,
+not the older polynomial baseline or the slower LUT variant. Each row compares
+identical snapshots within that rule. Differences between rows also reflect
+the independently trained networks and their different activity.
+
+The individual consolidated measurements are available as
+[mnist_dense_results.json](mnist_dense_results.json), a top-level JSON array
+with exactly these three fields per record:
+
+```json
+{"class": "1-trace dense", "presenting": true, "cycles": 3382}
+```
+
+`class` is `1-trace dense`, `2-trace dense`, or `3-trace dense`.
+`presenting` is true during digit presentation and false during rest; it does
+not indicate cache warmth or whether a neuron fired. `cycles` is the integer
+simulator cycle count for one timed 0.5-ms step, not a per-snapshot average or
+host execution time.
+
+The export contains all 3,600 timed steps: 1,200 per class, consisting of 840
+presentation and 360 rest steps. It excludes initialization and the four warm-up
+steps per snapshot, while retaining timed steps with first-use instruction
+fills. Records are ordered by class (one, two, three traces), then snapshot
+index 000–099, then timed step 1–12. The same snapshot index across classes
+does not identify the same trained network state. Source records are the final
+`results/{one-trace,two-trace,three-trace}/snapshot_*/result.json` files under
+`copilot/tmp/mnist-dense-consolidated-20260909`. The exporter checks the schema,
+sample counts, and overall/presentation/rest means against `final-audit.json`.
+
+| Rule | Presentation: before → after | Reduction | Rest: before → after | Reduction |
+| --- | ---: | ---: | ---: | ---: |
+| One-trace | 2,870.7417 → 2,796.7405 | 2.578% | 2,132.4556 → 2,093.6222 | 1.821% |
+| Two-trace | 5,828.4560 → 5,615.3560 | 3.656% | 2,156.0833 → 2,162.5000 | -0.298% |
+| Three-trace | 3,769.1893 → 3,641.2810 | 3.394% | 2,143.8333 → 2,108.0833 | 1.668% |
+
+The two-trace rest case is slightly slower, by 6.4167 cycles per step. The
+consolidation is a combined change, so these measurements do not isolate the
+individual contributions of constant reuse, instruction placement, and loop
+changes.
+
+The less frequent firing-post paths improve substantially more than the full
+average:
+
+| Rule | E-active timed steps | Previous mean | Consolidated mean | Reduction |
+| --- | ---: | ---: | ---: | ---: |
+| One-trace | 16 | 7,497.1875 | 5,649.1875 | 24.649% |
+| Two-trace | 14 | 7,645.7857 | 7,109.0714 | 7.020% |
+| Three-trace | 20 | 5,051.4000 | 4,545.6000 | 10.013% |
+
+One-trace evaluates a fifth root only for postsynaptic firing. Its replacement
+therefore improves the rare expensive steps much more than the overall mean;
+the complete-corpus p99 falls from 7,246.49 to 5,439.99 cycles. These E-active
+steps still include first-use fetch costs and are not purely hot arithmetic
+measurements.
+
+For a separate steady-state comparison, the following table uses only intervals
+that have zero instruction fills and zero unicast memory requests in **both**
+the old and new runs:
+
+| Rule | Common strictly hot steps | Previous mean | Consolidated mean | Reduction |
+| --- | ---: | ---: | ---: | ---: |
+| One-trace | 601 | 2,263.5291 | 2,224.1647 | 1.739% |
+| Two-trace | 500 | 2,963.6000 | 2,819.8940 | 4.849% |
+| Three-trace | 604 | 2,499.7020 | 2,439.7864 | 2.397% |
+
+On the common strictly hot **input-active** subset, reductions are 1.607%,
+7.884%, and 3.455%, respectively. Two-trace instruction fills nevertheless
+increase from 68,583 to 114,235 over the full 1,200 intervals; one-trace fills
+fall from 41,172 to 39,443 and three-trace from 57,514 to 55,312. Smaller text
+does not guarantee fewer first-use fills on every PU. Further placement of
+the shared two-trace handler/helper code remains worth profiling, using these
+same complete sample sets. This pass changes no I-cache, NoC, queue, priority,
+or simulator parameters, and does not establish a new communication bottleneck.
+
+The final audit reparsed every simulator log, verified each embedded executable,
+and checked 620 recorded file hashes. All 3,600 timed input/E/I spike counts
+and feedforward/reverse message counts match the corresponding baselines.
+Final checksums match in 80/100 one-trace cases, 98/100 two-trace cases, and
+100/100 three-trace cases. One-trace differences follow the changed root
+arithmetic; the two two-trace exceptions are the reference-validated clipping
+fix described above. These checks establish activity equivalence for the sampled
+continuations, not a new long-training accuracy result or CUDA bit identity.
+
+Additional validation passed 33 unit tests, nine actual-core directed cases
+(forced post, long fired vector, and colocated posts for every rule), three
+actual-core boundary cases, and ten native pilot cases. The boundary cases
+include negative/zero/subnormal weights, values near the upper bound, and
+weights above it, with both firing and quiet endpoints. Thirty-two alternate
+build configurations also compile; the reported 100-case runs use the bit seed,
+unbundled messages, eight-way full partition, and repeated-addition tree mode.
+
+Reproducibility artifacts under the experiment directory are:
+
+- `frozen/`, `payloads/`, and `full-provenance.json`: exact sources, binaries,
+  simulator/configuration identity, corpora, baseline results, and run scripts.
+- `results/{one-trace,two-trace,three-trace}/full-summary.json` and
+  `full-paired.json`: complete distributions and paired baseline comparisons.
+- `final-audit.json` and `additional-paired-subsets.json`: independent checks,
+  common hot intervals, and firing-post comparisons.
+- `clipping-reference-two-trace-{033,056}.json` and `clipping-control/`:
+  numerical diagnosis and the isolated simulator control.
+
+The standard `sim/payloads/sys/mnist_train.bin`/`.elf` artifacts are refreshed
+with the tested two-trace bit-seed payload, matching the rule selected there
+before this pass. All three tested payloads remain in the experiment directory;
+the Makefile still selects the desired rule explicitly with `MNIST_RULE`.

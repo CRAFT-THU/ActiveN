@@ -1,8 +1,9 @@
-/* Phase-persistent constants, private to each receiving SMT thread.
- * Input PUs restore these before completing input preparation/decay. The
+/* Constants private to each receiving SMT thread. Two-trace input PUs
+ * restore these before completing input preparation/decay. The
  * phase-start, reduction, and frame handlers preserve them until reverse
  * completion. a0-a3 are message registers and cannot hold persistent values.
- * The initializer is the last stacked call; sp is an arithmetic constant here.
+ * One-trace loads them only on a firing-post handler, before its row loop.
+ * Initialization is complete before sp becomes an arithmetic constant here.
  */
 #ifndef MNIST_FIFTH_ROOT_LUT
 #define MNIST_FIFTH_ROOT_LUT 0
@@ -11,7 +12,7 @@
 #error "MNIST_FIFTH_ROOT_LUT must be 0 or 1"
 #endif
 #if MNIST_TRACE_BUNDLE != 0
-#error "Cached two-trace constants require the maintained unbundled receiver"
+#error "Shared root constants require the maintained unbundled receiver"
 #endif
 
 #define ROOT_LUT_BASE 0x20002000

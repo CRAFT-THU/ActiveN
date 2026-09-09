@@ -19,11 +19,11 @@ N_INPUT = 784
 N_EXC = 400
 N_INH = 400
 SPM_SIZE = 16 * 1024
-SPM_HEADER_SIZE = 368
+SPM_HEADER_SIZE = 392
 MAX_MC = 16
 DRAM_HEADER_SIZE = 16
 SPM_DESCRIPTOR_SIZE = 8
-MAGIC = 0x4D543131
+MAGIC = 0x4D543132
 
 RULES = {"one-trace": 1, "two-trace": 2, "three-trace": 3}
 RECURRENT_MODES = {"scatter": 0, "tree": 1, "tree-aggregate": 2}
@@ -906,6 +906,14 @@ def pack_spm_header(
     struct.pack_into("<3I", spm, 348, 0, 0, 0)
     # Validated absolute fired-vector bounds, published once per phase.
     struct.pack_into("<2I", spm, 360, 0, 0)
+    # Immutable contiguous SMT ranges, shared by preparation, decay and join.
+    first_count = (input_count + 1) // 2
+    struct.pack_into(
+        "<5I", spm, 368, first_count, input_count - first_count,
+        0x20000000 + input_offset + first_count * INPUT_RECORD_SIZE,
+        0x20000000 + input_offset + input_count * INPUT_RECORD_SIZE,
+        0x20000000 + fired_vector_offset + first_count * FIRED_VECTOR_RECORD_SIZE,
+    )
 
 
 def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
@@ -1174,8 +1182,8 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
             if exc_per_pu[pu] else after_input_dest
         )
         use_root_lut = getattr(args, "fifth_root_seed", "bit") == "lut"
-        if use_root_lut and args.rule != "two-trace":
-            raise ValueError("the fifth-root LUT is specific to two-trace training")
+        if use_root_lut and args.rule == "three-trace":
+            raise ValueError("three-trace training does not use a fifth root")
         root_lut_bytes = FIFTH_ROOT_LUT_BYTES if use_root_lut and input_per_pu[pu] else 0
         if root_lut_bytes:
             if required > FIFTH_ROOT_LUT_OFFSET:
@@ -1536,7 +1544,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mem-line-width", type=int, default=256)
     parser.add_argument("--rule", choices=tuple(RULES), default="three-trace")
     parser.add_argument("--fifth-root-seed", choices=("bit", "lut"), default="bit",
-                        help="must match the two-trace payload's MNIST_FIFTH_ROOT_SEED build option")
+                        help="must match MNIST_FIFTH_ROOT_LUT in the one-/two-trace payload (bit=0, lut=1)")
     parser.add_argument("--input-pus", type=int, default=196)
     parser.add_argument("--neuron-pus", type=int, default=224)
     parser.add_argument(

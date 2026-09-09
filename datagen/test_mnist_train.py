@@ -22,48 +22,7 @@ def f32_mul(left: float, right: float) -> float:
     return mnist_train.f32(mnist_train.f32(left) * mnist_train.f32(right))
 
 
-def reference_fifth_root(value: float) -> float:
-    bits = mnist_train.f32_bits(value)
-    shifted_exponent = (bits >> 23) + 3
-    quotient = shifted_exponent // 5
-    remainder = shifted_exponent - quotient * 5
-    root_exponent = quotient - 26
-    normalized = struct.unpack(
-        "<f", struct.pack("<I", 0x3F800000 | (bits & 0x007FFFFF))
-    )[0]
-    z = f32_sub(f32_mul(normalized, 2.0), 3.0)
-    estimate = mnist_train.f32(float.fromhex("0x1.4ded0ap-17"))
-    coefficients = (
-        (-1.0, "0x1.2c0604p-15"),
-        (1.0, "0x1.d9c12ep-14"),
-        (-1.0, "0x1.d40d74p-12"),
-        (1.0, "0x1.f9744cp-10"),
-        (-1.0, "0x1.3be602p-7"),
-        (1.0, "0x1.28221p-4"),
-        (1.0, "0x1.159ff2p+0"),
-    )
-    for sign, coefficient in coefficients:
-        estimate = f32_add(
-            f32_mul(estimate, z),
-            sign * mnist_train.f32(float.fromhex(coefficient)),
-        )
-    remainder_scales = (
-        "0x1p+0",
-        "0x1.261118p+0",
-        "0x1.51cb46p+0",
-        "0x1.840600p+0",
-        "0x1.bdb8cep+0",
-    )
-    remainder_scale = mnist_train.f32(
-        float.fromhex(remainder_scales[remainder])
-    )
-    exponent_scale = struct.unpack(
-        "<f", struct.pack("<I", (root_exponent + 127) << 23)
-    )[0]
-    return f32_mul(f32_mul(estimate, remainder_scale), exponent_scale)
-
-
-def reference_two_trace_fifth_root(
+def reference_fifth_root(
     value: float, quadratic: bool = True, seed: str = "bit", folded: bool = True,
 ) -> float:
     """FP32 operation oracle; accuracy is checked against independent roots."""
@@ -126,13 +85,13 @@ class FifthRootAccuracyTests(unittest.TestCase):
             value = struct.unpack("<f", struct.pack("<I", word))[0]
             expected = mnist_train.f32_bits(value ** 0.2)
             for seed in ("bit", "lut"):
-                actual = mnist_train.f32_bits(reference_two_trace_fifth_root(value, seed=seed))
+                actual = mnist_train.f32_bits(reference_fifth_root(value, seed=seed))
                 self.assertLessEqual(abs(actual - expected), 4, (seed, hex(word)))
 
     def test_two_trace_root_nonpositive_values(self) -> None:
         for value in (0.0, -0.0, -1.0):
             for seed in ("bit", "lut"):
-                self.assertEqual(mnist_train.f32_bits(reference_two_trace_fifth_root(value, seed=seed)), 0)
+                self.assertEqual(mnist_train.f32_bits(reference_fifth_root(value, seed=seed)), 0)
 
 
 def reference_first_step_checksums(
@@ -142,6 +101,7 @@ def reference_first_step_checksums(
     quadratic_root: bool = True,
     root_seed: str = "bit",
     folded_root: bool = True,
+    weight_overrides: dict[tuple[int, int], float] | None = None,
 ) -> list[int]:
     fired_posts = set(post_fired_columns)
     if post_fired_column is not None:
@@ -149,6 +109,8 @@ def reference_first_step_checksums(
     pixels = [((index * 73 + 19) ^ (index >> 2)) & 0xFF for index in range(784)]
     fired = set(mnist_train.predict_input_spikes(pixels, input_intensity, 0x19260817))
     weights = mnist_train.initial_weights(19260817, 78.0)
+    for (input_index, column), weight in (weight_overrides or {}).items():
+        weights[input_index * 400 + column] = mnist_train.f32(weight)
     pre_decay = mnist_train.f32(0.9875778005)
     post1_decay = mnist_train.f32(0.9875778005)
     post2_decay = mnist_train.f32(0.9937694906)
@@ -182,6 +144,7 @@ def reference_first_step_checksums(
                                 f32_mul(mnist_train.f32(0.0001), post1),
                             ),
                         )
+                        weight = min(1.0, weight)
                     if post_fired:
                         weight = min(
                             1.0,
@@ -195,6 +158,7 @@ def reference_first_step_checksums(
                                 ),
                             ),
                         )
+                        weight = max(0.0, weight)
                 elif rule == 2:
                     if pre_fired:
                         weight = max(
@@ -203,10 +167,11 @@ def reference_first_step_checksums(
                                 weight,
                                 f32_mul(
                                     f32_mul(mnist_train.f32(0.0001), post1),
-                                    reference_two_trace_fifth_root(weight, quadratic_root, root_seed, folded_root),
+                                    reference_fifth_root(weight, quadratic_root, root_seed, folded_root),
                                 ),
                             ),
                         )
+                        weight = min(1.0, weight)
                     if post_fired:
                         weight = min(
                             1.0,
@@ -222,7 +187,7 @@ def reference_first_step_checksums(
                                                 mnist_train.f32(0.4),
                                             ),
                                         ),
-                                        reference_two_trace_fifth_root(
+                                        reference_fifth_root(
                                             f32_sub(1.0, weight), quadratic_root, root_seed, folded_root
                                         ),
                                     ),
@@ -243,7 +208,7 @@ def reference_first_step_checksums(
                                             effective_pre, mnist_train.f32(0.4)
                                         ),
                                     ),
-                                    reference_fifth_root(f32_sub(1.0, weight)),
+                                    reference_fifth_root(f32_sub(1.0, weight), quadratic_root, root_seed, folded_root),
                                 ),
                             ),
                         ),
@@ -449,7 +414,7 @@ class MnistTrainGeneratorTest(unittest.TestCase):
         self.assertEqual(
             self.dense["feedforward_physical_weight_bytes"], 784 * 400 * 4
         )
-        self.assertLessEqual(self.dense["max_spm_bytes"], 7808)
+        self.assertLessEqual(self.dense["max_spm_bytes"], 7832)
         self.assertGreaterEqual(self.dense["min_spm_free_bytes"], 8500)
         self.assertTrue(
             all(item["bytes"] <= mnist_train.STACK0_BASE
@@ -1146,17 +1111,30 @@ class MnistTrainGeneratorTest(unittest.TestCase):
         )
 
     def test_fired_vector_bounds_have_reserved_zeroed_header_words(self) -> None:
-        self.assertEqual(mnist_train.SPM_HEADER_SIZE, 368)
-        self.assertEqual(mnist_train.MAGIC, 0x4D543131)
+        self.assertEqual(mnist_train.SPM_HEADER_SIZE, 392)
+        self.assertEqual(mnist_train.MAGIC, 0x4D543132)
         for pu in self.dense["input_pus"]:
             spm = self.spm(self.dense_images, self.dense, pu - 1)
             self.assertEqual(struct.unpack_from("<2I", spm, 360), (0, 0))
-            self.assertGreaterEqual(struct.unpack_from("<I", spm, 28)[0], 368)
+            self.assertGreaterEqual(struct.unpack_from("<I", spm, 28)[0], 392)
+
+    def test_cached_smt_ranges_cover_inputs_without_overlap(self) -> None:
+        for images, manifest in ((self.dense_images, self.dense),):
+            for pu in manifest["input_pus"]:
+                spm = self.spm(images, manifest, pu - 1)
+                count, start = struct.unpack_from("<2I", spm, 24)
+                vector = struct.unpack_from("<I", spm, 296)[0]
+                first, second, middle, end, vector_second = struct.unpack_from("<5I", spm, 368)
+                self.assertEqual(first + second, count)
+                self.assertIn(first - second, (0, 1))
+                self.assertEqual(middle, 0x20000000 + start + first * mnist_train.INPUT_RECORD_SIZE)
+                self.assertEqual(end, middle + second * mnist_train.INPUT_RECORD_SIZE)
+                self.assertEqual(vector_second, 0x20000000 + vector + first * mnist_train.FIRED_VECTOR_RECORD_SIZE)
 
     def test_same_step_pre_and_post_weight_checksums_for_all_rules(self) -> None:
         self.assertEqual(
             reference_first_step_checksums(post_fired_column=1),
-            [0x0561F569, 0x04AC8FF3, 0x0480E684],
+            [0x0561F566, 0x04AC8FF3, 0x0480E684],
         )
 
     def test_two_same_step_posts_weight_checksums_for_all_rules(self) -> None:
@@ -1175,7 +1153,7 @@ class MnistTrainGeneratorTest(unittest.TestCase):
         self.assertNotEqual(locations[2][1], locations[3][1])
         self.assertEqual(
             reference_first_step_checksums(post_fired_columns=(2, 3)),
-            [0x049C8764, 0x05506231, 0x0409FC8F],
+            [0x049C8766, 0x05506231, 0x0409FC8F],
         )
 
     def test_sixteen_step_three_trace_checksum_without_posts(self) -> None:

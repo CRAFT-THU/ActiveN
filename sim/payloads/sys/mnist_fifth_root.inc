@@ -7,11 +7,8 @@
  * Separate FP32 operations; no FMA, division, or stack. Tiny inputs are scaled
  * exactly by 2^100 and the final exponent is reduced by 20.
  */
-/* Align the LUT helper; preserve the existing bit-seed binary layout.
- * The linker retains the boot-header entry while relaxing this padding. */
-#if MNIST_FIFTH_ROOT_LUT
+/* Stable cache-line entry, independent of the selected learning rule. */
   .balign 64
-#endif
 fifth_root:
   blez  a0, fifth_root_zero
   li    a3, 0

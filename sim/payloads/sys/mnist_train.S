@@ -84,7 +84,7 @@
 #define PRINT_ADDR                  0x4000000c
 #define MC_DST_BASE                 0x8001
 
-#define MT_MAGIC                    0x4d543131
+#define MT_MAGIC                    0x4d543132
 #define MT_PU_COUNT                 512
 #define MT_MC_COUNT                 16
 #define MT_INPUT_COUNT              784
@@ -94,6 +94,18 @@
 #define MT_RULE_ONE                 1
 #define MT_RULE_TWO                 2
 #define MT_RULE_THREE               3
+
+#if MNIST_RULE == MT_RULE_THREE
+/* No roots or stacked calls use sp after initialization in this rule. */
+#define UPDATE_MAX sp
+#else
+#define UPDATE_MAX s6
+#endif
+#if MNIST_TRACE_BUNDLE == 0
+#define TRACE_WAIT trace_wait
+#else
+#define TRACE_WAIT do_wfi
+#endif
 
 /* Control events may interleave with reverse events. For rule two, keep the
  * phase-cached root constants intact even when a trace beats local phase work.
@@ -234,6 +246,11 @@
 #define H_REDUCE_VALUE_EXTRA        356
 #define H_FIRED_VECTOR_BEGIN        360
 #define H_FIRED_VECTOR_END          364
+#define H_INPUT_SPLIT_COUNT        368
+#define H_INPUT_SECOND_COUNT       372
+#define H_INPUT_SECOND_BEGIN       376
+#define H_INPUT_END                380
+#define H_VECTOR_SECOND_BEGIN      384
 
 /* Input record byte offsets. */
 #define IN_GLOBAL                   0
@@ -330,7 +347,7 @@
   .endm
 
   .section .text
-#if MNIST_RULE == MT_RULE_TWO
+#if MNIST_RULE != MT_RULE_THREE
 #include "mnist_fifth_root_config.inc"
 #endif
   .option nopic
@@ -338,7 +355,7 @@
   .globl _start
 
 _start:
-  /* snn_init() is the only routine that uses the two private SPM stacks. */
+  /* Reserve both private SPM stacks for startup; runtime reuses sp. */
   mv    t6, a0
   slli  t0, t6, 11
   li    sp, SPM_BASE + 0x3800
@@ -348,6 +365,10 @@ _start:
   call  snn_init
   li    gp, SPM_BASE
   call  install_handlers
+#if MNIST_RULE == MT_RULE_THREE
+  /* Thread 0 does not execute setup_thread1/report_ready. */
+  lw    UPDATE_MAX, H_WEIGHT_MAX(gp)
+#endif
 
   /* Wake thread 1 only after SPM and all shared handler CSRs are ready. */
   li    t0, 12
@@ -629,13 +650,7 @@ report_no_inputs:
 #endif
   bgtu  t2, t3, fail_role
   lw    t2, H_INPUT_PU_COUNT(gp)
-#if MNIST_HORIZONTAL_GROUP_COUNT >= 8
   beqz  t2, fail_role
-  /* The generator validates physical-input-count / group-count exactly. */
-  nop
-#else
-  beqz  t2, fail_role
-#endif
   lw    t2, H_INPUT_DEST_OFFSET(gp)
   beqz  t2, fail_role
   lw    t2, H_EXC_TARGET_OFFSET(gp)
@@ -681,6 +696,10 @@ report_root_lut_ready:
   li    t1, 1
   SENDI t1, TAG_READY_I
 #else
+#if MNIST_RULE == MT_RULE_THREE
+  /* Thread 1's private copy; thread 0 initialized its copy in _start. */
+  lw    UPDATE_MAX, H_WEIGHT_MAX(gp)
+#endif
   li    t0, 1
   SENDI t0, TAG_READY_I
 #endif
@@ -1003,8 +1022,6 @@ phase_start_not_neuron:
   li    PHASE_TMP, PHASE_WEIGHT_UPDATE
   bne   s10, PHASE_TMP, phase_start_fanout
   sw    zero, H_DONE_SENT(gp)
-  /* H_REDUCE_PARENT is immutable after image initialization. */
-  nop
   sw    zero, H_TRACE_EXPECTED(gp)
 
 #if MNIST_TRACE_BUNDLE == 0
@@ -1204,10 +1221,7 @@ fail_phase_start:
   li    a0, 0xbadb0000
   j     fail
 
-/* Keep the reduction and later handlers at their measured I-cache addresses. */
-  .rept 10
-  nop
-  .endr
+  .balign 64
 
 /*
  * Phase reduction: a0=phase, a1=subtree size, a2=low value, a3=high value.
@@ -1300,16 +1314,11 @@ fail_reduce:
   li    a0, 0xbadc0000
   j     fail
 
-/* Preserve the measured conflict-free I-cache placement of later hot handlers. */
 #if MNIST_RECURRENT_MODE != MT_REC_SCATTER
 final_reduce_dispatch:
   j     final_reduce_handler
-  .rept 17
-#else
-  .rept 17
 #endif
-  nop
-  .endr
+  .balign 64
 
 /* Root phase completion: a0=phase, a1/a2=low/high aggregate value. */
 root_complete_handler:
@@ -1423,8 +1432,6 @@ root_checksum_fail:
 fail_root:
   li    a0, 0xbade0000
   j     fail
-  nop
-  nop
 
 /* Terminal helpers: a0=phase, a2/a3=low/high value. */
 reduce_local:
@@ -1450,11 +1457,6 @@ phase_handler:
   beq   a0, DISPATCH_TMP, phase_final_drain
   li    a0, 0xbad90000
   j     fail
-#if MNIST_PIPELINE_INPUT_PREPARE == 1
-  nop
-  nop
-#endif
-  nop
 
 /* Advance input state and build a flat vector of fired weight rows. */
 phase_input_prepare:
@@ -1485,8 +1487,7 @@ input_prepare_keep_done:
   /* Contiguous halves preserve serial ordering after the join compacts them. */
   li    t0, 2
   bltu  t1, t0, input_prepare_serial
-  addi  t0, t1, 1
-  srli  t1, t0, 1
+  lw    t1, H_INPUT_SPLIT_COUNT(gp)
   li    a0, 0
   li    a1, 0
   li    a2, 0
@@ -1570,10 +1571,10 @@ input_prepare_range:
 #if MNIST_INPUT_DECAY_MODE == 2
   li    a7, F_PRE_DECAY
 #endif
-  slli  a0, t1, 5
-  slli  a1, t1, 2
-  sub   a0, a0, a1
-  add   a0, t2, a0
+  /* t2 identifies the immutable first or second contiguous range. */
+  lw    a0, H_INPUT_SECOND_BEGIN(gp)
+  bltu  t2, a0, input_prepare_range_loop
+  lw    a0, H_INPUT_END(gp)
 input_prepare_range_loop:
   lw    t4, IN_RNG(t2)
   slli  t5, t4, 13
@@ -1881,8 +1882,7 @@ neuron_update_non_neuron:
   li    t1, 2
   bltu  t0, t1, input_pre_decay_serial
 
-  addi  t1, t0, 1
-  srli  t1, t1, 1
+  lw    t1, H_INPUT_SPLIT_COUNT(gp)
   li    a0, 0
   li    a1, 0
   li    a2, 0
@@ -1981,18 +1981,9 @@ neuron_join_handler:
 
 #if MNIST_INPUT_DECAY_MODE == 1
 input_pre_decay_worker:
-  lw    t0, H_INPUT_COUNT(gp)
-  li    t1, 2
-  bltu  t0, t1, fail_role
-  addi  t3, t0, 1
-  srli  t3, t3, 1
-  sub   t1, t0, t3
-  lw    t2, H_INPUT_OFFSET(gp)
-  add   t2, t2, gp
-  slli  t4, t3, 5
-  slli  t5, t3, 2
-  sub   t4, t4, t5
-  add   t2, t2, t4
+  lw    t1, H_INPUT_SECOND_COUNT(gp)
+  beqz  t1, fail_role
+  lw    t2, H_INPUT_SECOND_BEGIN(gp)
   jal   s7, input_pre_decay_range
 #if MNIST_RULE == MT_RULE_TWO
   INIT_FIFTH_ROOT
@@ -2012,30 +2003,15 @@ input_pre_decay_join:
 #if MNIST_PARALLEL_INPUT_PREPARE == 1
 /* Thread 1 owns the second ceil/floor partition and a fixed vector segment. */
 input_prepare_worker:
-  lw    t0, H_INPUT_COUNT(gp)
-  li    t1, 2
-  bltu  t0, t1, fail_role
-  addi  t3, t0, 1
-  srli  t3, t3, 1
-  sub   t1, t0, t3
-
-  lw    t2, H_INPUT_OFFSET(gp)
-  add   t2, t2, gp
-  slli  t4, t3, 5
-  slli  t5, t3, 2
-  sub   t4, t4, t5
-  add   t2, t2, t4
-
-  lw    a5, H_FIRED_VECTOR_OFFSET(gp)
-  beqz  a5, fail_input_vector
-  add   a5, a5, gp
-  slli  t5, t3, 3
-  add   a5, a5, t5
+  lw    t1, H_INPUT_SECOND_COUNT(gp)
+  beqz  t1, fail_role
+  lw    t2, H_INPUT_SECOND_BEGIN(gp)
+  lw    a5, H_VECTOR_SECOND_BEGIN(gp)
   jal   s7, input_prepare_range
 
   slli  a0, a6, 16
   or    a0, a0, t6
-#if MNIST_RULE == MT_RULE_TWO
+#if MNIST_RULE == MT_RULE_TWO && MNIST_INPUT_DECAY_MODE != 1
   INIT_FIFTH_ROOT
 #endif
   li    a1, 0
@@ -2053,9 +2029,8 @@ input_prepare_join:
   lw    t0, H_INPUT_COUNT(gp)
   li    t1, 2
   bltu  t0, t1, fail_role
-  addi  t2, t0, 1
-  srli  t2, t2, 1
-  sub   t3, t0, t2
+  lw    t2, H_INPUT_SPLIT_COUNT(gp)
+  lw    t3, H_INPUT_SECOND_COUNT(gp)
   bgtu  a0, t3, fail_role
   bgtu  a1, a0, fail_role
 
@@ -2072,8 +2047,7 @@ input_prepare_join:
   lw    a5, H_FIRED_VECTOR_OFFSET(gp)
   beqz  a5, fail_input_vector
   add   a5, a5, gp
-  slli  a4, t2, 3
-  add   a4, a5, a4
+  lw    a4, H_VECTOR_SECOND_BEGIN(gp)
   slli  a6, t4, 3
   add   a6, a5, a6
   beq   a4, a6, input_prepare_join_done
@@ -2099,6 +2073,10 @@ input_prepare_join_done:
 
 /* s0=exc, s2=paired inh; return s9=exc fired, s8=inh fired. */
 neuron_pair_update:
+  /* Shared E/I conductance factors; GE half and GI full are identical. */
+  li    a0, F_GE_HALF_DECAY
+  li    a1, F_GI_HALF_DECAY
+  li    a2, F_GE_DECAY
   li    s9, 0
   lw    t1, EXC_FLAGS(s0)
   andi  t1, t1, NEURON_FF_INPUT
@@ -2113,10 +2091,8 @@ neuron_pair_exc_active:
   lw    t2, EXC_GE(s0)
   lw    t3, EXC_GI(s0)
   lw    t4, EXC_V(s0)
-  li    a4, F_GE_HALF_DECAY
-  fmul.s t5, t2, a4
-  li    a4, F_GI_HALF_DECAY
-  fmul.s t6, t3, a4
+  fmul.s t5, t2, a0
+  fmul.s t6, t3, a1
 
   li    a4, F_EXC_REST
   fsub.s a4, a4, t4
@@ -2132,11 +2108,9 @@ neuron_pair_exc_active:
   fadd.s t4, t4, a4
   sw    t4, EXC_V(s0)
 
-  li    a4, F_GE_DECAY
-  fmul.s t2, t2, a4
+  fmul.s t2, t2, a2
   sw    t2, EXC_GE(s0)
-  li    a4, F_GI_DECAY
-  fmul.s t3, t3, a4
+  fmul.s t3, t3, a0
   sw    t3, EXC_GI(s0)
   lw    t2, EXC_THETA(s0)
   li    a4, F_THETA_DECAY
@@ -2170,10 +2144,8 @@ neuron_pair_inh_active:
   lw    t2, INH_GE(s2)
   lw    t3, INH_GI(s2)
   lw    t4, INH_V(s2)
-  li    a4, F_GE_HALF_DECAY
-  fmul.s t5, t2, a4
-  li    a4, F_GI_HALF_DECAY
-  fmul.s t6, t3, a4
+  fmul.s t5, t2, a0
+  fmul.s t6, t3, a1
 
   li    a4, F_INH_REST
   fsub.s a4, a4, t4
@@ -2189,11 +2161,9 @@ neuron_pair_inh_active:
   fadd.s t4, t4, a4
   sw    t4, INH_V(s2)
 
-  li    a4, F_GE_DECAY
-  fmul.s t2, t2, a4
+  fmul.s t2, t2, a2
   sw    t2, INH_GE(s2)
-  li    a4, F_GI_DECAY
-  fmul.s t3, t3, a4
+  fmul.s t3, t3, a0
   sw    t3, INH_GI(s2)
   li    a4, F_INH_THRESHOLD
   flt.s a5, a4, t4
@@ -2554,21 +2524,27 @@ weight_recurrent_next:
   bnez  t2, weight_recurrent_loop
 #endif
 
-  /* Post traces are sent in their already-decayed form. */
+  /* Decay only traces consumed by the selected learning rule. */
+#if MNIST_RULE != MT_RULE_ONE
   mv    t0, s7
   lw    t1, H_EXC_COUNT(gp)
   li    t4, F_POST1_DECAY
+#if MNIST_RULE == MT_RULE_THREE
   li    t5, F_POST2_DECAY
+#endif
 weight_post_decay_loop:
   lw    t2, EXC_POST1(t0)
+#if MNIST_RULE == MT_RULE_THREE
   lw    t3, EXC_POST2(t0)
-  fmul.s t2, t2, t4
   fmul.s t3, t3, t5
-  sw    t2, EXC_POST1(t0)
   sw    t3, EXC_POST2(t0)
+#endif
+  fmul.s t2, t2, t4
+  sw    t2, EXC_POST1(t0)
   addi  t0, t0, EXC_SIZE
   addi  t1, t1, -1
   bnez  t1, weight_post_decay_loop
+#endif
 
   lw    s0, H_INPUT_DEST_OFFSET(gp)
   beqz  s0, fail_weight_phase
@@ -2581,7 +2557,11 @@ weight_post_decay_loop:
 
   /* First local excitatory neuron's universal input-weight slot. */
   lw    t0, EXC_WEIGHT_SLOT(s7)
+#if MNIST_RULE != MT_RULE_ONE
   lw    a1, EXC_POST1(s7)
+#else
+  li    a1, 0
+#endif
   lw    t1, EXC_FLAGS(s7)
   andi  t1, t1, NEURON_FIRED
 #if MNIST_TRACE_BUNDLE == 0
@@ -2610,7 +2590,11 @@ weight_post_decay_loop:
   bne   t3, t4, weight_trace_payload_ready
   addi  t4, s7, EXC_SIZE
   lw    t5, EXC_WEIGHT_SLOT(t4)
+#if MNIST_RULE != MT_RULE_ONE
   lw    t6, EXC_POST1(t4)
+#else
+  li    t6, 0
+#endif
   lw    a4, EXC_FLAGS(t4)
   andi  a4, a4, NEURON_FIRED
 
@@ -2729,9 +2713,6 @@ weight_trace_destinations_ready:
   mv    s1, s0
   mv    s2, s8
 #endif
-  /* Preserve the conflict-free layout after removing an obsolete runtime clear. */
-  nop
-  nop
   beq   s1, s2, weight_trace_first_empty
 #if MNIST_TRACE_BUNDLE == 0
   /* Avoid a local continuation event when this post has one destination. */
@@ -2985,6 +2966,9 @@ trace_event_fast_handler:
 
 #if MNIST_RULE != MT_RULE_ONE
 /* Exactly one locally fired pre: direct row update, with no list scan. */
+#if MNIST_RULE == MT_RULE_THREE && MNIST_TRACE_BUNDLE == 0
+  .balign 64
+#endif
 trace_event_one_pre_handler:
 #if MNIST_TRACE_BUNDLE == 0
   bltz  a0, trace_event_handler
@@ -2995,13 +2979,24 @@ trace_event_one_pre_handler:
   lw    t5, 0(tp)
   fsub.s t5, t5, a1
   fmax.s t5, t5, zero
+  fmin.s t5, t5, UPDATE_MAX
   sw    t5, 0(tp)
 #else
   andi  s1, a0, TRACE_BYTE_MASK
   mv    s2, a1
-  jal   s6, depress_one_pre
+  lw    TRACE_TMP, H_CURSOR0(gp)
+  add   tp, TRACE_TMP, s1
+  lw    t5, 0(tp)
+  mv    a0, t5
+  jal   t6, fifth_root
+  fmul.s t2, s2, a0
+  fsub.s t5, t5, t2
+  fmax.s t5, t5, zero
+  lw    t4, H_WEIGHT_MAX(gp)
+  fmin.s t5, t5, t4
+  sw    t5, 0(tp)
 #endif
-  j     trace_event_add_count_active
+  /* Fall through to the adjacent completion counter and WFI. */
 #else
   srli  TRACE_TMP, a0, 18
   andi  TRACE_TMP, TRACE_TMP, 3
@@ -3024,6 +3019,7 @@ trace_one_pre_count_one:
   j     trace_event_add_count_active
 #endif
 
+#if MNIST_TRACE_BUNDLE == 1
 depress_one_pre:
   lw    TRACE_TMP, H_CURSOR0(gp)
 #if MNIST_TRACE_BUNDLE == 0
@@ -3054,8 +3050,10 @@ depress_one_pre_store:
   sw    t5, 0(tp)
   jr    s6
 #endif
+#endif
 
 /* Reverse trace payload; bundled mode may carry a second weight slot. */
+  .pushsection .text.trace_general, "ax", @progbits
 trace_event_handler:
 #if MNIST_TRACE_BUNDLE == 0
   andi  s1, a0, TRACE_BYTE_MASK
@@ -3117,11 +3115,16 @@ trace_event_count_one:
   andi  TRACE_TMP, s11, 2
   bnez  TRACE_TMP, fail_trace_event
   li    TRACE_TMP, 1
+  j     trace_event_add_count_active
 #endif
+  .popsection
 trace_event_add_count_active:
 #if MNIST_TRACE_BUNDLE == 0
   amoadd.w t2, s9, (s8)
-  bne   t2, s10, do_wfi
+  beq   t2, s10, trace_event_count_complete
+trace_wait:
+  wfi
+  j     trace_wait
 #else
   addi  t1, gp, H_TRACE_RECEIVED
   amoadd.w t2, TRACE_TMP, (t1)
@@ -3133,7 +3136,7 @@ trace_event_add_count_active:
 trace_event_count_complete:
   lw    TRACE_TMP, H_PHASE(gp)
   li    t1, PHASE_WEIGHT_UPDATE
-  bne   TRACE_TMP, t1, do_wfi
+  bne   TRACE_TMP, t1, TRACE_WAIT
   j     finish_input_traces
 
 #if MNIST_TRACE_BUNDLE == 0
@@ -3144,10 +3147,10 @@ trace_event_add_count_inactive:
   addi  t2, t2, 1
   lw    TRACE_TMP, H_PHASE(gp)
   li    t1, PHASE_WEIGHT_UPDATE
-  bne   TRACE_TMP, t1, do_wfi
+  bne   TRACE_TMP, t1, TRACE_WAIT
   lw    t3, H_TRACE_EXPECTED(gp)
   bgtu  t2, t3, fail_trace_count
-  bne   t2, t3, do_wfi
+  bne   t2, t3, TRACE_WAIT
   j     trace_event_count_complete
 #endif
 
@@ -3158,26 +3161,27 @@ fail_trace_event:
 /*
  * s1=weight slot, s2=depression delta, s3=potentiation factor,
  * s4=post-fired.
- * The routine preserves s0-s11 except for s5, which is its current input.
+ * s0/s5 bound the current input range; UPDATE_MAX holds the weight maximum.
+ * Root rules reuse the dead post-fired flag s4 for the pre target, and s3
+ * for the pot rate. The reducer's persistent ra must remain untouched.
  */
 apply_trace_slot:
   beqz  s4, apply_trace_not_post
   lw    TRACE_TMP, H_INPUT_COUNT(gp)
   beqz  TRACE_TMP, apply_trace_return
-#if MNIST_RULE == MT_RULE_THREE
-  lw    a6, H_WEIGHT_MAX(gp)
-#endif
   lw    s5, H_INPUT_OFFSET(gp)
   add   s5, s5, gp
-  slli  t1, TRACE_TMP, 5
-  slli  t2, TRACE_TMP, 2
-  sub   t1, t1, t2
-  add   s0, s5, t1
-apply_trace_all_loop:
-  jal   s6, update_synapse
-  addi  s5, s5, INPUT_SIZE
-  bne   s5, s0, apply_trace_all_loop
-  jr    s7
+  lw    s0, H_INPUT_END(gp)
+#if MNIST_RULE != MT_RULE_THREE
+  lw    UPDATE_MAX, H_WEIGHT_MAX(gp)
+  lw    s4, H_PRE_TARGET(gp)
+  lw    s3, H_POTENTIATION_RATE(gp)
+#if MNIST_RULE == MT_RULE_ONE
+  /* One-trace needs roots only for a firing post, once per handler's rows. */
+  INIT_FIFTH_ROOT
+#endif
+#endif
+  j     update_synapse_inline
 
 apply_trace_not_post:
 #if MNIST_RULE == MT_RULE_ONE
@@ -3192,8 +3196,8 @@ apply_trace_not_post:
   lw    t2, H_DEPRESSION_RATE(gp)
   fmul.s s2, s2, t2
 #endif
-#if MNIST_RULE == MT_RULE_THREE
-  lw    a6, H_WEIGHT_MAX(gp)
+#if MNIST_RULE != MT_RULE_THREE
+  lw    t4, H_WEIGHT_MAX(gp)
 #endif
 apply_trace_fired_loop:
   lw    TRACE_TMP, 0(s5)
@@ -3214,9 +3218,8 @@ apply_trace_fired_loop:
 #endif
   fmax.s t5, t5, zero
 #if MNIST_RULE == MT_RULE_THREE
-  fmin.s t5, t5, a6
+  fmin.s t5, t5, UPDATE_MAX
 #else
-  lw    t4, H_WEIGHT_MAX(gp)
   fmin.s t5, t5, t4
 #endif
   sw    t5, 0(tp)
@@ -3230,10 +3233,10 @@ fail_trace_list:
   li    a0, 0xbada1100
   j     fail
 
-/* Update exactly one dense input-to-E synapse. */
-update_synapse:
-  lw    TRACE_TMP, IN_FLAGS(s5)
-  andi  TRACE_TMP, TRACE_TMP, INPUT_FIRED
+/* Fall through a common per-row update; no call/return around each synapse. */
+update_synapse_inline:
+  lw    a2, IN_FLAGS(s5)
+  andi  a2, a2, INPUT_FIRED
   lw    t1, IN_PRE_TRACE(s5)
   lw    t2, IN_WEIGHT_OFFSET(s5)
   add   t2, t2, gp
@@ -3246,7 +3249,7 @@ update_synapse:
   lw    t5, 0(tp)
 
 #if MNIST_RULE == MT_RULE_THREE
-  beqz  TRACE_TMP, update_three_no_depression
+  beqz  a2, update_three_no_depression
 #if MNIST_TRACE_BUNDLE == 0
   fsub.s t5, t5, s2
 #else
@@ -3254,35 +3257,21 @@ update_synapse:
   fmul.s t2, t2, s2
   fsub.s t5, t5, t2
 #endif
-  flt.s t3, t5, zero
-  beqz  t3, update_three_dep_nonnegative
-  li    t5, 0
-update_three_dep_nonnegative:
-  mv    t4, a6
-  flt.s t3, t4, t5
-  beqz  t3, update_three_no_depression
-  mv    t5, t4
+  fmax.s t5, t5, zero
+  fmin.s t5, t5, UPDATE_MAX
 update_three_no_depression:
-  beqz  TRACE_TMP, update_three_pre_ready
+  beqz  a2, update_three_pre_ready
   li    t1, F_ONE
 update_three_pre_ready:
-  mv    t2, s3
-  fmul.s t2, t2, t1
+  fmul.s t2, s3, t1
   fadd.s t5, t5, t2
-  flt.s t3, t5, zero
-  beqz  t3, update_three_pot_nonnegative
-  li    t5, 0
-update_three_pot_nonnegative:
-  mv    t4, a6
-  flt.s t3, t4, t5
-  beqz  t3, update_synapse_store
-  mv    t5, t4
 
-#elif MNIST_RULE == MT_RULE_TWO
+#else
   mv    t4, t1
-  beqz  TRACE_TMP, update_two_effective_ready
+  beqz  a2, update_root_effective_ready
   li    t2, F_ONE
   fadd.s t4, t4, t2
+#if MNIST_RULE == MT_RULE_TWO
   mv    a0, t5
   jal   t6, fifth_root
 #if MNIST_TRACE_BUNDLE == 0
@@ -3293,61 +3282,23 @@ update_three_pot_nonnegative:
 #endif
   fmul.s t2, t2, a0
   fsub.s t5, t5, t2
-  flt.s t3, t5, zero
-  beqz  t3, update_two_dep_nonnegative
-  li    t5, 0
-update_two_dep_nonnegative:
-  lw    t2, H_WEIGHT_MAX(gp)
-  flt.s t3, t2, t5
-  beqz  t3, update_two_effective_ready
-  mv    t5, t2
-update_two_effective_ready:
-  lw    t2, H_PRE_TARGET(gp)
-  fsub.s t4, t4, t2
-  lw    t2, H_WEIGHT_MAX(gp)
-  fsub.s a0, t2, t5
-  jal   t6, fifth_root
-  lw    t2, H_POTENTIATION_RATE(gp)
-  fmul.s t2, t2, t4
-  fmul.s t2, t2, a0
-  fadd.s t5, t5, t2
-  flt.s t3, t5, zero
-  beqz  t3, update_two_pot_nonnegative
-  li    t5, 0
-update_two_pot_nonnegative:
-  lw    t2, H_WEIGHT_MAX(gp)
-  flt.s t3, t2, t5
-  beqz  t3, update_synapse_store
-  mv    t5, t2
-
-#else
-  mv    t4, t1
-  beqz  TRACE_TMP, update_one_effective_ready
-  li    t2, F_ONE
-  fadd.s t4, t4, t2
-update_one_effective_ready:
-  lw    t2, H_PRE_TARGET(gp)
-  fsub.s t4, t4, t2
-  lw    t2, H_WEIGHT_MAX(gp)
-  fsub.s a0, t2, t5
-  jal   t6, fifth_root
-  lw    t2, H_POTENTIATION_RATE(gp)
-  fmul.s t2, t2, t4
-  fmul.s t2, t2, a0
-  fadd.s t5, t5, t2
-  flt.s t3, t5, zero
-  beqz  t3, update_one_nonnegative
-  li    t5, 0
-update_one_nonnegative:
-  lw    t2, H_WEIGHT_MAX(gp)
-  flt.s t3, t2, t5
-  beqz  t3, update_synapse_store
-  mv    t5, t2
+  fmax.s t5, t5, zero
+  fmin.s t5, t5, UPDATE_MAX
 #endif
-
-update_synapse_store:
+update_root_effective_ready:
+  fsub.s t4, t4, s4
+  fsub.s a0, s6, t5
+  jal   t6, fifth_root
+  fmul.s t2, s3, t4
+  fmul.s t2, t2, a0
+  fadd.s t5, t5, t2
+#endif
+  fmax.s t5, t5, zero
+  fmin.s t5, t5, UPDATE_MAX
   sw    t5, 0(tp)
-  jr    s6
+  addi  s5, s5, INPUT_SIZE
+  bne   s5, s0, update_synapse_inline
+  jr    s7
 
 #if MNIST_RECURRENT_MODE != MT_REC_SCATTER
   .pushsection .text.final_reduce, "ax", @progbits
@@ -3428,96 +3379,6 @@ fail_final_reduce:
   .popsection
 #endif
 
-#if MNIST_RULE == MT_RULE_TWO
+#if MNIST_RULE != MT_RULE_THREE
 #include "mnist_fifth_root.inc"
-#elif MNIST_RULE == MT_RULE_ONE
-/* FP32 fifth-root approximation used by the GeNN-compatible weight rule. */
-fifth_root:
-  beqz  a0, fifth_root_zero
-  slli  t1, a0, 1
-  beqz  t1, fifth_root_zero
-  bltz  a0, fifth_root_zero
-  mv    a4, a0
-  li    a7, F_ONE
-  srli  t1, a4, 23
-  andi  t1, t1, 255
-  bnez  t1, fifth_root_scaled
-  li    t1, 0x71800000
-  fmul.s a4, a4, t1
-  li    a7, 0x35800000
-
-fifth_root_scaled:
-  srli  t2, a4, 23
-  addi  t2, t2, 3
-  li    t3, 0xcccccccd
-  mulhu t3, t2, t3
-  srli  t3, t3, 2
-  slli  a6, t3, 2
-  add   a6, a6, t3
-  sub   t2, t2, a6
-  addi  t3, t3, 101
-  slli  t3, t3, 23
-
-  slli  t1, a4, 9
-  srli  t1, t1, 9
-  li    a5, F_ONE
-  or    t1, t1, a5
-  fadd.s t1, t1, t1
-  li    a5, 0x40400000
-  fsub.s t1, t1, a5
-
-  li    a0, 0x3726f685
-  fmul.s a0, a0, t1
-  li    a5, 0x38160302
-  fsub.s a0, a0, a5
-  fmul.s a0, a0, t1
-  li    a5, 0x38ece097
-  fadd.s a0, a0, a5
-  fmul.s a0, a0, t1
-  li    a5, 0x39ea06ba
-  fsub.s a0, a0, a5
-  fmul.s a0, a0, t1
-  li    a5, 0x3afcba26
-  fadd.s a0, a0, a5
-  fmul.s a0, a0, t1
-  li    a5, 0x3c1df301
-  fsub.s a0, a0, a5
-  fmul.s a0, a0, t1
-  li    a5, 0x3d941108
-  fadd.s a0, a0, a5
-  fmul.s a0, a0, t1
-  li    a5, 0x3f8acff9
-  fadd.s a0, a0, a5
-
-  li    a5, 1
-  beq   t2, a5, fifth_root_rem1
-  li    a5, 2
-  beq   t2, a5, fifth_root_rem2
-  li    a5, 3
-  beq   t2, a5, fifth_root_rem3
-  li    a5, 4
-  beq   t2, a5, fifth_root_rem4
-  j     fifth_root_finish
-fifth_root_rem1:
-  li    a5, 0x3f93088c
-  fmul.s a0, a0, a5
-  j     fifth_root_finish
-fifth_root_rem2:
-  li    a5, 0x3fa8e5a3
-  fmul.s a0, a0, a5
-  j     fifth_root_finish
-fifth_root_rem3:
-  li    a5, 0x3fc20300
-  fmul.s a0, a0, a5
-  j     fifth_root_finish
-fifth_root_rem4:
-  li    a5, 0x3fdedc67
-  fmul.s a0, a0, a5
-fifth_root_finish:
-  fmul.s a0, a0, t3
-  fmul.s a0, a0, a7
-  jr    t6
-fifth_root_zero:
-  li    a0, 0
-  jr    t6
 #endif
