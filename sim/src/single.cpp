@@ -29,6 +29,7 @@
 
 #include "include/argparse.h"
 #include "devices.h"
+#include "icache_init.h"
 
 using namespace std;
 
@@ -252,6 +253,9 @@ struct SingleCoreSim {
 
 int main(int argc, char **argv) {
   argparse::ArgumentParser program("sim_single");
+  program.add_argument("--init-icache")
+    .help("Preload one cache-sized region (bare flag: 0x80000000; override: --init-icache=ADDR)")
+    .scan<'i', uint32_t>();
 
   program.add_argument("text")
     .help("Binary memory image");
@@ -279,7 +283,7 @@ int main(int argc, char **argv) {
     .help("Boot ROM image served at 0x60000000 (default: built-in)");
 
   try {
-    program.parse_args(argc, argv);
+    program.parse_args(icacheCommandArgs(argc, argv));
   } catch (const std::exception &err) {
     cerr << err.what() << endl;
     cerr << program;
@@ -347,6 +351,30 @@ int main(int argc, char **argv) {
   }
 
   SingleCoreSim sim;
+  vector<ICacheEndpoint> icaches{ICacheEndpoint::create(*sim.core, "Core.fetch.icache")};
+  optional<ICachePreload> preload;
+  vector<ICacheEndpoint*> pending_icaches;
+  if (auto start = program.present<uint32_t>("--init-icache")) {
+    try {
+      preload.emplace(icaches.front(), *start, [&](uint32_t addr) -> uint8_t {
+        if (addr >= 0x60000000u && addr < 0x68000000u) {
+          uint8_t byte;
+          sim.periph.readBootrom(addr - 0x40000000u, &byte, 1);
+          return byte;
+        }
+        if (addr >= TEXT_BASE && uint64_t(addr) - TEXT_BASE < text_size)
+          return reinterpret_cast<const uint8_t*>(text_aligned)[addr - TEXT_BASE];
+        throw runtime_error("--init-icache region must lie in boot ROM or mapped global memory");
+      });
+      pending_icaches.push_back(&icaches.front());
+      cerr << "[ICache] Preloading " << preload->lines.size() << " lines at 0x"
+           << hex << *start << dec << '\n';
+    } catch (const exception& error) {
+      cerr << "Error: " << error.what() << '\n';
+      ::operator delete[](text_mem, align_val_t(4));
+      return 1;
+    }
+  }
 
   if(TRACE) {
     sim.core->trace(tracer.get(), 128);
@@ -358,6 +386,7 @@ int main(int argc, char **argv) {
   auto wall_start = chrono::steady_clock::now();
   while(!sim.periph.result && sim.cycle < max_cycles && !exiting) {
     sim.step();
+    if (!pending_icaches.empty()) serviceICachePreload(*preload, pending_icaches);
   }
   auto wall_end = chrono::steady_clock::now();
   double wall_secs = chrono::duration<double>(wall_end - wall_start).count();
@@ -373,6 +402,7 @@ int main(int argc, char **argv) {
   cerr << "[Single] Runtime: " << fixed << setprecision(3) << wall_secs << "s" << endl;
 
   cerr << "[Single] Total events captured: " << sim.events.size() << endl;
+  printICacheStats(icaches, "single");
   for(auto &ev : sim.events) {
     cerr << "[Single]   @" << dec << ev.cycle
          << " dst=" << ev.dst << " tag=0x" << hex << ev.tag

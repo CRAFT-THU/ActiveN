@@ -120,6 +120,12 @@ with open(os.path.join(outdir, "hard_backend.h"), "w") as f:
 
     f.write("    ~HardSystemBackend() override { sys->final(); }\n\n")
 
+    f.write("    std::vector<ICacheEndpoint> icaches() override {\n")
+    f.write("        std::vector<ICacheEndpoint> result;\n")
+    for i in range(1, num_pu + 1):
+        f.write(f'        result.push_back(ICacheEndpoint::create(*sys, "System.pu_{i}.fetch.icache"));\n')
+    f.write("        return result;\n    }\n\n")
+
     f.write("    void attachTrace(VerilatedFstC *t, int depth) {\n")
     f.write("        tracing_ = t != nullptr;\n")
     f.write("        tracer_ = t;\n")

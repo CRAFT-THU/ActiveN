@@ -1,6 +1,7 @@
 #pragma once
 
 #include "system_config.h"
+#include "icache_init.h"
 #include "verilated_fst_c.h"
 #include <bit>
 #include <cwchar>
@@ -98,6 +99,7 @@ public:
   virtual ~SystemBackend() = default;
 
   virtual SystemConfig config() const = 0;
+  virtual std::vector<ICacheEndpoint> icaches() = 0;
 
   /**
    * Peek the outgoing memory requests presented by the backend for the next cycle
@@ -176,7 +178,8 @@ class System {
 public:
   System(
     std::vector<std::string_view> dramInitFiles,
-    std::optional<RamulatorConfig> ramulatorTimingModel
+    std::optional<RamulatorConfig> ramulatorTimingModel,
+    std::optional<uint32_t> initICache = std::nullopt
   );
   ~System();
 

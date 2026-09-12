@@ -156,8 +156,8 @@ else()
 endif()
 
 # Generated RTL directories
-set(GENERATED_CORE_DIR ${CMAKE_SOURCE_DIR}/../generated/core)
-set(GENERATED_SYSTEM_DIR ${CMAKE_SOURCE_DIR}/../generated/system)
+set(GENERATED_CORE_DIR ${CMAKE_SOURCE_DIR}/../generated/core CACHE PATH "Single-core RTL directory")
+set(GENERATED_SYSTEM_DIR ${CMAKE_SOURCE_DIR}/../generated/system CACHE PATH "System RTL directory")
 
 set(CORE_CONFIG_JSON ${GENERATED_CORE_DIR}/Core.config.json)
 if(NOT EXISTS ${CORE_CONFIG_JSON})
@@ -165,6 +165,17 @@ if(NOT EXISTS ${CORE_CONFIG_JSON})
 endif()
 file(READ ${CORE_CONFIG_JSON} CORE_CONFIG_CONTENT)
 string(JSON CORE_MEM_BUS_WIDTH GET ${CORE_CONFIG_CONTENT} "memBusWidth")
+
+# Geometry is taken from the same elaboration as each Verilated model.
+function(icache_dpi_args OUT CONFIG)
+  string(JSON LINES GET "${CONFIG}" "iCacheLines")
+  string(JSON BLOCK GET "${CONFIG}" "iCacheBlockSize")
+  string(JSON ASSOC GET "${CONFIG}" "iCacheAssoc")
+  set(${OUT} -DAN_ICACHE_LINES=${LINES} -DAN_ICACHE_BLOCK_SIZE=${BLOCK}
+             -DAN_ICACHE_ASSOC=${ASSOC} PARENT_SCOPE)
+endfunction()
+icache_dpi_args(CORE_ICACHE_ARGS "${CORE_CONFIG_CONTENT}")
+set(ICACHE_DPI_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/icache_dpi.sv)
 
 # cvfpu source files
 set(CVFPU_DIR ${CMAKE_SOURCE_DIR}/../dep/cvfpu)
@@ -241,12 +252,12 @@ target_compile_definitions(sim_single PRIVATE CORE_MEM_BUS_WIDTH=${CORE_MEM_BUS_
 
 verilate(
     sim_single
-  SOURCES ${CVFPU_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/../FPU.sv
+  SOURCES ${CVFPU_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/../FPU.sv ${ICACHE_DPI_SOURCE}
     PREFIX rtl
     TRACE_FST
     DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/verilated
     INCLUDE_DIRS ${GENERATED_CORE_DIR}
-    VERILATOR_ARGS "-f" "${GENERATED_CORE_DIR}/filelist.f" ${VERILATOR_CORE_ARGS}
+    VERILATOR_ARGS "-f" "${GENERATED_CORE_DIR}/filelist.f" ${VERILATOR_CORE_ARGS} ${CORE_ICACHE_ARGS}
 )
 apply_bolt(sim_single ${BOLT_SINGLE_PAYLOAD} ${BOLT_SINGLE_CYCLES})
 
@@ -264,6 +275,8 @@ file(READ ${SYSTEM_CONFIG_JSON} SYSTEM_CONFIG_CONTENT)
 string(JSON SYSTEM_NUM_PU GET ${SYSTEM_CONFIG_CONTENT} "numPU")
 string(JSON SYSTEM_NUM_MC GET ${SYSTEM_CONFIG_CONTENT} "numMC")
 string(JSON SYSTEM_MC_SIZE_0 GET ${SYSTEM_CONFIG_CONTENT} "core" "memCtrlSizes" 0)
+string(JSON SYSTEM_CORE_CONFIG GET ${SYSTEM_CONFIG_CONTENT} "core")
+icache_dpi_args(SYSTEM_ICACHE_ARGS "${SYSTEM_CORE_CONFIG}")
 
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/system_config.h
@@ -287,12 +300,12 @@ if(ENABLE_HARD_BACKEND)
   )
   verilate(
     hard_backend_lib
-      SOURCES ${CVFPU_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/../FPU.sv
+      SOURCES ${CVFPU_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/../FPU.sv ${ICACHE_DPI_SOURCE}
       PREFIX sys_rtl
       TRACE_FST
       DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/sys_verilated
       INCLUDE_DIRS ${GENERATED_SYSTEM_DIR}
-      VERILATOR_ARGS "-f" "${GENERATED_SYSTEM_DIR}/filelist.f" ${VERILATOR_SYSTEM_ARGS}
+      VERILATOR_ARGS "-f" "${GENERATED_SYSTEM_DIR}/filelist.f" ${VERILATOR_SYSTEM_ARGS} ${SYSTEM_ICACHE_ARGS}
   )
 endif()
 
@@ -304,12 +317,12 @@ add_library(soft_backend_lib STATIC
 
 verilate(
   soft_backend_lib
-    SOURCES ${CVFPU_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/../FPU.sv
+    SOURCES ${CVFPU_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/../FPU.sv ${ICACHE_DPI_SOURCE}
     PREFIX soft_rtl
     TRACE_FST
     DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/soft_verilated
     INCLUDE_DIRS ${GENERATED_SYSTEM_DIR}
-    VERILATOR_ARGS "-f" "${GENERATED_SYSTEM_DIR}/filelist.f" ${VERILATOR_CORE_ARGS}
+    VERILATOR_ARGS "-f" "${GENERATED_SYSTEM_DIR}/filelist.f" ${VERILATOR_CORE_ARGS} ${SYSTEM_ICACHE_ARGS}
 )
 
 # Unified binary: sim_system --soft / --hard / --soft --hard (cosim)

@@ -247,6 +247,7 @@ struct System::Impl {
 
   // Image paths (one per MC)
   vector<string> image_paths;
+  optional<uint32_t> init_icache;
 
   // Bus arrays (numMC + 1 entries, index 0 = peripheral)
   vector<MemBusIn> bus_in;
@@ -648,8 +649,10 @@ struct System::Impl {
 
 System::System(
   vector<string_view> dramInitFiles,
-  optional<RamulatorConfig> ramulatorTimingModel
+  optional<RamulatorConfig> ramulatorTimingModel,
+  optional<uint32_t> initICache
 ) : impl_(make_unique<Impl>()) {
+  impl_->init_icache = initICache;
   for (auto &f : dramInitFiles) {
     impl_->image_paths.push_back(string(f));
   }
@@ -694,6 +697,40 @@ bool System::run(uint64_t maxCycles) {
   loadImages(impl_->image_paths, cfg.core.mcSizes);
   cerr << "[System] Loaded " << mc_images.size() << " memory image(s)" << endl;
 
+  vector<vector<ICacheEndpoint>> icaches;
+  for (auto& backend : impl_->backends) icaches.push_back(backend->icaches());
+  optional<ICachePreload> preload;
+  vector<ICacheEndpoint*> pending_icaches;
+  if (impl_->init_icache) {
+    try {
+      preload.emplace(icaches.front().front(), *impl_->init_icache, [&](uint32_t addr) -> uint8_t {
+        if (addr >= 0x60000000u && addr < 0x68000000u) {
+          uint8_t byte;
+          impl_->periph.readBootrom(addr - 0x40000000u, &byte, 1);
+          return byte;
+        }
+        if (addr >= 0x80000000u) {
+          uint64_t offset = uint64_t(addr) - 0x80000000u;
+          for (const auto& mc : mc_images) {
+            if (offset < mc.tot_size) {
+              if (offset >= mc.dense_size) return 0;
+              return mc.dense[offset / MEM_BUS_WIDTH_B].inner[offset % MEM_BUS_WIDTH_B];
+            }
+            offset -= mc.tot_size;
+          }
+        }
+        throw runtime_error("--init-icache region must lie in boot ROM or mapped global memory");
+      });
+      for (auto& group : icaches)
+        for (auto& cache : group) pending_icaches.push_back(&cache);
+      cerr << "[ICache] Preloading " << preload->lines.size() << " lines per PU at 0x"
+           << hex << *impl_->init_icache << dec << '\n';
+    } catch (const exception& error) {
+      cerr << "Error: " << error.what() << '\n';
+      return false;
+    }
+  }
+
   // Ramulator
   if (impl_->ramulator_cfg) {
     impl_->initRamulator(*impl_->ramulator_cfg);
@@ -737,6 +774,7 @@ bool System::run(uint64_t maxCycles) {
 
     // Phase 5: step all backends (commit posedge).
     for (auto &b : impl_->backends) b->step(cycle);
+    if (!pending_icaches.empty()) serviceICachePreload(*preload, pending_icaches);
     if (impl_->timer_stopped_this_cycle) {
       for (auto &b : impl_->backends) b->timerStatsStop(cycle);
       impl_->timer_stopped_this_cycle = false;
@@ -776,6 +814,8 @@ bool System::run(uint64_t maxCycles) {
   cerr << "[System] Runtime: " << fixed << setprecision(3) << wall_secs << "s" << endl;
 
   // Print backend stats
+  for (const auto& group : icaches)
+    printICacheStats(group, group.front().name.c_str());
   for (auto &b : impl_->backends) {
     b->printStats(cycle, true);
   }
@@ -805,6 +845,9 @@ bool System::run(uint64_t maxCycles) {
 
 int main(int argc, char **argv) {
   argparse::ArgumentParser program("sim_system");
+  program.add_argument("--init-icache")
+    .help("Preload one cache-sized region (bare flag: 0x80000000; override: --init-icache=ADDR)")
+    .scan<'i', uint32_t>();
 
   program.add_argument("images")
     .help("Binary memory images (one per MC)")
@@ -894,7 +937,7 @@ int main(int argc, char **argv) {
     .required();
 
   try {
-    program.parse_args(argc, argv);
+    program.parse_args(icacheCommandArgs(argc, argv));
   } catch (const std::exception &err) {
     cerr << err.what() << endl;
     cerr << program;
@@ -1015,7 +1058,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  System system(dramInitFiles, ramulator_cfg);
+  System system(dramInitFiles, ramulator_cfg, program.present<uint32_t>("--init-icache"));
 
   bool enable_trace = program.get<bool>("--trace");
   uint64_t trace_start = program.get<uint64_t>("--trace-start");

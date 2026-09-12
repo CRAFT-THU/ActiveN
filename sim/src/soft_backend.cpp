@@ -585,6 +585,13 @@ void SoftSystemBackend::attachTrace(VerilatedFstC *trace_file, int depth) {
 
 SystemConfig SoftSystemBackend::config() const { return cfg; }
 
+std::vector<ICacheEndpoint> SoftSystemBackend::icaches() {
+  std::vector<ICacheEndpoint> result;
+  for (size_t pu = 1; pu <= cfg.numPU; ++pu)
+    result.push_back(ICacheEndpoint::create(*cores[pu], "Core.fetch.icache"));
+  return result;
+}
+
 // Peek only the priority of the flit the core is presenting for injection
 // (nullopt = nothing presented). Used for the stage accept decision, so no
 // flit needs to be materialized before it is known to be accepted.

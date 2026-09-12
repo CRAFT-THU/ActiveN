@@ -565,6 +565,7 @@ class SoftSystemBackend : public SystemBackend {
 
   // SystemBackend interface
   SystemConfig config() const override;
+  std::vector<ICacheEndpoint> icaches() override;
   void peek(uint64_t cycle, std::vector<MemBusOut *> out) override;
   void stage(uint64_t cycle, const std::vector<MemBusIn> &in) override;
   void step(uint64_t cycle) override;
