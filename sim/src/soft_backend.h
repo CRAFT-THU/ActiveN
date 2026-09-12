@@ -283,6 +283,7 @@ class SoftSystemBackend : public SystemBackend {
   Stat timer_stats_baseline_;
   uint64_t timer_stats_start_cycle_ = 0;
   uint64_t timer_stats_intervals_ = 0;
+  uint32_t sparse_observed_steps_ = 0;
   bool timer_stats_start_pending_ = false;
   bool timer_stats_active_ = false;
   bool log_ = false;

@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from collections import Counter
 from itertools import product
 from pathlib import Path
+import json
 import random
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -96,6 +98,34 @@ class SnapshotExportTest(unittest.TestCase):
                 checkpoint, SimpleNamespace(learning_rule="one-trace-power")
             )
 
+    def test_sparse_compensation_and_checkpoint_identity(self):
+        @dataclass
+        class Variant:
+            name: str = "dense"
+            learning_rule: str = "one-trace-power"
+            topology: str = "dense"
+            connection_rate: float = 1.0
+            connectivity_seed: int = 20260723
+            weight_max: float = 1.0
+            potentiation_rate: float = 0.0005
+            depression_rate: float = 0.0001
+            normalization_weight_max_tolerance: float | None = None
+
+        for rule in snapshots.RULES:
+            for rate in (0.5, 0.25, 0.125):
+                variant = snapshots.rule_variant(rule, lambda name: Variant(), rate, 17)
+                self.assertEqual(variant.topology, "bernoulli")
+                self.assertEqual(variant.weight_max, 1 / rate)
+                exponent = 1 if rule == "three-trace" else 0.8
+                self.assertAlmostEqual(variant.depression_rate, 0.0001 * rate ** -exponent)
+                self.assertAlmostEqual(variant.potentiation_rate, 0.0005 * rate ** -exponent)
+                checkpoint = SimpleNamespace(manifest={"variant": {"connectivity_seed": 18}})
+                with self.assertRaisesRegex(ValueError, "connectivity_seed"):
+                    snapshots.validate_checkpoint_rule(checkpoint, variant)
+        for rate in (0, -0.1, 1.1, float("nan")):
+            with self.assertRaises(ValueError):
+                snapshots.rule_variant("one-trace", lambda name: Variant(), rate)
+
     def test_fresh_training_cli(self):
         with mock.patch("sys.argv", ["export", "--rule", "two-trace", "--initial-weights",
                                      "initial.npy", "--output", "out", "--build-path", "build",
@@ -105,6 +135,87 @@ class SnapshotExportTest(unittest.TestCase):
         self.assertEqual(args.rule, "two-trace")
         self.assertEqual(args.end_sample, 30000)
         self.assertEqual(args.collection_mode, "single-pass")
+        self.assertFalse(args.skip_normalization_bound_check)
+
+    def test_normalization_bound_opt_out_is_explicit_and_recorded(self):
+        with mock.patch("sys.argv", ["export", "--initial-weights", "initial.npy",
+                                     "--output", "out", "--build-path", "build",
+                                     "--skip-normalization-bound-check"]):
+            self.assertTrue(snapshots.parse_args().skip_normalization_bound_check)
+        for enabled in (True, False):
+            network = SimpleNamespace(normalize=mock.Mock(), weight_max_by_post=None,
+                                      normalization_bound_check=enabled)
+            snapshots.normalize_for_training(network)
+            network.normalize.assert_called_once_with(check_weight_bound=enabled)
+            self.assertIs(snapshots.cap_metadata(network)["normalization_bound_check"], enabled)
+
+    def test_baseline_cli_uses_recorded_seed_and_continuation_length(self):
+        with mock.patch("sys.argv", ["export", "--rule", "two-trace", "--baseline-inputs",
+                                     "inputs", "--output", "out", "--build-path", "build"]):
+            args = snapshots.parse_args()
+        self.assertEqual(args.model_seed, 20260724)
+        self.assertEqual(args.end_sample, 10100)
+        self.assertIsNone(args.initial_weights)
+        self.assertIsNone(args.checkpoint)
+
+    def test_baseline_checkpoint_and_dataset_hashes_are_required(self):
+        fields = {"name": "mnist_1trace_bernoulli_0125", "weight_max": 8.0}
+        variant = SimpleNamespace(name=fields["name"], as_dict=lambda: fields)
+        checkpoint = SimpleNamespace(accepted_samples=10000, manifest={"variant": fields})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            weights, data = root / "checkpoint.npz", root / "train-images-idx3-ubyte"
+            weights.write_bytes(b"immutable checkpoint")
+            data.write_bytes(b"dataset")
+            manifest = {"schema": "genn-baseline-inputs-v1", "cases": {variant.name: {
+                "variant": fields, "checkpoint": weights.name,
+                "checkpoint_sha256": snapshots.sha256_file(weights), "starting_state": "trained-sparse-checkpoint",
+                "runtime_state": "reset; branched continuation", "parent_sha256": {}}},
+                "dataset_sha256": {f"data/mnist/{data.name}": snapshots.sha256_file(data)}}
+            (root / "manifest.json").write_text(json.dumps(manifest))
+            args = SimpleNamespace(baseline_inputs=root, data_path=root)
+            self.assertIs(snapshots.baseline_checkpoint(args, variant, lambda path: checkpoint), checkpoint)
+            self.assertEqual(args.checkpoint, weights)
+            data.write_bytes(b"changed dataset")
+            with self.assertRaisesRegex(ValueError, "dataset hash"):
+                snapshots.baseline_checkpoint(args, variant, lambda path: checkpoint)
+            weights.write_bytes(b"changed checkpoint")
+            with self.assertRaisesRegex(ValueError, "checkpoint path or hash"):
+                snapshots.baseline_checkpoint(args, variant, lambda path: checkpoint)
+
+    def test_sparse_build_uses_profile_policy_and_rejects_stale_reuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "reimpl/backends/genn_backend.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("# recorded backend\n")
+            variants = root / "reimpl/zd3/variants.py"
+            variants.parent.mkdir(parents=True)
+            variants.write_text("# recorded variants\n")
+            build = root / "build"
+            build.mkdir()
+            variant = SimpleNamespace(connection_rate=0.125, as_dict=lambda: {"connection_rate": 0.125})
+            args = SimpleNamespace(model_seed=20260724, genn_root=root)
+            checkpoint = SimpleNamespace(weights=np.zeros((2, 1)), theta_mv=np.zeros(1))
+            constructor = mock.Mock()
+            model = SimpleNamespace(train_inhibition=25.5)
+            with mock.patch.object(snapshots, "selected_variant", return_value=variant):
+                snapshots.make_network(args, checkpoint, constructor, model, lambda v: np.ones((2, 1), dtype=bool),
+                                       None, build_path=build, reuse_build=None)
+                self.assertEqual(constructor.call_args.kwargs["parallelism"], "presynaptic")
+                self.assertEqual(constructor.call_args.kwargs["num_threads_per_spike"], 32)
+                self.assertIsNone(constructor.call_args.kwargs["weight_max_by_post"])
+                args.weight_max_policy = "fan-in"
+                with self.assertRaisesRegex(ValueError, "does not match"):
+                    snapshots.make_network(args, checkpoint, constructor, model, lambda v: np.ones((2, 1), dtype=bool),
+                                           None, build_path=build, reuse_build=build)
+                args.weight_max_policy = "connection-rate"
+                contract = json.loads((build / "snapshot-build.json").read_text())
+                contract["parallelism"], contract["num_threads_per_spike"] = "postsynaptic", 1
+                (build / "snapshot-build.json").write_text(json.dumps(contract))
+                with self.assertRaisesRegex(ValueError, "scheduling"):
+                    snapshots.make_network(args, checkpoint, constructor, model, lambda v: np.ones((2, 1), dtype=bool),
+                                           None, build_path=build, reuse_build=build)
 
     def test_selection_is_deterministic_and_within_phases(self):
         args = dict(

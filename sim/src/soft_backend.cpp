@@ -18,6 +18,7 @@
 #include <iomanip>
 #include <iostream>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -25,6 +26,7 @@
 #include "soft_components.h"
 #include "soft_mem.h"
 #include "soft_verilated/soft_rtl___024root.h"
+#include "../payloads/sys/mnist_sparse_layout.inc"
 
 using namespace std;
 
@@ -670,6 +672,42 @@ void SoftSystemBackend::peek(uint64_t cycle, std::vector<MemBusOut *> out) {
   if (cycle <= releaseResetAfter) {
     for (auto &o : out) o->req = std::nullopt;
     return;
+  }
+
+  static const bool sparseSteps = [] {
+    const char *value = std::getenv("SOFT_MNIST_SPARSE_STEPS");
+    return value && std::strcmp(value, "0") != 0;
+  }();
+  if (sparseSteps) {
+    const auto word = [&](unsigned pu, unsigned offset) -> uint32_t {
+      const auto &spm = cores[pu]->rootp->Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
+      return spm[offset / MEM_BUS_WIDTH_B][(offset % MEM_BUS_WIDTH_B) / 4];
+    };
+    const uint32_t magic = word(1, H_MAGIC);
+    const uint32_t steps = word(1, H_STEPS);
+    // The root increments STEPS only after the reverse completion barrier.
+    // Observe warm-up as well as timed steps for independent FP32 replay.
+    if (magic >= 0x4d535031 && magic <= 0x4d535034
+        && word(1, H_PHASE) == 4 && steps != sparse_observed_steps_) {
+      if (steps != sparse_observed_steps_ + 1)
+        throw runtime_error("sparse observer skipped a completed step");
+      std::array<uint64_t, 8> posts{};
+      unsigned leaders = 0;
+      for (unsigned pu = 1; pu <= cfg.numPU; ++pu) {
+        if (word(pu, H_LEADER) != pu) continue;
+        const unsigned group = word(pu, H_GROUP);
+        if (group >= posts.size()) throw runtime_error("invalid sparse group");
+        posts[group] = word(pu, H_POST_LO) | (uint64_t{word(pu, H_POST_HI)} << 32);
+        ++leaders;
+      }
+      if (leaders != posts.size()) throw runtime_error("invalid sparse group count");
+      std::ostringstream line;
+      line << "[Sparse step] completed=" << steps << " posts=" << std::hex << std::setfill('0');
+      for (unsigned group = 0; group < posts.size(); ++group)
+        line << (group ? "," : "") << std::setw(16) << posts[group];
+      std::cerr << line.str() << '\n';
+      sparse_observed_steps_ = steps;
+    }
   }
 
   out[0]->req = periph.peekMem();
@@ -1363,6 +1401,40 @@ void SoftSystemBackend::timerStatsStop(uint64_t cycle) {
                 << interval.mnist_post_fired_trace_messages << '\n';
       std::cerr << "  mnist_inhibitory_spikes: "
                 << interval.mnist_inhibitory_spikes << '\n';
+    }
+    if (std::getenv("SOFT_MNIST_SPARSE_STATS")) {
+      // Read completed-step counters only at the timer boundary. This observes
+      // the payload ABI without changing target execution or per-cycle work.
+      uint64_t inputs = 0, exc = 0, inh = 0, forward = 0, reverse = 0;
+      for (unsigned pu = 1; pu <= cfg.numPU; ++pu) {
+        const auto &spm = cores[pu]->rootp->Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
+        const auto word = [&](unsigned offset) -> uint32_t {
+          return spm[offset / MEM_BUS_WIDTH_B][(offset % MEM_BUS_WIDTH_B) / 4];
+        };
+        if (word(H_MAGIC) < 0x4d535031 || word(H_MAGIC) > 0x4d535034)
+          throw runtime_error("sparse statistics require sparse SPM ABI v1/v2/v3");
+        if (word(H_PREPARED)) {
+          // Input preparation can already belong to the next timestep.
+          // Input PUs retain the sent-step totals in unused reverse-sender slots.
+          inputs += word(H_REV_MINUS);
+          forward += word(H_REV_PLUS);
+        } else for (unsigned n = 0; n < word(H_INPUT_COUNT); ++n) {
+          const unsigned state = word(H_INPUT_BASE) + n * 28;
+          if (word(state + 16)) {
+            inputs += word(state) >> 31;
+            forward += word(state + 24);
+          }
+        }
+        if (word(H_LEADER) == pu)
+          exc += std::popcount(word(H_POST_LO)) + std::popcount(word(H_POST_HI));
+        if (word(H_EXC_COUNT)) inh += word(H_LOCAL_SPIKES);
+        else reverse += word(H_RECEIVED);
+      }
+      std::cerr << "  sparse_input_spikes: " << inputs << '\n'
+                << "  sparse_excitatory_spikes: " << exc << '\n'
+                << "  sparse_inhibitory_spikes: " << inh << '\n'
+                << "  sparse_feedforward_messages: " << forward << '\n'
+                << "  sparse_reverse_messages: " << reverse << '\n';
     }
     timer_stats_active_ = false;
   }
@@ -2104,6 +2176,31 @@ bool SoftSystemBackend::printStats(uint64_t cycles, bool final_print) {
             v_ms, pct(v_ms), u_ms, pct(u_ms), tot_ms);
     stats_.print(cycles);
     printWorkProfile();
+    if (const char *path = std::getenv("SOFT_MNIST_SPARSE_DUMP")) {
+      // Portable little-endian initialized-SPM dump for independent state
+      // validation: magic, PU count, then (PU id, byte count, bytes) per PU.
+      std::ofstream stream(path, std::ios::binary);
+      const auto emit = [&](uint32_t value) {
+        for (unsigned shift = 0; shift < 32; shift += 8)
+          stream.put(static_cast<char>(value >> shift));
+      };
+      emit(0x4d535044);
+      emit(cfg.numPU);
+      for (unsigned pu = 1; pu <= cfg.numPU; ++pu) {
+        const auto &spm = cores[pu]->rootp->Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
+        const auto word = [&](unsigned offset) -> uint32_t {
+          return spm[offset / MEM_BUS_WIDTH_B][(offset % MEM_BUS_WIDTH_B) / 4];
+        };
+        const unsigned bytes = (word(H_DATA_END) + 3) & ~3U;
+        if ((word(H_MAGIC) < 0x4d535031 || word(H_MAGIC) > 0x4d535034)
+            || bytes > 0x3000 || bytes < 256)
+          throw runtime_error("invalid sparse SPM dump layout");
+        emit(pu);
+        emit(bytes);
+        for (unsigned offset = 0; offset < bytes; offset += 4) emit(word(offset));
+      }
+      if (!stream) throw runtime_error("cannot write sparse SPM dump");
+    }
   }
   return true;
 }

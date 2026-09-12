@@ -16,11 +16,33 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from mnist_weight_caps import fan_in_caps, caps_sha256
 
 
 SNAPSHOT_SCHEMA = "activen-mnist-runtime-snapshot-v1"
 SELECTION_SCHEMA = "activen-mnist-snapshot-selection-v1"
 RULES = ("one-trace", "two-trace", "three-trace")
+
+
+def configured_caps(args: argparse.Namespace, variant: Any, mask: np.ndarray) -> np.ndarray | None:
+    if getattr(args, "weight_max_policy", "connection-rate") == "connection-rate":
+        return None
+    degrees, caps = fan_in_caps(mask.ravel().tolist(), *mask.shape)
+    if not all(degrees):
+        raise ValueError("fan-in normalization requires at least one input per post")
+    return np.asarray(caps, dtype=np.float32)
+
+
+def cap_metadata(network: Any) -> dict:
+    caps = getattr(network, "weight_max_by_post", None)
+    return {"weight_max_policy": "connection-rate" if caps is None else "fan-in",
+            "weight_max_sha256": None if caps is None else caps_sha256(caps),
+            "normalization_bound_check": getattr(network, "normalization_bound_check", True)}
+
+
+def normalize_for_training(network: Any) -> None:
+    # Keep normalization and its finite/positive column-sum validation enabled.
+    network.normalize(check_weight_bound=getattr(network, "normalization_bound_check", True))
 
 
 @dataclass(frozen=True)
@@ -131,30 +153,100 @@ def load_dependencies(genn_root: Path) -> tuple[Any, ...]:
     return GeNNNetwork, MODEL, load_checkpoint, load_mnist, connectivity_mask, get_variant
 
 
-def rule_variant(rule: str, get_variant: Any) -> Any:
+def rule_variant(rule: str, get_variant: Any, connection_rate: float = 1.0,
+                 connectivity_seed: int = 20260723) -> Any:
+    if not 0.0 < connection_rate <= 1.0:
+        raise ValueError("connection rate must be in (0, 1]")
     if rule == "three-trace":
-        return get_variant("triplet-dense")
-    variant = get_variant("one-trace-dense")
-    if rule == "two-trace":
-        return replace(variant, name="two-trace-dense", learning_rule="two-trace-power")
-    if rule != "one-trace":
+        variant = get_variant("triplet-dense")
+    elif rule in ("one-trace", "two-trace"):
+        variant = get_variant("one-trace-dense")
+        if rule == "two-trace":
+            variant = replace(variant, name="two-trace-dense", learning_rule="two-trace-power")
+    else:
         raise ValueError(f"unsupported rule: {rule}")
+    if connection_rate < 1.0:
+        scale = (1.0 / connection_rate) ** (1.0 if rule == "three-trace" else 0.8)
+        variant = replace(
+            variant, name=f"{rule}-bernoulli-{connection_rate:g}",
+            topology="bernoulli", connection_rate=connection_rate,
+            connectivity_seed=connectivity_seed, weight_max=1.0 / connection_rate,
+            potentiation_rate=variant.potentiation_rate * scale,
+            depression_rate=variant.depression_rate * scale,
+            normalization_weight_max_tolerance=0.02,
+        )
     return variant
+
+
+def selected_variant(args: argparse.Namespace, get_variant: Any) -> Any:
+    variant = rule_variant(args.rule, get_variant, getattr(args, "connection_rate", 1.0),
+                           getattr(args, "connectivity_seed", 20260723))
+    if getattr(args, "baseline_inputs", None) is not None:
+        trace = RULES.index(args.rule) + 1
+        tags = {1.0: "dense", 0.5: "bernoulli_0500", 0.25: "bernoulli_0250", 0.125: "bernoulli_0125"}
+        if args.connection_rate not in tags:
+            raise ValueError("GeNN baseline supports connection rates 1, 0.5, 0.25, and 0.125")
+        variant = replace(variant, name=f"mnist_{trace}trace_{tags[args.connection_rate]}")
+    return variant
+
+
+def baseline_checkpoint(args: argparse.Namespace, variant: Any, load_checkpoint: Any) -> Any:
+    """Use the exact immutable input prepared by genn-sweep/baseline.py."""
+    directory = args.baseline_inputs.resolve()
+    manifest_path = directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    if manifest["schema"] != "genn-baseline-inputs-v1":
+        raise ValueError("unsupported GeNN baseline input manifest")
+    entry = manifest["cases"][variant.name]
+    if entry["variant"] != variant.as_dict():
+        raise ValueError("GeNN baseline variant differs from the requested workload")
+    path = (directory / entry["checkpoint"]).resolve()
+    if path.parent != directory or sha256_file(path) != entry["checkpoint_sha256"]:
+        raise ValueError("GeNN baseline checkpoint path or hash mismatch")
+    checkpoint = load_checkpoint(path)
+    if checkpoint.accepted_samples != 10000 or checkpoint.manifest["variant"] != variant.as_dict():
+        raise ValueError("GeNN baseline checkpoint metadata mismatch")
+    for relative, expected in manifest["dataset_sha256"].items():
+        if sha256_file(args.data_path / Path(relative).name) != expected:
+            raise ValueError(f"GeNN baseline dataset hash mismatch: {relative}")
+    args.checkpoint = path
+    args.baseline_provenance = {
+        "case": variant.name, "input_manifest": str(manifest_path),
+        "input_manifest_sha256": sha256_file(manifest_path),
+        "checkpoint_sha256": entry["checkpoint_sha256"],
+        "starting_state": entry["starting_state"],
+        "runtime_state": entry["runtime_state"],
+        "parent_sha256": entry["parent_sha256"],
+    }
+    return checkpoint
 
 
 def validate_checkpoint_rule(checkpoint: Any, variant: Any) -> None:
     source = checkpoint.manifest.get("variant", {})
-    for key in ("learning_rule", "topology", "weight_max", "potentiation_rate"):
+    for key in ("learning_rule", "topology", "weight_max", "potentiation_rate",
+                "depression_rate", "connection_rate", "connectivity_seed"):
         if key in source and source[key] != getattr(variant, key):
             raise ValueError(f"checkpoint {key} does not match selected rule")
 
 
 def initial_state(args: argparse.Namespace, dependencies: tuple[Any, ...]) -> Any:
-    _, MODEL, load_checkpoint, _, _, get_variant = dependencies
-    variant = rule_variant(args.rule, get_variant)
+    _, MODEL, load_checkpoint, _, connectivity_mask, get_variant = dependencies
+    variant = selected_variant(args, get_variant)
+    caps = configured_caps(args, variant, connectivity_mask(variant))
+    cap_info = {"weight_max_policy": "connection-rate" if caps is None else "fan-in",
+                "weight_max_sha256": None if caps is None else caps_sha256(caps)}
+    if getattr(args, "baseline_inputs", None) is not None:
+        if caps is not None:
+            raise ValueError("historical baseline inputs require --weight-max-policy connection-rate; "
+                             "fan-in training needs new reference checkpoints")
+        return baseline_checkpoint(args, variant, load_checkpoint)
     if args.checkpoint is not None:
         checkpoint = load_checkpoint(args.checkpoint)
         validate_checkpoint_rule(checkpoint, variant)
+        source_policy = checkpoint.manifest.get("weight_max_policy", "connection-rate")
+        if source_policy != cap_info["weight_max_policy"] or (
+                caps is not None and checkpoint.manifest.get("weight_max_sha256") != cap_info["weight_max_sha256"]):
+            raise ValueError("checkpoint weight cap policy or fan-in differs from requested training")
         return checkpoint
     from zd3.io import PortableCheckpoint, load_reference_triplets
     from zd3.variants import prepare_initial_weights
@@ -162,12 +254,13 @@ def initial_state(args: argparse.Namespace, dependencies: tuple[Any, ...]) -> An
     weights, _ = prepare_initial_weights(
         load_reference_triplets(args.initial_weights, MODEL.n_input, MODEL.n_exc),
         variant,
+        weight_max_by_post=caps,
     )
     return PortableCheckpoint(
         weights=weights,
         theta_mv=np.full(MODEL.n_exc, MODEL.theta_initial_mv, dtype=np.float64),
         accepted_samples=0,
-        manifest={"variant": variant.as_dict()},
+        manifest={"variant": variant.as_dict(), **cap_info},
     )
 
 
@@ -183,6 +276,7 @@ def save_training_checkpoint(args: argparse.Namespace, network: Any, accepted: i
             "rng_seed": args.model_seed, "variant": network.variant.as_dict(),
             "source_run": str(args.output),
             "runtime_state_scope": "weights-and-theta-only",
+            **cap_metadata(network),
         },
     )
 
@@ -198,8 +292,26 @@ def make_network(
     build_path: Path,
     reuse_build: Path | None,
 ) -> Any:
-    variant = rule_variant(args.rule, get_variant)
-    return GeNNNetwork(
+    variant = selected_variant(args, get_variant)
+    sparse = variant.connection_rate < 1.0
+    mask = connectivity_mask(variant)
+    caps = configured_caps(args, variant, mask)
+    contract = {
+        "schema": "activen-genn-snapshot-build-v2", "model_seed": args.model_seed,
+        "variant": variant.as_dict(), "precision": "float",
+        "parallelism": "presynaptic" if sparse else "postsynaptic",
+        "num_threads_per_spike": 32 if sparse else 1,
+        "mask_sha256": hashlib.sha256(np.packbits(mask).tobytes()).hexdigest(),
+        "backend_sha256": sha256_file(args.genn_root / "reimpl/backends/genn_backend.py"),
+        "variants_sha256": sha256_file(args.genn_root / "reimpl/zd3/variants.py"),
+        "weight_max_policy": "connection-rate" if caps is None else "fan-in",
+        "weight_max_sha256": None if caps is None else caps_sha256(caps),
+    }
+    contract_path = (reuse_build or build_path) / "snapshot-build.json"
+    if reuse_build is not None:
+        if not contract_path.exists() or json.loads(contract_path.read_text()) != contract:
+            raise ValueError("reusable GeNN snapshot build does not match source, graph, seed, or scheduling")
+    network = GeNNNetwork(
         weights=checkpoint.weights.copy(),
         theta_mv=checkpoint.theta_mv.copy(),
         plasticity=True,
@@ -208,13 +320,18 @@ def make_network(
         backend="cuda",
         build_path=build_path,
         variant=variant,
-        structural_mask=connectivity_mask(variant),
+        structural_mask=mask,
         precision="float",
-        parallelism="postsynaptic",
-        num_threads_per_spike=1,
+        parallelism="presynaptic" if sparse else "postsynaptic",
+        num_threads_per_spike=32 if sparse else 1,
         timing_enabled=False,
         reuse_build=reuse_build,
+        weight_max_by_post=caps,
     )
+    network.normalization_bound_check = not getattr(args, "skip_normalization_bound_check", False)
+    if reuse_build is None:
+        write_json(contract_path, contract)
+    return network
 
 
 def discover_attempts(
@@ -242,7 +359,7 @@ def discover_attempts(
             intensity = MODEL.initial_intensity
             while True:
                 frame_index = accepted % len(data.images)
-                network.normalize()
+                normalize_for_training(network)
                 network.set_image(data.images[frame_index], intensity)
                 counts = network.run_stimulus()
                 network.validate_runtime(counts, args.runaway_spikes)
@@ -444,6 +561,7 @@ def save_snapshot(
         "source_precision": "float",
         "pending_synaptic_inputs_folded_into_conductance": True,
         "poisson_state_source": "deterministic-activeN-xorshift-seed",
+        **cap_metadata(network),
     }
     metadata_json = json.dumps(
         metadata, sort_keys=True, separators=(",", ":")
@@ -453,6 +571,9 @@ def save_snapshot(
         np.savez_compressed(
             stream,
             weights=np.asarray(network.weights(), dtype=np.float32, order="C"),
+            structural_mask=np.asarray(network.structural_mask, dtype=np.uint8, order="C"),
+            weight_max_by_post=(network.weight_max_by_post if getattr(network, "weight_max_by_post", None) is not None
+                                else np.full(MODEL.n_exc, network.variant.weight_max, dtype=np.float32)),
             theta_mv=pull_array(network.exc, "theta", np.float32),
             input_pre_trace=input_pre_trace,
             input_rng_state=snapshot_rng(poisson_seed, selection, MODEL.n_input),
@@ -514,7 +635,7 @@ def capture_snapshots(
             expected = attempts[attempt_index]
             if expected.accepted_sample != accepted:
                 raise RuntimeError("capture replay diverged before an attempt")
-            network.normalize()
+            normalize_for_training(network)
             image = data.images[expected.frame_index]
             network.set_image(image, expected.intensity)
             for tick in range(MODEL.stimulus_ticks):
@@ -653,7 +774,7 @@ def train_and_capture(
                 frame_index = accepted % len(data.images)
                 # Presentation exports use only the fields known at phase entry.
                 attempt = Attempt(len(attempts), accepted, frame_index, float(intensity), 0, False)
-                network.normalize()
+                normalize_for_training(network)
                 network.set_image(data.images[frame_index], intensity)
                 run_phase("presentation", MODEL.stimulus_ticks, attempt, data.images[frame_index])
                 current = pull_array(network.exc, "spikeCount", np.uint32)
@@ -698,7 +819,15 @@ def parse_args() -> argparse.Namespace:
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--checkpoint", type=Path)
     source.add_argument("--initial-weights", type=Path)
+    source.add_argument("--baseline-inputs", type=Path,
+                        help="immutable inputs prepared by genn-sweep/baseline.py; continue 10k for 100 images")
     parser.add_argument("--rule", choices=RULES, default="three-trace")
+    parser.add_argument("--connection-rate", type=float, default=1.0)
+    parser.add_argument("--connectivity-seed", type=int, default=20260723)
+    parser.add_argument("--weight-max-policy", choices=("fan-in", "connection-rate"),
+                        help="fan-in uses 784 / realized incoming degree; connection-rate reproduces legacy caps")
+    parser.add_argument("--skip-normalization-bound-check", action="store_true",
+                        help="skip only the post-normalization weight bound assertion; retain column normalization and STDP clamps")
     parser.add_argument("--collection-mode", choices=("single-pass", "replay"),
                         default="single-pass")
     parser.add_argument("--output", type=Path, required=True)
@@ -707,18 +836,25 @@ def parse_args() -> argparse.Namespace:
     build = parser.add_mutually_exclusive_group(required=True)
     build.add_argument("--build-path", type=Path)
     build.add_argument("--reuse-build", type=Path)
-    parser.add_argument("--end-sample", type=int, default=40000)
+    parser.add_argument("--end-sample", type=int)
     parser.add_argument("--snapshots", type=int, default=100)
     parser.add_argument("--presentation-snapshots", type=int, default=70)
     parser.add_argument("--window-steps", type=int, default=16)
     parser.add_argument("--selection-seed", type=int, default=19260817)
     parser.add_argument("--poisson-seed", type=int, default=0x19260817)
-    parser.add_argument("--model-seed", type=int, default=19260817)
+    parser.add_argument("--model-seed", type=int)
     parser.add_argument("--max-intensity", type=float, default=20.0)
     parser.add_argument("--progress-interval", type=int, default=250)
     parser.add_argument("--checkpoint-interval", type=int, default=10000)
     parser.add_argument("--runaway-spikes", type=int, default=5000)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.weight_max_policy is None:
+        args.weight_max_policy = "fan-in" if args.connection_rate < 1.0 else "connection-rate"
+    if args.model_seed is None:
+        args.model_seed = 20260724 if args.baseline_inputs is not None else 19260817
+    if args.end_sample is None:
+        args.end_sample = 10100 if args.baseline_inputs is not None else 40000
+    return args
 
 
 def main() -> None:
@@ -764,7 +900,13 @@ def main() -> None:
         "snapshots": args.snapshots, "presentation_snapshots": args.presentation_snapshots,
         "window_steps": args.window_steps, "command": sys.argv,
         "collection_mode": args.collection_mode,
+        "baseline": getattr(args, "baseline_provenance", None),
+        "parallelism": "presynaptic" if args.connection_rate < 1.0 else "postsynaptic",
+        "num_threads_per_spike": 32 if args.connection_rate < 1.0 else 1,
         "cuda_trajectory_bitwise_reproducible": False,
+        "weight_max_policy": args.weight_max_policy,
+        "weight_max_sha256": checkpoint.manifest.get("weight_max_sha256"),
+        "normalization_bound_check": not args.skip_normalization_bound_check,
     })
     sampling_stats = None
     if args.collection_mode == "single-pass":
@@ -800,6 +942,7 @@ def main() -> None:
         "retry_count": sum(item.retry for item in attempts),
         "collection_mode": args.collection_mode,
         "selection_algorithm": "phase-stratified-algorithm-r" if sampling_stats else "offline-uniform",
+        "normalization_bound_check": not args.skip_normalization_bound_check,
         "sampling_stats": sampling_stats,
         "training_final_state_sha256": final_digest,
         "attempts": [asdict(item) for item in attempts],
@@ -816,6 +959,7 @@ def main() -> None:
         "schema": SNAPSHOT_SCHEMA, "rule": args.rule,
         "collection_mode": args.collection_mode,
         "snapshot_count": len(selections),
+        "normalization_bound_check": not args.skip_normalization_bound_check,
         "presentation_snapshot_count": args.presentation_snapshots,
         "rest_snapshot_count": args.snapshots - args.presentation_snapshots,
         "training_final_state_sha256": final_digest,

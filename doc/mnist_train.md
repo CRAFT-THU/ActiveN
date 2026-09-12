@@ -5,9 +5,9 @@ has 16 KiB of scratchpad, two SMT threads, and an 8 KiB two-way instruction
 cache. The model contains 784 Poisson inputs, 400 excitatory neurons, and 400
 inhibitory neurons and advances in 0.5 ms steps.
 
-This payload implements dense input-to-excitatory connectivity only. Sparse
-connectivity deliberately has no runtime path here; it will use a separate
-reverse/transposed representation in DRAM.
+The dense build uses compact input-to-excitatory rows. The separate
+[`mnist_sparse` build](mnist_sparse_train.md) adds sparse forward CSR and three
+reverse-delivery paths while sharing the dense FP32 neuron kernel.
 
 ## Placement
 

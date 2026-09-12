@@ -50,6 +50,24 @@ MEM_LINE_BYTES ?= 64
 MNIST_ARCH := rv32ima_zfinx_zicsr
 MNIST_CFLAGS := -O3 -fomit-frame-pointer -ffp-contract=off -fno-jump-tables
 MNIST_RULE ?= three-trace
+MNIST_SPARSE_MODE ?= 1
+MNIST_SPARSE_FUSE_FORWARD ?= 1
+MNIST_SPARSE_COMPACT_SCHEDULE ?= 1
+MNIST_SPARSE_FUSE_NEURON ?= $(if $(filter one-trace,$(MNIST_RULE)),0,$(MNIST_SPARSE_COMPACT_SCHEDULE))
+MNIST_SPARSE_BINARY_REVERSE ?= 2
+MNIST_SPARSE_ACTIVE_PREFIX ?= 0
+ifneq ($(filter-out 0 1,$(MNIST_SPARSE_COMPACT_SCHEDULE) $(MNIST_SPARSE_FUSE_NEURON) $(MNIST_SPARSE_ACTIVE_PREFIX)),)
+$(error Sparse scheduling switches must be 0 or 1)
+endif
+ifeq ($(filter 0 1 2,$(MNIST_SPARSE_BINARY_REVERSE)),)
+$(error MNIST_SPARSE_BINARY_REVERSE must be 0 (scan), 1 (binary), or 2 (binary with bounded linear tail))
+endif
+ifeq ($(filter 0 1,$(MNIST_SPARSE_FUSE_FORWARD)),)
+$(error MNIST_SPARSE_FUSE_FORWARD must be 0 or 1)
+endif
+ifeq ($(filter 1 2 3 4,$(MNIST_SPARSE_MODE)),)
+$(error MNIST_SPARSE_MODE must be 1, 2, 3, or 4)
+endif
 MNIST_RULE_ID := $(if $(filter one-trace,$(MNIST_RULE)),1,$(if $(filter two-trace,$(MNIST_RULE)),2,$(if $(filter three-trace,$(MNIST_RULE)),3,)))
 ifeq ($(MNIST_RULE_ID),)
 $(error MNIST_RULE must be one-trace, two-trace, or three-trace)
@@ -93,6 +111,11 @@ else
 $(error MNIST_FIFTH_ROOT_SEED must be bit or lut)
 endif
 MNIST_DEFINES := -DMNIST_RULE=$(MNIST_RULE_ID) -DMNIST_RECURRENT_MODE=$(MNIST_RECURRENT_MODE_ID) -DMNIST_TRACE_BUNDLE=$(MNIST_TRACE_BUNDLE) -DMNIST_PARALLEL_INPUT_PREPARE=$(MNIST_PARALLEL_INPUT_PREPARE) -DMNIST_INPUT_DECAY_MODE=$(MNIST_INPUT_DECAY_MODE) -DMNIST_FUSE_NEURON_UPDATE=$(MNIST_FUSE_NEURON_UPDATE) -DMNIST_PIPELINE_INPUT_PREPARE=$(MNIST_PIPELINE_INPUT_PREPARE) -DMNIST_HORIZONTAL_GROUP_COUNT=$(MNIST_HORIZONTAL_GROUP_COUNT) -DMNIST_FIFTH_ROOT_LUT=$(MNIST_FIFTH_ROOT_LUT)
+# Sparse placement is fixed at eight groups; dense scheduling switches do not
+# select sparse runtime implementations.
+MNIST_SPARSE_DEFINES := -DMNIST_RULE=$(MNIST_RULE_ID) -DMNIST_RECURRENT_MODE=$(MNIST_RECURRENT_MODE_ID) -DMNIST_TRACE_BUNDLE=$(MNIST_TRACE_BUNDLE) -DMNIST_FIFTH_ROOT_LUT=$(MNIST_FIFTH_ROOT_LUT) -DMNIST_SPARSE_FUSE_FORWARD=$(MNIST_SPARSE_FUSE_FORWARD)
+MNIST_SPARSE_DEFINES += -DMNIST_SPARSE_COMPACT_SCHEDULE=$(MNIST_SPARSE_COMPACT_SCHEDULE) -DMNIST_SPARSE_FUSE_NEURON=$(MNIST_SPARSE_FUSE_NEURON) -DMNIST_SPARSE_BINARY_REVERSE=$(MNIST_SPARSE_BINARY_REVERSE)
+MNIST_SPARSE_DEFINES += -DMNIST_SPARSE_ACTIVE_PREFIX=$(MNIST_SPARSE_ACTIVE_PREFIX)
 
 sys/pingpong_test.bin: sys/pingpong_test.S sys/linker_system.ld
 	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -o sys/pingpong_test.elf $<
@@ -144,9 +167,13 @@ sys/snn_cond.bin: sys/snn_cond.S sys/snn_main.S sys/snn_init.c sys/linker_system
 	${PREFIX}gcc -mabi=ilp32 -march=rv32imaf_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -DSNN_VERIFY_RESULT=${SNN_VERIFY_RESULT} -DSNN_WARMUP_STEPS=0 -DSNN_TIMED_STEPS=1 -DSNN_DRAIN_MODE=${SNN_DRAIN_MODE} -DMEM_LINE_BYTES=${MEM_LINE_BYTES} -O1 -o sys/snn_cond.elf sys/snn_cond.S sys/snn_init.c
 	${PREFIX}objcopy -j .text -j .data -O binary sys/snn_cond.elf $@
 
-sys/mnist_train.bin: force-mnist-train sys/mnist_train.S sys/mnist_fifth_root.inc sys/mnist_fifth_root_config.inc sys/snn_init.c sys/linker_mnist_train.ld
+sys/mnist_train.bin: force-mnist-train sys/mnist_train.S sys/mnist_neuron_pair.inc sys/mnist_fifth_root.inc sys/mnist_fifth_root_config.inc sys/snn_init.c sys/linker_mnist_train.ld
 	${PREFIX}gcc -mabi=ilp32 -march=$(MNIST_ARCH) -nostdlib -nostartfiles -Wl,-T,sys/linker_mnist_train.ld -Isys -DMEM_LINE_BYTES=32 -DMNIST_TRAIN=1 $(MNIST_DEFINES) $(MNIST_CFLAGS) -o sys/mnist_train.elf sys/mnist_train.S sys/snn_init.c
 	${PREFIX}objcopy --wildcard -j .text -j '.rodata*' -j '.srodata*' -j .data -O binary sys/mnist_train.elf $@
+
+sys/mnist_sparse.bin: force-mnist-train sys/mnist_train.S sys/mnist_sparse.inc sys/mnist_sparse_layout.inc sys/mnist_numeric.inc sys/mnist_neuron_pair.inc sys/mnist_fifth_root.inc sys/mnist_fifth_root_config.inc sys/snn_init.c sys/linker_mnist_train.ld
+	${PREFIX}gcc -mabi=ilp32 -march=$(MNIST_ARCH) -nostdlib -nostartfiles -Wl,-T,sys/linker_mnist_train.ld -Isys -DMEM_LINE_BYTES=32 -DMNIST_TRAIN=1 -DMNIST_SPARSE_MODE=$(MNIST_SPARSE_MODE) $(MNIST_SPARSE_DEFINES) $(MNIST_CFLAGS) -o sys/mnist_sparse.elf sys/mnist_train.S sys/snn_init.c
+	${PREFIX}objcopy --wildcard -j .text -j '.rodata*' -j '.srodata*' -j .data -O binary sys/mnist_sparse.elf $@
 
 force-mnist-train:
 
