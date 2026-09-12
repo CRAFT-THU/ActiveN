@@ -83,6 +83,8 @@ def run_case(snapshot: Path, mode: str, args: argparse.Namespace) -> dict:
         raise ValueError("requested simulation exceeds the exported snapshot window")
     simulation = [str(frozen / "sim_system"), "--soft", "--soft-threads", str(args.soft_threads),
         "--pu", "512", "--mc", "16", "--mc-size", "0x100000000", "--max-cycles", str(args.max_cycles)]
+    if getattr(args, "init_icache", False):
+        simulation.append("--init-icache")
     if args.ramulator_config:
         simulation += ["--ramulator-config", str(frozen / "ramulator.yaml")]
     simulation += [str(image_dir / f"dram.{mc}") for mc in range(16)]
@@ -143,6 +145,8 @@ def main() -> None:
     parser.add_argument("--connection-rate", type=float, required=True)
     parser.add_argument("--connectivity-seed", type=int, default=20260723)
     parser.add_argument("--simulator", type=Path, default=REPO / "sim/build/sim_system")
+    parser.add_argument("--init-icache", action="store_true",
+                        help="preload the simulator's configured instruction-cache region")
     parser.add_argument("--ramulator-config", type=Path)
     parser.add_argument("--warmup-steps", type=int, default=4)
     parser.add_argument("--timed-steps", type=int, default=12)

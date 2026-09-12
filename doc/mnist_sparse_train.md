@@ -621,3 +621,46 @@ It waits for the existing compact controller to exit successfully, then runs
 only mode 4 on the same reference windows and audits against compact-local.
 Frozen provenance, process identities, status, and automatic final reporting
 are retained in that directory; no manual batch handoff is needed.
+
+## Reverse setup pilot
+
+`MNIST_SPARSE_CACHE_REVERSE=1` (the compact-schedule default) prepares each
+input PU's reverse receiver registers before contributing to the existing
+neuron/group barrier. Thread zero installs its cache and sends one local
+setup event through the existing thread-one setup queue. Thread one installs
+the same cache and yields the PU's barrier contribution to the existing
+thread-zero reducer. No new global phase, handler queue, priority, or quota is
+introduced. Reverse messages cannot be issued until every input PU has
+completed both setups.
+
+Both threads retain the reverse-directory and per-post weight-cap base
+addresses. One-/two-trace handlers also retain the fired-vector end and the
+potentiation rate/pre-trace target; their six persistent fifth-root constants
+keep their existing registers. Three-trace has
+more free registers and additionally caches fired-vector bounds, input-state
+base, and received-count address/expected value. Per-post cap selection and
+all required FP32 operations remain in the receiver.
+
+In mode 4, the fired scratch vector now reserves eight bytes per input:
+the existing absolute input-state pointer followed by its byte index in a
+dense reverse row. Each firing computes that index once during preparation;
+insertion sort moves the two words together. The per-trace vector loop loads
+the cached index directly. When exactly one input fired, setup selects a
+quiet handler that performs one direct lookup and no vector loop. The
+ordinary post-fired handler remains available on both threads. Other modes
+retain their four-byte fired vectors; no synapse directory is added.
+
+The generator's larger mode-4 scratch allocation also accommodates legacy
+four-byte-vector binaries, allowing paired control/optimized images to have
+the same static layout. `MNIST_SPARSE_CACHE_REVERSE=0` retains the old receiver
+setup and vector format for comparisons. Destination activity masks and
+message-count semantics are unchanged in this pilot.
+
+The benchmark driver accepts `--init-icache`, records it in provenance, and
+passes it to the simulator. Both pilot variants use prefill with the existing
+four warmup and twelve timed steps. The frozen baseline, optimized payloads,
+directed checks, and background pilot are under
+`copilot/tmp/mnist-sparse-setup-20260913/`. Performance conclusions must use
+that directory's paired results; earlier cold-cache results are not its
+control. This pilot does not implement per-post activity masks or nibble
+skipping.

@@ -204,7 +204,9 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
                         if mode == 3 else post % POSTS)
                 struct.pack_into("<f", spm, cap_base + slot * 4, weight_caps[post])
         ff_counts = allocate(NEURON_PUS * 4) if own_inputs else 0
-        fired_base = allocate(len(own_inputs) * 4) if own_inputs else 0
+        # Dense reverse setup caches a row byte index beside each fired state
+        # pointer. Legacy four-byte-vector payloads also fit this allocation.
+        fired_base = allocate(len(own_inputs) * (8 if mode == 4 else 4)) if own_inputs else 0
         dest_base = allocate(INPUT_PUS * 4) if excs[pu] else 0
         if dest_base:
             # Rotate send order while preserving the original group rank bits.

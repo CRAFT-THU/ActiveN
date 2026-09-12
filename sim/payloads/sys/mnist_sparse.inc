@@ -32,6 +32,19 @@
 #ifndef MNIST_SPARSE_ACTIVE_PREFIX
 #define MNIST_SPARSE_ACTIVE_PREFIX 0
 #endif
+#ifndef MNIST_SPARSE_CACHE_REVERSE
+#define MNIST_SPARSE_CACHE_REVERSE MNIST_SPARSE_COMPACT_SCHEDULE
+#endif
+#if MNIST_SPARSE_CACHE_REVERSE && !MNIST_SPARSE_COMPACT_SCHEDULE
+#error "Reverse phase caching requires compact scheduling"
+#endif
+#if MNIST_SPARSE_CACHE_REVERSE && MNIST_SPARSE_MODE == 4
+#define FIRED_SIZE 8
+#define FIRED_SHIFT 3
+#else
+#define FIRED_SIZE 4
+#define FIRED_SHIFT 2
+#endif
 #if MNIST_SPARSE_COMPACT_SCHEDULE && !MNIST_SPARSE_FUSE_FORWARD
 #error "Compact scheduling requires fused preparation/feedforward"
 #endif
@@ -105,6 +118,33 @@
   li t0, ((\threads << 3) | \argc)
   csrw (0x710 + \index), t0
 .endm
+/* Input-only registers, installed before the neuron/group barrier completes.
+ * ra/tp and the three-trace cache registers are untouched by input control,
+ * preparation, and reduction handlers. One/two-trace s3/s9/s10 remain live
+ * throughout reverse handling; fifth_root preserves them.
+ */
+.macro INIT_REVERSE_PHASE
+  lw ra, H_REVERSE_PTR(gp)
+  add ra, ra, gp
+  lw tp, H_WMAX_BASE(gp)
+  add tp, tp, gp
+#if MNIST_RULE == MT_RULE_THREE
+  lw a4, H_FIRED_BASE(gp)
+  add a4, a4, gp
+  lw a5, H_FIRED_END(gp)
+  lw a6, H_INPUT_BASE(gp)
+  add a6, a6, gp
+  addi sp, gp, H_RECEIVED
+  lw s11, H_EXPECTED(gp)
+#if MNIST_SPARSE_MODE == 4
+  lw a7, H_REV_CURSOR(gp)
+#endif
+#else
+  lw s3, H_FIRED_END(gp)
+  lw s9, H_POT(gp)
+  lw s10, H_PRE_TARGET(gp)
+#endif
+.endm
   .section .text
   .option nopic
   .globl _start
@@ -149,6 +189,9 @@ sparse_wait_thread1:
 sparse_setup_thread1:
   li gp, SPM_BASE
 #if MNIST_SPARSE_COMPACT_SCHEDULE
+#if MNIST_SPARSE_CACHE_REVERSE
+  bltz a1, sparse_reverse_setup_thread1
+#endif
   lw t0, H_PHASE(gp)
   bnez t0, sparse_prepare_worker
 #endif
@@ -161,6 +204,19 @@ sparse_setup_thread1:
   li a3, 0
   li t0, 1
   SENDI t0, TAG_GROUP
+#if MNIST_SPARSE_CACHE_REVERSE
+  j sparse_wait
+sparse_reverse_setup_thread1:
+  INIT_REVERSE_PHASE
+  /* Both caches are ready before this PU contributes to the existing barrier.
+   * This uses the existing thread-zero reducer and one reserved outgoing slot.
+   */
+  lw a0, H_PHASE(gp)
+  li a1, 1
+  li a2, 0
+  li a3, 0
+  YIELDI zero, TAG_REDUCE
+#endif
 sparse_wait:
   wfi
   j sparse_wait
@@ -407,9 +463,20 @@ sparse_prepare_row:
   addi t1, gp, H_FIRED_COUNT
   li t2, 1
   amoadd.w t2, t2, (t1)
-  slli t2, t2, 2
+  slli t2, t2, FIRED_SHIFT
   add t2, s3, t2
   sw s1, 0(t2)
+#if MNIST_SPARSE_CACHE_REVERSE && MNIST_SPARSE_MODE == 4
+  /* Cache the dense row byte index once per firing, rather than per trace. */
+  lw t0, H_INPUT_BASE(gp)
+  add t0, t0, gp
+  sub t0, s1, t0
+  srli t0, t0, 2
+  li t1, 0xb6db6db7
+  mul t0, t0, t1
+  slli t0, t0, 2
+  sw t0, 4(t2)
+#endif
 sparse_prepare_next:
   addi s1, s1, INPUT_SIZE
   addi s0, s0, -1
@@ -425,26 +492,36 @@ sparse_prepare_join:
   lw s3, H_FIRED_BASE(gp)
   add s3, s3, gp
   lw t0, H_FIRED_COUNT(gp)
-  slli t0, t0, 2
+  slli t0, t0, FIRED_SHIFT
   add s4, s3, t0
   sw s4, H_FIRED_END(gp)
   /* Atomic append permits SMT interleaving. Sort only the fired vector;
    * connection rows are already strictly sorted by input-state offset. */
-  addi t0, s3, 4
+  addi t0, s3, FIRED_SIZE
 sparse_fired_sort:
   bgeu t0, s4, sparse_fired_sorted
   lw t1, 0(t0)
+#if FIRED_SIZE == 8
+  lw t4, 4(t0)
+#endif
   mv t2, t0
 sparse_fired_insert:
   beq t2, s3, sparse_fired_insert_store
-  lw t3, -4(t2)
+  lw t3, -FIRED_SIZE(t2)
   bleu t3, t1, sparse_fired_insert_store
   sw t3, 0(t2)
-  addi t2, t2, -4
+#if FIRED_SIZE == 8
+  lw t5, -4(t2)
+  sw t5, 4(t2)
+#endif
+  addi t2, t2, -FIRED_SIZE
   j sparse_fired_insert
 sparse_fired_insert_store:
   sw t1, 0(t2)
-  addi t0, t0, 4
+#if FIRED_SIZE == 8
+  sw t4, 4(t2)
+#endif
+  addi t0, t0, FIRED_SIZE
   j sparse_fired_sort
 sparse_fired_sorted:
   lw s2, H_FF_COUNTS(gp)
@@ -455,7 +532,7 @@ sparse_fired_sorted:
 sparse_prepare_count_row:
   beq s3, s4, sparse_prepare_counts_done
   lw t0, 0(s3)
-  addi s3, s3, 4
+  addi s3, s3, FIRED_SIZE
   lw t1, IN_WEIGHT_COUNT(t0)
   lw t0, IN_WEIGHT_OFFSET(t0)
   add t0, t0, gp
@@ -620,7 +697,7 @@ sparse_forward_stats:
   add t2, t2, t5
   lw t5, IN_WEIGHT_COUNT(t4)
   add t3, t3, t5
-  addi t0, t0, 4
+  addi t0, t0, FIRED_SIZE
   addi t1, t1, -1
   bnez t1, sparse_forward_stats
 sparse_forward_stats_done:
@@ -656,7 +733,7 @@ sparse_ff_next_row:
   lw t3, H_FIRED_END(gp)
   beq t2, t3, sparse_ff_sent
   lw t3, 0(t2)
-  addi t2, t2, 4
+  addi t2, t2, FIRED_SIZE
   sw t2, H_FF_ROW(gp)
   lw t0, IN_WEIGHT_OFFSET(t3)
   add t0, t0, gp
@@ -1037,6 +1114,29 @@ sparse_active_partition_done:
   sw s3, H_FIRED_COUNT(gp) /* Unused by neuron state/observers. */
 #endif
 sparse_mask_report:
+#if MNIST_SPARSE_CACHE_REVERSE
+  lw t0, H_INPUT_COUNT(gp)
+  beqz t0, sparse_mask_report_neuron
+#if MNIST_SPARSE_MODE == 4 && MNIST_RULE != MT_RULE_ONE
+  la t0, sparse_reverse_quiet
+  lw t1, H_FIRED_COUNT(gp)
+  li t2, 1
+  bne t1, t2, sparse_reverse_select
+  la t0, sparse_reverse_one_pre
+  lw t1, H_FIRED_BASE(gp)
+  add t1, t1, gp
+  lw t1, 4(t1)
+  sw t1, H_REV_CURSOR(gp) /* Sender-only slot is unused on input PUs. */
+sparse_reverse_select:
+  csrw 0x704, t0
+#endif
+  INIT_REVERSE_PHASE
+  li a0, 0
+  li a1, -1
+  SENDI zero, 0x40f
+  j sparse_wait
+sparse_mask_report_neuron:
+#endif
   lw a2, H_LOCAL_SPIKES(gp)
   li a3, 0
   j sparse_reduce_local
@@ -1248,9 +1348,13 @@ sparse_reverse_post:
   li s4, 1
 sparse_reverse_decode:
   mv s2, a2
+#if !MNIST_SPARSE_CACHE_REVERSE || MNIST_RULE == MT_RULE_THREE
   mv s3, a3
+#endif
+#if !MNIST_SPARSE_CACHE_REVERSE
   lw s9, H_POT(gp)
   lw s10, H_PRE_TARGET(gp)
+#endif
 #if MNIST_SPARSE_MODE == 3
   add s0, a0, gp
   add s1, a1, gp
@@ -1258,10 +1362,15 @@ sparse_reverse_decode:
 #else
   li t1, 50
   bgeu a1, t1, sparse_fail
+#if MNIST_SPARSE_CACHE_REVERSE
+  slli t2, a1, 1
+  add t1, ra, t2
+#else
   lw t1, H_REVERSE_PTR(gp)
   add t1, t1, gp
   slli t2, a1, 1
   add t1, t1, t2
+#endif
   lhu s5, 0(t1)
   lhu s6, 2(t1)
   add s5, s5, gp
@@ -1269,10 +1378,14 @@ sparse_reverse_decode:
   beq s5, s6, sparse_reverse_received
   mv t2, a1
 #endif
+  slli t2, t2, 2
+#if MNIST_SPARSE_CACHE_REVERSE
+  add s8, tp, t2
+#else
   lw s8, H_WMAX_BASE(gp)
   add s8, s8, gp
-  slli t2, t2, 2
   add s8, s8, t2
+#endif
   lw s8, 0(s8)
 #if MNIST_RULE != MT_RULE_THREE
 #if MNIST_SPARSE_COMPACT_SCHEDULE
@@ -1282,6 +1395,23 @@ sparse_reverse_decode:
 #endif
 #endif
 #if MNIST_SPARSE_MODE == 4
+#if MNIST_SPARSE_CACHE_REVERSE
+  beqz s4, sparse_reverse_dense_quiet_setup
+#if MNIST_RULE == MT_RULE_THREE
+  mv s7, a6
+#else
+  lw s7, H_INPUT_BASE(gp)
+  add s7, s7, gp
+#endif
+  j sparse_reverse_entry
+sparse_reverse_dense_quiet_setup:
+#if MNIST_RULE == MT_RULE_THREE
+  mv s7, a4
+#else
+  lw s7, H_FIRED_BASE(gp)
+  add s7, s7, gp
+#endif
+#else
   lw s7, H_INPUT_BASE(gp)
   add s7, s7, gp
   bnez s4, sparse_reverse_entry
@@ -1290,7 +1420,18 @@ sparse_reverse_decode:
   add s7, s7, gp
   lw s9, H_FIRED_END(gp)
   li s6, 0xb6db6db7 /* Multiplicative inverse of 7 modulo 2^32. */
+#endif
 sparse_reverse_dense_next:
+#if MNIST_SPARSE_CACHE_REVERSE
+#if MNIST_RULE == MT_RULE_THREE
+  beq s7, a5, sparse_reverse_received
+#else
+  beq s7, s3, sparse_reverse_received
+#endif
+  lw s0, 0(s7)
+  lw t1, 4(s7)
+  addi s7, s7, FIRED_SIZE
+#else
   beq s7, s9, sparse_reverse_received
   lw s0, 0(s7)
   addi s7, s7, 4
@@ -1298,6 +1439,7 @@ sparse_reverse_dense_next:
   srli t1, t1, 2
   mul t1, t1, s6 /* Exact local index: (state - base) / 28. */
   slli t1, t1, 2
+#endif
   add t1, s5, t1
   lhu s1, 0(t1)
   beqz s1, sparse_reverse_dense_next
@@ -1307,16 +1449,30 @@ sparse_reverse_dense_next:
 #endif
 #if MNIST_SPARSE_BINARY_REVERSE && MNIST_SPARSE_MODE <= 2
   bnez s4, sparse_reverse_entry
+#if MNIST_SPARSE_CACHE_REVERSE && MNIST_RULE == MT_RULE_THREE
+  mv s7, a4
+#else
   lw s7, H_FIRED_BASE(gp)
   add s7, s7, gp
+#endif
+#if !MNIST_SPARSE_CACHE_REVERSE
   lw s9, H_FIRED_END(gp) /* Quiet posts do not use the potentiation rate. */
+#endif
   j sparse_reverse_search_next
 
 /* Both vectors are sorted by local input-state offset. Search only the
  * remaining suffix; a hit or insertion position advances the lower bound.
  * Storage remains the existing CSR plus the O(local inputs) fired vector. */
 sparse_reverse_search_next:
+#if MNIST_SPARSE_CACHE_REVERSE
+#if MNIST_RULE == MT_RULE_THREE
+  beq s7, a5, sparse_reverse_received
+#else
+  beq s7, s3, sparse_reverse_received
+#endif
+#else
   beq s7, s9, sparse_reverse_received
+#endif
   beq s5, s6, sparse_reverse_received
   lw s0, 0(s7)
   addi s7, s7, 4
@@ -1439,7 +1595,51 @@ sparse_reverse_entry_done:
 #endif
   bne s5, s6, sparse_reverse_entry
 #endif
+#if MNIST_SPARSE_CACHE_REVERSE && MNIST_SPARSE_MODE == 4 && MNIST_RULE != MT_RULE_ONE
+  j sparse_reverse_received
+/* Selected once before the reverse barrier when precisely one local pre fired.
+ * Quiet depression needs neither its state pointer nor a fired-vector loop.
+ */
+sparse_reverse_one_pre:
+  slli t1, a1, 1
+  add t1, ra, t1
+  lhu t1, 0(t1)
+  add t1, t1, gp
+#if MNIST_RULE == MT_RULE_THREE
+  add t1, t1, a7
+#else
+  lw t2, H_REV_CURSOR(gp)
+  add t1, t1, t2
+#endif
+  lhu s1, 0(t1)
+  beqz s1, sparse_reverse_received
+  add s1, s1, gp
+  slli t1, a1, 2
+  add t1, tp, t1
+  lw s8, 0(t1)
+  lw t5, 0(s1)
+#if MNIST_RULE == MT_RULE_TWO
+  mv s2, a2
+  li ROOT_NEWTON, 0x3f99ca19
+  mv a0, t5
+  jal t6, fifth_root
+  fmul.s t2, s2, a0
+#else
+  mv t2, a2
+#endif
+  fsub.s t5, t5, t2
+  fmax.s t5, t5, zero
+  fmin.s t5, t5, s8
+  sw t5, 0(s1)
+#endif
 sparse_reverse_received:
+#if MNIST_SPARSE_CACHE_REVERSE && MNIST_RULE == MT_RULE_THREE
+  li t1, 1
+  amoadd.w t2, t1, (sp)
+  addi t2, t2, 1
+  bgtu t2, s11, sparse_fail
+  bne t2, s11, sparse_wait
+#else
   addi t0, gp, H_RECEIVED
   li t1, 1
   amoadd.w t2, t1, (t0)
@@ -1447,6 +1647,7 @@ sparse_reverse_received:
   lw t3, H_EXPECTED(gp)
   bgtu t2, t3, sparse_fail
   bne t2, t3, sparse_wait
+#endif
 sparse_reverse_maybe_done:
   lw t0, H_PHASE(gp)
   li t1, PH_REVERSE
