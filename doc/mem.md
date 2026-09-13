@@ -16,22 +16,22 @@ We currently allocates the following events Tag for memory requests / responses.
   - operand[0]: the address, aligned to size
   - operand[1][31:16]: The size of the access (log2, can be <= 15 for now)
   - operand[1][15:0]: The request ID
+  - operand[2]: Carried data 1
+    - For request ID = 0x8002, carried data 1 = {return tag ID, address of SPM writeback location IN LINE GRANULARITY relative to the SPM AC base CSR}. The address will be in the carried data 2 slot in the message.
+  - operand[3]: Carried data 2
 - 0x?01: Normal store
   - operand[0]: the address, aligned to size
   - operand[1][31:16]: The size of the access (log2, can be 0, 1, 2 for now)
   - FIXME: multibeat stores so that size can be > 2
   - operand[1][15:0]: The request ID
-  - operand[2]: The data to write, replicated to fill 32 bits (e.g. for byte access, the byte is replicated 4 times in operand[2])
-- 0x?02: AMO
-  - operand[0]: the address, aligned to size
-  - operand[1][15:0]: The request ID
-  - operand[1][31:16]: The AMO operation (with size, to be defined)
-  - operand[2]: The AMO operand
+  - operand[2]: Carried data 1
+    - For request ID = 0x8003, carried data 2 = {return tag ID, any 16 bit data}. The low 16bit will be in the carried data 2 slot in the message.
+  - operand[3]: The data to write, replicated to fill 32 bits (e.g. for byte access, the byte is replicated 4 times in operand[2])
 - 0x?10: CSR access
   - operand[0]: the start of the row
   - operand[1][31:16]: the length of the access (in MEM_BEATS bytes)
   - operand[1][15:0]: the return tag value (which is scattered, locally)
-  - TODO: operand[2] & operand[3]: Carried data, passed to the handler.
+  - operand[2] & operand[3]: Carried data, passed to the handler.
 - 0x?11: Bulk load
   - operand[0]: the start of the row
   - operand[1][31:16]: the length of the access (in MEM_BEATS bytes)

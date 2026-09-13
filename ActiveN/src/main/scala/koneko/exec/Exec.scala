@@ -192,8 +192,8 @@ class Exec(implicit val param: CoreParameters) extends Module {
   lsu.req.bits.smsel := uop.smsel
   lsu.req.valid := valid && uop.isMem
 
-  val acGBase = RegInit(0.U(32.W))
-  val acSBase = RegInit(0.U(32.W))
+  val acGBase = RegInit(0x80000000L.U(32.W))
+  val acSBase = RegInit(0x20000000L.U(32.W))
   val acLen = RegInit(0.U(32.W))
   lsu.ac.gBase := acGBase
   lsu.ac.sBase := acSBase
@@ -209,6 +209,10 @@ class Exec(implicit val param: CoreParameters) extends Module {
   biu.ext.in <> ext.in
   biu.ext.out <> ext.out
   biu.bcast <> bcast
+
+  val biuPushArb = Module(new Arbiter(biu.push.bits.cloneType, 2))
+  biu.push <> biuPushArb.io.out
+  biuPushArb.io.in(0) <> lsu.push
 
   // Idling management
   // Next cycle idlings
@@ -241,18 +245,18 @@ class Exec(implicit val param: CoreParameters) extends Module {
   biu.msg.bits.dst := rs1val
   biu.msg.bits.data := directval
   biu.msg.bits.tag := msgLocalTag // Reuse alu2imm for decode
-  biu.push.bits.handler := msgLocalHandler
-  biu.push.bits.regs := directval
+  biuPushArb.io.in(1).bits.handler := msgLocalHandler
+  biuPushArb.io.in(1).bits.regs := directval
 
   // FIXME: quota check. See targetQuotaSufficient below
   // We don't need to quota check send-yields: they don't consume any send queue space, and semantically
   // immeidately executes a new handler.
   biu.msg.valid := valid && uop.isAM && !msgIsLocal
-  biu.push.valid := valid && uop.isAM && msgIsLocal && !sendFastPath
+  biuPushArb.io.in(1).valid := valid && uop.isAM && msgIsLocal && !sendFastPath
 
   // We use fire here because there is a chance of insufficient quota
   // so valid is not necessarily true
-  val biuAccepted = Mux(msgIsLocal, biu.push.fire, biu.msg.fire)
+  val biuAccepted = Mux(msgIsLocal, biuPushArb.io.in(1).fire, biu.msg.fire)
 
   // TODO: optimize local send + yield
   // If biu.sched does not need to be consumed by the current thread, i.e.

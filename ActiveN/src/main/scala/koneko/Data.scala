@@ -18,6 +18,8 @@ class MemResp(implicit val param: CoreParameters) extends Bundle {
   val id = UInt(16.W)
   val ident = UInt(16.W) // Used in bulk transfer to identify the request
   val data = UInt(param.memBusWidth.W)
+  val extra0 = UInt(16.W)
+  val extra1 = UInt(32.W)
 }
 
 class uOp(implicit val param: CoreParameters) extends Bundle {

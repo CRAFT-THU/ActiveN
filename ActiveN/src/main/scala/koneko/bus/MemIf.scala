@@ -72,10 +72,11 @@ object MSHR {
     p.size := flit.data(1)(31, 16)
     p.id := flit.data(1)(15, 0)
 
-    p.carried := DontCare
+    p.carried(0) := flit.data(2)
+    p.carried(1) := flit.data(3)
 
     // Operand 2
-    val data = flit.data(2)
+    val data = flit.data(3)
 
     (isScalar, p, data)
   }
@@ -164,6 +165,8 @@ class RingResp(implicit params: CoreParameters) extends Bundle {
   val id   = UInt(16.W)
   val ident = UInt(16.W) // Used in bulk transfer to identify the request
   val data = UInt(params.memBusWidth.W)
+  val extra0 = UInt(16.W)
+  val extra1 = UInt(32.W)
 }
 
 // Base class for DRAMIf and MMIOIf, the former implements scatter & bulk access & local response egress, the latter implements config ROM.
@@ -234,6 +237,8 @@ abstract class MemIf(
   ucstEject.bits.id := mshrs(ucstIdx).id
   ucstEject.bits.data := buffer(ucstIdx)
   ucstEject.bits.ident := mshrs(ucstIdx).carried(0)
+  ucstEject.bits.extra0 := mshrs(ucstIdx).carried(0)(31, 16)
+  ucstEject.bits.extra1 := mshrs(ucstIdx).carried(1)
   ucstEject.valid := ucstMap.orR
   when(ucstEject.fire) {
     allocated(ucstIdx) := false.B

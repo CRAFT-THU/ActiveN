@@ -43,6 +43,12 @@ class LSU(implicit val param: CoreParameters) extends Module {
     val remaining = Output(UInt(16.W))
   })
 
+  // Manual async-copy completion push
+  val push = IO(Decoupled(new Bundle {
+    val handler = UInt(4.W)
+    val regs = Vec(4, UInt(32.W))
+  }))
+
   // Asserts that write and AMO cannot both be asserted
   assert(!req.valid || !req.bits.write || !req.bits.amo, "AMO and write cannot both be true")
   // LR/SC only supports 32-bit
@@ -62,10 +68,16 @@ class LSU(implicit val param: CoreParameters) extends Module {
   val spm = Module(new SPM)
 
   /* Response validness */
-  val respAc = mem.resp.valid && mem.resp.bits.id === 1.U
+  // Global response
   val respG = mem.resp.valid && mem.resp.bits.id === 0.U
+  // Async copy response
+  val respAc = mem.resp.valid && mem.resp.bits.id === 1.U
+  // Manual copy with writeback
+  val respMcwb = mem.resp.valid && mem.resp.bits.id === 2.U
+  // Manual copy without writeback
+  val respMcn = mem.resp.valid && mem.resp.bits.id === 3.U
 
-  /* Async-copy state machine */
+  /* Async-copy state Mcwbhine */
   val acOp = Reg(ACOps()) // This is unused for now.
   val acPending = RegInit(false.B) // Whether the async-copy request is not sent yet
   val acRemaining = RegInit(0.U(16.W))
@@ -201,22 +213,22 @@ class LSU(implicit val param: CoreParameters) extends Module {
   //   - If the next cycle we get a SPM AMO, then it will operate like a load + store
   // - If the next cycle we get any global request, global requests is guaranteed to take at least one cycle
   val spmBusy = (
-    RegNext(req.ready || !req.valid || respAc) && req.bits.amo
-    || respAc
+    RegNext(req.ready || !req.valid || respAc || respMcwb) && req.bits.amo
+    || respAc || respMcwb
   )
   delayed := isSPM && !req.bits.amo && !req.bits.write
 
   val spmShortWe = MuxCase(0.U(4.W), Seq(
     (req.valid && isSPM && req.bits.write && (!req.bits.lrsc || reserved)) -> wbe,
-    RegNext(req.valid && !req.ready && !respAc && isSPM && req.bits.amo) -> "b1111".U(4.W)
+    RegNext(req.valid && !req.ready && !(respAc || respMcwb) && isSPM && req.bits.amo) -> "b1111".U(4.W)
   ))
   val spmShortWdata = Mux(req.bits.amo, spmamoalu.written, wmapped)
   val spmBulkWriteAddr = (mem.resp.bits.ident << log2Ceil(param.memBusWidth / 8)) + (ac.sBase - 0x20000000.U)
-  spm.io.addr := Mux(respAc, spmBulkWriteAddr, spmAlignedAddr)
-  spm.io.we := Mux(respAc, Fill(param.memBusWidth / 8, 1.U(1.W)), spmShortWe << spmWordOffset)
+  spm.io.addr := Mux(respAc || respMcwb, spmBulkWriteAddr, spmAlignedAddr)
+  spm.io.we := Mux(respAc || respMcwb, Fill(param.memBusWidth / 8, 1.U(1.W)), spmShortWe << spmWordOffset)
   // Note: AMO necessarily takes two cycles, so if req.bits.atomic causes timing hazard,
   // we can RegNext here.
-  spm.io.wdata := Mux(respAc, mem.resp.bits.data, Fill(param.memBusWidth / 32, spmShortWdata))
+  spm.io.wdata := Mux(respAc || respMcwb, mem.resp.bits.data, Fill(param.memBusWidth / 32, spmShortWdata))
 
   // --- Global memory path ---
   val memSent = RegInit(false.B)
@@ -268,4 +280,25 @@ class LSU(implicit val param: CoreParameters) extends Module {
     dlen.b -> VecInit(Seq.fill(24)(drsext && rbyte(7))).asUInt ## rbyte,
   ))
   resp := rmapped
+
+  // Push registers
+  val COMPLETION_TIMEOUT = 3;
+  val pushingData = Reg(push.bits.cloneType)
+  val pushing = RegInit(0.U(log2Ceil(COMPLETION_TIMEOUT + 1).W))
+  push.bits := pushingData
+  push.valid := pushing =/= 0.U
+  when (respMcwb || respMcn) {
+    // May overwrite existing data. Also can happen on the same tick as push.fire
+    pushing := COMPLETION_TIMEOUT.U
+    pushingData.handler := mem.resp.bits.extra0
+    pushingData.regs(0) := mem.resp.bits.ident
+    pushingData.regs(1) := mem.resp.bits.extra1
+    pushingData.regs(2) := DontCare
+    pushingData.regs(3) := DontCare
+  } .elsewhen (push.ready) {
+    // No new data, current data accepted
+    pushing := 0.U
+  } .elsewhen (pushing =/= 0.U) {
+    pushing := pushing - 1.U
+  }
 }

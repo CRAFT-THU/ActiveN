@@ -44,6 +44,8 @@ class Distributor(
   out.unicast.resp.id := unicast.bits.id
   out.unicast.resp.data := unicast.bits.data
   out.unicast.resp.ident := unicast.bits.ident
+  out.unicast.resp.extra0 := unicast.bits.extra0
+  out.unicast.resp.extra1 := unicast.bits.extra1
   out.unicast.valids := Fill(16, unicast.valid) & UIntToOH(unicast.bits.dst - puStart.U, 16)
 
   // Single slot queue for broadcasts

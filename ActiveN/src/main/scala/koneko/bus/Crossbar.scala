@@ -40,6 +40,8 @@ class Crossbar(n: Int)(implicit val param: CoreParameters) extends Module {
     u.resp.valid := downstream.resp.valid && selected
     u.resp.bits.id := respId
     u.resp.bits.ident := downstream.resp.bits.ident
+    u.resp.bits.extra0 := downstream.resp.bits.extra0
+    u.resp.bits.extra1 := downstream.resp.bits.extra1
     u.resp.bits.data := downstream.resp.bits.data
   }
 }

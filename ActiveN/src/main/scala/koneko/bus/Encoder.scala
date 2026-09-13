@@ -74,6 +74,6 @@ class Encoder(implicit val param: CoreParameters) extends Module {
   out.bits.data(0) := finalAddr
   val size = Mux(req.bits.bulk, req.bits.bulkSize, 0.U(12.W) ## req.bits.size)
   out.bits.data(1) := size ## req.bits.id
-  out.bits.data(2) := req.bits.wdata
-  out.bits.data(3) := 0.U
+  out.bits.data(2) := DontCare
+  out.bits.data(3) := req.bits.wdata
 }
