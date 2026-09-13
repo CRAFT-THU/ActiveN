@@ -622,6 +622,34 @@ only mode 4 on the same reference windows and audits against compact-local.
 Frozen provenance, process identities, status, and automatic final reporting
 are retained in that directory; no manual batch handoff is needed.
 
+## Established sparse benchmark baseline
+
+The user accepted reverse setup extraction as the baseline for subsequent
+sparse MNIST experiments. Use `MNIST_SPARSE_CACHE_REVERSE=1`, compact scheduling,
+the existing bounded-tail binary reverse search, and the existing per-mode
+forward packet format. Relevant masks, MC drain synchronization, and nibble
+skipping are experiments relative to this baseline, not baseline features.
+The current Makefile defaults already select this implementation.
+
+Every paired timing comparison must enable `--init-icache` on both sides and
+retain four warmup plus twelve timed steps, with identical checkpoints,
+connectivity, trace rules and reverse-map modes. The timing baseline uses flat
+memory; the Ramulator runs are separate protocol stress tests. Report residual
+timed I-cache fills alongside cycle results even when prefill is enabled.
+
+`doc/mnist_sparse_baseline.json` records the twelve frozen payload hashes,
+simulator/configuration/source hashes, build settings, timing settings and
+validation records. Its frozen executable directory is
+`copilot/tmp/mnist-sparse-setup-20260913/setup/frozen/`. All 48 setup-extraction
+pairs passed independent FP32 checks and had bit-identical logical final states.
+The original pre-extraction binaries remain historical controls only.
+
+The current 72-case mask pilot already compares each candidate against these
+established baseline results. It covers per-post PU masks for local CSR/dense
+maps, per-post MC masks plus drain synchronization for both scatter modes, and
+drain-only controls that retain the old MC activity filter. Nibble skipping
+remains the next experiment after this pilot has been assessed.
+
 ## Reverse setup pilot
 
 `MNIST_SPARSE_CACHE_REVERSE=1` (the compact-schedule default) prepares each
@@ -664,3 +692,72 @@ directed checks, and background pilot are under
 that directory's paired results; earlier cold-cache results are not its
 control. This pilot does not implement per-post activity masks or nibble
 skipping.
+
+### Relevant activity and MC drain experiments (2026-09-13)
+
+These are opt-in payload switches, layered on compact scheduling and reverse
+phase caching; the default remains the setup-only implementation:
+
+- `MNIST_SPARSE_RELEVANT_MASKS=1`: collect activity separately for each local
+  postsynaptic neuron during its existing, thread-zero forward handler.
+- `MNIST_SPARSE_MC_DRAIN=1`: replace expected reverse-response counts with
+  issuer completion, MC idle notification, and domain-local draining; modes 2/3
+  only, required when those modes use relevant masks.
+- `MNIST_SPARSE_IDLE_GATE=256`: retain the inference workload's `idle > 256`
+  threshold, i.e. at least 257 idle cycles.
+
+Images for relevant-mask payloads must be generated with `--relevant-masks`
+(also supported by the benchmark driver). Modes 1/4 encode the logical post
+slot in forward descriptor bits 6..11; bits 0..5 keep their existing meaning.
+Their forward message's source word additionally carries the input group rank
+in bits 16..21; the physical source ID and existing last-packet flag remain in
+bits 0..15 and 31. Each sparse forward message still carries exactly one weight.
+Modes 2/3 derive the source MC directly from the physical source ID.
+
+Modes 1/4 collect a 64-bit relevant-PU mask per local post. An input PU collects
+`T`, the set of posts reached by its fired inputs, during its existing forward
+count traversal. Its expected reverse-message count becomes `popcount(T | F)`,
+where `F` is the existing group fired-post mask; one-trace uses `popcount(F)`.
+The sender caches the selected post mask once before its destination traversal.
+Fired posts retain delivery to every input PU in the group. Quiet posts select
+only their relevant PUs. Destination traversal remains bit-by-bit; nibble
+skipping is a separate future experiment.
+
+Modes 2/3 collect a 16-bit relevant-MC mask per post in a 32-bit word. Quiet
+posts scatter only into a structurally nonempty MC selected by that mask.
+Fired posts retain every structurally nonempty MC descriptor. A separate
+binomial issuer reduction includes all 512 PUs, since a sender can target an
+MC outside its own domain. It completes only after all reverse scatters have
+been issued. PU1 then passes a bounded, priority-three installation token
+through the 16 MC leaders. Each leader installs its own idle notifier and,
+when notified, starts a priority-three reverse chain through its 32 PUs.
+
+The chain uses handler 14 on thread zero, below reverse handlers 4/5. Input PUs
+then join with a handler-15 token pinned to thread one. Each thread clears only
+its own reverse-handler enable bits before joining. The second join commits
+input traces and starts the existing next-step preparation; the usual global
+reverse/preparation reduction remains the timestep boundary. Neuron PUs also
+wait for their drain token before contributing, so neuron-only MC domains
+cannot leave stale drain tokens in the following timestep. Reverse receipt
+AMOs remain for simulator statistics, but no expected-count check or completion
+branch is performed on each response. The next reverse phase restores both
+threads' handler enables.
+
+The drain protocol is experimental: MemIf idle excludes downstream distributor
+and PU buffers. The inherited idle interval is not a hardware fence for those
+buffers; priority ordering and the SMT join alone do not prove transport
+completion. Directed tests and paired state checks must pass before a pilot,
+and results must not be interpreted as a general proof of this assumption.
+Notifier registration failures stop the workload rather than retrying silently.
+
+The runtime uses 32 bytes at SPM `0x3000..0x301f`, above the existing initialized
+image limit and below the startup stack at `0x3800`. They hold two post masks,
+the input reached-post mask, the issuer reduction counter and the SMT join.
+Boot explicitly clears this scratch. No dense synapse directory is introduced.
+
+Experiment artifacts, frozen executables, directed cases and paired pilot
+scripts are under `copilot/tmp/mnist-sparse-masks-20260913/`. The pilot compares
+against the setup-only frozen executable and also includes a scatter control
+with the old activity filter plus the new drain protocol, to separate filtering
+benefit from synchronization overhead. All timing cases retain I-cache prefill,
+four warmup steps and twelve timed steps.

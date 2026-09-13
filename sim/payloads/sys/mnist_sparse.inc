@@ -38,6 +38,40 @@
 #if MNIST_SPARSE_CACHE_REVERSE && !MNIST_SPARSE_COMPACT_SCHEDULE
 #error "Reverse phase caching requires compact scheduling"
 #endif
+#ifndef MNIST_SPARSE_RELEVANT_MASKS
+#define MNIST_SPARSE_RELEVANT_MASKS 0
+#endif
+#ifndef MNIST_SPARSE_MC_DRAIN
+#define MNIST_SPARSE_MC_DRAIN 0
+#endif
+#ifndef MNIST_SPARSE_IDLE_GATE
+#define MNIST_SPARSE_IDLE_GATE 256
+#endif
+#if MNIST_SPARSE_IDLE_GATE < 0 || MNIST_SPARSE_IDLE_GATE >= 65535
+#error "Idle gate must be in 0..65534"
+#endif
+#if MNIST_SPARSE_MC_DRAIN && (MNIST_SPARSE_MODE != 2 && MNIST_SPARSE_MODE != 3)
+#error "MC drain requires a scatter mode"
+#endif
+#if MNIST_SPARSE_RELEVANT_MASKS && (MNIST_SPARSE_MODE == 2 || MNIST_SPARSE_MODE == 3) && !MNIST_SPARSE_MC_DRAIN
+#error "Relevant MC masks require MC drain completion"
+#endif
+#if (MNIST_SPARSE_RELEVANT_MASKS || MNIST_SPARSE_MC_DRAIN) && (!MNIST_SPARSE_CACHE_REVERSE || MNIST_SPARSE_ACTIVE_PREFIX)
+#error "Mask/drain experiments require reverse caching and no active-prefix partition"
+#endif
+/* Experimental scratch: 32 bytes above the initialized-data limit, below
+ * the startup stack at 0x3800. No synapse-index directory is added.
+ * R: two per-post u64 PU masks, or two per-post u32 MC masks at stride 8.
+ * T: the input PU's u64 set of posts reached by its fired inputs.
+ */
+#define X_BASE 0x20003000
+#define X_T_LO 16
+#define X_T_HI 20
+#define X_ISSUED 24
+#define X_JOIN 28
+#define TAG_ISSUED 0x400
+#define TAG_IDLE_CONTROL -1023 /* 0xc01, bounded notifier installation token */
+#define TAG_DRAIN -1010        /* 0xc0e, domain-local reverse chain */
 #if MNIST_SPARSE_CACHE_REVERSE && MNIST_SPARSE_MODE == 4
 #define FIRED_SIZE 8
 #define FIRED_SHIFT 3
@@ -162,6 +196,21 @@ _start:
   lw t0, H_RULE(gp)
   li t1, MNIST_RULE
   bne t0, t1, sparse_fail
+#if MNIST_SPARSE_RELEVANT_MASKS || MNIST_SPARSE_MC_DRAIN
+  li t0, X_BASE
+  sw zero, 0(t0)
+  sw zero, 4(t0)
+  sw zero, 8(t0)
+  sw zero, 12(t0)
+  sw zero, X_T_LO(t0)
+  sw zero, X_T_HI(t0)
+  sw zero, X_ISSUED(t0)
+  sw zero, X_JOIN(t0)
+#endif
+#if MNIST_SPARSE_MC_DRAIN
+  INSTALL 0, sparse_issued, 1, 1, 2, 2
+  INSTALL 1, sparse_idle_control, 1, 1, 2, 2
+#endif
   INSTALL 2, sparse_ff_receive, 1, 3, 1, 1
   INSTALL 3, sparse_root, 1, 4, 1, 1
   INSTALL 4, sparse_reverse_quiet, 3, 4, 1, 1
@@ -173,8 +222,17 @@ _start:
   INSTALL 10, sparse_start, 1, 2, 10, 10
   INSTALL 11, sparse_group, 1, 4, 1, 1
   INSTALL 12, sparse_mask, 1, 4, 1, 1
+#if MNIST_SPARSE_MC_DRAIN
+  /* Reverse commit emits one issuer contribution. Drain work emits a chain
+   * token plus a local join (input), or a completion reduction (neuron).
+   * Reserve two further slots for higher-priority idle/control work.
+   */
+  INSTALL 13, sparse_reverse_send, 1, 0, 1, 3
+  INSTALL 14, sparse_group_send, 1, 0, 2, 4
+#else
   INSTALL 13, sparse_reverse_send, 1, 0, 1, 2
   INSTALL 14, sparse_group_send, 1, 0, 1, 2
+#endif
   INSTALL 15, sparse_setup_thread1, 2, 2, 1, 1
 #if MNIST_SPARSE_COMPACT_SCHEDULE && MNIST_RULE != MT_RULE_THREE
   /* Input handlers preserve sp, s11 and a4-a7 throughout the runtime. */
@@ -188,6 +246,10 @@ sparse_wait_thread1:
   j sparse_wait_thread1
 sparse_setup_thread1:
   li gp, SPM_BASE
+#if MNIST_SPARSE_MC_DRAIN
+  li t0, -2
+  beq a1, t0, sparse_drain_thread1
+#endif
 #if MNIST_SPARSE_COMPACT_SCHEDULE
 #if MNIST_SPARSE_CACHE_REVERSE
   bltz a1, sparse_reverse_setup_thread1
@@ -235,6 +297,19 @@ sparse_fail:
  * this handler on thread 1. Reset DONE before publishing the phase.
  */
 sparse_start:
+#if MNIST_SPARSE_MC_DRAIN
+  /* The preceding global reverse reduction joins both threads everywhere.
+   * Restore receive enables before any new reverse responses can be issued.
+   */
+  li t0, PH_REVERSE
+  bne a0, t0, 1f
+  li t0, X_BASE
+  sw zero, X_JOIN(t0)
+  li t0, (3 << 3) | 4
+  csrw 0x714, t0
+  csrw 0x715, t0
+1:
+#endif
   sw zero, H_DONE(gp)
   sw zero, H_REDUCE_COUNT(gp)
   sw zero, H_REDUCE_VALUE(gp)
@@ -524,6 +599,10 @@ sparse_fired_insert_store:
   addi t0, t0, FIRED_SIZE
   j sparse_fired_sort
 sparse_fired_sorted:
+#if MNIST_SPARSE_RELEVANT_MASKS && (MNIST_SPARSE_MODE == 1 || MNIST_SPARSE_MODE == 4) && MNIST_RULE != MT_RULE_ONE
+  li s6, 0
+  li s7, 0
+#endif
   lw s2, H_FF_COUNTS(gp)
   add s2, s2, gp
   li s5, 0
@@ -539,6 +618,21 @@ sparse_prepare_count_row:
   beqz t1, sparse_prepare_count_row
 sparse_prepare_edges:
   lhu t2, 2(t0)
+#if MNIST_SPARSE_RELEVANT_MASKS && (MNIST_SPARSE_MODE == 1 || MNIST_SPARSE_MODE == 4) && MNIST_RULE != MT_RULE_ONE
+  srli t3, t2, 6 /* Logical post slot, encoded in spare descriptor bits. */
+  li t4, 1
+  sll t4, t4, t3
+  li t5, 32
+  bgeu t3, t5, 1f
+  or s6, s6, t4
+  j 2f
+1:
+  or s7, s7, t4
+2:
+#endif
+#if MNIST_SPARSE_RELEVANT_MASKS && (MNIST_SPARSE_MODE == 1 || MNIST_SPARSE_MODE == 4)
+  andi t2, t2, 63
+#endif
   srli t2, t2, 1
   slli t2, t2, 2
   add t2, s2, t2
@@ -558,6 +652,11 @@ sparse_prepare_destination_known:
   bnez t1, sparse_prepare_edges
   j sparse_prepare_count_row
 sparse_prepare_counts_done:
+#if MNIST_SPARSE_RELEVANT_MASKS && (MNIST_SPARSE_MODE == 1 || MNIST_SPARSE_MODE == 4) && MNIST_RULE != MT_RULE_ONE
+  li t0, X_BASE
+  sw s6, X_T_LO(t0)
+  sw s7, X_T_HI(t0)
+#endif
   sw s5, H_FF_PENDING(gp)
   lw t0, H_PREPARED(gp)
   addi t0, t0, 1
@@ -748,7 +847,12 @@ sparse_ff_send_edge:
   lw a1, 4(t0)
   addi t0, t0, 8
   sw t0, H_FF_CURSOR(gp)
+#if MNIST_SPARSE_RELEVANT_MASKS && (MNIST_SPARSE_MODE == 1 || MNIST_SPARSE_MODE == 4)
+  andi t0, a0, 63
+  srli t0, t0, 1
+#else
   srli t0, a0, 1
+#endif
   slli t0, t0, 2
   lw t2, H_FF_COUNTS(gp)
   add t2, t2, gp
@@ -764,6 +868,11 @@ sparse_ff_count_remaining:
 #endif
   sw t0, 0(t2)
   lw a2, H_ID(gp)
+#if MNIST_SPARSE_RELEVANT_MASKS && (MNIST_SPARSE_MODE == 1 || MNIST_SPARSE_MODE == 4)
+  lw t3, H_RANK(gp)
+  slli t3, t3, 16
+  or a2, a2, t3 /* Preserve physical destination for existing acknowledgements. */
+#endif
   seqz t0, t0
   slli t0, t0, 31
   or a2, a2, t0
@@ -844,6 +953,28 @@ sparse_ff_receive:
   lw t1, EXC_GE(t0)
   fadd.s t1, t1, a1
   sw t1, EXC_GE(t0)
+#if MNIST_SPARSE_RELEVANT_MASKS && MNIST_RULE != MT_RULE_ONE
+  /* All forward delivery is on thread zero: these ORs need no atomics. */
+  li t0, X_BASE
+  slli t1, a0, 3
+  add t0, t0, t1
+#if MNIST_SPARSE_MODE == 1 || MNIST_SPARSE_MODE == 4
+  srli t1, a2, 16
+  andi t1, t1, 63
+  srli t2, t1, 5
+  slli t2, t2, 2
+  add t0, t0, t2
+#else
+  addi t1, a2, -1
+  srli t1, t1, 5
+  andi t1, t1, 15
+#endif
+  li t2, 1
+  sll t2, t2, t1
+  lw t1, 0(t0)
+  or t1, t1, t2
+  sw t1, 0(t0)
+#endif
 #if MNIST_SPARSE_FUSE_NEURON
   lw t0, H_FF_ACKS(gp)
   addi t0, t0, 1
@@ -977,6 +1108,11 @@ sparse_boot_ready:
   bne t0, t1, sparse_wait
   j sparse_step_start
 sparse_group_send:
+#if MNIST_SPARSE_MC_DRAIN
+  lw t0, H_PHASE(gp)
+  li t1, PH_REVERSE
+  beq t0, t1, sparse_drain_thread0
+#endif
   lw t0, H_BCAST_CURSOR(gp)
   lw t1, H_PEERS(gp)
   add t1, t1, gp
@@ -1017,6 +1153,31 @@ sparse_mask_local:
   lw a3, H_ACTIVE_HI(gp)
   lw t0, H_INPUT_COUNT(gp)
   beqz t0, sparse_mask_done
+#if MNIST_SPARSE_MC_DRAIN
+  j sparse_mask_done /* MC drain replaces all expected-degree computations. */
+#elif MNIST_SPARSE_RELEVANT_MASKS
+#if MNIST_RULE != MT_RULE_ONE
+  li t0, X_BASE
+  lw t1, X_T_LO(t0)
+  or a0, a0, t1
+  lw t1, X_T_HI(t0)
+  or a1, a1, t1
+#endif
+  /* |T union F|, with each set bit counted exactly once. */
+  li t2, 0
+1:
+  beqz a0, 2f
+  addi t0, a0, -1
+  and a0, a0, t0
+  addi t2, t2, 1
+  j 1b
+2:
+  beqz a1, sparse_mask_store
+  addi t0, a1, -1
+  and a1, a1, t0
+  addi t2, t2, 1
+  j 2b
+#endif
   li s0, 0
 #if MNIST_RULE != MT_RULE_ONE
 #if (MNIST_SPARSE_MODE == 1 || MNIST_SPARSE_MODE == 4)
@@ -1147,7 +1308,15 @@ sparse_weight:
   sw t0, H_GROUP_COUNT(gp)
 #endif
   lw t0, H_INPUT_COUNT(gp)
+#if MNIST_SPARSE_MC_DRAIN
+  beqz t0, 1f
+  li a0, 1
+  YIELDI zero, TAG_ISSUED
+  j sparse_wait
+1:
+#else
   bnez t0, sparse_reverse_maybe_done
+#endif
   lw s0, H_EXC_BASE(gp)
   add s0, s0, gp
   lw s2, H_INH_BASE(gp)
@@ -1203,8 +1372,25 @@ sparse_reverse_send:
   beqz t2, sparse_reverse_next_post
 #else
   bnez t2, sparse_reverse_coefficients
+#if MNIST_SPARSE_RELEVANT_MASKS
+  lw t3, H_EXC_BASE(gp)
+  add t3, t3, gp
+  sub t3, t0, t3
+  snez t3, t3 /* At most two local posts. */
+  slli t3, t3, 3
+  li t4, X_BASE
+  add t4, t4, t3
+  lw t3, 0(t4)
+  lw t4, 4(t4)
+  /* Cache the selected post's mask once for the destination continuation.
+   * Group activity is no longer needed on a neuron PU after reverse starts.
+   */
+  sw t3, H_ACTIVE_LO(gp)
+  sw t4, H_ACTIVE_HI(gp)
+#else
   lw t3, H_ACTIVE_LO(gp)
   lw t4, H_ACTIVE_HI(gp)
+#endif
   or t3, t3, t4
   beqz t3, sparse_reverse_next_post
 #endif
@@ -1279,6 +1465,13 @@ sparse_reverse_local_send:
   slli t4, t1, 4
   add t3, t3, t4
   bnez t2, sparse_reverse_scatter_send
+#if MNIST_SPARSE_RELEVANT_MASKS
+  lw t4, H_ACTIVE_LO(gp)
+  lhu t5, 0(t3)
+  addi t5, t5, -1 /* MC destination 0x8001 + mc; shift masks low five bits. */
+  srl t4, t4, t5
+  andi t4, t4, 1
+#else
   lw t4, H_ACTIVE_LO(gp)
   lw t5, 8(t3)
   and t4, t4, t5
@@ -1286,6 +1479,7 @@ sparse_reverse_local_send:
   lw t5, 12(t3)
   and t2, t2, t5
   or t4, t4, t2
+#endif
   beqz t4, sparse_reverse_send
 sparse_reverse_scatter_send:
   lhu t4, 0(t3)
@@ -1307,6 +1501,17 @@ sparse_reverse_next_post:
   sw t1, H_REV_CURSOR(gp)
   j sparse_reverse_continue
 sparse_post_commit:
+#if MNIST_SPARSE_RELEVANT_MASKS
+  li t0, X_BASE
+  sw zero, 0(t0)
+  sw zero, 4(t0)
+  sw zero, 8(t0)
+  sw zero, 12(t0)
+#endif
+#if MNIST_SPARSE_MC_DRAIN
+  li a0, 1
+  SENDI zero, TAG_ISSUED
+#endif
   lw t0, H_EXC_BASE(gp)
   add t0, t0, gp
   lw t1, H_EXC_COUNT(gp)
@@ -1328,7 +1533,12 @@ sparse_post_commit_next:
   addi t0, t0, EXC_SIZE
   addi t1, t1, -1
   bnez t1, sparse_post_commit_loop
+#if MNIST_SPARSE_MC_DRAIN
+  /* Neuron-only MC domains must also drain before the global step advances. */
+  j sparse_wait
+#else
   j sparse_prepare_empty
+#endif
 
 /* s0=input state, s1=weight, s2=d_minus, s3=d_plus, s4=post fired,
  * s5/s6=reverse row bounds, s8=wmax, s9=pot rate, s10=pre target.
@@ -1633,6 +1843,13 @@ sparse_reverse_one_pre:
   sw t5, 0(s1)
 #endif
 sparse_reverse_received:
+#if MNIST_SPARSE_MC_DRAIN
+  /* Diagnostic receipt count only; no expected count or completion decision. */
+  addi t0, gp, H_RECEIVED
+  li t1, 1
+  amoadd.w zero, t1, (t0)
+  j sparse_wait
+#endif
 #if MNIST_SPARSE_CACHE_REVERSE && MNIST_RULE == MT_RULE_THREE
   li t1, 1
   amoadd.w t2, t1, (sp)
@@ -1655,6 +1872,7 @@ sparse_reverse_maybe_done:
   lw t0, H_RECEIVED(gp)
   lw t1, H_EXPECTED(gp)
   bne t0, t1, sparse_wait
+sparse_reverse_drained:
   addi t0, gp, H_DONE
   li t1, 1
   amoswap.w t2, t1, (t0)
@@ -1697,6 +1915,92 @@ sparse_reverse_terminal:
   li a3, 0
   YIELDI zero, TAG_REDUCE
   j sparse_wait
+#if MNIST_SPARSE_MC_DRAIN
+/* Separate binomial reduction: input PUs contribute at reverse start, neuron
+ * PUs after their last scatter. It may overlap ordinary reverse completion.
+ * Reset after forwarding: no next-step contribution exists before the global
+ * reverse/preparation barrier. Reports can beat local phase-start delivery.
+ */
+sparse_issued:
+  li t0, X_BASE
+  lw t1, X_ISSUED(t0)
+  add t1, t1, a0
+  lw t2, H_TREE_SIZE(gp)
+  bgtu t1, t2, sparse_fail
+  sw t1, X_ISSUED(t0)
+  bne t1, t2, sparse_wait
+  sw zero, X_ISSUED(t0)
+  mv a0, t2
+  lw t0, H_TREE_PARENT(gp)
+  bnez t0, 1f
+  li a0, 1
+  YIELDI zero, TAG_IDLE_CONTROL
+  j sparse_wait
+1:
+  SENDI t0, TAG_ISSUED
+  j sparse_wait
+
+/* Bounded priority-three installation chain, as in snn_main.S. The callback
+ * is priority one and only launches a drain; it never changes neuron state.
+ * The 257-cycle idle interval is an experimental transport-drain assumption,
+ * not a hardware acknowledgement that downstream queues are empty.
+ */
+sparse_idle_control:
+  bgtz a0, sparse_idle_install
+  bnez a0, sparse_fail
+  lw t0, H_ID(gp)
+  addi t0, t0, 31
+  SENDI t0, TAG_DRAIN
+  j sparse_wait
+sparse_idle_install:
+  lw t2, H_ID(gp)
+  addi t0, t2, -1
+  srli t0, t0, 5
+  li t1, 0x8001
+  add t0, t0, t1
+  li a0, (MNIST_SPARSE_IDLE_GATE << 16) | 0x401
+  li t1, 0xcf0
+  SEND t0, t1
+  addi t0, t2, 32
+  li t1, 512
+  bgtu t0, t1, sparse_wait
+  li a0, 1
+  SENDI t0, TAG_IDLE_CONTROL
+  j sparse_wait
+
+/* Handler 14 is thread zero only and below reverse handlers 4/5. Pass the
+ * domain token downward, then join a handler-15 token pinned to thread one.
+ * Each thread disables only its own reverse enable bits after queued reverse
+ * work. The join ensures a sibling's in-flight weight update has finished.
+ */
+sparse_drain_thread0:
+  lw t0, H_ID(gp)
+  addi t1, t0, -1
+  andi t2, t1, 31
+  beqz t2, 1f
+  SENDI t1, TAG_DRAIN
+1:
+  lw t0, H_INPUT_COUNT(gp)
+  beqz t0, sparse_prepare_empty /* Neuron PUs contribute only after this token. */
+  li t0, 8
+  csrc 0x714, t0
+  csrc 0x715, t0
+  li a0, 0
+  li a1, -2
+  SENDI zero, 0x40f
+  j sparse_drain_join
+sparse_drain_thread1:
+  li t0, 16
+  csrc 0x714, t0
+  csrc 0x715, t0
+sparse_drain_join:
+  li t0, X_BASE + X_JOIN
+  li t1, 1
+  amoadd.w t2, t1, (t0)
+  bgtu t2, t1, sparse_fail
+  bne t2, t1, sparse_wait
+  j sparse_reverse_drained
+#endif
 sparse_checksum:
   lw t0, H_FORWARD_BASE(gp)
   add t0, t0, gp

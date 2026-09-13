@@ -75,6 +75,8 @@ def run_case(snapshot: Path, mode: str, args: argparse.Namespace) -> dict:
         "--reverse-mode", mode, "--rule", args.rule, "--connection-rate", str(args.connection_rate),
         "--connectivity-seed", str(args.connectivity_seed), "--runtime-snapshot", str(snapshot),
         "--warmup-steps", str(args.warmup_steps), "--timed-steps", str(args.timed_steps)]
+    if getattr(args, "relevant_masks", False):
+        generation.append("--relevant-masks")
     code, generation_seconds = run_logged(generation, case / "generate.log", cwd=REPO)
     if code:
         raise RuntimeError(f"image generation failed: {case}")
@@ -147,6 +149,8 @@ def main() -> None:
     parser.add_argument("--simulator", type=Path, default=REPO / "sim/build/sim_system")
     parser.add_argument("--init-icache", action="store_true",
                         help="preload the simulator's configured instruction-cache region")
+    parser.add_argument("--relevant-masks", action="store_true",
+                        help="generate descriptors for a relevant-mask payload")
     parser.add_argument("--ramulator-config", type=Path)
     parser.add_argument("--warmup-steps", type=int, default=4)
     parser.add_argument("--timed-steps", type=int, default=12)

@@ -1,0 +1,66 @@
+{
+  "name": "Sparse MNIST baseline with reverse setup extracted",
+  "status": "established by user approval",
+  "frozen_directory": "copilot/tmp/mnist-sparse-setup-20260913/setup/frozen",
+  "sha256": {
+    "one-trace-local.bin": "a3442fdfddcf918f4078dee2962cb7a72833947b90141dbb1b6ddf48798fa550",
+    "one-trace-pu-scatter.bin": "6c11066230b0345d83d164e035486f47852820c90af3b185da51f5f3649c3fde",
+    "one-trace-neuron-scatter.bin": "d44ea5079ed870cfe8c2aa2687ad78966e6feffeb448f70dcb854474b836c611",
+    "one-trace-dense.bin": "f5b5cb709452f7171f2bc37cd00dd90b9632c4fb81361685ff6d9f41b305ed6f",
+    "two-trace-local.bin": "b9ccb7c5148a4f2bb2327b385bd994a11da59da9d29bc24285c313ad744f295c",
+    "two-trace-pu-scatter.bin": "dca677f717de7444b2e203e86675f3a156d3eeb543ce7b4395ad00c02bfb919e",
+    "two-trace-neuron-scatter.bin": "6d7ddb0baf519e556842952c6775727e219de657df6d4d5e0805f72fb74347b5",
+    "two-trace-dense.bin": "b74c10cd9c51a1af80cdc0179ee8fdff91016b26fb8cf0c171e5b139ff1778a9",
+    "three-trace-local.bin": "8099e87d7ec2de74a5a88f7a78a8c5edccc2a8455352eb0aa27e8b7b44ef5ac0",
+    "three-trace-pu-scatter.bin": "fecef229664ae2473e6349892e59342a7069fde94208654a4998d74a71367cc4",
+    "three-trace-neuron-scatter.bin": "6e602386123b4caaba1752dee5fe316c68e3f73c9102fca3c8bc1a0019675dbd",
+    "three-trace-dense.bin": "c05d4907670456d9649e7f46da2a6504b0f810dcabf6560592dd6f82e1a4586f",
+    "sim_system": "b52178f4213fbde1b1b175177392e49ca8c78f02f11e1879219455f15c1c5295",
+    "System.config.json": "fabdd401aa04db52ddc2c7fdc2cf044cca48992ef38678b4713f41921b7e7367",
+    "mnist_sparse.inc": "a8fa5c57f0e16fa5bc2241b88302180c904a9e9cb329daf92a20d02df0a2f132",
+    "mnist_sparse.py": "21b510e020a88fcd08b8241845edda125dd1ef3e5850e3d70e2f1fdea0cc3caf"
+  },
+  "payload_settings": {
+    "MNIST_SPARSE_COMPACT_SCHEDULE": 1,
+    "MNIST_SPARSE_FUSE_FORWARD": 1,
+    "MNIST_SPARSE_FUSE_NEURON": {
+      "one-trace": 0,
+      "two-trace": 1,
+      "three-trace": 1
+    },
+    "MNIST_SPARSE_BINARY_REVERSE": 2,
+    "MNIST_SPARSE_ACTIVE_PREFIX": 0,
+    "MNIST_SPARSE_CACHE_REVERSE": 1,
+    "MNIST_SPARSE_RELEVANT_MASKS": 0,
+    "MNIST_SPARSE_MC_DRAIN": 0
+  },
+  "timing_settings": {
+    "backend": "soft",
+    "memory_model": "flat",
+    "init_icache": true,
+    "warmup_steps": 4,
+    "timed_steps": 12,
+    "soft_threads": 1,
+    "pu": 512,
+    "mc": 16,
+    "mc_size": "0x100000000",
+    "hardware_smt_threads": 2
+  },
+  "comparison_rules": [
+    "Use the same checkpoint, connectivity seed, trace rule, connection rate, and reverse-map mode for every pair.",
+    "Enable --init-icache on both sides and retain 4 warmup + 12 timed steps.",
+    "Report any residual timed I-cache fills per side.",
+    "Compare candidate weight/input state and spike histories against this baseline, and independently validate FP32 arithmetic."
+  ],
+  "validation": {
+    "setup_pairs": 48,
+    "all_logical_state_hashes_identical": true,
+    "results": "copilot/tmp/mnist-sparse-setup-20260913/pilot-results.json",
+    "summary": "copilot/tmp/mnist-sparse-masks-20260913/setup-summary.json"
+  },
+  "current_mask_pilot": {
+    "directory": "copilot/tmp/mnist-sparse-masks-20260913",
+    "cases": 72,
+    "nibble_skipping": false
+  }
+}

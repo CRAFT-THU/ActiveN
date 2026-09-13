@@ -74,6 +74,7 @@ def initial_weights(mask: list[bool], seed: int) -> list[float]:
 
 def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
     mode = MODES[args.reverse_mode]
+    relevant_masks = getattr(args, "relevant_masks", False)
     mask = structural_mask(args.connection_rate, args.connectivity_seed)
     fan_in, weight_caps = fan_in_caps(mask)
     params = parameters(args.rule, args.connection_rate)
@@ -157,6 +158,8 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
                     continue
                 dst, post_local = locations[post]
                 descriptor = neuron_groups[group].index(dst) * 2 + post_local
+                if relevant_masks and mode in (1, 4):
+                    descriptor |= (post % POSTS) << 6
                 offset = len(spm) + 4
                 spm.extend(struct.pack("<HHf", dst + 1, descriptor, weights[pre * 400 + post]))
                 local_reverse[post % POSTS].append((state, offset))
@@ -304,6 +307,7 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
         if present:
             checksum ^= dense.f32_bits(w)
     manifest = dict(schema="activen-mnist-sparse-v4", rule=args.rule, reverse_mode=args.reverse_mode,
+        relevant_masks=relevant_masks, experimental_scratch_region=dict(offset=SPM_LIMIT, bytes=32),
         connection_rate=args.connection_rate, connectivity_seed=args.connectivity_seed,
         structural_synapses=sum(mask), mask_sha256=hashlib.sha256(bytes(mask)).hexdigest(),
         payload_sha256=hashlib.sha256(payload).hexdigest(), horizontal_partition="full-8",
@@ -323,6 +327,7 @@ def parse_args():
     parser.add_argument("--payload", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--reverse-mode", choices=MODES, required=True)
+    parser.add_argument("--relevant-masks", action="store_true", help="encode logical post slots for the relevant-mask payload")
     parser.add_argument("--rule", choices=dense.RULES, default="three-trace")
     parser.add_argument("--connection-rate", type=float, default=0.125)
     parser.add_argument("--connectivity-seed", type=int, default=20260723)

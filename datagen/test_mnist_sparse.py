@@ -83,6 +83,26 @@ class SparseImagesTest(unittest.TestCase):
             self.assertEqual(len(forward), manifest["structural_synapses"])
             self.assertEqual(reverse, forward)
 
+    def test_relevant_mask_descriptors_preserve_edges_and_encode_post(self):
+        for mode in ("local", "dense"):
+            images, manifest = sparse.make_images(SimpleNamespace(
+                reverse_mode=mode, relevant_masks=True, **self.args))
+            spms = spm_images(images)
+            original = spm_images(self.cases[mode][0])
+            self.assertTrue(manifest["relevant_masks"])
+            for pu, spm in enumerate(spms):
+                base, count = header(spm, "FORWARD_BASE"), header(spm, "FORWARD_COUNT")
+                for edge in range(base, base + count * 8, 8):
+                    dst, descriptor, weight = struct.unpack_from("<HHI", spm, edge)
+                    old_dst, old_descriptor, old_weight = struct.unpack_from(
+                        "<HHI", original[pu], edge)
+                    target = spms[dst - 1]
+                    post_offset = header(target, "EXC_BASE") + (descriptor & 1) * sparse.EXC_SIZE + 32
+                    post = struct.unpack_from("<I", target, post_offset)[0]
+                    self.assertEqual(descriptor >> 6, post)
+                    self.assertEqual((dst, descriptor & 63, weight),
+                                     (old_dst, old_descriptor, old_weight))
+
     def test_group_mask_trees_cover_each_group_once(self):
         for images, manifest in self.cases.values():
             spms = spm_images(images)
