@@ -109,14 +109,14 @@ struct MSHR {
     bool isWrite = (f.tag & 0xFF) != 0;
 
     std::array<uint32_t, MEM_BUS_WIDTH_B / 4> tmp;
-    tmp.fill(f.data[2]);
+    tmp.fill(f.data[3]);
 
     return MSHR {
       .addr = f.data[0],
       .src = f.src,
       .id = (uint16_t) (f.data[1] & 0xFFFF),
       .rwdata = std::bit_cast<MemLine>(tmp),
-      .carried = {},
+      .carried = {f.data[2], f.data[3]},
       .size = (uint8_t) (f.data[1] >> 16),
       .write = isWrite,
     };
@@ -173,6 +173,8 @@ struct RingResp {
   uint16_t dst; // PU, because ring bus will only carry unicast responses for now
   uint16_t ident;
   MemLine data;
+  uint16_t extra0; // High half of carried[0]: manual completion handler.
+  uint32_t extra1; // carried[1]: manual completion argument.
 };
 
 struct RingIntf {
@@ -422,6 +424,8 @@ public:
       .dst = mshrs[slot].src,
       .ident = static_cast<uint16_t>(mshrs[slot].carried[0]),
       .data = mshrs[slot].rwdata,
+      .extra0 = static_cast<uint16_t>(mshrs[slot].carried[0] >> 16),
+      .extra1 = mshrs[slot].carried[1],
     };
   }
 

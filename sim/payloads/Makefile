@@ -164,6 +164,15 @@ sys/local_send_test.bin: sys/local_send_test.S sys/linker_system.ld
 	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -o sys/local_send_test.elf sys/local_send_test.S
 	${PREFIX}objcopy -j .text -j .data -O binary sys/local_send_test.elf $@
 
+# Two distinct MC images for the fixed 64-PU / 2-MC / 64-byte-line regression.
+sys/manual_async_test.bin: sys/manual_async_test.S sys/linker_system.ld
+	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DMC_INDEX=0 -o sys/manual_async_test.elf $<
+	${PREFIX}objcopy -j .text -j .data -O binary sys/manual_async_test.elf $@
+
+sys/manual_async_dram1.bin: sys/manual_async_test.S sys/linker_system.ld
+	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DMC_INDEX=1 -o sys/manual_async_dram1.elf $<
+	${PREFIX}objcopy -j .text -j .data -O binary sys/manual_async_dram1.elf $@
+
 sys/random_noc_test.bin: sys/random_noc_test.S sys/linker_system.ld
 	${PREFIX}gcc -mabi=ilp32 -march=rv32imaf_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -o sys/random_noc_test.elf sys/random_noc_test.S
 	${PREFIX}objcopy -j .text -j .data -O binary sys/random_noc_test.elf $@
@@ -186,7 +195,7 @@ sys/mnist_sparse.bin: force-mnist-train sys/mnist_train.S sys/mnist_sparse.inc s
 
 force-mnist-train:
 
-sys-tests: sys/pingpong_test.bin sys/sha256_concurrent.bin sys/spm_init.bin sys/barrier_test.bin sys/local_send_test.bin sys/random_noc_test.bin sys/config_rom_test.bin
+sys-tests: sys/pingpong_test.bin sys/sha256_concurrent.bin sys/spm_init.bin sys/barrier_test.bin sys/local_send_test.bin sys/random_noc_test.bin sys/config_rom_test.bin sys/manual_async_test.bin sys/manual_async_dram1.bin
 	@echo "All system tests built successfully"
 
 clean:

@@ -640,6 +640,8 @@ static void presentCoreMem(soft_rtl &core, const soft_mem::DRAMIf::PUResp &resp)
   if (resp.unicast.has_value()) {
     core.mem_unicast_bits_id = resp.unicast->tag;
     core.mem_unicast_bits_ident = resp.unicast->ident;
+    core.mem_unicast_bits_extra0 = resp.unicast->extra0;
+    core.mem_unicast_bits_extra1 = resp.unicast->extra1;
     // The Verilated wide value and MemLine have the same byte layout.
     static_assert(sizeof(core.mem_unicast_bits_data) == sizeof(resp.unicast->data));
     std::memcpy(&core.mem_unicast_bits_data, resp.unicast->data.data(),
