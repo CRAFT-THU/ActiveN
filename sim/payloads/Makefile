@@ -201,3 +201,20 @@ sys-tests: sys/pingpong_test.bin sys/sha256_concurrent.bin sys/spm_init.bin sys/
 clean:
 	rm -f test.single test.double test.single.bin test.double.bin
 	rm -f asm/*.bin asm/*.elf c/*.bin c/*.elf sys/*.bin sys/*.elf
+
+# Keep the cache/numeric kernels at O3, but prevent speculative code expansion.
+# Dispatch/report/recording routines explicitly use Os to fit the 8 KiB ICache.
+BRUNEL_OPT ?= -O3 -fno-inline -fno-peel-loops -fno-unswitch-loops --param=max-completely-peel-times=0
+sys/brunel.bin: Makefile sys/brunel.S sys/brunel.c sys/brunel.h sys/brunel_numeric.h sys/linker_brunel.ld sys/snn_init.c
+	${PREFIX}gcc -mabi=ilp32 -march=rv32ia_zmmul_zfinx_zicsr $(BRUNEL_OPT) -ffunction-sections -fdata-sections -Wl,--gc-sections -ffreestanding -fno-builtin -fno-jump-tables -fno-tree-loop-distribute-patterns -msmall-data-limit=0 -ffp-contract=off -nostdlib -nostartfiles -Wl,-T,sys/linker_brunel.ld -DMNIST_TRAIN=1 -DMEM_LINE_BYTES=32 -o sys/brunel.elf sys/brunel.S sys/brunel.c sys/snn_init.c
+	${PREFIX}objcopy -j .text -j .data -O binary sys/brunel.elf $@
+
+# Maintainable hand-written runtime; C remains an independent implementation.
+sys/brunel_asm.bin: Makefile sys/brunel.S sys/brunel_runtime.S sys/brunel_asm_layout.inc sys/linker_brunel.ld
+	${PREFIX}gcc -mabi=ilp32 -march=rv32ia_zmmul_zfinx_zicsr -Os -msmall-data-limit=0 -ffreestanding -fno-builtin -nostdlib -nostartfiles -Wl,-T,sys/linker_brunel.ld -DMNIST_TRAIN=1 -DMEM_LINE_BYTES=32 -DBR_ASM_RUNTIME=1 -o sys/brunel_asm.elf sys/brunel.S sys/brunel_runtime.S
+	${PREFIX}objcopy -j .text -j .data -O binary sys/brunel_asm.elf $@
+
+# Opt-in startup arithmetic vectors followed by the normal generated workload.
+sys/brunel_asm_numeric.bin: Makefile sys/brunel.S sys/brunel_runtime.S sys/brunel_asm_layout.inc ../tests/brunel_asm_numeric.S sys/linker_brunel.ld
+	${PREFIX}gcc -mabi=ilp32 -march=rv32ia_zmmul_zfinx_zicsr -Os -msmall-data-limit=0 -ffreestanding -fno-builtin -nostdlib -nostartfiles -Wl,-T,sys/linker_brunel.ld -DMNIST_TRAIN=1 -DMEM_LINE_BYTES=32 -DBR_ASM_RUNTIME=1 -DBR_ASM_SELFTEST=1 -o sys/brunel_asm_numeric.elf sys/brunel.S sys/brunel_runtime.S ../tests/brunel_asm_numeric.S
+	${PREFIX}objcopy -j .text -j .data -O binary sys/brunel_asm_numeric.elf $@

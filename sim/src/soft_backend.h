@@ -284,6 +284,8 @@ class SoftSystemBackend : public SystemBackend {
   uint64_t timer_stats_start_cycle_ = 0;
   uint64_t timer_stats_intervals_ = 0;
   uint32_t sparse_observed_steps_ = 0;
+  uint32_t brunel_observed_steps_ = 0;
+  std::array<uint64_t, 8> brunel_last_counts_{};
   bool timer_stats_start_pending_ = false;
   bool timer_stats_active_ = false;
   bool log_ = false;

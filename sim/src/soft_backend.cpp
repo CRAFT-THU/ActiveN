@@ -1,3 +1,4 @@
+#include "../payloads/sys/brunel.h"
 /**
  * Software NoC system simulator.
  *
@@ -716,6 +717,50 @@ void SoftSystemBackend::peek(uint64_t cycle, std::vector<MemBusOut *> out) {
         line << (group ? "," : "") << std::setw(16) << posts[group];
       std::cerr << line.str() << '\n';
       sparse_observed_steps_ = steps;
+    }
+  }
+
+  if (const char *directory = std::getenv("SOFT_BRUNEL_DUMP")) {
+    const auto word = [&](unsigned pu, unsigned offset) -> uint32_t {
+      const auto &spm = cores[pu]->rootp->Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
+      return spm[offset / MEM_BUS_WIDTH_B][(offset % MEM_BUS_WIDTH_B) / 4];
+    };
+    const auto completed = word(1, offsetof(BrHeader, completed));
+    if (word(1, 0) == BR_MAGIC && completed != brunel_observed_steps_) {
+      if (completed != brunel_observed_steps_ + 1)
+        throw runtime_error("Brunel observer missed step");
+      std::ostringstream name;
+      name << directory << "/step-" << std::setfill('0') << std::setw(4) << completed << ".bin";
+      std::ofstream stream(name.str(), std::ios::binary);
+      auto emit = [&](uint32_t v) {
+        for (unsigned b = 0; b < 32; b += 8) stream.put(static_cast<char>(v >> b));
+      };
+      emit(0x42534431); emit(cfg.numPU);
+      std::array<uint64_t,8> counts{};
+      uint32_t excitatory=0,inhibitory=0,resident=0,pending=0;
+      for (unsigned pu=1;pu<=cfg.numPU;pu++) {
+        if (word(pu, offsetof(BrHeader,step)) != completed)
+          throw runtime_error("Brunel completed before all PUs");
+        emit(pu); emit(BR_DATA_END);
+        for (unsigned offset=0;offset<BR_DATA_END;offset+=4) emit(word(pu,offset));
+        for(unsigned i=0;i<8;i++) counts[i]+=word(pu,offsetof(BrHeader,hits)+4*i);
+        for(unsigned i=0;i<word(pu,offsetof(BrHeader,nn));i++) {
+          unsigned n=BR_NEURONS+i*sizeof(BrNeuron);
+          if(word(pu,n+offsetof(BrNeuron,fire))) {
+            if(word(pu,n+offsetof(BrNeuron,gid))<9000)excitatory++; else inhibitory++;
+          }
+        }
+        for(unsigned i=0;i<BR_SLOTS;i++) if(word(pu,BR_TABLE+i*sizeof(BrEntry))) {
+          if(!(word(pu,BR_TABLE+i*sizeof(BrEntry))&2u))resident++;else pending++;
+        }
+      }
+      if(!stream) throw runtime_error("cannot write Brunel state");
+      std::cerr << "[Brunel step] step=" << completed << " cycle=" << cycle
+                << " E=" << excitatory << " I=" << inhibitory;
+      const char *keys[]={"hits","misses","pending_ops","evictions","write_words","forced","probes","reverse_events"};
+      for(unsigned i=0;i<8;i++)std::cerr << ' ' << keys[i] << '=' << counts[i]-brunel_last_counts_[i];
+      std::cerr << " resident_entries=" << resident << " pending_entries=" << pending << '\n';
+      brunel_last_counts_=counts; brunel_observed_steps_=completed;
     }
   }
 

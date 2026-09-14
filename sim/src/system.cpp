@@ -838,6 +838,20 @@ bool System::run(uint64_t maxCycles) {
     }
   }
 
+  // Opt-in Brunel validation captures backing weights as well as PU cache state.
+  // Only initialized image extents are exported; the Brunel generator keeps
+  // every mutable weight within those extents.
+  if (const char *directory = std::getenv("SOFT_BRUNEL_DUMP")) {
+    for (size_t mc = 0; mc < mc_images.size(); ++mc) {
+      const auto &image = mc_images[mc];
+      std::ofstream dump(std::string(directory) + "/dram." + std::to_string(mc), std::ios::binary);
+      for (size_t offset = 0; offset < image.dense_size; offset += MEM_BUS_WIDTH_B)
+        dump.write(reinterpret_cast<const char *>(image.dense[offset / MEM_BUS_WIDTH_B].inner.data()),
+                   std::min(size_t(MEM_BUS_WIDTH_B), image.dense_size - offset));
+      if (!dump) throw runtime_error("cannot dump Brunel backing memory");
+    }
+  }
+
   mc_images.clear();
 
   return impl_->periph.result && *impl_->periph.result == 0 ? 0 : 1;

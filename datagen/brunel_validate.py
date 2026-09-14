@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""Validate observed Brunel neuron states and logical cached/backing weights."""
+
+import argparse
+import json
+import re
+import struct
+from pathlib import Path
+import numpy as np
+from brunel import NE, NI, PU, MC, F, offsets, Reference
+
+
+def pending_power(w):
+    """Reconstruct the runtime polynomial when materializing a pending LTP.
+
+    The independent neuron/weight reference continues to use numpy.power.
+    Unit tests check this reconstruction bit for bit against the C helper.
+    """
+    if w == 0:
+        return F(0)
+    mantissa, exponent = np.frexp(F(w))
+    exponent = int(exponent) - 1
+    z = F(F(F(2) * mantissa - F(1.5)) * F(2 / 3))
+    p = F(-0.015155712)
+    for coefficient in (
+        0.01837056,
+        -0.0229632,
+        0.029952,
+        -0.0416,
+        0.064,
+        -0.12,
+        0.4,
+        1,
+    ):
+        p = F(F(coefficient) + F(z * p))
+    p = F(p * F(1.1760790225246736))
+    scales = (
+        1,
+        1.3195079107728942,
+        1.7411011265922482,
+        2.29739670999407,
+        3.031433133020796,
+    )
+    return F(F(p * F(scales[exponent % 5])) * F(2.0 ** (2 * (exponent // 5))))
+
+
+def dump(path):
+    b = path.read_bytes()
+    magic, count = struct.unpack_from("<II", b)
+    if (magic, count) != (0x42534431, PU):
+        raise ValueError("not a 512-PU Brunel dump")
+    pos = 8
+    spms = []
+    neurons = np.zeros((NE + NI, 20), np.uint32)
+    for pu in range(PU):
+        identity, size = struct.unpack_from("<II", b, pos)
+        pos += 8
+        if identity != pu + 1 or size != 10240:
+            raise ValueError("invalid SPM record")
+        s = np.frombuffer(b[pos : pos + size], "<u4")
+        pos += size
+        spms.append(s)
+        n = s[64 : 64 + int(s[4]) * 20].reshape(-1, 20)
+        if np.any(n[:, 17:19]):
+            raise ValueError("completed timestep retains incoming spike accumulators")
+        neurons[n[:, 11]] = n
+    if pos != len(b):
+        raise ValueError("trailing SPM data")
+    return spms, neurons
+
+
+def compare_nodes(actual, expected):
+    out = {}
+    for i, name in enumerate(
+        (
+            "V",
+            "Iex",
+            "dIex",
+            "Iin",
+            "dIin",
+            "refractory",
+            "pre_trace",
+            "post_trace",
+            "rng",
+            "fire",
+            "pre_fire",
+            "gid",
+        )
+    ):
+        if i in (5, 8, 9, 10, 11):
+            out[name] = {
+                "different": int(np.count_nonzero(actual[:, i] != expected[:, i]))
+            }
+        else:
+            a = actual[:, i].view(np.float32)
+            b = expected[:, i].view(np.float32)
+            if not np.all(np.isfinite(a)):
+                raise ValueError("nonfinite " + name)
+            err = np.abs(a.astype(float) - b.astype(float))
+            out[name] = {
+                "max_absolute": float(err.max()),
+                "rms": float(np.sqrt(np.mean(err**2))),
+                "max_relative_scaled": float(np.max(err / np.maximum(1, np.abs(b)))),
+            }
+    return out
+
+
+def logical_weights(spms, nodes, initial, path, rule):
+    drams = [np.fromfile(path / f"dram.{mc}", dtype="<u4") for mc in range(MC)]
+    off = offsets(initial["pre"], NE)
+    w = np.empty(len(initial["pre"]), np.float32)
+    scalar = int(spms[0][0]) == 0x42524E32
+    slots, stride = (800, 2) if scalar else (160, 10)
+    cache = dict(
+        resident_entries=0,
+        pending_entries=0,
+        resident_synapses=0,
+        pending_synapses=0,
+        dirty_synapses=0,
+        entry_bytes=stride * 4,
+        entries_per_pu=slots,
+    )
+    for pre in range(NE):
+        lo, hi = off[pre : pre + 2]
+        base = int(nodes[pre, 12])
+        mc = (pre % PU) // 32
+        w[lo:hi] = drams[mc][base // 4 : base // 4 + hi - lo].view(np.float32)
+    for pu, s in enumerate(spms):
+        if s[18] != s[19] or np.any(s[38:46]):
+            raise ValueError("snapshot contains unfinished memory requests")
+        owners = [pre for pre in range(pu, NE, PU)]
+        seen = set()
+        for slot in range(slots):
+            e = s[576 + slot * stride : 576 + (slot + 1) * stride]
+            tag = int(e[0])
+            if not tag:
+                continue
+            if scalar:
+                state, tag = tag & 3, tag & ~3
+                h = ((tag >> 2) * 2654435761) & 0xFFFFFFFF
+                home = ((h >> 16) * slots) >> 16
+                if (slot - home) % slots >= 4:
+                    raise ValueError("cache tag outside bounded probe range")
+                dirty_mask = int(state == 1)
+                resident, mask, count = state < 2, 1, 1
+                data = e[1:2].view(np.float32)
+                potentials = 1 if state == 3 else 0
+            else:
+                ctrl = int(e[1])
+                dirty_mask = (ctrl >> 16) & 255
+                resident, mask, count = bool(ctrl & (1 << 24)), ctrl & 255, 8
+                data = e[2:].view(np.float32)
+                potentials = (ctrl >> 8) & 255
+                if tag & 31 or (not resident and not mask):
+                    raise ValueError("invalid legacy cache entry")
+            if tag in seen:
+                raise ValueError("duplicate cache tag")
+            seen.add(tag)
+            for pre in owners:
+                base, owner_count = map(int, nodes[pre, 12:14])
+                if base <= tag < base + owner_count * 4:
+                    break
+            else:
+                raise ValueError("cache tag outside owner weights")
+            lane0 = (tag - base) // 4
+            count = min(count, owner_count - lane0)
+            lo = off[pre] + lane0
+            if resident:
+                cache["resident_entries"] += 1
+                cache["resident_synapses"] += count
+                cache["dirty_synapses"] += (dirty_mask & ((1 << count) - 1)).bit_count()
+                w[lo : lo + count] = data[:count]
+            else:
+                cache["pending_entries"] += 1
+                cache["pending_synapses"] += (mask & ((1 << count) - 1)).bit_count()
+                for lane in range(count):
+                    if mask & (1 << lane):
+                        v, c = w[lo + lane], data[lane]
+                        pot = bool(potentials & (1 << lane))
+                        if rule == "morrison":
+                            c = F(c * (pending_power(v) if pot else v))
+                        v = max(F(0), F(v + c if pot else v - c))
+                        if rule == "additive":
+                            v = min(F(2 * 45.609600316540956), v)
+                        w[lo + lane] = v
+    cache["resident_synapse_fraction"] = cache["resident_synapses"] / len(w)
+    cache["buffered_synapse_fraction"] = (
+        cache["resident_synapses"] + cache["pending_synapses"]
+    ) / len(w)
+    cache["mean_pending_synapses_per_entry"] = (
+        cache["pending_synapses"] / cache["pending_entries"]
+        if cache["pending_entries"]
+        else None
+    )
+    return w, cache
+
+
+def validate(args):
+    manifest = json.loads((args.images / "manifest.json").read_text())
+    initial = np.load(args.images / "initial.npz")
+    log = args.log.read_text()
+    if "[System] Result: 0 (0x0)" not in log:
+        raise ValueError("simulator did not report success")
+    steps = []
+    for line in log.splitlines():
+        if line.startswith("[Brunel step]"):
+            steps.append({k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", line)})
+    expected = manifest["reference_spikes"]
+    reference = Reference(
+        tuple(initial[k] for k in ("pre", "post", "static_pre", "static_post")),
+        manifest["rule"],
+        state=(initial["neurons"], initial["weights"]),
+    )
+    comparisons = {}
+    popcount = np.array([i.bit_count() for i in range(256)], np.int32)
+    occupied = 0
+    previous_loads = previous_weight_loads = previous_resident = 0
+    previous_replay = [0, 0, 0]
+    scalar = manifest["spm"].get("cache_entry_bytes") == 8
+    slots = 800 if scalar else 160
+    for s in steps:
+        if "resident_lines" in s:
+            s["resident_entries"] = s["resident_lines"]
+            s["pending_entries"] = s["pending_lines"]
+        spms_step, observed_nodes = dump(args.dumps / f"step-{s['step']:04}.bin")
+        pending_coefficients = dirty_weights = 0
+        for spm in spms_step:
+            entries = spm[576:2176].reshape(slots, -1)
+            valid = entries[:, 0] != 0
+            if scalar:
+                state = entries[:, 0] & 3
+                pending_coefficients += int(np.count_nonzero(valid & (state >= 2)))
+                dirty_weights += int(np.count_nonzero(valid & (state == 1)))
+            else:
+                ctrl = entries[:, 1]
+                resident = (ctrl & (1 << 24)) != 0
+                pending_coefficients += int(
+                    popcount[ctrl[valid & ~resident] & 255].sum()
+                )
+                dirty_weights += int(
+                    popcount[(ctrl[valid & resident] >> 16) & 255].sum()
+                )
+        s["pending_coefficients"] = pending_coefficients
+        s["dirty_weights"] = dirty_weights
+        reference.tick()
+        comparisons[str(s["step"])] = compare_nodes(observed_nodes, reference.n)
+        replay = manifest["spm"].get("replay_record_bytes") == 8
+        spill_total = sum(int(spm[0x2400 // 4 + 4]) for spm in spms_step) if replay else 0
+        if replay:
+            current_replay = [spill_total] + [sum(int(spm[0x2400 // 4 + i]) for spm in spms_step) for i in (5, 6)]
+            for j, key in enumerate(("spill_records", "manual_reverse", "scatter_reverse")):
+                s[key] = current_replay[j] - previous_replay[j]
+            previous_replay = current_replay
+            s["record_peak_per_pu"] = max(int(spm[0x2400 // 4 + 1]) for spm in spms_step)
+        loads = sum(int(spm[18]) - int(spm[34]) for spm in spms_step) - 2 * spill_total
+        s["async_line_loads"] = loads - previous_loads
+        previous_loads = loads
+        if scalar:
+            weight_loads = sum(int(spm[62]) for spm in spms_step)
+            s["weight_line_loads"] = weight_loads - previous_weight_loads
+            previous_weight_loads = weight_loads
+        else:
+            # A legacy line fill either creates a resident table entry or
+            # materializes an evicted pending line. Net resident growth plus
+            # all evictions therefore counts weight fills exactly.
+            s["weight_line_loads"] = s["resident_entries"] - previous_resident + s["evictions"]
+        previous_resident = s["resident_entries"]
+        s["other_async_line_loads"] = s["async_line_loads"] - s["weight_line_loads"]
+        s["reference_E"], s["reference_I"] = expected[s["step"] - 1]
+        total = s["hits"] + s["misses"]
+        s["hit_rate"] = s["hits"] / total if total else None
+        current = s["resident_entries"] + s["pending_entries"]
+        # Each insertion adds one entry unless it evicts one existing tag.
+        s["table_inserts"] = current - occupied + s["evictions"]
+        occupied = current
+        if not 0 <= s["table_inserts"] <= s["misses"]:
+            raise ValueError("invalid cache accounting")
+        s["tag_hit_rate"] = 1 - s["table_inserts"] / total if total else None
+        s["occupancy_fraction"] = current / (512 * slots)
+        s["resident_weight_capacity_fraction"] = (
+            s["resident_entries"] * (1 if scalar else 8) / 4050000
+        )
+    if len(steps) != manifest["warmup"] + manifest["timed"]:
+        raise ValueError(f"only {len(steps)} completed steps")
+    if [s["step"] for s in steps] != list(range(1, len(steps) + 1)):
+        raise ValueError("missing or duplicate steps")
+    for step in (1, manifest["warmup"], len(steps)):
+        if not step:
+            continue
+        ref = np.load(args.images / f"reference-{step:04}.npz")
+        spms, actual = dump(args.dumps / f"step-{step:04}.bin")
+        checkpoint = compare_nodes(actual, ref["neurons"])
+        if checkpoint != comparisons[str(step)]:
+            raise ValueError("saved checkpoint disagrees with independent replay")
+    observed, cache = logical_weights(
+        spms, actual, initial, args.dumps, manifest["rule"]
+    )
+    expected_w = ref["weights"]
+    if not np.all(np.isfinite(observed)):
+        raise ValueError("nonfinite plastic weights")
+    err = np.abs(observed.astype(float) - expected_w.astype(float))
+    weights = {
+        "count": len(observed),
+        "max_absolute": float(err.max()),
+        "rms": float(np.sqrt(np.mean(err**2))),
+        "different": int(np.count_nonzero(observed != expected_w)),
+    }
+    timed = steps[manifest["warmup"] :]
+    blocks = []
+    for start in range(0, len(timed), 10):
+        block = timed[start : start + 10]
+        h = sum(s["hits"] for s in block)
+        m = sum(s["misses"] for s in block)
+        inserts = sum(s["table_inserts"] for s in block)
+        blocks.append(
+            {
+                "steps": [s["step"] for s in block],
+                "hits": h,
+                "misses": m,
+                "hit_rate": h / (h + m) if h + m else None,
+                "tag_hit_rate": 1 - inserts / (h + m) if h + m else None,
+            }
+        )
+    rates = [s["hit_rate"] for s in blocks if s["hit_rate"] is not None]
+    timer = re.search(r"\[System\] Timer: (\d+) cycles", log)
+    if not timer:
+        raise ValueError("missing workload timer")
+    totals = {
+        key: sum(s[key] for s in timed)
+        for key in (
+            "E",
+            "I",
+            "hits",
+            "misses",
+            "pending_ops",
+            "evictions",
+            "write_words",
+            "forced",
+            "probes",
+            "reverse_events",
+            "table_inserts",
+        )
+    }
+    totals["async_line_loads"] = sum(s["async_line_loads"] for s in timed)
+    totals["weight_line_loads"] = sum(s["weight_line_loads"] for s in timed)
+    totals["other_async_line_loads"] = sum(s["other_async_line_loads"] for s in timed)
+    if replay:
+        for key in ("spill_records", "manual_reverse", "scatter_reverse"):
+            totals[key] = sum(s[key] for s in timed)
+    demands = totals["hits"] + totals["misses"]
+    report = {
+        "rule": manifest["rule"],
+        "presim_steps": manifest["presim"],
+        "steps": steps,
+        "neurons": comparisons,
+        "weights": weights,
+        "final_cache": cache,
+        "timed_blocks": blocks,
+        "timed_totals": totals,
+        "average_per_timestep": {k: v / len(timed) for k, v in totals.items()},
+        "table_state_change_per_timestep": {
+            k: (
+                steps[-1][k]
+                - (steps[manifest["warmup"] - 1][k] if manifest["warmup"] else 0)
+            )
+            / len(timed)
+            for k in ("pending_coefficients", "dirty_weights")
+        },
+        "cycles_per_timestep": int(timer[1]) / len(timed),
+        "timed_resident_hit_rate": totals["hits"] / demands if demands else None,
+        "timed_tag_hit_rate": 1 - totals["table_inserts"] / demands
+        if demands
+        else None,
+        "written_words_per_eviction": totals["write_words"] / totals["evictions"]
+        if totals["evictions"]
+        else None,
+        "timed_population_rate_hz": {
+            "E": totals["E"] / (NE * len(timed) * 0.0001),
+            "I": totals["I"] / (NI * len(timed) * 0.0001),
+        },
+        "hit_rate_block_range": max(rates) - min(rates) if rates else None,
+        "spike_count_max_difference": max(
+            max(abs(s["E"] - s["reference_E"]), abs(s["I"] - s["reference_I"]))
+            for s in steps
+        ),
+        "timed_cycles": int(timer[1]),
+        "observed_step_cycles": steps[-1]["cycle"]
+        - steps[manifest["warmup"] - 1]["cycle"]
+        if manifest["warmup"]
+        else None,
+    }
+    args.output.write_text(json.dumps(report, indent=2) + "\n")
+    # RNG and identity must be exact independently of network sensitivity.
+    for c in comparisons.values():
+        if any(
+            c[key]["different"]
+            for key in ("rng", "gid", "fire", "pre_fire", "refractory")
+        ):
+            raise ValueError("integer neuron state divergence")
+        if c["V"]["max_absolute"] > 0.02:
+            raise ValueError("voltage diverged by >0.02 mV")
+        for key in ("Iex", "dIex", "Iin", "dIin", "pre_trace", "post_trace"):
+            if c[key]["max_relative_scaled"] > 2e-4:
+                raise ValueError(key + " diverged by >2e-4 scaled relative error")
+    if report["spike_count_max_difference"] > 2:
+        raise ValueError("per-step spike count differs by >2")
+    if weights and weights["max_absolute"] > 0.002:
+        raise ValueError("weights differ by >0.002 pA")
+    print(
+        json.dumps(
+            {k: v for k, v in report.items() if k not in ("steps", "neurons")}, indent=2
+        )
+    )
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--images", type=Path, required=True)
+    p.add_argument("--dumps", type=Path, required=True)
+    p.add_argument("--log", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True)
+    validate(p.parse_args())

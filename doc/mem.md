@@ -17,7 +17,7 @@ We currently allocates the following events Tag for memory requests / responses.
   - operand[1][31:16]: The size of the access (log2, can be <= 15 for now)
   - operand[1][15:0]: The request ID
   - operand[2]: Carried data 1
-    - For request ID = 0x8002, carried data 1 = {return tag ID, address of SPM writeback location IN LINE GRANULARITY relative to the SPM AC base CSR}. The address will be in the carried data 2 slot in the message.
+    - For request ID = 0x8002, carried data 1 = {16-bit return handler ID, 16-bit SPM line index relative to the SPM AC base CSR}. Completion passes the line index in `a0` and operand[3] in `a1`, after writing the returned line into SPM.
   - operand[3]: Carried data 2
 - 0x?01: Normal store
   - operand[0]: the address, aligned to size
@@ -25,16 +25,16 @@ We currently allocates the following events Tag for memory requests / responses.
   - FIXME: multibeat stores so that size can be > 2
   - operand[1][15:0]: The request ID
   - operand[2]: Carried data 1
-    - For request ID = 0x8003, carried data 2 = {return tag ID, any 16 bit data}. The low 16bit will be in the carried data 2 slot in the message.
-  - operand[3]: The data to write, replicated to fill 32 bits (e.g. for byte access, the byte is replicated 4 times in operand[2])
+    - For request ID = 0x8003, carried data 1 = {16-bit return handler ID, any 16-bit token}. Completion passes the token in `a0` and operand[3] in `a1`.
+  - operand[3]: The data to write, replicated to fill 32 bits (e.g. for byte access, the byte is replicated 4 times in operand[3])
 - 0x?10: CSR access
   - operand[0]: the start of the row
-  - operand[1][31:16]: the length of the access (in MEM_BEATS bytes)
+  - operand[1][31:16]: the number of memory lines to read
   - operand[1][15:0]: the return tag value (which is scattered, locally)
   - operand[2] & operand[3]: Carried data, passed to the handler.
 - 0x?11: Bulk load
   - operand[0]: the start of the row
-  - operand[1][31:16]: the length of the access (in MEM_BEATS bytes)
+  - operand[1][31:16]: the number of memory lines to read
   - operand[1][15:0]: the request ID
 - 0x?F0: Register idle notification
   - operand[0][31:16]: After +1, the least amount of cycle the handler need to be idle for this to trigger (+ 1 so 0 does not result in a trivially triggering notifier, i.e., idleCycle > operand[0][31:16]). Note that the idle counter will saturate at 0xFFFF, so if operand[0][31:16] = 0xFFFF, then this notifier will never fire
@@ -49,10 +49,19 @@ Memory response is sent on the memory response bus, which is separated from the 
 
 The width of the bus is based on a parameter.
 
-The current system configuration uses 512-bit (64-byte) memory lines. Scatter
+The line width is configuration-dependent: inspect the elaborated JSON. The
+512-PU Brunel configuration uses 256-bit (32-byte) memory lines. Scatter
 and bulk lengths count memory lines, not bytes. Image generators must align CSR
 row starts and ends to the configured line size because responses do not carry
 an entry-valid mask.
+
+Manual ID-2 loads and ID-3 stores produce volatile completion events. The LSU
+consumes scalar responses immediately; a pending notification can be replaced
+by a newer response or expire after three blocked cycles. Software must bound
+issued-but-unconsumed notifications and reserve a dedicated completion queue
+when it needs reliable accounting. ID-3 responses do not complete ordinary LSU
+instructions and do not write SPM. See [Brunel](brunel.md) for one software credit
+and writeback-ordering implementation.
 
 ## Address map
 
