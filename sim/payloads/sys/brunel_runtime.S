@@ -861,7 +861,7 @@ br_report:
  SEND t0,t1
 9: ret
 .Lroot_report:
- beqz a0,.Lnext_forward
+ beqz a0,.Lreport_boot
  li t0,1
  beq a0,t0,.Lreport_forward
  li t0,2
@@ -886,6 +886,12 @@ br_report:
  sw zero,0(t1)
  li a0,0
  j br_halt
+.Lreport_boot:
+ lw t0,H_WARMUP(gp)
+ bnez t0,.Lnext_forward
+ li t0,0x40000004
+ li t1,1
+ sw t1,0(t0)
 .Lnext_forward:
  li a0,1
  li a1,0
@@ -994,6 +1000,9 @@ br_boot:
  addi s0,s0,1
  li t0,4
  bltu s0,t0,.Lboot_verify
+ call br_drain
+ sw zero,H_ISSUED(gp)
+ sw zero,H_CONSUMED(gp)
 .Lboot_report:
  li a0,0
  li a1,0
@@ -1114,7 +1123,7 @@ br_work:
  slli t0,t2,16
  srli t0,t0,16
  fmul.s a1,s7,a1
- li t1,1
+ li t1,0xc01
  SEND t0,t1
  addi a2,a2,4
  addi s6,s6,4
@@ -1164,24 +1173,27 @@ br_work:
  li a2,0
  li a3,0
  li t2,1
- beq s0,t2,4f
+ beq s0,t2,.Lstatic_scatter_tag
  lw t0,H_DEP(gp)
  lw t1,28(s2)
  fmul.s a2,t0,t1
  lw a3,H_POT(gp)
- li t2,4
+ li t2,0xc04
  li t0,REPLAY
  add t0,t0,gp
  lw t1,24(t0)
  add t1,t1,s5
  sw t1,24(t0)
+ j 4f
+.Lstatic_scatter_tag:
+ li t2,0xc01
 4: addi a1,s5,3
  srli a1,a1,2
  slli a1,a1,16
  or a1,a1,t2
  li t0,0x8001
  add t0,t0,s6
- li t1,0x810
+ li t1,0xc10
  SEND t0,t1
  lw t0,H_SENT(gp)
  add t0,t0,s5
@@ -1317,7 +1329,7 @@ br_work:
  li a3,0
  slli t0,s6,16
  srli t0,t0,16
- li t1,4
+ li t1,0xc04
  SEND t0,t1
  INC H_SENT,t0
  lw t0,X_MANUAL_REVERSE(s2)

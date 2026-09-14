@@ -16,7 +16,7 @@ void br_send(uint32_t dst, uint32_t tag, uint32_t addr, uint32_t id,
              uint32_t carried, uint32_t data) {
   (void)dst;
   if (tag == 8) return;
-  if (tag == 4) { br_reverse(addr, id, carried, data); return; }
+  if (tag == 0xc04) { br_reverse(addr, id, carried, data); return; }
   assert(tag == 0x800 || tag == 0x401);
   assert(queued < 12);
   struct Request *r = &queue[queued++];

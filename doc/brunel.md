@@ -156,11 +156,16 @@ at most 8,100 plastic arrivals per PU per timestep (18 * 450 indegree).
 
 ## Transport and progress
 
-The current workload **assumes memory effects occur in request order**. This is
-an explicit experimental contract: the preserved old simulator does not fully
-guarantee that order, and small resulting weight differences are accepted for
-this experiment. It does not wait for a matching-line writeback acknowledgment
+The current workload **requires memory effects to follow request order** and
+uses the MemIf FIFO issue queue. It does not wait for a matching-line writeback acknowledgment
 before issuing a refill, nor serialize same-word stores by acknowledgment.
+
+Neural forward/replay messages and scatter requests/responses use priority 3
+(`0xc01`, `0xc04`, and `0xc10`), below priority-2 refills and priority-1 stores.
+Bounded control/report traffic stays at priority 0. This ordering is necessary
+for progress: the earlier priority-0 replay messages could obstruct the refills
+needed to consume those messages, deadlocking the Additive burst at step 32.
+Handler IDs, quotas, margins, and queue depths are unchanged by this correction.
 
 Manual line loads use tag `0x800` and words
 `{address, (5 << 16) | 0x8002, line_ident, refill_slot}`. Dirty word stores and
@@ -180,11 +185,11 @@ spikes. The report tree and cooperative continuations are bounded protocol
 traffic, rather than unlimited new work.
 
 Root phase markers use tag 10 addressed through the NoC to PU1's no-op handler.
-`SOFT_MNIST_PHASE_LOG=1` exposes their injection cycles using an already-present
-hook in the preserved simulator: phases 2/3/4/5 denote forward/integrate/reverse/
+`SOFT_MNIST_PHASE_LOG=1` exposes their injection cycles using the simulator's
+existing marker hook: phases 2/3/4/5 denote forward/integrate/reverse/
 finish, and `low` is the timestep. Marker intervals include barrier/control
-traffic and differ slightly from local PU start times. The simulator is not
-rebuilt or re-elaborated for these observations.
+traffic and differ slightly from local PU start times. The additional sampled
+profiler described below observes the rebuilt simulator without target changes.
 
 Global phases use a binary control/report tree. Send counts are accumulated and
 compared with receiver counts before advancing past forward or reverse traffic.
@@ -207,10 +212,11 @@ contains no compiled C. Both linkers require the entire payload plus the image
 header to fit the preloaded 8 KiB ICache. The C implementation remains available
 as a reference; `brunel_asm_layout.inc` names the frozen header/record ABI offsets.
 
-For the ongoing ordered-memory experiment, use the copied simulator and YAML
-under `copilot/tmp/brunel-replay-20260914/frozen/`, whose hashes and configuration
-are recorded there. Do not rebuild it from concurrently changing RTL. The
-following commands describe creating a simulator for a *new* experiment:
+The FIFO MemIf experiment uses the regenerated 512-PU configuration and copied
+simulator under `copilot/tmp/brunel-ordered-20260914/design/`. The earlier frozen
+simulator under `copilot/tmp/brunel-replay-20260914/frozen/` remains preserved as
+historical evidence, including the priority deadlock diagnostics. The following
+commands create the required 512-PU simulator configuration:
 
 Run project commands inside the Nix development shell. The Python interpreter
 used for generation and validation must provide NumPy. If the development
@@ -218,7 +224,7 @@ shell's Python lacks it, enter a nested
 `nix-shell -p 'python3.withPackages (ps: [ps.numpy])'` for the Python commands.
 
 ```sh
-mill ActiveN.run --system --pu=512 --mc=16 --mem-bus-width=256 --icache-lines=128
+JAVA_TOOL_OPTIONS=-Xmx12g mill ActiveN.run --system --pu=512 --mc=16 --mem-bus-width=256 --icache-lines=128
 cmake -S sim -B sim/build -G Ninja -DENABLE_HARD_BACKEND=OFF -DUSE_BOLT=OFF
 ninja -C sim/build -j8 sim_system
 make -C sim/payloads sys/brunel.bin sys/brunel_asm.bin
@@ -281,6 +287,152 @@ words, then runs the ordinary network; the normal assembly binary omits it.
 The C compiler stack audit reports a largest individual frame of 128 bytes;
 the deepest cache/refill call chain remains below 400 bytes, within each 2 KiB
 stack allocation.
+
+`SOFT_BRUNEL_PROFILE=1`, together with `SOFT_BRUNEL_DUMP`, enables observation
+without adding target instructions. `pu-profile.csv` samples activity, stalls,
+queue pressure, and outstanding requests every 256 simulated cycles, grouped
+by PU, timestep, and global phase. `pc-profile.csv` samples each active thread's
+fetch PC over the timed interval; function attribution is approximate because
+of pipeline lookahead. `mc-profile.csv` records per-cycle MSHR occupancy and
+accepted/presented memory requests. A profile-on/off smoke comparison checks
+identical simulated timing, SPM snapshots, and final DRAM.
+
+`datagen/brunel_hotspots.py` reports work per PU and timestep. It independently
+reconstructs nonzero LTD/LTP demands from spike/trace state, and checks each PU
+against `hits + misses - forward weight reads`. It also counts arithmetic
+applications using pending-entry conservation:
+`applied updates = new update demands - change in pending coefficients`.
+This includes materializing older coefficients during reads or evictions.
+Distinct affected synapses, new demands, and applied arithmetic are separate
+quantities; clipping or FP32 rounding can leave a weight numerically unchanged.
+
+## Recorded replay and ordered MemIf results (2026-09-14)
+
+The simulator was re-elaborated and rebuilt for the configuration above, including
+the FIFO MemIf implementation. Each run uses eight simulator workers, the software
+NoC/MemIf with RTL cores, HBM2 timing, 30 warmup steps and 30 timed steps. The C
+payload is 8,000 bytes and the hand-written assembly payload is 6,276 bytes; both
+fit the preloaded 8 KiB ICache, including the 16-byte image header.
+
+The earlier individual-entry run was stopped early. Compare it with the new
+implementations on **the same steps 31–40**, not against a different part of the
+burst or against the earlier line-entry cache:
+
+| Common steps 31–40 | Additive | Morrison |
+| --- | ---: | ---: |
+| Previous individual-entry cycles/timestep | 1,020,411.9 | 556,779.9 |
+| Recorded replay, C cycles/timestep | 785,651.6 | 353,442.6 |
+| Recorded replay, assembly cycles/timestep | 678,721.1 | 301,245.6 |
+| Previous reverse deliveries/timestep | 3,803,239.7 | 1,953,795.8 |
+| Assembly reverse deliveries/timestep | 99,742.9 | 10,121.4 |
+| Previous table probes/timestep | 483,740.9 | 47,047.4 |
+| Assembly table probes/timestep | 484,807.5 | 47,065.0 |
+
+Reverse traffic falls by 97.38% / 99.48%, while assembly cycles fall by
+33.49% / 45.90%. The removed deliveries mostly took the cheap early-return path.
+Useful forwarding and learning work remains: table-probe counts barely change.
+Traffic is distributed across the system, whereas a phase barrier waits for its
+slowest PU. Removing most messages therefore does not remove most cycles.
+
+### Full assembly timing and work
+
+All averages in this table cover timed steps 31–60. A new update is a nonzero
+LTD/LTP operation, even if rounding or clipping leaves the weight unchanged.
+Applied arithmetic additionally accounts for materializing older pending values.
+
+| Metric | Additive | Morrison |
+| --- | ---: | ---: |
+| C cycles/timestep | 667,488.3 | 351,923.0 |
+| Assembly cycles/timestep | 570,721.0 | 300,412.1 |
+| Assembly cycle reduction relative to C | 14.50% | 14.64% |
+| Forward cycles/timestep | 391,316.8 | 207,703.0 |
+| Reverse cycles/timestep | 173,395.1 | 86,548.9 |
+| New LTD updates/PU/timestep | 24.24 | 4.27 |
+| New LTP updates/PU/timestep | 23.81 | 4.38 |
+| New updates/PU/timestep | 48.04 | 8.65 |
+| Applied arithmetic updates/PU/timestep | 38.53 | 4.84 |
+| Distinct updated synapses/PU/timestep | 47.96 | 8.65 |
+| Forward weight reads/PU/timestep | 55.86 | 8.44 |
+| Median new updates in a PU/timestep | 17 | 4 |
+| 99th percentile new updates in a PU/timestep | 304.41 | 230 |
+| Maximum new updates in one PU/timestep | 807 | 470 |
+| Reverse deliveries/timestep | 56,793.97 | 8,695.80 |
+| Table probes/timestep | 298,039.70 | 42,743.50 |
+| FP32 word stores/timestep | 14,993.20 | 852.27 |
+
+Additive's maximum update demand occurs on PU297 at step 41: four firing source
+neurons cause 1,749 outgoing weight reads and 807 new updates. Its largest forward
+row workload occurs on PU210 at step 39: four firing sources cause 1,807 weight
+reads and 786 new updates, while that PU receives only 146 plastic spikes.
+Morrison's maximum is PU190 at step 35: two firing sources, 915 outgoing weight
+reads, 470 new updates, and 16 received plastic spikes. Fan-out averages 450;
+these large source workloads do not require unusually large incoming fan-in.
+
+### Measured bottleneck
+
+Forward processing consumes 68.57% / 69.14% of assembly cycles. Its mean busiest
+PU activity is 389,350 / 206,012 cycles per timestep, almost the complete forward
+phase; mean activity across all PUs is only 23,713 / 3,360 cycles per timestep.
+The busiest PU is selected separately each step. Source-owned rows concentrate
+work on the few PUs whose neurons fired, leaving other PUs waiting at the barrier.
+
+Sampled forward SMT0 fetch PCs attribute 35.56% / 28.16% to `br_insert`,
+16.11% / 17.11% to `br_lookup`, and 15.81% / 16.80% to `br_forward_weights`.
+The `br_load_wait` routine accounts for 5.77% / 3.26%. These are approximate
+active-thread function shares, not retired-instruction or whole-phase shares.
+The next optimization target is the insertion/probing and scalar admission path;
+these measurements do not isolate the multiply hash as the cause.
+
+Reverse processing remains a secondary bottleneck, especially when useful replay
+converges on those source PUs. Additive's reverse-phase MC occupancy averages
+36.73 entries per MC, of which 36.40 are already fulfilled, 0.021 are unissued,
+and 0.308 await memory. The high occupancy is mainly completed scatter data
+waiting for downstream delivery, consistent with slow receiver consumption.
+Forward MC occupancy averages only 0.207 / 0.028 entries per MC. DRAM service
+capacity is not the dominant measured limit; local cache work and the resulting
+response/replay backpressure are more important.
+
+There is also a remaining sender-side optimization: recorded replay currently
+sends even when its LTD coefficient is zero. Filtering these would remove
+15,984.6 / 2,129.8 deliveries per timestep, or 28.14% / 24.49% of the remaining
+reverse traffic. These counts are independently reconstructed from the recorded
+spikes and postsynaptic traces. This filter is not part of the measured payload;
+forward cache processing remains the larger target.
+
+### Cache contents, warmup and correctness
+
+| Assembly cache metric | Additive | Morrison |
+| --- | ---: | ---: |
+| Timed resident-weight hit rate | 18.87% | 23.09% |
+| Timed tag hit rate, including pending entries | 20.34% | 23.88% |
+| Resident hit, steps 31–40 | 18.35% | 23.55% |
+| Resident hit, steps 41–50 | 19.21% | 23.53% |
+| Resident hit, steps 51–60 | 20.31% | 22.10% |
+| Occupancy at step 30 / 60 | 14.19% / 99.37% | 27.23% / 62.03% |
+| Final resident weights / all plastic synapses | 6.01% | 3.84% |
+| Final resident weights plus pending coefficients / all plastic synapses | 10.05% | 6.27% |
+| Maximum recording length in one PU/timestep | 221 | 25 |
+| Overflow records/timestep | 0 | 0 |
+
+The Additive table is still being populated in the first timed block; it reaches
+93.03% occupancy at step 40. Morrison is fairly stable by the requested hit-rate
+criterion, but continues accumulating pending entries. Its word stores rise from
+582.9 to 801.9 to 1,172.0 per timestep across the three blocks. Stable hit rates
+alone therefore do not establish settled writeback/materialization costs.
+
+All four C/assembly runs match every reference firing decision across all 60 steps.
+All 4.05 million final logical Additive weights match exactly; Morrison differs
+on 75 weights by one FP32 ULP at most (3.8147e-6 pA), matching the earlier numerical
+error bound. Maximum voltage errors are 1.3351e-5 / 3.8147e-6 mV. The full network
+runs do not spill; a separate one-record-buffer assembly test exercises the
+overflow fallback and numerical startup checks. Profile-on/off versions of that
+test have identical target cycles, SPM snapshots, and final DRAM.
+
+Artifacts are under `copilot/tmp/brunel-ordered-20260914/`: copied design and
+source hashes, all four C/assembly runs, validation reports, `work-per-pu.csv`,
+`hotspot-profile.json`, and the performance/cache and bottleneck figures. The
+per-PU CSV independently agrees with runtime demand counters for every PU and
+timestep, rather than estimating work by dividing message volume by PU count.
 
 ## Reference dynamics check (2026-09-14)
 
@@ -475,3 +627,174 @@ after every operation in the original cache's randomized stress workload. The
 individual-entry version counts weight fills directly in header word 62. Total
 manual loads minus weight fills gives destination/directory loads, which are
 checked for equality between cache variants on the identical spike history.
+
+## Generator cache model and hot checkpoints
+
+`datagen/brunel_cache_model.cpp` implements a native functional model, shared by
+`datagen/brunel_cache.py`, the image generator, and
+`datagen/brunel_cache_sweep.py`. It uses the payload's FP32 arithmetic and Morrison
+polynomial. The ordinary independent reference still uses NumPy's power function.
+The model reproduces eight-weight forward staging, one shared 32-byte refill,
+individual admission, pending materialization before displacement, and ordered
+backing-memory effects. It does not predict completion timing or NoC arrival order.
+
+The baseline is checked against the actual C payload through
+`sim/tests/brunel_cache_oracle.c`: identical ordered operations must give identical
+slots, backing memory, hit/miss counts, pending counts, evictions, stores, forced
+materializations, probes, and weight-line requests. The existing cache test also
+checks twelve outstanding requests with newest-first completion notifications.
+`sim/tests/brunel_cache_model.py` additionally checks every policy against eager
+logical weights, including clipping, zero coefficients, partial-line forwarding,
+and pending updates, for both learning rules.
+
+Image generation accepts `--cache-warmup N --cache-library <libcache.so>` to model
+the final N timesteps of CPU presimulation, including any subsequent active-window
+search advancement. N must not exceed `--presim`. Weight addresses are assigned
+before this simulation and are independent of the executable and cache policy.
+The checkpoint contains neurons/traces/RNG, physical backing weights, resident
+clean/dirty weights, and pending coefficients. `initial.npz` contains **logical**
+weights; dirty/pending data must not also be eagerly applied to image DRAM.
+`cache-initial.npz` records the cache and diagnostic counters. Runtime counters,
+inflight bookkeeping, replay records, and local timestep start at zero.
+
+Only policy 1 is exported into executable images in this stage; alternative
+policy checkpoints from the sweep are offline artifacts. Their different lookup
+rules require a matching payload before they can run on hardware. The 800-slot,
+eight-byte table ABI remains unchanged. Policies 3–5 require 200 bytes of packed
+two-bit usefulness counters, fitting in the unused writeback-descriptor region
+at SPM 0x2280. This preserves the 800-entry capacity and replay/stack allocations.
+
+Hardware `--warmup 0` is supported by both C and assembly payloads. PU1 starts the
+timer after the boot barrier, immediately before broadcasting the first forward
+phase. The transport self-test drains its notifications before resetting its
+request counters, so its traffic is excluded. Validators use the exported initial
+occupancy and pending state when computing insertions and applied updates.
+`sim/tests/brunel_hot_image.py` verifies the serialized neurons, tags/data,
+sidecar, quiescent header, and all 4.05 million reconstructed logical weights.
+
+The deterministic offline event order is source-neuron/row order for forwarding,
+then fired-post gid/CSR order (LTD followed by LTP for each connection), then
+manual reverse events in forward-delivery order. Different NoC interleavings can
+change placement and traffic. Exact parity is claimed for the **same ordered
+operations**, not for the offline table and an arbitrary network arrival order.
+
+### Five policies
+
+All policies have 800 slots per PU and full-address keys. Lookup examines all
+four legal positions when necessary, without stopping at an empty entry.
+
+1. **Current:** multiply hash, at most four probes across the entire insertion,
+   Robin-Hood-like movements; each entry also remains within distances 0–3.
+2. **Shifted:** the same policy with `h=((address>>2)<<shift)&1023`, followed by
+   `home=h>=800?h-800:h`. The measured shift is 2, making neighboring words'
+   four-slot candidate groups disjoint. All 800 slots remain reachable, although
+   only 200 are home positions. Folding doubles the address population of 56 of
+   the 200 groups relative to the other 144; this is deliberately not described
+   as a uniform hash.
+3. **Four candidates with usefulness:** one mixed-hash candidate in each of four
+   disjoint 200-slot banks, with no relocation chain. A miss decrements all four
+   occupied candidates, prefers the first empty candidate, then the first zero,
+   and otherwise bypasses admission. Updates are resolved immediately; a bypass
+   still loads/applies/writes the modified weight. No learning is dropped.
+4. **Current with usefulness:** decrement each occupied slot encountered during
+   insertion; immediately evict a zero-usefulness entry as a tombstone. Otherwise
+   retain the original Robin Hood movements and total-four-probe insertion cap.
+5. **Element bound with usefulness:** policy 4 without the total-probe cap; each
+   held element is still limited to distances 0–3. A swap changes the held
+   element and its distance. Usefulness travels with moved entries. Each occupied
+   encounter decreases the usefulness potential, bounding termination by
+   3×800+1 encounters; assertions and insertion histograms check this bound.
+
+Counters initialize to 3 and saturating-increment on each logical tag hit,
+including pending-coefficient hits. Internal materialization lookups do not
+increment usefulness a second time. Policies 1, 2, 4, and 5 retain one pending
+coefficient per absent key; policy 3 resolves new updates immediately.
+
+### Offline comparison
+
+Artifacts are in `copilot/tmp/brunel-cache-20260914/`. Both rules use seed
+20260724, 1,000 CPU warmup timesteps and 300 measured timesteps (1001–1300).
+Every forward value and updated logical weight is checked bit-for-bit across
+all five policies at every timestep. Counts below are system averages per
+timestep; refills are 32-byte weight requests and stores are FP32 write requests.
+These are functional traffic measurements, not cycle estimates.
+
+| Policy | Additive resident hits | Additive refills/step | Additive stores/step | Morrison resident hits | Morrison refills/step | Morrison stores/step |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 Current | 20.17% | 1,934.50 | 2,575.07 | 23.01% | 1,858.93 | 2,563.47 |
+| 2 Shifted | 26.59% | 1,562.27 | 2,602.72 | 30.74% | 1,452.13 | 2,579.49 |
+| 3 Four candidates | 25.03% | 2,025.33 | 2,574.77 | 29.28% | 1,831.80 | 2,565.97 |
+| 4 Current + usefulness | 24.39% | 1,702.76 | 2,589.07 | 27.73% | 1,626.50 | 2,568.40 |
+| 5 Element bound | 26.86% | 1,565.30 | 2,599.71 | 30.67% | 1,477.80 | 2,577.46 |
+
+Policy 2 reduces refills by 19.24% / 21.88%, with 11.70% / 10.14% more slot probes
+and a cheaper hash. Stores change by only +1.07% / +0.62%. Policy 4 reduces probes
+by 6.41% / 6.94%, but adds usefulness bookkeeping. Policy 5's longest measured
+insertions are 88 / 55 probes; its tail matters even though average traffic is
+competitive. Policy 3 bypasses 296.54 / 265.53 admissions per timestep; immediate
+update resolution offsets much of its hit-rate improvement in refill traffic.
+
+Resident-hit rates exclude pending matches; tag-hit rates include them. For
+policies 1–5, Additive tag hits are 22.26%, 28.15%, 25.03%, 26.10%, 28.30%; Morrison
+tag hits are 26.08%, 33.11%, 29.28%, 30.28%, 32.83%. Policy 3 has no pending entries.
+The reports separate clean/dirty/pending evictions, bypasses, and write requests,
+and include per-PU/timestep distributions and full insertion-length histograms.
+
+The cache is essentially full before measurement, but hit rates still follow
+the biological firing pattern. In particular, Additive's measured window spans
+quiet intervals and a burst. `warmup.*` shows occupancy and hit rates in 30-step
+blocks; `policy-comparison.*` shows the full-window comparison.
+`common-active-windows.json` also reports biological steps 1190–1219 for Additive
+and 1031–1060 for Morrison, matching the earlier experiment's timed windows.
+
+Build and run the native tools through the Nix shell (Python needs NumPy):
+
+```sh
+g++ -std=c++17 -O3 -fPIC -shared -ffp-contract=off \
+  datagen/brunel_cache_model.cpp -o copilot/tmp/libcache.so
+gcc -O3 -fPIC -shared -fno-builtin -ffp-contract=off \
+  sim/tests/brunel_cache_oracle.c -o copilot/tmp/liboracle.so
+python3 sim/tests/brunel_cache_model.py \
+  --library copilot/tmp/libcache.so --oracle copilot/tmp/liboracle.so
+python3 datagen/brunel_cache_sweep.py --rule additive \
+  --library copilot/tmp/libcache.so --output copilot/tmp/cache-additive
+python3 datagen/brunel.py --rule additive --presim 1189 --cache-warmup 1189 \
+  --warmup 0 --timed 30 --payload sim/payloads/sys/brunel_asm.bin \
+  --cache-library copilot/tmp/libcache.so --output copilot/tmp/hot-additive
+python3 sim/tests/brunel_hot_image.py copilot/tmp/hot-additive
+```
+
+### Hot-start simulator pilots
+
+The copied ordered-MemIf 512-PU simulator uses eight host threads, 16 MCs,
+32-byte memory lines, 16 KiB SPM and 8 KiB ICache per PU. No RTL or simulator
+changes were needed for this stage. Rebuilt C/assembly payloads are 8,040 / 6,316
+bytes, both fitting the ICache including the 16-byte image header.
+
+Assembly pilots execute three timed steps with HBM2 timing and no hardware
+warmup. Additive starts after CPU step 1189; Morrison starts after step 1030.
+Cold controls have exactly the same logical weights and neuron states, with
+those weights materialized in backing memory and empty tables.
+
+| Rule | Hot cycles/timestep | Cold cycles/timestep | Hot increase |
+|---|---:|---:|---:|
+| Additive | 557,570.33 | 408,032.67 | 36.65% |
+| Morrison | 333,515.67 | 192,413.00 | 73.33% |
+
+The empty table postpones almost all writebacks and pending-eviction refills
+during this short window. Thus hot initialization improves benchmark realism;
+it is not itself a cycle-reduction optimization. These three-step pilots
+validate startup and illustrate cold-start bias, not long-window performance.
+
+Both rules pass full neuron-state and logical-weight validation: all firing
+decisions, refractory counters, RNG states and traces match the reference.
+Hot Additive has all 4.05 million logical weights exact and at most
+1.90735e-6 mV voltage error. Hot Morrison differs on five weights by one FP32 ULP
+at most (3.81470e-6 pA), with exact voltages. One-step C hot-start pilots also
+pass, using flat memory (577,837 / 374,549 cycles per timestep); these validate
+the C boot path and are not directly comparable to the HBM2 three-step averages.
+
+`pilot-summary.json` contains per-timestep traffic, cache hits and numerical
+errors for every run. The per-PU work analyzer also passes pending-conservation
+checks starting from the hot checkpoint, including coefficients created before
+the hardware run. `validation-status.json` records the complete test status.

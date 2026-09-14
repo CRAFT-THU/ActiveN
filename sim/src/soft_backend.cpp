@@ -726,6 +726,8 @@ void SoftSystemBackend::peek(uint64_t cycle, std::vector<MemBusOut *> out) {
       return spm[offset / MEM_BUS_WIDTH_B][(offset % MEM_BUS_WIDTH_B) / 4];
     };
     const auto completed = word(1, offsetof(BrHeader, completed));
+    if (word(1, 0) == BR_MAGIC)
+      observeBrunelProfile(cycle, directory, completed);
     if (word(1, 0) == BR_MAGIC && completed != brunel_observed_steps_) {
       if (completed != brunel_observed_steps_ + 1)
         throw runtime_error("Brunel observer missed step");
@@ -767,6 +769,111 @@ void SoftSystemBackend::peek(uint64_t cycle, std::vector<MemBusOut *> out) {
   out[0]->req = periph.peekMem();
   for (size_t i = 0; i < cfg.numMC; ++i)
     out[i + 1]->req = drams[i].peekMem();
+}
+
+// Sample pre-edge state every 256 target cycles. PC histograms cover the timed
+// interval; per-PU samples cover every timestep and flush at the global barrier.
+// Fetch PCs are approximate attribution (pipeline/lookahead), not retired PCs.
+void SoftSystemBackend::observeBrunelProfile(uint64_t cycle,
+                                            const char *directory,
+                                            uint32_t completed) {
+  static const bool enabled = std::getenv("SOFT_BRUNEL_PROFILE") != nullptr;
+  if (!enabled) return;
+  if (brunelPuProfile_.empty()) brunelPuProfile_.resize(cfg.numPU + 1);
+  if (brunelMcProfile_.empty()) brunelMcProfile_.resize(cfg.numMC);
+  const auto word = [&](unsigned pu, unsigned offset) -> uint32_t {
+    const auto &s = cores[pu]->rootp->Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
+    return s[offset / MEM_BUS_WIDTH_B][(offset % MEM_BUS_WIDTH_B) / 4];
+  };
+  const unsigned last = word(1, offsetof(BrHeader, steps));
+  if (completed != brunelProfileCompleted_) {
+    const auto path = std::filesystem::path(directory) / "pu-profile.csv";
+    std::ofstream out(path, completed == 1 ? std::ios::out : std::ios::app);
+    if (completed == 1)
+      out << "step,phase,pu,samples,active0,active1,executing,stalled,outstanding,egress,injection_blocked,reverse_full,spike_full\n";
+    constexpr unsigned phases[] = {1, 2, 3, 6};
+    for (unsigned pu = 1; pu <= cfg.numPU; ++pu)
+      for (unsigned ph = 0; ph < 4; ++ph) {
+        auto &p = brunelPuProfile_[pu][ph];
+        if (p.samples)
+          out << completed << ',' << phases[ph] << ',' << pu << ','
+              << p.samples << ',' << p.active0 << ',' << p.active1 << ','
+              << p.executing << ',' << p.stalled << ',' << p.outstanding << ','
+              << p.egress << ',' << p.injection_blocked << ','
+              << p.reverse_full << ',' << p.spike_full << '\n';
+        p = {};
+      }
+    if (!out) throw runtime_error("cannot write Brunel PU profile");
+    std::ofstream mc(std::filesystem::path(directory) / "mc-profile.csv",
+                     completed == 1 ? std::ios::out : std::ios::app);
+    if (completed == 1)
+      mc << "step,phase,mc,cycles,presented,accepted,responses,inflight,unissued,fulfilled,max_inflight\n";
+    for (unsigned id = 0; id < cfg.numMC; ++id)
+      for (unsigned ph = 0; ph < 4; ++ph) {
+        auto &p = brunelMcProfile_[id][ph];
+        if (p.cycles)
+          mc << completed << ',' << phases[ph] << ',' << id << ',' << p.cycles
+             << ',' << p.presented << ',' << p.accepted << ',' << p.responses
+             << ',' << p.inflight << ',' << p.unissued << ',' << p.fulfilled
+             << ',' << p.max_inflight << '\n';
+        p = {};
+      }
+    if (!mc) throw runtime_error("cannot write Brunel MC profile");
+    brunelProfileCompleted_ = completed;
+    if (completed == last) {
+      std::ofstream pc(std::filesystem::path(directory) / "pc-profile.csv");
+      pc << "phase,pu,thread,pc,samples\n";
+      for (const auto &[key, count] : brunelPcProfile_)
+        pc << (key >> 43) << ',' << ((key >> 32) & 1023) << ','
+           << ((key >> 42) & 1) << ',' << uint32_t(key) << ',' << count << '\n';
+      if (!pc) throw runtime_error("cannot write Brunel PC profile");
+    }
+  }
+  if (completed >= last) return;
+  const unsigned phase = word(1, offsetof(BrHeader, phase));
+  if (phase != 1 && phase != 2 && phase != 3 && phase != 6) return;
+  const unsigned ph = phase == 6 ? 3 : phase - 1;
+  for (unsigned id = 0; id < cfg.numMC; ++id) {
+    auto &p = brunelMcProfile_[id][ph];
+    const auto &d = drams[id];
+    const auto &event = d.cycleEvents();
+    ++p.cycles;
+    p.presented += event.externalRequestPresented;
+    p.accepted += event.externalRequestAccepted;
+    p.responses += event.externalResponseAccepted;
+    const uint64_t occupancy = d.mshrInflightCount();
+    p.inflight += occupancy;
+    p.unissued += d.mshrUnissuedCount();
+    p.fulfilled += d.mshrFulfilledCount();
+    p.max_inflight = std::max(p.max_inflight, occupancy);
+  }
+  if (cycle & 255) return;
+  const bool timed = completed >= word(1, offsetof(BrHeader, warmup));
+  for (unsigned pu = 1; pu <= cfg.numPU; ++pu) {
+    const auto *root = cores[pu]->rootp;
+    auto &p = brunelPuProfile_[pu][ph];
+    const unsigned idle = root->Core__DOT__exec__DOT__idlings;
+    ++p.samples;
+    p.active0 += !(idle & 1);
+    p.active1 += !(idle & 2);
+    const bool executing = root->Core__DOT__exec__DOT__valid;
+    p.executing += executing;
+    p.stalled += executing && !root->Core__DOT__exec__DOT__s0step;
+    p.outstanding += word(pu, offsetof(BrHeader, issued)) - word(pu, offsetof(BrHeader, consumed));
+    p.egress += root->Core__DOT__exec__DOT__biu__DOT__sendQueue__DOT__cnt;
+    const auto &buf = routers[pu].buf;
+    p.injection_blocked += buf.core_inject_presenting && !buf.core_inject_accepting;
+    p.reverse_full += root->Core__DOT__exec__DOT__biu__DOT__evq_4__DOT__full;
+    p.spike_full += root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__full;
+    if (timed) {
+      const uint32_t pcs[] = {root->Core__DOT__fetch__DOT__pcs_0,
+                              root->Core__DOT__fetch__DOT__pcs_1};
+      for (unsigned thread = 0; thread < 2; ++thread)
+        if (!(idle & (1 << thread)))
+          ++brunelPcProfile_[(uint64_t(phase) << 43) | (uint64_t(thread) << 42)
+                            | (uint64_t(pu) << 32) | pcs[thread]];
+    }
+  }
 }
 
 void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {

@@ -132,13 +132,15 @@ class Reference:
         else:
             self.n, self.w = state[0].copy(), state[1].copy()
 
-    def tick(self):
+    def tick(self, cache=None):
         n = self.n
         f = n.view(np.float32)
         c = self.c
         old = n[:, 9].copy()
         n[:, 10] = old
         plastic = ranges(np.flatnonzero(old[:NE]), self.po)
+        if cache is not None:
+            self.w[plastic] = cache.forward_spikes(self, old, plastic)
         static = ranges(np.flatnonzero(old), self.so)
         ei = np.zeros(NE + NI, dtype=np.float32)
         ii = ei.copy()
@@ -169,12 +171,17 @@ class Reference:
         n[fired, 5] = 5
         f[:, 6] = F(f[:, 6] * c["decay_pre"])
         f[:, 7] = F(f[:, 7] * c["decay_post"])
+        potentiated = self.reverse[ranges(np.flatnonzero(fired[:NE]), self.ro)]
+        if cache is not None:
+            cache.learn(self, old, plastic, potentiated)
+            f[:, 6] = F(f[:, 6] + old.astype(np.float32))
+            f[:, 7] = F(f[:, 7] + fired.astype(np.float32))
+            return [int(fired[:NE].sum()), int(fired[NE:].sum())]
         dep = F(c["dep"] * f[self.post[plastic], 7])
         w = self.w[plastic]
         if self.rule == "morrison":
             dep = F(dep * w)
         self.w[plastic] = np.maximum(F(0), F(w - dep))
-        potentiated = self.reverse[ranges(np.flatnonzero(fired[:NE]), self.ro)]
         pot = F(c["pot"] * f[self.pre[potentiated], 6])
         w = self.w[potentiated]
         if self.rule == "morrison":
@@ -187,35 +194,81 @@ class Reference:
         return [int(fired[:NE].sum()), int(fired[NE:].sum())]
 
 
+def weight_layout(ref):
+    """Stable MC-local addresses, independent of payload and cache policy."""
+    images = [bytearray(65536) for _ in range(MC)]
+    addresses = np.zeros(len(ref.pre), dtype=np.uint32)
+    for src in range(NE):
+        lo, hi = ref.po[src:src + 2]
+        count = hi - lo
+        mc = (src % PU) // 32
+        pad = (-count) % 8
+        image = images[mc]
+        ref.n[src, 12] = len(image)
+        ref.n[src, 13] = count
+        image.extend(np.pad(ref.w[lo:hi], (0, pad)).tobytes())
+        ref.n[src, 14] = len(image)
+        destinations = (
+            (NODE_BASE + (ref.post[lo:hi] // PU) * 80 + 68).astype(np.uint32) << 16
+        ) | ((ref.post[lo:hi] % PU) + 1).astype(np.uint32)
+        image.extend(np.pad(destinations, (0, pad)).tobytes())
+        addresses[lo:hi] = ref.n[src, 12] + np.arange(count, dtype=np.uint32) * 4
+    return images, addresses
+
+
+def write_weights(images, ref):
+    for src in range(NE):
+        lo, hi = ref.po[src:src + 2]
+        base = int(ref.n[src, 12])
+        images[(src % PU) // 32][base:base + (hi - lo) * 4] = ref.w[lo:hi].tobytes()
+
+
 def generate(args):
-    if args.warmup < 1 or args.timed < 1 or args.presim < 0:
-        raise ValueError("warmup/timed must be positive and presim nonnegative")
+    if args.warmup < 0 or args.timed < 1 or args.presim < 0:
+        raise ValueError("timed must be positive; warmup/presim nonnegative")
+    if not 0 <= args.cache_warmup <= args.presim:
+        raise ValueError("cache-warmup must be between zero and presim")
+    if args.cache_warmup and not args.cache_library:
+        raise ValueError("cache-warmup requires --cache-library")
     out = args.output
     out.mkdir(parents=True, exist_ok=False)
     edges = graph(args.seed)
     ref = Reference(edges, args.rule, seed=args.seed)
+    images, addresses = weight_layout(ref)
+    cache = None
+    cache_history = []
     history = []
     for t in range(args.presim):
-        history.append(ref.tick())
+        if args.cache_warmup and t == args.presim - args.cache_warmup:
+            from brunel_cache import CacheModel, summary
+            write_weights(images, ref)
+            cache = CacheModel(args.cache_library, images, args.rule, ref.c["wmax"])
+            cache.bind(ref, addresses)
+        history.append(ref.tick(cache))
+        if cache is not None:
+            cache_history.append(summary(cache.export()))
         if (t + 1) % 100 == 0:
             print(
                 "presim",
                 t + 1,
-                "spikes",
-                np.sum(history[-100:], axis=0).tolist(),
+                "spikes_per_timestep",
+                np.mean(history[-100:], axis=0).tolist(),
                 flush=True,
             )
     if args.seek_active:
         saved = (ref.n.copy(), ref.w.copy())
+        # Preserve the historical 30-step activity-selection window even when
+        # the hardware warmup is zero. Selection is independent of cache policy.
+        selection_warmup = args.warmup or 30
         future = []
         chosen = None
         for extra in range(2000):
             future.append(ref.tick())
-            if len(future) >= args.warmup + args.timed:
-                start = len(future) - args.warmup - args.timed
+            if len(future) >= selection_warmup + args.timed:
+                start = len(future) - selection_warmup - args.timed
                 if (
-                    sum(x[0] for x in future[start : start + args.warmup]) >= 100
-                    and sum(x[0] for x in future[start + args.warmup :]) >= 100
+                    sum(x[0] for x in future[start : start + selection_warmup]) >= 100
+                    and sum(x[0] for x in future[start + selection_warmup :]) >= 100
                 ):
                     chosen = start
                     break
@@ -223,7 +276,9 @@ def generate(args):
             raise RuntimeError("no active warmup+timing window within 200ms")
         ref = Reference(edges, args.rule, state=saved)
         for extra in range(chosen):
-            history.append(ref.tick())
+            history.append(ref.tick(cache))
+            if cache is not None:
+                cache_history.append(summary(cache.export()))
         args.presim += chosen
         print("selected active starting step", args.presim, flush=True)
     pre, post, sp, st = edges
@@ -238,7 +293,16 @@ def generate(args):
     )
     initial_n = ref.n.copy()
     initial_w = ref.w.copy()
-    images = [bytearray(65536) for _ in range(MC)]
+    hot = None
+    if cache is not None:
+        hot = cache.export()
+        # Keep stale backing values where resident dirty data / pending
+        # coefficients carry the logical value. Never eagerly flush this state.
+        images = [bytearray(d.tobytes()) for d in cache.drams]
+        np.savez(out / "cache-initial.npz", **hot)
+        cache.close()
+    else:
+        write_weights(images, ref)
     payload = args.payload.read_bytes()
     if len(payload) + 16 > 0x8000:
         raise ValueError("payload overlaps reserved transport test region")
@@ -252,20 +316,6 @@ def generate(args):
         return offset
 
     n = initial_n.copy()
-    addresses = np.zeros(len(pre), dtype=np.uint32)
-    for src in range(NE):
-        lo, hi = ref.po[src : src + 2]
-        count = hi - lo
-        mc = (src % PU) // 32
-        pad = (-count) % 8
-        w = np.pad(initial_w[lo:hi], (0, pad))
-        n[src, 12] = place(mc, w.tobytes())
-        n[src, 13] = count
-        destinations = (
-            (NODE_BASE + (post[lo:hi] // PU) * 80 + 68).astype(np.uint32) << 16
-        ) | ((post[lo:hi] % PU) + 1).astype(np.uint32)
-        n[src, 14] = place(mc, np.pad(destinations, (0, pad)).tobytes())
-        addresses[lo:hi] = n[src, 12] + np.arange(count, dtype=np.uint32) * 4
 
     def csr(sources, targets, data, index, nsource):
         dstpu = (targets % PU) + 1
@@ -352,6 +402,13 @@ def generate(args):
         struct.pack_into("<I", blob, 0x2400 + 28, 256)
         blob[:256] = header.tobytes()
         blob[NODE_BASE : NODE_BASE + rows.nbytes] = rows.tobytes()
+        if hot is not None:
+            blob[TABLE:TABLE + 6400] = hot["entries"][pu].tobytes()
+            # Reserved descriptor region: packed 2-bit usefulness sidecar.
+            u = hot["usefulness"][pu].reshape(-1, 4)
+            blob[0x2280:0x2280 + 200] = np.sum(
+                u.astype(np.uint32) << (2 * np.arange(4)), axis=1
+            ).astype(np.uint8).tobytes()
         spms.append(blob)
     images[0].extend(bytes((-len(images[0])) % LINE))
     section = len(images[0])
@@ -372,6 +429,12 @@ def generate(args):
         rule=args.rule,
         seed=args.seed,
         presim=args.presim,
+        cache_warmup_steps=len(cache_history),
+        cache_policy="bounded",
+        cache_model_sha256=hashlib.sha256(args.cache_library.read_bytes()).hexdigest()
+        if hot is not None else None,
+        cache_initial=summary(hot) if hot is not None else {},
+        cache_warmup_state=cache_history,
         warmup=args.warmup,
         timed=args.timed,
         neurons=NE + NI,
@@ -415,6 +478,9 @@ def main():
     p.add_argument("--seed", type=int, default=20260724)
     p.add_argument("--presim", type=int, default=1000)
     p.add_argument("--warmup", type=int, default=30)
+    p.add_argument("--cache-warmup", type=int, default=0,
+                   help="simulate cache during this many final CPU presim steps")
+    p.add_argument("--cache-library", type=Path)
     p.add_argument("--timed", type=int, default=30)
     p.add_argument("--seek-active", action="store_true")
     p.add_argument("--payload", type=Path, default=Path("sim/payloads/sys/brunel.bin"))

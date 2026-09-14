@@ -222,10 +222,9 @@ protected:
   size_t inflight;
   std::vector<MSHR> mshrs;
   DynamicBitMask allocated;
-  DynamicBitMask issued;
   DynamicBitMask fulfilled;
   FlitArb reqArb;
-  FlitArb issueArb;
+  FixedLenQueue<uint8_t> issueQueue;
   FlitArb unicastArb;
   FlitArb broadcastArb;
   std::optional<IdleNotifier> idleNotifier;
@@ -309,8 +308,8 @@ public:
     size_t inflight,
     size_t numReq
   ) : idx(idx), inflight(inflight), mshrs(inflight), allocated(inflight),
-      issued(inflight), fulfilled(inflight), reqArb(numReq),
-      issueArb(inflight), unicastArb(inflight), broadcastArb(inflight) {
+      fulfilled(inflight), reqArb(numReq), issueQueue(inflight),
+      unicastArb(inflight), broadcastArb(inflight) {
     if (inflight < 2 || inflight > 256)
       throw std::invalid_argument("inflight must be between 2 and 256");
   }
@@ -330,11 +329,11 @@ public:
   }
 
   size_t mshrUnissuedCount() const noexcept {
-    return allocated.countAndNot(issued);
+    return issueQueue.size();
   }
 
   size_t mshrIssuedUnfulfilledCount() const noexcept {
-    return allocated.countAndAndNot(issued, fulfilled);
+    return mshrInflightCount() - mshrUnissuedCount() - mshrFulfilledCount();
   }
 
   size_t mshrFulfilledCount() const noexcept {
@@ -350,23 +349,27 @@ public:
       if (allocated.test(slot))
         throw std::logic_error("mshrAllocCommit: slot already allocated");
     }
+    // Each queued ID owns an allocated MSHR, so a free MSHR guarantees
+    // issue-queue space. Callers capture the old head before committing
+    // allocations to preserve the RTL Queue's non-flowing behavior.
+    const bool pushed = issueQueue.push(slot);
+    if constexpr (ASSERTIONS_ENABLED) {
+      if (!pushed)
+        throw std::logic_error("mshrAllocCommit: issue queue unexpectedly full");
+    }
     allocated.set(slot);
-    issued.reset(slot);
     fulfilled.reset(slot);
     mshrs[slot] = req;
   }
 
   void mshrDeallocCommit(uint8_t slot) noexcept __attribute__((always_inline)) {
     allocated.reset(slot);
-    issued.reset(slot);
     fulfilled.reset(slot);
   }
 
   std::optional<uint8_t> mshrReqSlot() const noexcept __attribute__((always_inline)) {
-    return issueArb.peek([&](size_t i) -> std::optional<uint8_t> {
-      return allocated.test(i) && !issued.test(i)
-          ? std::optional<uint8_t>(0) : std::nullopt;
-    });
+    if (auto head = issueQueue.front()) return head->get();
+    return std::nullopt;
   }
 
   GlobalMemReq mshrReq(uint8_t slot) const noexcept __attribute__((always_inline)) {
@@ -384,14 +387,13 @@ public:
     if constexpr (ASSERTIONS_ENABLED) {
       if (!allocated.test(slot))
         throw std::logic_error("mshrReqCommit: slot not allocated");
-      if (issued.test(slot))
-        throw std::logic_error("mshrReqCommit: slot already issued");
+      if (mshrReqSlot() != slot)
+        throw std::logic_error("mshrReqCommit: slot is not the issue queue head");
     }
-    issued.set(slot);
-    issueArb.commit(slot);
+    issueQueue.pop();
   }
 
-  void mshrRespAccept(const GlobalMemResp &resp, std::optional<uint8_t> issuedNow = std::nullopt)
+  void mshrRespAccept(const GlobalMemResp &resp)
       __attribute__((always_inline)) {
     if constexpr (ASSERTIONS_ENABLED) {
       if (resp.id >= inflight) throw std::logic_error("mshrRespAccept: invalid id");
@@ -399,8 +401,6 @@ public:
     if constexpr (ASSERTIONS_ENABLED) {
       if (!allocated.test(resp.id))
         throw std::logic_error("mshrRespAccept: slot not allocated");
-      if (!issued.test(resp.id) && issuedNow != resp.id)
-        throw std::logic_error("mshrRespAccept: slot not issued");
       if (fulfilled.test(resp.id))
         throw std::logic_error("mshrRespAccept: duplicate response");
     }
@@ -860,7 +860,7 @@ public:
     lastCycleEvents.externalRequestAccepted = issueFire;
     lastCycleEvents.externalResponseAccepted = mem.resp.has_value();
     if (issueFire) MemIf::mshrReqCommit(*issueSlot);
-    if (mem.resp) MemIf::mshrRespAccept(*mem.resp, issueFire ? issueSlot : std::nullopt);
+    if (mem.resp) MemIf::mshrRespAccept(*mem.resp);
 
     if (broadcastEject) {
       lastCycleEvents.broadcastRetired = true;
@@ -999,8 +999,7 @@ public:
     // Grant is given to potentially config ROM is external mem does not give a response
     bool romServed = false;
     if (mem.resp) // Contains resp
-      mshrRespAccept(*mem.resp,
-                     mem.reqAccepting && issueSlot ? issueSlot : std::nullopt);
+      mshrRespAccept(*mem.resp);
     else if (issueSlot) {
       auto req = MemIf::mshrReq(*issueSlot);
       auto alignedAddr = req.addr & MEM_ADDR_ALIGN_MASK;
@@ -1009,7 +1008,7 @@ public:
         mshrRespAccept({
           .id = req.id,
           .data = configROM[alignedAddr]
-        }, issueSlot);
+        });
       }
     }
 

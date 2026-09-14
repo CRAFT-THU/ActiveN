@@ -340,6 +340,8 @@ __attribute__((optimize("Os"))) void br_boot(void) {
           stop(0xb00b);
     }
     H->evictions = H->write_words = 0;
+    while (H->issued != H->consumed) BR_RELAX();
+    H->issued = H->consumed = 0;
   }
   report(0, 0, 0);
 }
@@ -389,6 +391,8 @@ __attribute__((optimize("Os"))) void br_report(uint32_t type, uint32_t count, ui
     return;
   }
   if (type == 0) {
+    if (!H->warmup)
+      *(volatile uint32_t *)0x40000004u = 1;
     broadcast(1, 0);
     return;
   }
@@ -483,7 +487,7 @@ __attribute__((optimize("Os"))) void br_work(void) {
       }
       uint32_t post = meta >> 24;
       if (!N[post].fire) {
-        send(meta & 65535u, 4, (meta >> 16) & 255u, addr,
+        send(meta & 65535u, 0xc04, (meta >> 16) & 255u, addr,
              fmul(H->dep, N[post].y), 0);
         H->sent++;
         X->manual_reverse++;
@@ -535,7 +539,7 @@ __attribute__((optimize("Os"))) void br_work(void) {
        * only R(0), and the phase barrier excludes new learning here. */
       for (uint32_t lane = 0; lane < count; lane++) {
         uint32_t dst = R(1)[lane];
-        send(dst & 65535u, 1, dst >> 16,
+        send(dst & 65535u, 0xc01, dst >> 16,
              fmul(fmul(H->epsc, H->delivery), R(3)[lane]),
              n->weights + 4 * (off + lane), H->pu | (i << 16));
         H->sent++;
@@ -565,8 +569,8 @@ __attribute__((optimize("Os"))) void br_work(void) {
     if (count) {
       F minus = phase == 3 ? fmul(H->dep, n->y) : 0;
       F plus = phase == 3 && n->fire ? H->pot : 0;
-      uint32_t handler = phase == 3 ? 4 : 1;
-      send(0x8001u + mc, 0x810, addr, (((count + 3) >> 2) << 16) | handler,
+      uint32_t handler = phase == 3 ? 0xc04 : 0xc01;
+      send(0x8001u + mc, 0xc10, addr, (((count + 3) >> 2) << 16) | handler,
            minus, plus);
       H->sent += count;
       if (phase == 3) X->scatter_reverse += count;

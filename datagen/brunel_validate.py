@@ -213,7 +213,8 @@ def validate(args):
     )
     comparisons = {}
     popcount = np.array([i.bit_count() for i in range(256)], np.int32)
-    occupied = 0
+    hot = manifest.get("cache_initial", {})
+    occupied = hot.get("occupied", 0)
     previous_loads = previous_weight_loads = previous_resident = 0
     previous_replay = [0, 0, 0]
     scalar = manifest["spm"].get("cache_entry_bytes") == 8
@@ -361,7 +362,7 @@ def validate(args):
         "table_state_change_per_timestep": {
             k: (
                 steps[-1][k]
-                - (steps[manifest["warmup"] - 1][k] if manifest["warmup"] else 0)
+                - (steps[manifest["warmup"] - 1][k] if manifest["warmup"] else hot.get(k, 0))
             )
             / len(timed)
             for k in ("pending_coefficients", "dirty_weights")

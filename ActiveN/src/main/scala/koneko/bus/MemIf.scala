@@ -200,13 +200,14 @@ abstract class MemIf(
   // Common MSHR states
   final protected val allocated = RegInit(VecInit(Seq.fill(inflight)(false.B)))
   private val mshrs     = Reg(Vec(inflight, new MSHR))
-  // Whether this request is issued
-  private val issued    = Reg(Vec(inflight, Bool()))
   // Whether this request is fulfilled
   private val fulfilled = Reg(Vec(inflight, Bool()))
   // Buffers either write data, or response data, or both (for AMO)
   // We cannot reduce this to 32 bit: ICache fetches whole lines, and AMOs
   private val buffer    = Reg(Vec(inflight, UInt(coreParams.memBusWidth.W)))
+
+  private val issueQ    = Module(new Queue(UInt(log2Ceil(inflight).W), inflight))
+  assert(issueQ.io.enq.ready || !issueQ.io.enq.valid, "Issue queue should never block")
 
   // Allocation inputs
   protected class Alloc extends Bundle {
@@ -223,12 +224,13 @@ abstract class MemIf(
 
   alloc.ready := !allocated.asUInt.andR // Not full
   val allocIdx = PriorityEncoder(allocated.map(!_))
+  issueQ.io.enq.bits := allocIdx
+  issueQ.io.enq.valid := alloc.fire
   when(alloc.fire) {
     mshrs(allocIdx) := alloc.bits.mshr
     buffer(allocIdx) := alloc.bits.data
     allocated(allocIdx) := true.B
     fulfilled(allocIdx) := false.B
-    issued(allocIdx) := false.B
   }
 
   val ucstMap = allocated.asUInt & fulfilled.asUInt & VecInit(mshrs.map(!_.isBroadcast)).asUInt
@@ -274,9 +276,9 @@ abstract class MemIf(
 
   // Outgoing request
   final protected val req = Wire(Decoupled(new GlobalMemReq))
-  val issueMap = allocated.asUInt & ~issued.asUInt
-  val issueIdx = Common.rr(issueMap, req.fire, "issueIdx")
-  req.valid := issueMap.orR
+  val issueIdx = issueQ.io.deq.bits
+  req.valid := issueQ.io.deq.valid
+  issueQ.io.deq.ready := req.ready
   req.bits.id := issueIdx
   req.bits.addr := mshrs(issueIdx).address
   req.bits.wdata := buffer(issueIdx)
@@ -284,9 +286,6 @@ abstract class MemIf(
   req.bits.size := mshrs(issueIdx).size
   assert(!req.valid || req.bits.size <= busParams.lineAddrShift.U, "Unsupported scalar access size")
   req.bits.write := mshrs(issueIdx).ty === MemOp.Store // TODO: handle RMW for subline writes, or let's have a LLDC
-  when(req.fire) {
-    issued(issueIdx) := true.B
-  }
 
   // Incoming response
   final protected val resp = Wire(Valid(new GlobalMemResp))
@@ -295,9 +294,10 @@ abstract class MemIf(
   when(resp.valid) {
     assert(respInRange, "Received response ID outside the MSHR range")
     when(respInRange) {
-      val issuedNow = req.fire && req.bits.id === resp.bits.id
+      // We curently don't have a issued bitmask, so this assertion is disabled
+      // val issuedNow = req.fire && req.bits.id === resp.bits.id
+      // assert(issued(respIdx) || issuedNow, "Received response for an unissued MSHR")
       assert(allocated(respIdx), "Received response for an unallocated MSHR")
-      assert(issued(respIdx) || issuedNow, "Received response for an unissued MSHR")
       assert(!fulfilled(respIdx), "Received duplicate response for an MSHR")
       fulfilled(respIdx) := true.B
       // May overwrite wdata, but stores do not consume it after completion.

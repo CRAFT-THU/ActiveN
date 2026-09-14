@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 #include <thread>
 
@@ -285,6 +286,23 @@ class SoftSystemBackend : public SystemBackend {
   uint64_t timer_stats_intervals_ = 0;
   uint32_t sparse_observed_steps_ = 0;
   uint32_t brunel_observed_steps_ = 0;
+  // Optional observation only: sampled target cycles, never host wall time.
+  struct BrunelPuProfile {
+    uint64_t samples = 0, active0 = 0, active1 = 0;
+    uint64_t executing = 0, stalled = 0, outstanding = 0;
+    uint64_t egress = 0, injection_blocked = 0;
+    uint64_t reverse_full = 0, spike_full = 0;
+  };
+  std::vector<std::array<BrunelPuProfile, 4>> brunelPuProfile_;
+  struct BrunelMcProfile {
+    uint64_t cycles = 0, presented = 0, accepted = 0, responses = 0;
+    uint64_t inflight = 0, unissued = 0, fulfilled = 0, max_inflight = 0;
+  };
+  std::vector<std::array<BrunelMcProfile, 4>> brunelMcProfile_;
+  std::unordered_map<uint64_t, uint64_t> brunelPcProfile_;
+  uint32_t brunelProfileCompleted_ = 0;
+  void observeBrunelProfile(uint64_t cycle, const char *directory,
+                           uint32_t completed);
   std::array<uint64_t, 8> brunel_last_counts_{};
   bool timer_stats_start_pending_ = false;
   bool timer_stats_active_ = false;
