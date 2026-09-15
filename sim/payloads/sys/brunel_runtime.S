@@ -1,8 +1,9 @@
 /* Hand-written Brunel runtime, RV32I/Zmmul/Zfinx.
  * gp = immutable local SPM base on both SMT threads.
  * a0-a7,t0-t6 are caller-clobbered; s0-s11 follow the usual callee-save ABI.
- * Only SMT0 mutates the timestep buffer and issues credited memory requests.
- * SMT1 consumes completions and records spikes until the local buffer fills.
+ * Only SMT0 owns phase work and credited memory requests.
+ * Forward delivery uses only the 2 KiB ping-pong staging area; quiet LTD is
+ * committed at the postsynaptic PU with a fire-and-forget scalar store.
  * Reverse events carry full MC-local addresses. Memory effects must be ordered.
  */
 #include "brunel_asm_layout.inc"
@@ -415,44 +416,9 @@ br_reverse:
  or t0,s2,s3
  slli t0,t0,1
  beqz t0,8f
- lw s4,N_BUFFER(s0)
- beqz s4,5f
- lw t0,N_WEIGHTS(s0)
- sub t0,s1,t0
- srli t1,t0,10
- slli t1,t1,9
- andi t0,t0,511
- add t0,t0,t1
- add s4,s4,t0
- lw a0,0(s4)
- beqz s2,2f
- mv a1,s2
- li a2,0
- call br_update
- INC H_BUFFER_UPDATES,t0
-2: beqz s3,3f
- mv a1,s3
- li a2,1
- call br_update
- INC H_BUFFER_UPDATES,t0
-3: sw a0,0(s4)
- sub t0,s4,gp
- li t1,BUFFER
- sub t0,t0,t1
- srli t0,t0,2
- andi t1,t0,31
- li t2,1
- sll t1,t2,t1
- srli t0,t0,5
- slli t0,t0,2
- li t2,DIRTY
- add t0,t0,t2
- add t0,t0,gp
- lw t2,0(t0)
- or t2,t2,t1
- sw t2,0(t0)
- j 8f
-5: mv a0,s1
+ /* The forward buffer is gone.  Every post-active update uses an MSHR
+  * line load, then the normal ordered scalar writeback path. */
+ mv a0,s1
  mv a1,s2
  mv a2,s3
  call br_mshr_allocate
@@ -647,83 +613,58 @@ br_integrate:
  addi t1,gp,H_JOIN_COUNT
  amoadd.w t2,t0,(t1)
  bne t2,t0,.Lintegrate_return
- li a0,2
+ li a0,1
  li a1,0
  li a2,0
  lw a3,H_PU(gp)
  SENDI zero,3
 .Lintegrate_return:
  ret
-/* Input a0=input offset,a1=weight,a2=weight address (zero for static),
- * a3=prePU | preLocal<<16. Recording uses full addresses, no CSR search. */
+/* Direct event handler.  Input a0=input offset,a1=weight,a2=weight address
+ * (zero for static), a3=prePU | preLocal<<16.  A quiet postsynaptic target
+ * applies LTD locally and sends a no-receipt scalar store to the source MC. */
 .globl br_spike
 br_spike:
  add t0,gp,a0
  lw t1,0(t0)
  fadd.s t1,t1,a1
  sw t1,0(t0)
- beqz a2,.Lspike_received
- li t2,REPLAY
- add t2,t2,gp
- lw t3,0(t2)
- lw t4,28(t2)
- addi t0,a0,-256
- li t1,0xcccccccd
- mulhu t0,t0,t1
- srli t0,t0,6
- slli t0,t0,24
- or a3,a3,t0
- bgeu t3,t4,.Lspill_spike
- slli t0,t3,3
- li t1,RECORD
+ beqz a2,.Lspike_done
+ /* a0 points at N_INPUT_E; subtract its field offset to reach the neuron. */
+ addi t0,a0,-68
+ add t0,gp,t0
+ lw t1,N_FIRE(t0)
+ bnez t1,.Lspike_done       /* post-active path handles LTD and LTP */
+ lw t1,N_Y(t0)
+ lw t2,H_DEP(gp)
+ fmul.s t1,t1,t2
+ lw t2,H_RULE(gp)
+ bnez t2,.Lspike_morrison
+ fsub.s a1,a1,t1
+ lw t2,H_WMAX(gp)
+ fmax.s a1,a1,zero
+ fmin.s a1,a1,t2
+ j .Lspike_writeback
+.Lspike_morrison:
+ fmul.s t2,a1,t1
+ fsub.s a1,a1,t2
+ fmax.s a1,a1,zero
+.Lspike_writeback:
+ slli t0,a3,16
+ srli t0,t0,16
+ addi t0,t0,-1
+ srli t0,t0,5
+ li t1,0x8001
  add t0,t0,t1
- add t0,t0,gp
- sw a2,0(t0)
- sw a3,4(t0)
- addi t3,t3,1
- sw t3,0(t2)
- lw t0,4(t2)
- bgeu t0,t3,1f
- sw t3,4(t2)
-1: INC H_RECEIVED,t0
- bne t3,t4,2f
- li t0,12
- csrw 0x711,t0
-2: ret
-.Lspike_received:
+ mv a0,a2
+ mv a3,a1
+ li a1,0x20000
+ li a2,0
+ li t1,0x402
+ SEND t0,t1
+.Lspike_done:
  INC H_RECEIVED,t0
- ret
-.Lspill_spike:
- li t0,8100
- bgeu t3,t0,.Lspill_bad
- ENTER 5
- mv s0,t2
- mv s1,t3
- mv s2,a3
- mv s3,a2
- sub t0,t3,t4
- slli t0,t0,3
- lw s4,12(s0)
- add s4,s4,t0
- mv a0,s4
- mv a1,s3
- call br_store_word
- addi a0,s4,4
- mv a1,s2
- call br_store_word
- lw t0,16(s0)
- addi t0,t0,1
- sw t0,16(s0)
- addi s1,s1,1
- sw s1,0(s0)
- lw t0,4(s0)
- bgeu t0,s1,1f
- sw s1,4(s0)
-1: INC H_RECEIVED,t0
- LEAVE 5
-.Lspill_bad:
- li a0,0xb00c
- j br_halt
+ j br_idle
 .globl br_control
 br_control:
  sw zero,H_REPORT_COUNT(gp)
@@ -747,15 +688,15 @@ br_control:
  beq a0,t0,3f
  sw a0,H_PHASE(gp)
  sw zero,H_JOIN_COUNT(gp)
- li t0,1
- bne a0,t0,5f
  sw zero,H_BUF_USED(gp)
 5: sw a1,H_ACTIVE_MCS(gp)
  sw zero,H_WORK_NEURON(gp)
  sw zero,H_WORK_LINE(gp)
  sw zero,H_WORK_MC(gp)
  sw zero,H_SENT(gp)
- li t0,2
+ /* Phase 1 is integration.  Phase 2 is forward delivery and static CSR
+  * scatter.  Phase 3 remains post-active reverse learning. */
+ li t0,1
  bne a0,t0,6f
  addi t0,gp,256
  sw t0,H_WORK_NEURON(gp)
@@ -840,9 +781,9 @@ br_report:
 .Lroot_report:
  beqz a0,.Lreport_boot
  li t0,1
- beq a0,t0,.Lreport_forward
+ beq a0,t0,.Lreport_integrate
  li t0,2
- beq a0,t0,.Lnext_reverse
+ beq a0,t0,.Lreport_forward
  li t0,3
  beq a0,t0,.Lreport_reverse
  li t0,4
@@ -873,6 +814,11 @@ br_report:
  li a0,1
  li a1,0
  j br_broadcast
+.Lreport_integrate:
+ /* The integration barrier advances directly to phase 2 forward work. */
+ li a0,2
+ lw a1,H_ACTIVE_MCS(gp)
+ j br_broadcast
 .Lreport_forward:
  lw t0,H_EXPECTED_FORWARD(gp)
  add t0,t0,t1
@@ -886,7 +832,7 @@ br_report:
  bgtu t1,t0,.Lreport_bad
  li a0,4
  bne t0,t1,1f
- li a0,2
+ li a0,3
 1: lw a1,H_ACTIVE_MCS(gp)
  j br_broadcast
 .Lnext_reverse:
@@ -1010,7 +956,7 @@ br_work:
  lw s1,H_WORK_NEURON(gp)
  li t0,6
  beq s0,t0,.Lwork_finish
- li t0,1
+ li t0,2
  bne s0,t0,.Lwork_select
  lw t0,H_WORK_LINE(gp)
  lw t1,H_WORK_MC(gp)
@@ -1034,20 +980,13 @@ br_work:
 .Lwork_select:
  lw t0,H_NN(gp)
  bltu s1,t0,.Lwork_neuron
- li t0,3
- bne s0,t0,.Lwork_report
- li s2,REPLAY
- add s2,s2,gp
- lw t0,8(s2)
- lw t1,0(s2)
- bltu t0,t1,.Lwork_replay
  j .Lwork_report
 .Lwork_neuron:
  li t0,80
  mul s2,s1,t0
  add s2,s2,gp
  addi s2,s2,256
- li t0,1
+ li t0,2
  bne s0,t0,.Lwork_reverse_neuron
  /* Start a fired row once; later work events finish its static directories. */
  lw t0,H_WORK_LINE(gp)
@@ -1060,22 +999,6 @@ br_work:
  beqz t0,.Lwork_next_neuron
  lw s4,N_COUNT(s2)
  beqz s4,.Lwork_directory
- /* Keep only FP32 weights in the persistent 8 KiB buffer. */
- addi t0,s4,7
- andi t0,t0,-8
- slli t0,t0,2
- lw t1,H_BUF_USED(gp)
- add t2,t1,t0
- li t3,BR_BUFFER_LIMIT
- bgtu t2,t3,.Lforward_overflow
- li t0,BUFFER
- add t0,t0,gp
- add t0,t0,t1
- sw t0,N_BUFFER(s2)
- sw t2,H_BUF_USED(gp)
- j .Lforward_first
-.Lforward_overflow:
- INC H_OVERFLOW_ROWS,t0
 .Lforward_first:
  li s3,0                     # row synapse index at chunk start
  li s11,0                    # landing half, 0 or 1
@@ -1120,13 +1043,7 @@ br_forward_wait:
  add s5,s5,gp
  slli t0,s4,2
  add s9,s5,t0              # weight-half end
- lw s8,N_BUFFER(s2)
- beqz s8,2f
- slli t0,s3,2
- add s8,s8,t0
- j 3f
-2: mv s8,s5                # overflow: harmless store back to staging
-3: lw s6,N_WEIGHTS(s2)
+ lw s6,N_WEIGHTS(s2)
  srli t0,s3,7
  slli t0,t0,10
  add s6,s6,t0
@@ -1162,12 +1079,10 @@ br_forward_drain:
  bgeu s5,s9,.Lforward_chunk_done
  lw t0,512(s5)             # destination: high 16 input offset, low 16 PU
  lw a1,0(s5)               # already scaled FP32 weight
- sw a1,0(s8)
  srli a0,t0,16
  mv a2,s6
  mv a3,s10
  addi s5,s5,4
- addi s8,s8,4
  addi s6,s6,4
  SENDI t0,-1023            # 0xc01; destination is truncated to 16 bits
  YIELDI 12                 # replenish quota and admit higher-priority events
@@ -1220,7 +1135,7 @@ br_work_directory:
  lw s6,H_WORK_MC(gp)
  li t0,16
  bgeu s6,t0,.Lwork_next_neuron
- li t0,1
+ li t0,2
  bne s0,t0,1f
  lw s7,60(s2)
  j 2f
@@ -1246,18 +1161,13 @@ br_work_directory:
  beqz s5,5f
  li a2,0
  li a3,0
- li t2,1
+ li t2,2
  beq s0,t2,.Lstatic_scatter_tag
  lw t0,H_DEP(gp)
  lw t1,28(s2)
  fmul.s a2,t0,t1
  lw a3,H_POT(gp)
  li t2,0xc04
- li t0,REPLAY
- add t0,t0,gp
- lw t1,24(t0)
- add t1,t1,s5
- sw t1,24(t0)
  j 4f
 .Lstatic_scatter_tag:
  li t2,0xc01
@@ -1284,66 +1194,6 @@ br_work_advance:
  j .Lwork_continue
 br_work_flush:
 .Lwork_finish:
- /* Examine one aligned group of eight dirty bits, skipping clean groups.
-  * Row padding is eight words, so a group never includes another row. */
-.Lflush_next:
- lw s1,H_WORK_NEURON(gp)
- lw t0,H_NN(gp)
- bgeu s1,t0,.Lflush_done
- li t0,80
- mul s2,s1,t0
- add s2,s2,gp
- addi s2,s2,256
- lw s5,N_BUFFER(s2)
- beqz s5,.Lflush_next_row
- lw s3,H_WORK_LINE(gp)
- lw t0,N_COUNT(s2)
- bgeu s3,t0,.Lflush_next_row
- slli t0,s3,2
- add s5,s5,t0
- lw s7,N_WEIGHTS(s2)
- srli t1,s3,7
- slli t1,t1,10
- andi t0,s3,127
- slli t0,t0,2
- add s7,s7,t1
- add s7,s7,t0
- sub t0,s5,gp
- li t1,BUFFER
- sub t0,t0,t1
- srli t0,t0,2
- andi t1,t0,31
- srli t0,t0,5
- slli t0,t0,2
- li t2,DIRTY
- add t0,t0,t2
- add t0,t0,gp
- lw s6,0(t0)
- srl s6,s6,t1
- andi s6,s6,255
- li s4,8
-.Lflush_lane:
- beqz s6,2f
- andi t0,s6,1
- beqz t0,1f
- mv a0,s7
- lw a1,0(s5)
- call br_store_word
- INC H_WRITE_WORDS,t0
-1: srli s6,s6,1
- addi s5,s5,4
- addi s7,s7,4
- addi s4,s4,-1
- bnez s4,.Lflush_lane
-2: addi s3,s3,8
- sw s3,H_WORK_LINE(gp)
- j .Lwork_continue
-.Lflush_next_row:
- addi s1,s1,1
- sw s1,H_WORK_NEURON(gp)
- sw zero,H_WORK_LINE(gp)
- j .Lflush_next
-br_work_finalize:
 .Lflush_done:
  call br_drain
  lw t0,H_MSHR_COUNT(gp)
@@ -1393,7 +1243,7 @@ br_work_finalize:
 br_work_report:
 .Lwork_report:
  li a2,0
- li t0,1
+ li t0,2
  bne s0,t0,3f
  addi t0,gp,256
  lw t1,H_NN(gp)

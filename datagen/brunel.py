@@ -157,17 +157,12 @@ class Reference:
         f = n.view(np.float32)
         c = self.c
         old = n[:, 9].copy()
-        n[:, 10] = old
-        plastic = ranges(np.flatnonzero(old[:NE]), self.po)
-        if cache is not None:
-            self.w[plastic] = cache.forward_spikes(self, old, plastic)
-        static = ranges(np.flatnonzero(old), self.so)
-        ei = np.zeros(NE + NI, dtype=np.float32)
-        ii = ei.copy()
-        np.add.at(ei, self.post[plastic], self.w[plastic])
-        exc = self.sp[static] < NE
-        np.add.at(ei, self.st[static[exc]], F(c["external_weight"] * c["epsc"] * c["delivery"]))
-        np.add.at(ii, self.st[static[~exc]], F(c["inhibitory_weight"] * c["epsc"] * c["delivery"]))
+        # The hardware integrates first, then forwards the spikes produced by
+        # this integration.  Input fields are the one-step delivery buffer.
+        ei = f[:, 17].copy()
+        ii = f[:, 18].copy()
+        f[:, 17] = F(0)
+        f[:, 18] = F(0)
         v = F(
             F(F(F(c["p31"] * f[:, 2]) + F(c["p32"] * f[:, 1])) + F(c["p31"] * f[:, 4]))
             + F(c["p32"] * f[:, 3])
@@ -186,14 +181,23 @@ class Reference:
         )
         fired = (n[:, 5] == 0) & (f[:, 0] >= 20)
         n[:, 9] = fired
+        n[:, 10] = fired
         f[fired, 0] = 0
         n[fired, 5] = 5
         f[:, 6] = F(f[:, 6] * c["decay_pre"])
         f[:, 7] = F(f[:, 7] * c["decay_post"])
+        plastic = ranges(np.flatnonzero(fired[:NE]), self.po)
+        if cache is not None:
+            self.w[plastic] = cache.forward_spikes(self, fired, plastic)
+        static = ranges(np.flatnonzero(fired), self.so)
+        np.add.at(f[:, 17], self.post[plastic], self.w[plastic])
+        exc = self.sp[static] < NE
+        np.add.at(f[:, 17], self.st[static[exc]], F(c["external_weight"] * c["epsc"] * c["delivery"]))
+        np.add.at(f[:, 18], self.st[static[~exc]], F(c["inhibitory_weight"] * c["epsc"] * c["delivery"]))
         potentiated = self.reverse[ranges(np.flatnonzero(fired[:NE]), self.ro)]
         if cache is not None:
-            cache.learn(self, old, plastic, potentiated)
-            f[:, 6] = F(f[:, 6] + old.astype(np.float32))
+            cache.learn(self, fired, plastic, potentiated)
+            f[:, 6] = F(f[:, 6] + fired.astype(np.float32))
             f[:, 7] = F(f[:, 7] + fired.astype(np.float32))
             return [int(fired[:NE].sum()), int(fired[NE:].sum())]
         dep = F(c["dep"] * f[self.post[plastic], 7])
@@ -208,7 +212,7 @@ class Reference:
         self.w[potentiated] = F(w + pot)
         if self.rule == "additive":
             np.minimum(self.w, c["wmax"], out=self.w)
-        f[:, 6] = F(f[:, 6] + old.astype(np.float32))
+        f[:, 6] = F(f[:, 6] + fired.astype(np.float32))
         f[:, 7] = F(f[:, 7] + fired.astype(np.float32))
         return [int(fired[:NE].sum()), int(fired[NE:].sum())]
 
@@ -454,7 +458,7 @@ def generate(args):
             data_end=DATA_END,
             stack_bytes=256,
             stack_bases=[0x3F00, 0x3F80],
-            forward_buffer_bytes=8192,
+            forward_buffer_bytes=0,
             forward_weight_bytes=4,
             mshr_entries=16,
             mshr_entry_bytes=64,
@@ -468,7 +472,7 @@ def generate(args):
             stream_offset=STREAM_BASE,
             spill_bytes_per_pu=65536,
         ),
-        ordering="forward -> alpha-current integration -> reverse LTD then LTP -> trace increments",
+        ordering="alpha-current integration -> forward/static delivery with post-side quiet LTD -> reverse LTP/LTD -> trace increments",
         graph_rng="numpy.default_rng; fixed indegree with replacement, recurrent autapses excluded",
         numpy_version=np.__version__,
         payload_sha256=hashlib.sha256(payload).hexdigest(),

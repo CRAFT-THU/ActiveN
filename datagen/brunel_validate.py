@@ -61,8 +61,6 @@ def dump(path):
         pos += size
         spms.append(s)
         n = s[64 : 64 + int(s[4]) * 20].reshape(-1, 20)
-        if np.any(n[:, 17:19]):
-            raise ValueError("completed timestep retains incoming spike accumulators")
         neurons[n[:, 11]] = n
     if pos != len(b):
         raise ValueError("trailing SPM data")
@@ -234,15 +232,13 @@ def validate_buffer(args, manifest, initial, log, steps):
             # deterministic equations, including delivery, with that integer.
             # A missing/misrouted recurrent spike is not an integer noise draw
             # and fails the residual check instead of being hidden by resync.
-            old = reference.n[:, 9]
-            plastic = ranges(np.flatnonzero(old[:NE]), reference.po)
-            static = ranges(np.flatnonzero(old), reference.so)
-            ei = np.zeros(NE + NI, np.float32)
-            np.add.at(ei, reference.post[plastic], reference.w[plastic])
-            static = static[reference.sp[static] < NE]
             c = reference.c
-            np.add.at(ei, reference.st[static], F(c["external_weight"] * c["epsc"] * c["delivery"]))
-            base = F(F(c["p11"] * reference.n[:, 2].view(np.float32)) + ei)
+            # Integration now consumes the one-step input fields populated by
+            # the preceding forward phase.  Recurrent deliveries are already
+            # present in fields 17/18, so the only unknown increment is the
+            # external Poisson sample.
+            f = reference.n.view(np.float32)
+            base = F(F(c["p11"] * f[:, 2]) + f[:, 17])
             delta = (actual[:, 2].view(np.float32).astype(float) - base) / float(F(c["epsc"] * c["external_weight"]))
             noise = np.rint(delta).astype(np.int32)
             residual = float(np.max(np.abs(delta - noise)))

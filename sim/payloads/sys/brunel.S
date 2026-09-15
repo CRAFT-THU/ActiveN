@@ -20,7 +20,7 @@ _start:
   csrw (0x710+\id),t0
   .endm
   INSTALL 0,completion,18,0
-  INSTALL 1,spike,20,0x00020002
+  INSTALL 1,br_spike,20,0x00020002
   INSTALL 2,control,20,0x00030005
   INSTALL 3,report,20,0x00020004
   INSTALL 4,reverse,12,0x000a0011
@@ -41,9 +41,6 @@ thread_one:
   j idle
 completion:
   call br_completion
-  j idle
-spike:
-  call br_spike
   j idle
 control:
   call br_control
