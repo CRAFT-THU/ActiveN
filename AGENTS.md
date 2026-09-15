@@ -460,6 +460,7 @@ For the current 64-PU/2-MC configuration:
 | --- | --- | --- | ---: |
 | `barrier_test` | `sys/barrier_test.bin` | same | 100,000 |
 | `local_send_test` | `sys/local_send_test.bin` | same | 100,000 |
+| `no_receipt_store_test` | `sys/no_receipt_store_test.bin` | same | 100,000 |
 | `csr_scatter_test` | `sys/csr_scatter_test.bin` | `sys/csr_scatter_dram1.bin` | 100,000 |
 | `pingpong_test` | `sys/pingpong_test.bin` | same | 500,000 |
 | `random_noc_test` | `sys/random_noc_test.bin` | same | 500,000 |

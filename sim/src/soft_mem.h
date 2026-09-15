@@ -101,19 +101,22 @@ struct MSHR {
   bool write;
 
   bool isBroadcast() const noexcept { return src == 0; }
+  bool isNoReceipt() const noexcept { return src == 0xFFFF; }
 
   static MSHR fromScalarFlit(const Flit &f) {
+    const uint8_t tag = static_cast<uint8_t>(f.tag);
     if constexpr (ASSERTIONS_ENABLED) {
-      if ((f.tag & 0xFF) > 1) throw std::invalid_argument("Unknown scalar request type");
+      if (tag != 0x00 && tag != 0x01 && tag != 0x02)
+        throw std::invalid_argument("Unknown scalar request type");
     }
-    bool isWrite = (f.tag & 0xFF) != 0;
+    bool isWrite = tag == 0x01 || tag == 0x02;
 
     std::array<uint32_t, MEM_BUS_WIDTH_B / 4> tmp;
     tmp.fill(f.data[3]);
 
     return MSHR {
       .addr = f.data[0],
-      .src = f.src,
+      .src = tag == 0x02 ? static_cast<uint16_t>(0xFFFF) : f.src,
       .id = (uint16_t) (f.data[1] & 0xFFFF),
       .rwdata = std::bit_cast<MemLine>(tmp),
       .carried = {f.data[2], f.data[3]},
@@ -233,7 +236,7 @@ protected:
 
   static bool isScalarRequest(const Flit &f) noexcept {
     const uint8_t tag = static_cast<uint8_t>(f.tag);
-    return tag == 0x00 || tag == 0x01;
+    return tag == 0x00 || tag == 0x01 || tag == 0x02;
   }
 
   static bool isBulkRequest(const Flit &f) noexcept {
@@ -404,8 +407,10 @@ public:
       if (fulfilled.test(resp.id))
         throw std::logic_error("mshrRespAccept: duplicate response");
     }
+    const bool noReceipt = mshrs[resp.id].isNoReceipt();
     mshrs[resp.id].rwdata = resp.data;
     fulfilled.set(resp.id);
+    if (noReceipt) mshrDeallocCommit(resp.id);
   }
 
   std::optional<uint8_t> mshrReturnSlot(bool broadcast) const noexcept
