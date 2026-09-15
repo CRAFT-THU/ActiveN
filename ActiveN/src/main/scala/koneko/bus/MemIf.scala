@@ -35,7 +35,7 @@ object MemOp extends ChiselEnum {
   def fromTag(tag: UInt): (Bool, MemOp.Type) = {
     // TODO: impl by decoder
     (
-      tag(7, 0) === 0x00.U || tag(7, 0) === 0x01.U,
+      tag(7, 0) === 0x00.U || tag(7, 0) === 0x01.U || tag(7, 0) === 0x02.U,
       Mux(tag(7, 0) === 0x00.U, MemOp.Load, MemOp.Store)
     )
   }
@@ -45,7 +45,9 @@ class MSHR extends Bundle {
   val ty        = MemOp()
 
   // Return status
-  val src       = UInt(16.W) // 0 = broadcast. TODO: this is bad for constant propagation & DCE
+  // 0 = broadcast. TODO: this is bad for constant propagation & DCE
+  // 0xFFFF = no receipt
+  val src       = UInt(16.W)
   val id        = UInt(16.W) // Or return tag
 
   val address   = UInt(32.W)
@@ -55,6 +57,7 @@ class MSHR extends Bundle {
   val carried = Vec(2, UInt(32.W)) // Extra data carried by the request, e.g. for broadcast
 
   def isBroadcast: Bool = src === 0.U
+  def isNoRecepit: Bool = src === 0xFFFF.U
 }
 
 object MSHR {
@@ -63,7 +66,7 @@ object MSHR {
     val p = Wire(new MSHR)
     val (isScalar, ty) = MemOp.fromTag(flit.tag)
     p.ty := ty
-    p.src := flit.src
+    p.src := Mux(flit.tag(7, 0) === 0x02.U, 0xFFFF.U, flit.src)
 
     // Operand 0
     p.address := flit.data(0)
@@ -302,6 +305,12 @@ abstract class MemIf(
       fulfilled(respIdx) := true.B
       // May overwrite wdata, but stores do not consume it after completion.
       buffer(respIdx) := resp.bits.rdata
+
+      // Directly deallocate MSHR if it is a no-receipt request to prevent it from participating in the
+      // ejection arbitration
+      when(mshrs(respIdx).isNoRecepit) {
+        allocated(respIdx) := false.B
+      }
     }
   }
 

@@ -27,6 +27,8 @@ We currently allocates the following events Tag for memory requests / responses.
   - operand[2]: Carried data 1
     - For request ID = 0x8003, carried data 1 = {16-bit return handler ID, any 16-bit token}. Completion passes the token in `a0` and operand[3] in `a1`.
   - operand[3]: The data to write, replicated to fill 32 bits (e.g. for byte access, the byte is replicated 4 times in operand[3])
+- 0x?02: Fire-and-forget store
+  - Identical to stores, but with no receipt. Operand[2] and the low half of operand[1] is meaningless.
 - 0x?10: CSR access
   - operand[0]: the start of the row
   - operand[1][31:16]: the number of memory lines to read
