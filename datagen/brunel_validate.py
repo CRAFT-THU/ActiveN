@@ -7,7 +7,7 @@ import re
 import struct
 from pathlib import Path
 import numpy as np
-from brunel import NE, NI, PU, MC, F, offsets, Reference
+from brunel import NE, NI, PU, MC, F, offsets, ranges, Reference
 
 
 def pending_power(w):
@@ -55,7 +55,7 @@ def dump(path):
     for pu in range(PU):
         identity, size = struct.unpack_from("<II", b, pos)
         pos += 8
-        if identity != pu + 1 or size != 10240:
+        if identity != pu + 1 or size not in (10240, 16384):
             raise ValueError("invalid SPM record")
         s = np.frombuffer(b[pos : pos + size], "<u4")
         pos += size
@@ -124,7 +124,16 @@ def logical_weights(spms, nodes, initial, path, rule):
         lo, hi = off[pre : pre + 2]
         base = int(nodes[pre, 12])
         mc = (pre % PU) // 32
-        w[lo:hi] = drams[mc][base // 4 : base // 4 + hi - lo].view(np.float32)
+        if int(spms[0][0]) == 0x42524E34:
+            lane = np.arange(hi - lo)
+            index = base // 4 + (lane // 128) * 256 + lane % 128
+            w[lo:hi] = drams[mc][index].view(np.float32)
+        else:
+            w[lo:hi] = drams[mc][base // 4 : base // 4 + hi - lo].view(np.float32)
+    if int(spms[0][0]) in (0x42524E33, 0x42524E34):
+        if any(s[18] != s[19] or s[39] or s[42] for s in spms):
+            raise ValueError("unfinished buffer transport")
+        return w, {"persistent_cache": False}
     for pu, s in enumerate(spms):
         if s[18] != s[19] or np.any(s[38:46]):
             raise ValueError("snapshot contains unfinished memory requests")
@@ -195,6 +204,149 @@ def logical_weights(spms, nodes, initial, path, rule):
     return w, cache
 
 
+def validate_buffer(args, manifest, initial, log, steps):
+    """New runtime has no deferred learning: final DRAM is authoritative."""
+    reference = Reference(
+        tuple(initial[k] for k in ("pre", "post", "static_pre", "static_post")),
+        manifest["rule"],
+        state=(initial["neurons"], initial["weights"]),
+    )
+    comparisons = {}
+    previous = np.zeros(3, np.int64)
+    shared_rng = manifest.get("rng", "").startswith("per-SMT")
+    noise_counts = np.zeros(10, np.int64)
+    maximum_noise_residual = 0.0
+    previous_stream = np.zeros(4, np.int64)
+    for s in steps:
+        s.setdefault("pool_full", s["allocation_waits"])
+        spms, actual = dump(args.dumps / f"step-{s['step']:04}.bin")
+        for spm in spms:
+            if spm[0] not in (0x42524E33, 0x42524E34) or spm[18] != spm[19] or spm[39] or spm[42]:
+                raise ValueError("unfinished buffer/MSHR transport")
+            if np.any(spm[0x2E00 // 4 : 0x2F00 // 4]):
+                raise ValueError("unflushed dirty weights")
+            if any(spm[base // 4] != 0x19CA7EAD for base in manifest["spm"].get("stack_bases", [0x3800, 0x3C00])):
+                raise ValueError("stack guard damaged")
+            if np.any(spm[0x2900 // 4 + 11 : 0x2D00 // 4 : 16]):
+                raise ValueError("live MSHR at timestep boundary")
+        if shared_rng:
+            # Infer the independent Poisson integer from dIex. Re-run all
+            # deterministic equations, including delivery, with that integer.
+            # A missing/misrouted recurrent spike is not an integer noise draw
+            # and fails the residual check instead of being hidden by resync.
+            old = reference.n[:, 9]
+            plastic = ranges(np.flatnonzero(old[:NE]), reference.po)
+            static = ranges(np.flatnonzero(old), reference.so)
+            ei = np.zeros(NE + NI, np.float32)
+            np.add.at(ei, reference.post[plastic], reference.w[plastic])
+            static = static[reference.sp[static] < NE]
+            c = reference.c
+            np.add.at(ei, reference.st[static], F(c["external_weight"] * c["epsc"] * c["delivery"]))
+            base = F(F(c["p11"] * reference.n[:, 2].view(np.float32)) + ei)
+            delta = (actual[:, 2].view(np.float32).astype(float) - base) / float(F(c["epsc"] * c["external_weight"]))
+            noise = np.rint(delta).astype(np.int32)
+            residual = float(np.max(np.abs(delta - noise)))
+            maximum_noise_residual = max(maximum_noise_residual, residual)
+            if np.any(noise < 0) or np.any(noise > 9) or residual > 2e-4:
+                raise ValueError(f"invalid external Poisson increment: residual={residual}")
+            noise_counts += np.bincount(noise, minlength=10)
+            reference.tick(external=noise)
+        else:
+            reference.tick()
+        comparisons[str(s["step"])] = compare_nodes(actual, reference.n)
+        if shared_rng:
+            # Carry the observed stochastic trajectory into the next step;
+            # weights remain independently computed throughout the run.
+            reference.n = actual.copy()
+        s["reference_E"], s["reference_I"] = manifest["reference_spikes"][s["step"] - 1]
+        replay = 0x2D80 // 4
+        current = np.array(
+            [sum(int(spm[replay + k]) for spm in spms) for k in (4, 5, 6)]
+        )
+        for key, value in zip(
+            ("spill_records", "manual_reverse", "scatter_reverse"), current - previous
+        ):
+            s[key] = int(value)
+        previous = current
+        s["maximum_buffer_bytes_per_pu"] = max(int(spm[38]) for spm in spms)
+        s["mshr_peak_per_pu"] = max(int(spm[45]) for spm in spms)
+        s["record_peak_per_pu"] = max(int(spm[replay + 1]) for spm in spms)
+        if "stream_offset" in manifest["spm"]:
+            stream = manifest["spm"]["stream_offset"] // 4
+            current_stream = np.array([sum(int(spm[stream + k]) for spm in spms) for k in range(1, 5)])
+            for key, value in zip(("bulk_copies", "overlap_checks", "overlap_ready", "ac_wait_polls"), current_stream - previous_stream):
+                s[key] = int(value)
+            previous_stream = current_stream
+    if len(steps) != manifest["warmup"] + manifest["timed"]:
+        raise ValueError("incomplete timestep sequence")
+    observed, _ = logical_weights(spms, actual, initial, args.dumps, manifest["rule"])
+    error = np.abs(observed.astype(float) - reference.w.astype(float))
+    timed = steps[manifest["warmup"] :]
+    keys = (
+        "E",
+        "I",
+        "buffer_updates",
+        "mshr_loads",
+        "mshr_commits",
+        "overflow_rows",
+        "write_words",
+        "pool_full",
+        "allocation_waits",
+        "forward_weights",
+        "reverse_events",
+        "spill_records",
+        "manual_reverse",
+        "scatter_reverse",
+    )
+    if shared_rng:
+        keys += ("bulk_copies", "overlap_checks", "overlap_ready", "ac_wait_polls")
+    timer = re.search(r"\[System\] Timer: (\d+) cycles", log)
+    if timer is None:
+        raise ValueError("missing timer")
+    report = dict(
+        rule=manifest["rule"],
+        kernel=manifest["kernel"],
+        steps=steps,
+        neurons=comparisons,
+        cycles_per_timestep=int(timer[1]) / len(timed),
+        average_per_timestep={k: sum(s[k] for s in timed) / len(timed) for k in keys},
+        maximum_buffer_bytes_per_pu=max(
+            s["maximum_buffer_bytes_per_pu"] for s in steps
+        ),
+        mshr_peak_per_pu=max(s["mshr_peak_per_pu"] for s in steps),
+        record_peak_per_pu=max(s["record_peak_per_pu"] for s in steps),
+        weights=dict(
+            count=len(observed),
+            max_absolute=float(error.max()),
+            rms=float(np.sqrt(np.mean(error**2))),
+            different=int(np.count_nonzero(observed != reference.w)),
+        ),
+        stochastic_replay=shared_rng,
+        inferred_poisson_histogram=noise_counts.tolist() if shared_rng else None,
+        maximum_poisson_residual=maximum_noise_residual if shared_rng else None,
+        reference_average_per_timestep={k: float(np.mean([manifest["reference_spikes"][s["step"] - 1][i] for s in timed])) for i, k in enumerate(("E", "I"))},
+    )
+    args.output.write_text(json.dumps(report, indent=2) + "\n")
+    for c in comparisons.values():
+        integer_fields = ("gid", "fire", "pre_fire", "refractory") if shared_rng else ("rng", "gid", "fire", "pre_fire", "refractory")
+        if any(c[k]["different"] for k in integer_fields):
+            raise ValueError("integer neuron state divergence")
+        if c["V"]["max_absolute"] > 0.02:
+            raise ValueError("voltage divergence")
+        for k in ("Iex", "dIex", "Iin", "dIin", "pre_trace", "post_trace"):
+            if c[k]["max_relative_scaled"] > 2e-4:
+                raise ValueError("neuron state divergence: " + k)
+    if not np.all(np.isfinite(observed)) or error.max() > (0.02 if shared_rng else 0.002):
+        raise ValueError("plastic weight divergence")
+    if sum(s["mshr_loads"] for s in steps) != sum(s["mshr_commits"] for s in steps):
+        raise ValueError("MSHR accounting mismatch")
+    print(
+        json.dumps(
+            {k: v for k, v in report.items() if k not in ("steps", "neurons")}, indent=2
+        )
+    )
+
+
 def validate(args):
     manifest = json.loads((args.images / "manifest.json").read_text())
     initial = np.load(args.images / "initial.npz")
@@ -205,6 +357,8 @@ def validate(args):
     for line in log.splitlines():
         if line.startswith("[Brunel step]"):
             steps.append({k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", line)})
+    if manifest.get("kernel") == "timestep-buffer-mshr":
+        return validate_buffer(args, manifest, initial, log, steps)
     expected = manifest["reference_spikes"]
     reference = Reference(
         tuple(initial[k] for k in ("pre", "post", "static_pre", "static_post")),
@@ -246,13 +400,21 @@ def validate(args):
         reference.tick()
         comparisons[str(s["step"])] = compare_nodes(observed_nodes, reference.n)
         replay = manifest["spm"].get("replay_record_bytes") == 8
-        spill_total = sum(int(spm[0x2400 // 4 + 4]) for spm in spms_step) if replay else 0
+        spill_total = (
+            sum(int(spm[0x2400 // 4 + 4]) for spm in spms_step) if replay else 0
+        )
         if replay:
-            current_replay = [spill_total] + [sum(int(spm[0x2400 // 4 + i]) for spm in spms_step) for i in (5, 6)]
-            for j, key in enumerate(("spill_records", "manual_reverse", "scatter_reverse")):
+            current_replay = [spill_total] + [
+                sum(int(spm[0x2400 // 4 + i]) for spm in spms_step) for i in (5, 6)
+            ]
+            for j, key in enumerate(
+                ("spill_records", "manual_reverse", "scatter_reverse")
+            ):
                 s[key] = current_replay[j] - previous_replay[j]
             previous_replay = current_replay
-            s["record_peak_per_pu"] = max(int(spm[0x2400 // 4 + 1]) for spm in spms_step)
+            s["record_peak_per_pu"] = max(
+                int(spm[0x2400 // 4 + 1]) for spm in spms_step
+            )
         loads = sum(int(spm[18]) - int(spm[34]) for spm in spms_step) - 2 * spill_total
         s["async_line_loads"] = loads - previous_loads
         previous_loads = loads
@@ -264,7 +426,9 @@ def validate(args):
             # A legacy line fill either creates a resident table entry or
             # materializes an evicted pending line. Net resident growth plus
             # all evictions therefore counts weight fills exactly.
-            s["weight_line_loads"] = s["resident_entries"] - previous_resident + s["evictions"]
+            s["weight_line_loads"] = (
+                s["resident_entries"] - previous_resident + s["evictions"]
+            )
         previous_resident = s["resident_entries"]
         s["other_async_line_loads"] = s["async_line_loads"] - s["weight_line_loads"]
         s["reference_E"], s["reference_I"] = expected[s["step"] - 1]
@@ -362,7 +526,11 @@ def validate(args):
         "table_state_change_per_timestep": {
             k: (
                 steps[-1][k]
-                - (steps[manifest["warmup"] - 1][k] if manifest["warmup"] else hot.get(k, 0))
+                - (
+                    steps[manifest["warmup"] - 1][k]
+                    if manifest["warmup"]
+                    else hot.get(k, 0)
+                )
             )
             / len(timed)
             for k in ("pending_coefficients", "dirty_weights")

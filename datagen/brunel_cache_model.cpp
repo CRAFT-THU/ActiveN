@@ -1,13 +1,19 @@
 /* Functional Brunel cache model. Memory effects execute in issue order; this
  * models traffic and state, not NoC arrival order or cycle timing. Compile with
  * -ffp-contract=off and without fast-math, as for the bare-metal payload. */
-#include "../sim/payloads/sys/brunel.h"
 #include "../sim/payloads/sys/brunel_numeric.h"
 #include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cstddef>
 #include <vector>
+
+// Historical cache policy experiment; deliberately independent of the current
+// timestep-buffer payload's SPM ABI.
+constexpr unsigned BR_SLOTS = 800;
+constexpr unsigned BR_CLEAN = 0, BR_DIRTY = 1, BR_PENDING_LTD = 2, BR_PENDING_LTP = 3;
+struct BrEntry { uint32_t tag, data; };
 
 enum Metric {
   Hits, Misses, TagHits, Probes, Inserts, Evictions, CleanEvictions,

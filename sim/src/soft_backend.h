@@ -292,6 +292,10 @@ class SoftSystemBackend : public SystemBackend {
     uint64_t executing = 0, stalled = 0, outstanding = 0;
     uint64_t egress = 0, injection_blocked = 0;
     uint64_t reverse_full = 0, spike_full = 0;
+    uint64_t mshr_occupancy = 0, mshr_full = 0, credit_full = 0;
+    uint64_t issued0 = 0, issued1 = 0, neurons0 = 0, neurons1 = 0;
+    uint64_t ac_wait_cycles = 0, biu_blocked_cycles = 0;
+    uint64_t last_forward_injection = 0;
   };
   std::vector<std::array<BrunelPuProfile, 4>> brunelPuProfile_;
   struct BrunelMcProfile {
@@ -301,9 +305,12 @@ class SoftSystemBackend : public SystemBackend {
   std::vector<std::array<BrunelMcProfile, 4>> brunelMcProfile_;
   std::unordered_map<uint64_t, uint64_t> brunelPcProfile_;
   uint32_t brunelProfileCompleted_ = 0;
+  struct BrunelMemoryEvent { uint64_t cycle; uint32_t pu, kind, token, address; };
+  std::vector<BrunelMemoryEvent> brunelMemoryEvents_;
+  void observeBrunelMemory(uint64_t cycle);
   void observeBrunelProfile(uint64_t cycle, const char *directory,
                            uint32_t completed);
-  std::array<uint64_t, 8> brunel_last_counts_{};
+  std::array<uint64_t, 9> brunel_last_counts_{};
   bool timer_stats_start_pending_ = false;
   bool timer_stats_active_ = false;
   bool log_ = false;

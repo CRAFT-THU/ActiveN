@@ -1,17 +1,34 @@
 /* Hand-written Brunel runtime, RV32I/Zmmul/Zfinx.
  * gp = immutable local SPM base on both SMT threads.
  * a0-a7,t0-t6 are caller-clobbered; s0-s11 follow the usual callee-save ABI.
- * Only SMT0 mutates the weight cache and issues credited memory requests.
+ * Only SMT0 mutates the timestep buffer and issues credited memory requests.
  * SMT1 consumes completions and records spikes until the local buffer fills.
- * All cache keys are full MC-local addresses. Memory effects must be ordered.
+ * Reverse events carry full MC-local addresses. Memory effects must be ordered.
  */
 #include "brunel_asm_layout.inc"
 .option norelax
-.equ TABLE, 0x900
-.equ READ, 0x2200
-.equ REPLAY, 0x2400
-.equ RECORD, 0x2800
-.equ SLOTS, 800
+.equ BUFFER, 0x900
+.equ BR_BASE, 0x20000000
+.equ MSHR, 0x2900
+.equ READ, 0x2d00
+.equ REPLAY, 0x2d80
+.equ RECORD, 0x2f00
+.equ DIRTY, 0x2e00
+.equ PING, 0x3700
+.equ POISSON, 0x2da4
+.equ STREAM, 0x2dd0
+#ifndef BR_MSHR_LIMIT
+#define BR_MSHR_LIMIT 16
+#endif
+#ifndef BR_BUFFER_LIMIT
+#define BR_BUFFER_LIMIT 8192
+#endif
+#if BR_MSHR_LIMIT < 1 || BR_MSHR_LIMIT > 16
+#error Invalid MSHR test limit
+#endif
+#if BR_BUFFER_LIMIT < 0 || BR_BUFFER_LIMIT > 8192 || (BR_BUFFER_LIMIT & 31)
+#error Invalid forward buffer test limit
+#endif
 .macro ENTER n
  addi sp,sp,-(((\n+1)*4+15)&-16)
  sw ra,0(sp)
@@ -93,18 +110,17 @@
  addi sp,sp,(((\n+1)*4+15)&-16)
  ret
 .endm
-/* Address/tag -> home index. State bits disappear in the word-address shift. */
-.macro HASH out,addr,tmp
- srli \out,\addr,2
- li \tmp,2654435761
- mul \out,\out,\tmp
- srli \out,\out,16
- li \tmp,SLOTS
- mul \out,\out,\tmp
- srli \out,\out,16
-.endm
 .macro SEND dst,tag
  .insn r 0x0b,4,0,x0,\dst,\tag
+.endm
+.macro YIELD dst,tag
+ .insn r 0x0b,5,0,x0,\dst,\tag
+.endm
+.macro SENDI dst,tag
+ .insn i 0x2b,4,x0,\dst,\tag
+.endm
+.macro YIELDI tag
+ .insn i 0x2b,5,x0,zero,\tag
 .endm
 .macro INC offset,tmp
  lw \tmp,\offset(gp)
@@ -119,30 +135,51 @@ br_completion:
  and t0,a0,t0
  bnez t0,1f
  li t0,3
- bgtu a1,t0,.Lbad_completion
+ bgtu a1,t0,.Lcompletion_mshr
  slli t0,a1,2
  add t0,gp,t0
  li t1,1
  sw t1,80(t0)
 1: INC H_CONSUMED,t0
  ret
+.Lcompletion_mshr:
+ li t0,MSHR
+ bltu a1,t0,.Lbad_completion
+ li t0,READ
+ bgeu a1,t0,.Lbad_completion
+ andi t0,a1,63
+ bnez t0,.Lbad_completion
+ add t0,gp,a1
+ li t1,2
+ sw t1,44(t0)
+ INC H_CONSUMED,t0
+ ret
 .Lbad_completion:
  li a0,0xb002
  j br_halt
 /* These leaf transports do not impose address-specific completion waits. */
 br_load_start:
+ slli a2,a1,5
+ li t0,READ
+ add a2,a2,t0
+/* a0=DRAM address, a1=completion token, a2=SPM byte offset. */
+br_line_start:
+ li t0,4
+ bgeu a1,t0,2f
  slli t0,a1,2
  add t0,gp,t0
  sw zero,80(t0)
-1: lw t0,H_ISSUED(gp)
+2:
+.Lload_credit_wait:
+ lw t0,H_ISSUED(gp)
  lw t1,H_CONSUMED(gp)
  sub t1,t0,t1
  sltiu t1,t1,12
- beqz t1,1b
+ beqz t1,.Lload_credit_wait
  addi t0,t0,1
  sw t0,H_ISSUED(gp)
  mv a3,a1
- addi a2,a1,(READ>>5)
+ srli a2,a2,5
  li a1,0x58002
  lw t0,H_MC(gp)
  li t1,0x8001
@@ -156,16 +193,37 @@ br_load_wait:
 1: lw t1,80(t0)
  beqz t1,1b
  ret
+/* Arm a LoadManual AC and issue the matching bulk request to the selected MC.
+ * a0=MC-local source address, a1=SPM offset, a2=byte length. */
+br_ac_start:
+ li t0,BR_BASE
+ add t0,t0,a1
+ csrw 0x732,t0
+ csrw 0x733,a2
+ li t0,1
+ csrw 0x730,t0
+ srli t0,a2,5
+ slli t0,t0,16
+ li t1,0x8001
+ or a1,t0,t1
+ li a2,0
+ li a3,0
+ lw t0,H_MC(gp)
+ li t1,0x8001
+ add t0,t0,t1
+ li t1,0x811
+ SEND t0,t1
+ ret
 br_weight_load:
  INC H_WEIGHT_LOADS,t0
  andi a0,a0,-32
  j br_load_start
 br_store_word:
-1: lw t0,H_ISSUED(gp)
+.Lstore_credit_wait: lw t0,H_ISSUED(gp)
  lw t1,H_CONSUMED(gp)
  sub t1,t0,t1
  sltiu t1,t1,12
- beqz t1,1b
+ beqz t1,.Lstore_credit_wait
  addi t0,t0,1
  sw t0,H_ISSUED(gp)
  mv a3,a1
@@ -193,32 +251,6 @@ br_halt:
  sw a0,0(t0)
 1: wfi
  j 1b
-/* lookup(a0=address) -> a0=entry or zero. Count all examined slots once. */
-br_lookup:
- HASH t0,a0,t1
- slli t0,t0,3
- li t1,TABLE
- add t0,t0,t1
- add t0,t0,gp
- li t3,0
- li t4,READ
- add t4,t4,gp
-1: lw t1,0(t0)
- addi t3,t3,1
- andi t1,t1,-4
- beq t1,a0,3f
- addi t0,t0,8
- bne t0,t4,2f
- li t0,TABLE
- add t0,t0,gp
-2: li t2,4
- bltu t3,t2,1b
- li t0,0
-3: lw t1,H_PROBES(gp)
- add t1,t1,t3
- mv a0,t0
- sw t1,H_PROBES(gp)
- ret
 /* update(a0=weight,a1=coefficient,a2=potentiation) -> updated/clipped a0. */
 #ifdef BR_ASM_SELFTEST
 .globl br_update
@@ -248,154 +280,126 @@ br_update:
  fadd.s a0,a0,s1
  fmax.s a0,a0,zero
  LEAVE 2
-/* Materialize exactly one pending coefficient, using refill slot zero. */
-br_materialize:
- lw t0,0(a0)
- andi t1,t0,2
- beqz t1,9f
- ENTER 2
- mv s0,a0
- mv s1,t0
- andi a0,t0,-4
- li a1,0
- call br_weight_load
- li a0,0
- call br_load_wait
- andi t0,s1,28
- li t1,READ
- add t0,t0,t1
- add t0,t0,gp
- lw a0,0(t0)
- lw a1,4(s0)
- andi a2,s1,1
- call br_update
- andi t0,s1,-4
- ori t0,t0,1
- sw a0,4(s0)
- sw t0,0(s0)
- LEAVE 2
-9: ret
-br_evict:
- lw t0,0(a0)
+/* One coalesced service event; only SMT0 owns ring indices and allocation.
+ * SMT1 only changes an allocated descriptor from loading(1) to ready(2).
+ * A full-pool allocator can retire the head itself, so it never waits for
+ * its own lower-priority service event. Same-step reverse routing emits each
+ * synapse exactly once (fired-post scatter OR nonfired-post replay).
+ */
+br_mshr_retire:
+ lw t0,H_MSHR_COUNT(gp)
  beqz t0,9f
- ENTER 1
- mv s0,a0
- INC H_EVICTIONS,t1
- andi t1,t0,2
- beqz t1,1f
- INC H_FORCED,t1
- call br_materialize
-1: lw t0,0(s0)
- andi t1,t0,3
- beqz t1,8f
- andi a0,t0,-4
- lw a1,4(s0)
+ ENTER 3
+ lw s0,H_MSHR_HEAD(gp)
+ slli s1,s0,6
+ li t0,MSHR
+ add s1,s1,t0
+ add s1,s1,gp
+ lw t0,44(s1)
+ li t1,2
+ bne t0,t1,8f
+ lw t0,32(s1)
+ andi t0,t0,28
+ add t0,t0,s1
+ lw s2,0(t0)
+ lw a1,36(s1)
+ beqz a1,1f
+ mv a0,s2
+ li a2,0
+ call br_update
+ mv s2,a0
+1: lw a1,40(s1)
+ beqz a1,2f
+ mv a0,s2
+ li a2,1
+ call br_update
+ mv s2,a0
+2: lw a0,32(s1)
+ mv a1,s2
  call br_store_word
  INC H_WRITE_WORDS,t0
-8: LEAVE 1
+ INC H_MSHR_COMMITS,t0
+ sw zero,44(s1)
+ addi s0,s0,1
+ andi s0,s0,15
+ sw s0,H_MSHR_HEAD(gp)
+ lw t0,H_MSHR_COUNT(gp)
+ addi t0,t0,-1
+ sw t0,H_MSHR_COUNT(gp)
+8: LEAVE 3
 9: ret
-/* Four probes total, including displacements. Scratch held entry at sp+40. */
-br_insert:
- ENTER 8
- HASH s2,a0,t0
- slli s5,s2,3
- li t0,TABLE
- add s5,s5,t0
- add s5,s5,gp
- lw s0,0(s5)
- lw s1,4(s5)
- sw a0,0(s5)
- sw a1,4(s5)
- INC H_PROBES,t0
- beqz s0,.Linsert_done
- HASH t0,s0,t1
- sub s3,s2,t0
- bgez s3,1f
- addi s3,s3,SLOTS
-1: li s4,3
-.Linsert_probe:
- addi s3,s3,1
- li t0,4
- beq s3,t0,.Linsert_evict
- HASH s2,s0,t0
- add s2,s2,s3
- li t0,SLOTS
- bltu s2,t0,2f
- addi s2,s2,-SLOTS
-2: slli s5,s2,3
- li t0,TABLE
- add s5,s5,t0
- add s5,s5,gp
- INC H_PROBES,t0
- lw s6,0(s5)
- lw s7,4(s5)
- beqz s6,.Linsert_empty
- HASH t0,s6,t1
- sub t0,s2,t0
- bgez t0,3f
- addi t0,t0,SLOTS
-3: bgtu t0,s3,4f
- sw s0,0(s5)
- sw s1,4(s5)
- mv s0,s6
- mv s1,s7
- mv s3,t0
-4: addi s4,s4,-1
- bnez s4,.Linsert_probe
-.Linsert_evict:
- sw s0,40(sp)
- sw s1,44(sp)
- addi a0,sp,40
- call br_evict
- j .Linsert_done
-.Linsert_empty:
- sw s0,0(s5)
- sw s1,4(s5)
-.Linsert_done:
- LEAVE 8
-/* apply(address,coefficient,potentiation). A missing key stores one coefficient. */
-br_apply:
- slli t0,a1,1
- beqz t0,9f
+.globl br_mshr_service
+br_mshr_service:
+ ENTER 0
+ call br_mshr_retire
+ lw t0,H_MSHR_COUNT(gp)
+ beqz t0,1f
+ li t0,0
+ li t1,6
+ SEND t0,t1
+ LEAVE 0
+1: sw zero,H_MSHR_SCHEDULED(gp)
+ LEAVE 0
+/* a0=address, a1=LTD coefficient, a2=LTP coefficient. */
+br_mshr_allocate:
  ENTER 4
  mv s0,a0
  mv s1,a1
  mv s2,a2
- call br_lookup
- mv s3,a0
- beqz a0,3f
- lw t0,0(a0)
- andi t0,t0,2
- bnez t0,2f
- INC H_HITS,t0
- lw a0,4(s3)
- mv a1,s1
- mv a2,s2
- call br_update
- sw a0,4(s3)
- ori t0,s0,1
- sw t0,0(s3)
- j 8f
-2: INC H_MISSES,t0
- INC H_FORCED,t0
- call br_materialize
- lw a0,4(s3)
- mv a1,s1
- mv a2,s2
- call br_update
- sw a0,4(s3)
- j 8f
-3: INC H_MISSES,t0
- addi t0,s2,2
- or a0,s0,t0
- mv a1,s1
- call br_insert
- INC H_PENDING,t0
-8: LEAVE 4
-9: ret
+ lw t0,H_MSHR_COUNT(gp)
+ li t1,BR_MSHR_LIMIT
+ bltu t0,t1,2f
+ INC H_POOL_FULL,t0
+ lw t0,H_MSHR_HEAD(gp)
+ slli t0,t0,6
+ li t1,MSHR
+ add t0,t0,t1
+ add t0,t0,gp
+ lw t0,44(t0)
+ li t1,2
+ beq t0,t1,1f
+ INC H_MSHR_WAITS,t0
+1: call br_mshr_retire
+ lw t0,H_MSHR_COUNT(gp)
+ li t1,BR_MSHR_LIMIT
+ bgeu t0,t1,1b
+2: lw t0,H_MSHR_TAIL(gp)
+ slli s3,t0,6
+ li t1,MSHR
+ add s3,s3,t1
+ add s3,s3,gp
+ addi t0,t0,1
+ andi t0,t0,15
+ sw t0,H_MSHR_TAIL(gp)
+ sw s0,32(s3)
+ sw s1,36(s3)
+ sw s2,40(s3)
+ li t0,1
+ sw t0,44(s3)
+ INC H_MSHR_LOADS,t0
+ sw t0,48(s3)
+ lw t0,H_MSHR_COUNT(gp)
+ addi t0,t0,1
+ sw t0,H_MSHR_COUNT(gp)
+ lw t1,H_MSHR_PEAK(gp)
+ bgeu t1,t0,3f
+ sw t0,H_MSHR_PEAK(gp)
+3: andi a0,s0,-32
+ sub a1,s3,gp
+ mv a2,a1
+ INC H_WEIGHT_LOADS,t0
+ call br_line_start
+ lw t0,H_MSHR_SCHEDULED(gp)
+ bnez t0,4f
+ li t0,1
+ sw t0,H_MSHR_SCHEDULED(gp)
+ li t0,0
+ li t1,6
+ SEND t0,t1
+4: LEAVE 4
 .globl br_reverse
 br_reverse:
- ENTER 4
+ ENTER 5
  li t0,80
  mul t0,a0,t0
  add s0,gp,t0
@@ -404,116 +408,57 @@ br_reverse:
  mv s2,a2
  mv s3,a3
  lw t0,N_PRE_FIRE(s0)
- beqz t0,1f
- mv a0,s1
+ bnez t0,1f
+ li s2,0
+1: lw t0,N_X(s0)
+ fmul.s s3,s3,t0
+ or t0,s2,s3
+ slli t0,t0,1
+ beqz t0,8f
+ lw s4,N_BUFFER(s0)
+ beqz s4,5f
+ lw t0,N_WEIGHTS(s0)
+ sub t0,s1,t0
+ srli t1,t0,10
+ slli t1,t1,9
+ andi t0,t0,511
+ add t0,t0,t1
+ add s4,s4,t0
+ lw a0,0(s4)
+ beqz s2,2f
  mv a1,s2
  li a2,0
- call br_apply
-1: beqz s3,2f
- lw t0,N_X(s0)
- mv a0,s1
- fmul.s a1,s3,t0
- li a2,1
- call br_apply
-2: INC H_REVERSE_RECEIVED,t0
- INC H_REVERSE_EVENTS,t0
- LEAVE 4
-/* A single 32B fill feeds eight independently tagged slots. Resolve every
- * pending lane before admitting any absent lane, including parallel edges. */
-br_forward_weights:
- ENTER 8
- addi sp,sp,-64
- mv s0,a0
- mv s1,a1
- mv s2,a2
- li s3,0
- li s4,0
- li s5,0
-.Lstage_lane:
- slli t0,s5,2
- add a0,s0,t0
- call br_lookup
- slli t0,s5,3
- add s6,sp,t0
- beqz a0,1f
- lw t0,0(a0)
- lw t1,4(a0)
- sw t0,0(s6)
- sw t1,4(s6)
- andi t0,t0,2
- bnez t0,2f
- INC H_HITS,t0
- j 3f
-1: sw zero,0(s6)
- li t0,1
- sll t0,t0,s5
- or s4,s4,t0
-2: li s3,1
- INC H_MISSES,t0
-3: addi s5,s5,1
- bltu s5,s1,.Lstage_lane
- beqz s3,.Lresolve_begin
- mv a0,s0
- li a1,3
- call br_weight_load
- li a0,3
- call br_load_wait
-.Lresolve_begin:
- li s5,0
-.Lresolve_lane:
- slli t0,s5,3
- add s6,sp,t0
- lw t0,0(s6)
- bnez t0,1f
- slli t0,s5,2
- add t1,s0,t0
- sw t1,0(s6)
- li t1,READ+96
- add t1,t1,gp
- add t1,t1,t0
- lw t0,0(t1)
- sw t0,4(s6)
- j 3f
-1: andi t1,t0,2
- beqz t1,3f
- andi a2,t0,1
- lw a1,4(s6)
- slli t0,s5,2
- li t1,READ+96
- add t1,t1,gp
- add t1,t1,t0
- lw a0,0(t1)
  call br_update
- sw a0,4(s6)
- slli t0,s5,2
- add a0,s0,t0
- ori t1,a0,1
- sw t1,0(s6)
- call br_lookup
- lw t0,0(s6)
- lw t1,4(s6)
- sw t0,0(a0)
- sw t1,4(a0)
-3: lw t0,4(s6)
- slli t1,s5,2
- add t1,t1,s2
- sw t0,0(t1)
- addi s5,s5,1
- bltu s5,s1,.Lresolve_lane
- li s5,0
-.Ladmit_lane:
- andi t0,s4,1
- srli s4,s4,1
- beqz t0,1f
- slli t0,s5,3
- add t0,t0,sp
- lw a0,0(t0)
- lw a1,4(t0)
- call br_insert
-1: addi s5,s5,1
- bltu s5,s1,.Ladmit_lane
- addi sp,sp,64
- LEAVE 8
+ INC H_BUFFER_UPDATES,t0
+2: beqz s3,3f
+ mv a1,s3
+ li a2,1
+ call br_update
+ INC H_BUFFER_UPDATES,t0
+3: sw a0,0(s4)
+ sub t0,s4,gp
+ li t1,BUFFER
+ sub t0,t0,t1
+ srli t0,t0,2
+ andi t1,t0,31
+ li t2,1
+ sll t1,t2,t1
+ srli t0,t0,5
+ slli t0,t0,2
+ li t2,DIRTY
+ add t0,t0,t2
+ add t0,t0,gp
+ lw t2,0(t0)
+ or t2,t2,t1
+ sw t2,0(t0)
+ j 8f
+5: mv a0,s1
+ mv a1,s2
+ mv a2,s3
+ call br_mshr_allocate
+8: INC H_REVERSE_RECEIVED,t0
+ INC H_REVERSE_EVENTS,t0
+ LEAVE 5
 /* Range-reduced w^0.4, identical FP32 operation ordering to the C polynomial. */
 .macro HORNER bits
  li t2,\bits
@@ -580,34 +525,19 @@ br_pow04:
  fmul.s a0,a0,t2
  fmul.s a0,a0,t5
 9: ret
-/* Poisson(a0=rng) -> a0=count, a1=updated rng. Positive float bit ordering. */
-br_poisson:
- mv t0,a0
- li t1,0x3f800000
- li t2,0
- li a2,0x33800000
- lw a3,H_EXTERNAL_LIMIT(gp)
-1: slli t3,t0,13
- xor t0,t0,t3
- srli t3,t0,17
- xor t0,t0,t3
- slli t3,t0,5
- xor t0,t0,t3
- srli t3,t0,8
- addi t3,t3,1
- fcvt.s.wu t3,t3
- fmul.s t3,t3,a2
- addi t2,t2,1
- fmul.s t1,t1,t3
- bgtu t1,a3,1b
- addi a0,t2,-1
- mv a1,t0
- ret
-/* Integration hoists immutable constants across all local neurons. */
+/* Both SMT workers claim a neuron address with AMOADD. Constants and one
+ * xorshift state stay in registers for the complete invocation. tp is the SMT
+ * identity set at boot; no worker frame or per-neuron RNG spill is needed. */
+.globl br_integrate
 br_integrate:
- ENTER 10
- addi s0,gp,256
+ slli t0,tp,2
+ add t0,t0,gp
+ lw s11,H_RNG0(t0)
+ li s0,80
  lw s1,H_NN(gp)
+ mul s1,s1,s0
+ add s1,s1,gp
+ addi s1,s1,256
  lw s2,H_P11(gp)
  lw s3,H_P21(gp)
  lw s4,H_P31(gp)
@@ -618,79 +548,112 @@ br_integrate:
  fmul.s s7,s7,t0
  lw s8,H_DECAY_PRE(gp)
  lw s9,H_DECAY_POST(gp)
-.Lintegrate_neuron:
- lw t0,N_REFRAC(s0)
- beqz t0,1f
- addi t0,t0,-1
- sw t0,N_REFRAC(s0)
- j 2f
-1: lw t0,N_DE(s0)
- lw t1,N_IE(s0)
- lw t2,N_DI(s0)
- lw t3,N_II(s0)
- lw t4,N_V(s0)
- fmul.s a0,s4,t0
- fmul.s a1,s5,t1
- fmul.s a2,s4,t2
+ li s10,0x41a00000
+ li t0,POISSON
+ add t0,t0,gp
+ lw a4,0(t0)
+ lw a5,4(t0)
+ lw a6,8(t0)
+.Lintegrate_claim:
+ addi t5,gp,H_WORK_NEURON
+ amoadd.w t5,s0,(t5)
+ bgeu t5,s1,.Lintegrate_done
+ lw t0,N_DE(t5)
+ lw t1,N_IE(t5)
+ lw t2,N_DI(t5)
+ lw t3,N_II(t5)
+ lw t4,N_V(t5)
+ lw t6,N_REFRAC(t5)
+ beqz t6,.Lintegrate_voltage
+ addi t6,t6,-1
+ j .Lintegrate_currents
+.Lintegrate_voltage:
+ fadd.s a0,t0,t2
+ fmul.s a0,s4,a0
+ fadd.s a1,t1,t3
+ fmul.s a1,s5,a1
  fadd.s a0,a0,a1
- fmul.s a3,s5,t3
- fadd.s a0,a0,a2
- fmul.s a4,s6,t4
- fadd.s a0,a0,a3
- fadd.s a0,a0,a4
- sw a0,N_V(s0)
-2: lw t0,N_DE(s0)
- lw t1,N_IE(s0)
- lw t2,N_DI(s0)
- lw t3,N_II(s0)
+ fmul.s t4,s6,t4
+ fadd.s t4,t4,a0
+.Lintegrate_currents:
  fmul.s a0,s3,t0
- fmul.s a1,s2,t1
- fmul.s a2,s3,t2
- fmul.s a3,s2,t3
- fadd.s a0,a0,a1
- fadd.s a2,a2,a3
- sw a0,N_IE(s0)
- sw a2,N_II(s0)
- lw t1,N_INPUT_E(s0)
- lw t3,N_INPUT_I(s0)
+ fmul.s t1,s2,t1
+ fadd.s t1,t1,a0
+ fmul.s a0,s3,t2
+ fmul.s t3,s2,t3
+ fadd.s t3,t3,a0
+ sw t1,N_IE(t5)
+ sw t3,N_II(t5)
+ lw a0,N_INPUT_E(t5)
+ lw a1,N_INPUT_I(t5)
  fmul.s t0,s2,t0
  fmul.s t2,s2,t2
- fadd.s t0,t0,t1
- fadd.s t2,t2,t3
- sw t0,N_DE(s0)
- sw t2,N_DI(s0)
- sw zero,N_INPUT_E(s0)
- sw zero,N_INPUT_I(s0)
- lw a0,N_RNG(s0)
- call br_poisson
- sw a1,N_RNG(s0)
+ fadd.s t0,t0,a0
+ fadd.s t2,t2,a1
+ slli t1,s11,13
+ xor s11,s11,t1
+ srli t1,s11,17
+ xor s11,s11,t1
+ slli t1,s11,5
+ xor s11,s11,t1
+ li a0,0
+ bltu s11,a4,.Lintegrate_poisson_done
+ li a0,1
+ bltu s11,a5,.Lintegrate_poisson_done
+ li a0,2
+ bltu s11,a6,.Lintegrate_poisson_done
+ /* Rare tail: thresholds are generated from this rule's exact mean. */
+ li a0,3
+ li t1,POISSON+12
+ add t1,t1,gp
+.Lintegrate_poisson_tail:
+ lw t3,0(t1)
+ bltu s11,t3,.Lintegrate_poisson_done
+ addi a0,a0,1
+ addi t1,t1,4
+ li t3,9
+ bltu a0,t3,.Lintegrate_poisson_tail
+.Lintegrate_poisson_done:
  fcvt.s.wu a0,a0
- lw t0,N_DE(s0)
  fmul.s a0,s7,a0
  fadd.s t0,t0,a0
- sw t0,N_DE(s0)
- lw t0,N_REFRAC(s0)
- lw t1,N_V(s0)
- li t2,0
- bnez t0,3f
- bltz t1,3f
- li t0,0x41a00000
- bltu t1,t0,3f
- li t2,1
- li t0,5
- sw t0,N_REFRAC(s0)
- sw zero,N_V(s0)
-3: sw t2,N_FIRE(s0)
- lw t0,N_X(s0)
- lw t1,N_Y(s0)
+ sw t0,N_DE(t5)
+ sw t2,N_DI(t5)
+ sw zero,N_INPUT_E(t5)
+ sw zero,N_INPUT_I(t5)
+ li a0,0
+ bnez t6,.Lintegrate_no_fire
+ bltz t4,.Lintegrate_no_fire
+ bltu t4,s10,.Lintegrate_no_fire
+ li a0,1
+ li t6,5
+ li t4,0
+.Lintegrate_no_fire:
+ sw a0,N_FIRE(t5)
+ sw t6,N_REFRAC(t5)
+ sw t4,N_V(t5)
+ lw t0,N_X(t5)
+ lw t1,N_Y(t5)
  fmul.s t0,t0,s8
  fmul.s t1,t1,s9
- sw t0,N_X(s0)
- sw t1,N_Y(s0)
- addi s0,s0,80
- addi s1,s1,-1
- bnez s1,.Lintegrate_neuron
- LEAVE 10
+ sw t0,N_X(t5)
+ sw t1,N_Y(t5)
+ j .Lintegrate_claim
+.Lintegrate_done:
+ slli t0,tp,2
+ add t0,t0,gp
+ sw s11,H_RNG0(t0)
+ li t0,1
+ addi t1,gp,H_JOIN_COUNT
+ amoadd.w t2,t0,(t1)
+ bne t2,t0,.Lintegrate_return
+ li a0,2
+ li a1,0
+ li a2,0
+ lw a3,H_PU(gp)
+ SENDI zero,3
+.Lintegrate_return:
+ ret
 /* Input a0=input offset,a1=weight,a2=weight address (zero for static),
  * a3=prePU | preLocal<<16. Recording uses full addresses, no CSR search. */
 .globl br_spike
@@ -766,6 +729,7 @@ br_control:
  sw zero,H_REPORT_COUNT(gp)
  sw zero,H_REPORT_SUM(gp)
  sw zero,H_REPORT_MCS(gp)
+ sw zero,H_JOIN_COUNT(gp)
  lw t2,H_PU(gp)
  lw t3,H_NUM_PU(gp)
  slli t0,t2,1
@@ -782,12 +746,25 @@ br_control:
  li t0,5
  beq a0,t0,3f
  sw a0,H_PHASE(gp)
- sw a1,H_ACTIVE_MCS(gp)
+ sw zero,H_JOIN_COUNT(gp)
+ li t0,1
+ bne a0,t0,5f
+ sw zero,H_BUF_USED(gp)
+5: sw a1,H_ACTIVE_MCS(gp)
  sw zero,H_WORK_NEURON(gp)
  sw zero,H_WORK_LINE(gp)
  sw zero,H_WORK_MC(gp)
  sw zero,H_SENT(gp)
- j br_continue
+ li t0,2
+ bne a0,t0,6f
+ addi t0,gp,256
+ sw t0,H_WORK_NEURON(gp)
+ li t0,0
+ li t1,9
+ SEND t0,t1
+ SEND t0,t1
+ ret
+6: j br_continue
 2: lw a1,H_RECEIVED(gp)
  j 4f
 3: lw a1,H_REVERSE_RECEIVED(gp)
@@ -797,7 +774,7 @@ br_control:
  li t1,3
  SEND t0,t1
  ret
-/* Root-only broadcast and the frozen simulator's existing phase-marker ABI. */
+/* Root-only broadcast and the simulator's phase-marker ABI. */
 br_broadcast:
  ENTER 2
  mv s0,a0
@@ -937,8 +914,13 @@ br_report:
 .globl br_boot
 br_boot:
  ENTER 3
+ li t0,0x3f00
+ add t0,t0,gp
+ li t1,0x19ca7ead
+ sw t1,0(t0)
+ sw t1,128(t0)
  lw t0,H_MAGIC(gp)
- li t1,0x42524e32
+ li t1,0x42524e34
  bne t0,t1,.Lboot_bad
  li t0,REPLAY
  add t0,t0,gp
@@ -1004,6 +986,12 @@ br_boot:
  sw zero,H_ISSUED(gp)
  sw zero,H_CONSUMED(gp)
 .Lboot_report:
+ addi t0,gp,256
+ lw t1,N_RNG(t0)
+ sw t1,H_RNG0(gp)
+ addi t0,t0,80
+ lw t1,N_RNG(t0)
+ sw t1,H_RNG1(gp)
  li a0,0
  li a1,0
  li a2,0
@@ -1018,11 +1006,8 @@ br_boot:
 /* Cooperative work: bounded sends per invocation, cache mutation on SMT0. */
 .globl br_work
 br_work:
- ENTER 8
  lw s0,H_PHASE(gp)
  lw s1,H_WORK_NEURON(gp)
- li t0,2
- beq s0,t0,.Lwork_integrate
  li t0,6
  beq s0,t0,.Lwork_finish
  li t0,1
@@ -1041,6 +1026,7 @@ br_work:
  lw t0,36(s2)
  bnez t0,2f
  sw zero,40(s2)
+ sw zero,N_BUFFER(s2)
  addi s1,s1,1
  addi s2,s2,80
  j 1b
@@ -1063,85 +1049,173 @@ br_work:
  addi s2,s2,256
  li t0,1
  bne s0,t0,.Lwork_reverse_neuron
+ /* Start a fired row once; later work events finish its static directories. */
  lw t0,H_WORK_LINE(gp)
  lw t1,H_WORK_MC(gp)
  or t0,t0,t1
- bnez t0,1f
- lw t0,36(s2)
- sw t0,40(s2)
-1: lw t0,40(s2)
+ bnez t0,.Lwork_directory
+ lw t0,N_FIRE(s2)
+ sw t0,N_PRE_FIRE(s2)
+ sw zero,N_BUFFER(s2)
  beqz t0,.Lwork_next_neuron
- lw s3,H_WORK_LINE(gp)
- lw t0,52(s2)
- bgeu s3,t0,.Lwork_directory
- sub s4,t0,s3
- li t0,8
- bleu s4,t0,2f
- li s4,8
-2: lw t0,H_FORWARD_PREPARED(gp)
- bnez t0,.Lwork_send_segment
- lw s5,H_ISSUED(gp)
- lw a0,56(s2)
- slli t0,s3,2
- add a0,a0,t0
- li a1,1
- call br_load_start
- lw a0,48(s2)
- slli t0,s3,2
- add a0,a0,t0
- mv a1,s4
- li a2,READ+96
- add a2,a2,gp
- call br_forward_weights
- li a0,1
- call br_load_wait
- lw t0,H_ISSUED(gp)
- sub t0,t0,s5
- add t0,t0,s4
- addi t0,t0,1
- li t1,24
- bleu t0,t1,.Lwork_send_segment
- li t0,1
- sw t0,H_FORWARD_PREPARED(gp)
- j .Lwork_continue
-.Lwork_send_segment:
- lw s7,H_EPSC(gp)
- lw t0,H_DELIVERY(gp)
- fmul.s s7,s7,t0
- lw a2,48(s2)
- slli t0,s3,2
- add a2,a2,t0
- slli a3,s1,16
+ lw s4,N_COUNT(s2)
+ beqz s4,.Lwork_directory
+ /* Keep only FP32 weights in the persistent 8 KiB buffer. */
+ addi t0,s4,7
+ andi t0,t0,-8
+ slli t0,t0,2
+ lw t1,H_BUF_USED(gp)
+ add t2,t1,t0
+ li t3,BR_BUFFER_LIMIT
+ bgtu t2,t3,.Lforward_overflow
+ li t0,BUFFER
+ add t0,t0,gp
+ add t0,t0,t1
+ sw t0,N_BUFFER(s2)
+ sw t2,H_BUF_USED(gp)
+ j .Lforward_first
+.Lforward_overflow:
+ INC H_OVERFLOW_ROWS,t0
+.Lforward_first:
+ li s3,0                     # row synapse index at chunk start
+ li s11,0                    # landing half, 0 or 1
+ slli s10,s1,16
  lw t0,H_PU(gp)
- or a3,a3,t0
- li s5,0
- li s6,READ+32
- add s6,s6,gp
-1: lw t2,0(s6)
- lw a1,64(s6)
- srli a0,t2,16
- slli t0,t2,16
- srli t0,t0,16
- fmul.s a1,s7,a1
- li t1,0xc01
- SEND t0,t1
- addi a2,a2,4
+ or s10,s10,t0
+ li t0,STREAM
+ add t0,t0,gp
+ li t1,1
+ sw t1,0(t0)
+ lw t1,4(t0)
+ addi t1,t1,1
+ sw t1,4(t0)
+ lw a0,N_WEIGHTS(s2)
+ li a1,PING
+ li a2,1024
+ call br_ac_start
+ YIELDI 11
+ j br_idle
+/* Frame-free local continuations preserve s0-s11. Higher-priority SMT0
+ * reverse/service handlers preserve these registers with their bounded ABI. */
+.globl br_forward_wait
+br_forward_wait:
+ csrr t0,0x730
+ beqz t0,.Lforward_ready
+ li t0,STREAM
+ add t0,t0,gp
+ lw t1,16(t0)
+ addi t1,t1,1
+ sw t1,16(t0)
+ YIELDI 11
+ j br_idle
+.Lforward_ready:
+ lw s4,N_COUNT(s2)
+ sub s4,s4,s3
+ li t0,128
+ bleu s4,t0,1f
+ mv s4,t0
+1: slli s5,s11,10
+ li t0,PING
+ add s5,s5,t0
+ add s5,s5,gp
+ slli t0,s4,2
+ add s9,s5,t0              # weight-half end
+ lw s8,N_BUFFER(s2)
+ beqz s8,2f
+ slli t0,s3,2
+ add s8,s8,t0
+ j 3f
+2: mv s8,s5                # overflow: harmless store back to staging
+3: lw s6,N_WEIGHTS(s2)
+ srli t0,s3,7
+ slli t0,t0,10
+ add s6,s6,t0
+ add t0,s3,s4
+ lw t1,N_COUNT(s2)
+ bgeu t0,t1,.Lforward_last_chunk
+ /* The sole AC engine now fills the other half while this half drains. */
+ li t0,STREAM
+ add t0,t0,gp
+ li t1,2
+ sw t1,0(t0)
+ lw t1,4(t0)
+ addi t1,t1,1
+ sw t1,4(t0)
+ addi a0,s6,1024
+ xori a1,s11,1
+ slli a1,a1,10
+ li t0,PING
+ add a1,a1,t0
+ li a2,1024
+ call br_ac_start
+ YIELDI 12
+ j br_idle
+.Lforward_last_chunk:
+ li t0,STREAM
+ add t0,t0,gp
+ li t1,3
+ sw t1,0(t0)
+ YIELDI 12
+ j br_idle
+.globl br_forward_drain
+br_forward_drain:
+ bgeu s5,s9,.Lforward_chunk_done
+ lw t0,512(s5)             # destination: high 16 input offset, low 16 PU
+ lw a1,0(s5)               # already scaled FP32 weight
+ sw a1,0(s8)
+ srli a0,t0,16
+ mv a2,s6
+ mv a3,s10
+ addi s5,s5,4
+ addi s8,s8,4
  addi s6,s6,4
- addi s5,s5,1
- bltu s5,s4,1b
+ SENDI t0,-1023            # 0xc01; destination is truncated to 16 bits
+ YIELDI 12                 # replenish quota and admit higher-priority events
+ j br_idle
+.Lforward_chunk_done:
+ /* Sample AC readiness immediately at the drain boundary. */
+ csrr t3,0x730
  lw t0,H_SENT(gp)
  add t0,t0,s4
  sw t0,H_SENT(gp)
- sw zero,H_FORWARD_PREPARED(gp)
- addi s3,s3,8
+ lw t0,H_FORWARD_WEIGHTS(gp)
+ add t0,t0,s4
+ sw t0,H_FORWARD_WEIGHTS(gp)
+ add s3,s3,s4
  sw s3,H_WORK_LINE(gp)
+ li t0,STREAM
+ add t0,t0,gp
+ lw t1,0(t0)
+ li t2,2
+ bne t1,t2,.Lforward_row_done
+ lw t1,8(t0)
+ addi t1,t1,1
+ sw t1,8(t0)
+ bnez t3,1f
+ lw t1,12(t0)
+ addi t1,t1,1
+ sw t1,12(t0)
+1: li t1,1
+ sw t1,0(t0)
+ xori s11,s11,1
+ YIELDI 11
+ j br_idle
+br_forward_row_done:
+.Lforward_row_done:
+ sw zero,0(t0)
+ /* Scalar ID-2 refills use the same base: restore it before any directory
+  * or MSHR loads. There is no AC outstanding after draining the last half. */
+ csrw 0x732,gp
+ sw zero,H_WORK_MC(gp)
  j .Lwork_continue
+br_work_reverse_row:
 .Lwork_reverse_neuron:
  lw t0,44(s2)
  li t1,9000
  bgeu t0,t1,.Lwork_next_neuron
  lw t0,36(s2)
  beqz t0,.Lwork_next_neuron
+br_work_directory:
 .Lwork_directory:
  lw s6,H_WORK_MC(gp)
  li t0,16
@@ -1201,20 +1275,94 @@ br_work:
 5: addi s6,s6,1
  sw s6,H_WORK_MC(gp)
  j .Lwork_continue
+br_work_advance:
 .Lwork_next_neuron:
  addi s1,s1,1
  sw s1,H_WORK_NEURON(gp)
  sw zero,H_WORK_LINE(gp)
  sw zero,H_WORK_MC(gp)
  j .Lwork_continue
-.Lwork_integrate:
- call br_integrate
- li a0,2
- li a1,0
- li a2,0
- j .Lwork_send_report
+br_work_flush:
 .Lwork_finish:
+ /* Examine one aligned group of eight dirty bits, skipping clean groups.
+  * Row padding is eight words, so a group never includes another row. */
+.Lflush_next:
+ lw s1,H_WORK_NEURON(gp)
+ lw t0,H_NN(gp)
+ bgeu s1,t0,.Lflush_done
+ li t0,80
+ mul s2,s1,t0
+ add s2,s2,gp
+ addi s2,s2,256
+ lw s5,N_BUFFER(s2)
+ beqz s5,.Lflush_next_row
+ lw s3,H_WORK_LINE(gp)
+ lw t0,N_COUNT(s2)
+ bgeu s3,t0,.Lflush_next_row
+ slli t0,s3,2
+ add s5,s5,t0
+ lw s7,N_WEIGHTS(s2)
+ srli t1,s3,7
+ slli t1,t1,10
+ andi t0,s3,127
+ slli t0,t0,2
+ add s7,s7,t1
+ add s7,s7,t0
+ sub t0,s5,gp
+ li t1,BUFFER
+ sub t0,t0,t1
+ srli t0,t0,2
+ andi t1,t0,31
+ srli t0,t0,5
+ slli t0,t0,2
+ li t2,DIRTY
+ add t0,t0,t2
+ add t0,t0,gp
+ lw s6,0(t0)
+ srl s6,s6,t1
+ andi s6,s6,255
+ li s4,8
+.Lflush_lane:
+ beqz s6,2f
+ andi t0,s6,1
+ beqz t0,1f
+ mv a0,s7
+ lw a1,0(s5)
+ call br_store_word
+ INC H_WRITE_WORDS,t0
+1: srli s6,s6,1
+ addi s5,s5,4
+ addi s7,s7,4
+ addi s4,s4,-1
+ bnez s4,.Lflush_lane
+2: addi s3,s3,8
+ sw s3,H_WORK_LINE(gp)
+ j .Lwork_continue
+.Lflush_next_row:
+ addi s1,s1,1
+ sw s1,H_WORK_NEURON(gp)
+ sw zero,H_WORK_LINE(gp)
+ j .Lflush_next
+br_work_finalize:
+.Lflush_done:
  call br_drain
+ lw t0,H_MSHR_COUNT(gp)
+ bnez t0,.Lboot_bad
+ lw t0,H_MSHR_SCHEDULED(gp)
+ bnez t0,.Lboot_bad
+ li t0,0x3f00
+ add t0,t0,gp
+ li t1,0x19ca7ead
+ lw t2,0(t0)
+ bne t1,t2,.Lboot_bad
+ lw t2,128(t0)
+ bne t1,t2,.Lboot_bad
+ li t0,DIRTY
+ add t0,t0,gp
+ addi t1,t0,256
+1: sw zero,0(t0)
+ addi t0,t0,4
+ bne t0,t1,1b
  addi s2,gp,256
  lw s1,H_NN(gp)
 1: lw t0,24(s2)
@@ -1242,6 +1390,7 @@ br_work:
  li a1,0
  li a2,0
  j .Lwork_send_report
+br_work_report:
 .Lwork_report:
  li a2,0
  li t0,1
@@ -1268,12 +1417,14 @@ br_work:
  li t1,3
  SEND t0,t1
  j .Lwork_return
+br_work_continue:
 .Lwork_continue:
  call br_continue
 .Lwork_return:
- LEAVE 8
+ j br_idle
 /* s2=replay header, four records per invocation. Spill reads are acknowledged
  * before consumption; cached entries remain on SMT0 throughout replay. */
+br_work_replay:
 .Lwork_replay:
  li s3,4
 .Lreplay_record:

@@ -1,11 +1,13 @@
 .section .text.boot
 .globl _start
 _start:
+  mv tp,a0
 #ifdef BR_ASM_RUNTIME
   li gp,0x20000000
 #endif
   bnez a0, thread_one
-  li sp, 0x20003800
+  # The deepest call chain is 96 bytes. Each 128-byte stack has a base guard.
+  li sp, 0x20003f80
   call snn_init
   li t0, 0x20000000
   csrw 0x732,t0
@@ -22,9 +24,15 @@ _start:
   INSTALL 2,control,20,0x00030005
   INSTALL 3,report,20,0x00020004
   INSTALL 4,reverse,12,0x000a0011
+  INSTALL 6,mshr_service,8,0x00020003
   INSTALL 8,work,8,0x0018001f
+  INSTALL 9,integrate,24,0x00010002
   INSTALL 10,idle,16,0
+  INSTALL 11,br_forward_wait,8,0x00020013
+  INSTALL 12,br_forward_drain,8,0x00020013
   call br_boot
+.globl br_idle
+br_idle:
 idle:
   wfi
   j idle
@@ -64,16 +72,10 @@ reverse_active:
   call br_reverse
   j idle
 work:
-  call br_work
+  j br_work
+integrate:
+  call br_integrate
   j idle
-/* Normal C ABI arguments: destination, tag, payload0..3. */
-.globl br_send
-br_send:
-  mv t0,a0
-  mv t1,a1
-  mv a0,a2
-  mv a1,a3
-  mv a2,a4
-  mv a3,a5
-  .insn r 0x0b,4,0,x0,t0,t1
-  ret
+mshr_service:
+  call br_mshr_service
+  j idle

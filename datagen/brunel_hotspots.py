@@ -12,6 +12,7 @@ from brunel_validate import dump
 
 def analyze(images, dumps, start, steps, output):
     manifest = json.loads((images / "manifest.json").read_text())
+    buffered = manifest.get("kernel") == "timestep-buffer-mshr"
     initial = np.load(images / "initial.npz")
     pre, post = initial["pre"], initial["post"]
     owner = pre % PU
@@ -37,9 +38,11 @@ def analyze(images, dumps, start, steps, output):
         previous_pending = np.zeros((PU, 2), dtype=np.int64)
         if manifest.get("cache_initial"):
             tags = np.load(images / "cache-initial.npz")["entries"][:, :, 0]
-            previous_pending = np.column_stack([
-                np.count_nonzero((tags & 3) == state, axis=1) for state in (2, 3)
-            ])
+            previous_pending = np.column_stack(
+                [np.count_nonzero((tags & 3) == state, axis=1) for state in (2, 3)]
+            )
+    if buffered:
+        previous_pending[:] = 0
     rows, per_step = [], []
 
     def count(mask):
@@ -62,13 +65,24 @@ def analyze(images, dumps, start, steps, output):
                 for s in spms
             ]
         )
+        if buffered:
+            pending[:] = 0
         # Each demand applies once or adds one pending coefficient; materializing
         # an older coefficient removes it. Conservation counts actual arithmetic.
         applied = np.column_stack((down, up)) - (pending - previous_pending)
         if np.any(applied < 0):
             raise ValueError("invalid pending-update conservation")
         # Runtime cache demand = scalar forward reads + nonzero update operations.
-        np.testing.assert_array_equal(delta[:, 0] + delta[:, 1] - reads, updates)
+        if buffered:
+            in_buffer = n[pre, 19] != 0
+            np.testing.assert_array_equal(delta[:, 6], reads)
+            np.testing.assert_array_equal(
+                delta[:, 0], count(ltd & in_buffer) + count(ltp & in_buffer)
+            )
+            np.testing.assert_array_equal(delta[:, 1], count((ltd | ltp) & ~in_buffer))
+            np.testing.assert_array_equal(delta[:, 1], delta[:, 2])
+        else:
+            np.testing.assert_array_equal(delta[:, 0] + delta[:, 1] - reads, updates)
         pre_fired = np.bincount(
             np.arange(NE) % PU, weights=n[:NE, 10], minlength=PU
         ).astype(int)
@@ -89,8 +103,19 @@ def analyze(images, dumps, start, steps, output):
                     pre_fired=int(pre_fired[pu]),
                     received_plastic_spikes=int(arrivals[pu]),
                     reverse_deliveries=int(delta[pu, 7]),
-                    probes=int(delta[pu, 6]),
-                    evictions=int(delta[pu, 3]),
+                    probes=0 if buffered else int(delta[pu, 6]),
+                    evictions=0 if buffered else int(delta[pu, 3]),
+                    **(
+                        dict(
+                            buffer_updates=int(delta[pu, 0]),
+                            mshr_loads=int(delta[pu, 1]),
+                            overflow_rows=int(delta[pu, 3]),
+                            pool_full=int(delta[pu, 5]),
+                            buffer_bytes=int(spms[pu][38]),
+                        )
+                        if buffered
+                        else {}
+                    ),
                     stores=int(delta[pu, 4]),
                 )
             )
@@ -120,7 +145,9 @@ def analyze(images, dumps, start, steps, output):
         rule=manifest["rule"],
         steps=[start, start + steps - 1],
         definition="Nonzero LTD/LTP operations; rounding/clipping may leave a weight unchanged. Parallel edges are distinct.",
-        verification="Every PU/timestep agrees with runtime (hits + misses - forward weights).",
+        verification="Every PU/timestep agrees with forward, buffered-update, and MSHR counters."
+        if buffered
+        else "Every PU/timestep agrees with runtime (hits + misses - forward weights).",
         average_per_pu_per_timestep={k: float(v.mean()) for k, v in matrices.items()},
         average_system_per_timestep={
             k: float(v.sum(axis=1).mean()) for k, v in matrices.items()

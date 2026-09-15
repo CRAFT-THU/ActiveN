@@ -126,6 +126,7 @@
             circt cmake ninja verilator espresso
             cargo rustc
             python3 nodejs
+            python3Packages.numpy
             ramulator2Native ramulator2Python zlib
             crossPkgs.buildPackages.gcc
             llvmPackages.clang

@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 import numpy as np
-from brunel import constants, poisson
+from brunel import constants, poisson, poisson_thresholds
 from brunel_validate import pending_power
 from brunel_reuse import working_sets
 
@@ -71,6 +71,30 @@ class Numerics(unittest.TestCase):
             a = np.concatenate(draws)
             self.assertLess(abs(a.mean() - c["external_mean"]), 0.015)
             self.assertLess(abs(a.var() - c["external_mean"]), 0.03)
+
+    def test_single_draw_poisson_distribution(self):
+        for rule in ("additive", "morrison"):
+            mean = float(constants(rule)["external_mean"])
+            cdf = poisson_thresholds(mean).astype(float) / 2**32
+            probability = np.diff(np.r_[0, cdf, 1])
+            values = np.arange(10)
+            self.assertTrue(np.all(probability >= 0))
+            self.assertLess(abs(probability @ values - mean), 2e-6)
+            self.assertLess(abs(probability @ (values - mean)**2 - mean), 3e-5)
+
+    def test_scaled_learning_equivalence(self):
+        for rule in ("additive", "morrison"):
+            c = constants(rule)
+            scale = float(c["epsc"]) * float(c["delivery"])
+            w = np.linspace(0, 2 * 45.609600316540956, 1001)
+            for trace in (0.0, 0.1, 1.0, 3.0):
+                if rule == "additive":
+                    expected = np.clip(w - 0.01 * 1.05 * 2 * 45.609600316540956 * trace, 0, 2 * 45.609600316540956) * scale
+                    actual = np.clip(w * scale - float(c["dep"]) * trace, 0, c["wmax"])
+                else:
+                    expected = (w * (1 - 0.01026 * trace) + 0.1 * trace * w**0.4) * scale
+                    actual = w * scale * (1 - float(c["dep"]) * trace) + float(c["pot"]) * trace * (w * scale)**0.4
+                np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-4)
 
 
 class WorkingSets(unittest.TestCase):

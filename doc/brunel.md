@@ -1,6 +1,6 @@
 # Sparse Brunel training
 
-`sim/payloads/sys/brunel.c` and the hand-written `brunel_runtime.S` implement
+The hand-written `sim/payloads/sys/brunel_runtime.S` implements
 Additive and Morrison training on
 512 PUs, 16 MCs, two SMT pipes, 16 KiB SPM per PU, and 256-bit memory lines.
 `datagen/brunel.py` generates the images and an independent NumPy FP32 reference;
@@ -30,8 +30,11 @@ The model follows the selected sparse, zero-delay alpha-current Brunel cases in
 
 Connections are sampled with replacement, excluding recurrent autapses.
 The NumPy RNG realization is recorded in the manifest: using the same seed does
-**not** reproduce GeNN's graph RNG stream. Per-neuron external input uses a
-specified xorshift32/Poisson process shared by the payload and reference.
+**not** reproduce GeNN's graph RNG stream. External input is Poisson-distributed.
+The payload keeps one xorshift32 state per SMT thread in a register during
+integration and uses one draw per neuron with a generated inverse-CDF table.
+The nine thresholds represent counts 0–8; the very small remaining tail is
+mapped to 9. The CPU presimulation retains its independent per-neuron generator.
 
 Each tick forwards the preceding tick's spikes using current logical weights,
 integrates all neurons, processes LTD then LTP for each affected synapse, and
@@ -48,263 +51,309 @@ zero. The payload uses a degree-eight range-reduced polynomial for `w^0.4`;
 weights, including subnormals.
 
 CPU presimulation establishes neural activity before generating initially empty
-PU caches. It is distinct from the **simulated cache warmup**. The default CPU
+timestep buffers. The simulated warmup is retained for comparable activity windows;
+there is no persistent cache to populate. The default CPU
 presimulation is 1,000 steps (100 ms). `--seek-active` advances to a reproducibly
 selected active window if the initial 30+30 window is quiet, and records the
 actual presimulation duration. Short burst windows are not estimates of the
 long-duration population mean firing rate.
 
-## Ownership, addressing, and SPM budget
+## Current assembly runtime: timestep buffer and MSHRs
 
-Neuron `g` belongs to PU `1 + g % 512`, at local index `g / 512`; its MC is
-`(g % 512) / 32`. Plastic FP32 weights and forward destination arrays are
-contiguous per presynaptic neuron in that neuron's MC. A cache key is the aligned
-32-bit **MC-local byte address** of an individual FP32 weight. MC identity is implicit in PU
-ownership. Zero is reserved for an empty tag.
+The current payload is **assembly only**, in `brunel.S` and `brunel_runtime.S`.
+`make -C sim/payloads sys/brunel.bin` builds that runtime; `brunel_asm.bin` is
+also available. The C kernel has been removed. The host numerical helper and
+historical cache-policy evaluator remain independent testing/research tools.
+The image ABI is `0x42524e34`; images with older plastic-row layouts must be
+regenerated.
 
-Static weights use the existing target-owned CSR scatter. Reverse plastic
-connectivity uses neuron scatter: entries carry the owning PU, local presynaptic
-neuron index, and that synapse's weight address. Forward and reverse directories
-are stored in DRAM and streamed, avoiding a 16-MC directory per neuron in SPM.
+There is no persistent cache or deferred learning across timesteps. Plastic
+weights are presynaptic-MC-owned, and static connections retain target-owned
+CSR scatter. Neuron ownership is `PU = 1 + gid % 512`, local index `gid / 512`.
 
-| SPM offset | Size | Contents |
+| SPM offsets | Bytes | Contents |
 | --- | ---: | --- |
-| `0x0000` | 256 B | Frozen header, counters, constants; legacy bucket fields stay zero |
-| `0x0100` | up to 2,000 B | Up to 25 × 80 B neuron records; actual maximum is 22 |
-| `0x0900` | 6,400 B | 800 × 8 B cache entries |
-| `0x2200` | 128 B | Four independent 32 B refill buffers |
-| `0x2280` | 256 B | Reserved, formerly writeback descriptors |
-| `0x2400`–`0x27ff` | 1,024 B | Replay counters, cursor, capacity and spill-region base |
-| `0x2800`–`0x2fff` | 2,048 B | 256 arrival records, eight bytes each |
-| `0x3000`–`0x37ff` | 2,048 B | SMT 0 stack, descending from `0x3800` |
-| `0x3800`–`0x3fff` | 2,048 B | SMT 1 stack, descending from `0x4000` |
+| `0x0000–0x0100` | 256 | Header, counters, constants |
+| `0x0100–0x0900` | 2,048 | Up to 25 neurons, 80 bytes each |
+| `0x0900–0x2900` | 8,192 | Forward FP32 weight rows, padded to 32 bytes |
+| `0x2900–0x2d00` | 1,024 | 16 MSHRs, 64 bytes each |
+| `0x2d00–0x2d80` | 128 | Four transport/directory/replay scratch lines |
+| `0x2d80–0x2e00` | 128 | Replay descriptor, Poisson thresholds, stream counters |
+| `0x2e00–0x2f00` | 256 | One dirty bit per forward-buffer weight |
+| `0x2f00–0x3700` | 2,048 | 256 incoming plastic-spike records, 8 bytes each |
+| `0x3700–0x3f00` | 2,048 | Two 1 KiB async-copy staging halves |
+| `0x3f00–0x3f80` | 128 | SMT0 stack |
+| `0x3f80–0x4000` | 128 | SMT1 stack |
 
-The mean is 21.97265625 neurons/PU, requiring 1,757.8125 B of neuron records.
-There are 409,600 individual entries across the system: **10.11% of the
-4.05 million plastic weights before collisions**. Every occupied entry holds
-one useful weight or pending coefficient. The earlier line-entry design had
-16.18% nominal capacity, but its sparse pending lanes reduced useful occupancy.
+The generator initializes through `0x3f00`; the observer dumps the complete
+16 KiB, including both stack guards. The assembly's deepest normal call path
+uses 96 stack bytes; the arithmetic startup test uses at most 64. Both stack
+base guards are checked at every timestep boundary. The work/wait/drain event
+continuations have no stack frame across a yield. Helper calls preserve the
+registers holding the forward stream's state.
+The deepest chain is reverse handling (32 bytes), allocation (32), inline
+retirement (16), and the Morrison update helper (16).
 
-## Cache and pending-update state
+### Integration
 
-Each eight-byte entry contains a word address plus two state bits and one FP32
-value. The address's low bits encode clean weight (0), dirty weight (1), pending
-LTD (2), or pending LTP (3). A zero tag marks empty; weight addresses are nonzero.
-Probe distance is derived from the address and occupied position. The multiply
-hash uses the word index and enough high bits to distribute over all 800 homes.
+Handler 9 runs on both SMT threads. An AMO claims the next 80-byte neuron
+record, so static SMT0 priority does not leave a fixed partition stranded on
+SMT1. The final worker reports completion after an AMO join. Each worker loads
+shared coefficients and its RNG state once, then writes its RNG state once on
+completion. Neuron fields remain in registers until their final stores.
 
-Lookup examines all four allowed positions; deletion needs no tombstone. A new
-key takes its home position. Displacements consume the **insertion operation's**
-remaining budget, with at most four insertion probes total. The held victim is
-evicted when that budget is exhausted or it has no further legal position.
-The budget does not restart when the identity of the held synapse changes.
+The membrane expression factors the equal excitatory/inhibitory coefficients
+as `p31 * (dIex + dIin) + p32 * (Iex + Iin) + p33 * V`. The usual
+non-refractory, non-firing path has 22 FP instructions, including current and
+trace decay, integer-to-float conversion, and external-current accumulation.
+The Poisson sample uses integer comparisons; its first three thresholds are
+held in registers, and rarer cases read the remaining small table.
 
-A missing weight can hold one FP32 coefficient and an LTD/LTP kind. No two
-updates are combined. A second update to that synapse first loads the weight,
-applies the older coefficient, and then applies the new update. Reading a weight
-for spike delivery also materializes it first. Pending-only eviction follows
-the same rule before issuing dirty word stores. Thus Additive clipping and
-Morrison weight dependence are preserved without representing an arbitrary
-composition of updates in one scalar.
+### Forward and reverse processing
 
-Presynaptic forwarding inspects up to eight individual entries, then issues
-one async 32-byte weight read if any required weight is absent or pending.
-Resident cached values override fetched data. Existing pending values are
-materialized in place before admission can evict them, preventing double
-application and stale-lane reuse. Only initially absent entries are admitted;
-an entry evicted during this bounded operation is not immediately reinserted.
-A postsynaptic miss admits one pending coefficient. A second update fetches a
-line but materializes only the affected synapse. Clean evictions need no write;
-dirty evictions issue one acknowledged FP32 store.
+On a presynaptic spike, reserve its entire outgoing weight row in the forward
+buffer. The neuron word at offset 76 holds its SPM row pointer (zero means
+unbuffered). Each DRAM row consists of 1 KiB chunks: 128 FP32 weights in the
+first 512 bytes and their 128 packed destinations in the next 512 bytes.
+The last chunk is padded; only the row's actual entries are sent.
 
-SMT 0 exclusively mutates the cache and issues credited memory operations.
-SMT 1 consumes completions and incoming spikes. R(0) is eviction/materialization
-scratch, R(1) holds forward destinations or spill records, R(2) caches a scatter
-directory line, and R(3) holds forward weights. An eight-entry stack staging
-array protects pending values during admissions. Refilling entries do not migrate
-concurrently. Assembly resolves weights directly into R(3), avoiding the C
-caller's extra copy after admission.
+The first async copy loads one chunk into the first staging half. A local
+yielding wait polls completion. Once ready, it starts the next copy into the
+other half before draining this half. Each drain iteration loads the target
+and weight from SPM, saves the weight in the persistent forward buffer, sends
+the spike, and yields to a local drain continuation. The steady loop is 12
+instructions, including its exit branch, remote blocking send, and local
+yield. The local yield replenishes quota and admits higher-priority handlers.
+After the half is consumed, the continuation waits for the next copy and
+exchanges halves. The MSHR region remains separate.
 
-Forward transmission occurs in the same invocation when issued memory requests
-plus outgoing spikes plus the continuation fit quota 24. Otherwise a continuation
-preserves R(1)/R(3) and sends the prepared segment separately. The worst admission
-still fits: target + weight + eight victim read/write pairs + continuation = 19.
+`LoadManual` is armed with SPM destination, byte length, and operation value 1
+at CSR `0x730`. Software then sends bulk tag `0x811` to the source MC with
+return ID `0x8001`: the high bit selects the LSU at the core crossbar, and the
+LSU sees ID 1. There is one active bulk copy per PU. Before returning to
+directory or MSHR scalar reads, software restores the shared AC SPM base to
+`0x20000000`. Future overlap between forward and reverse phases must account
+for that shared base; ID-2 scalar landing addresses use it too.
 
-## Recorded backward replay
+The matrix stores the delivered value `W = S*w`, where
+`S = EPSC*delivery`. Sending therefore requires no FP multiply. Additive
+increments and the upper bound scale by `S`. Morrison's proportional LTD
+coefficient stays unchanged; its LTP coefficient becomes `eta*S^0.6`, since
+`S*eta*(W/S)^0.4 = eta*S^0.6*W^0.4`.
 
-Plastic forward messages carry the weight's MC-local address in a2 and
-`prePU | preLocal << 16` in a3. Static scatter sets a2/a3 to zero. Each plastic
-arrival records `{address, prePU | preLocal << 16 | postLocal << 24}` in eight
-bytes. The recording is strictly one timestep; STDP history remains in traces.
+A reverse event carries `(preLocal, weightDramAddress, LTD, LTP)`; the LTP field
+is multiplied by the local presynaptic trace. A buffered weight is located by
+`neuron.buffer + (delta >> 10)*512 + (delta & 511)`, where
+`delta = weightDramAddress - neuron.weights`. Apply nonzero LTD, then
+nonzero LTP, and mark its dirty bit. The ordering is identical for both rules.
+If a whole row does not fit, stream it through the same staging halves and handle its
+reverse events through the MSHR path. Overflow is counted, never silently lost.
 
-After integration, fired excitatory postsynaptic neurons retain full global
-reverse scatter, applying LTD to currently firing sources and LTP to sources
-with nonzero pre-traces. Recorded arrivals for nonfiring postsynaptic neurons
-instead send the existing reverse handler `{preLocal, address, dep*y, 0}`.
-Records for fired posts are skipped, including each distinct parallel edge.
-Nonfiring posts no longer scan reverse directories by active-MC bitmap.
+Reverse routing still sends all fired-post reverse CSR entries, then replays
+recorded `(weightAddress, packedPreAndPostIdentity)` spikes whose post did not
+fire. These sets are disjoint: each connection receives at most one reverse
+event per timestep, including parallel edges (which have distinct addresses).
+Thus different outstanding MSHRs cannot update the same word. Different words
+in the same DDR line are safe because writeback writes only the selected FP32
+word. The existing 64 KiB per-PU DRAM spill fallback for incoming records remains.
 
-Each PU reserves 64 KiB in its local MC for record overflow. Once the local
-recording fills, the spike handler is moved from SMT1 to SMT0. It can issue two
-acknowledged word stores per overflow record and wait for credits while SMT1
-continues consuming completions. No local staging queue can fill behind a
-completion handler blocked on its own thread. The handler is restored to SMT1
-after the finish barrier. Spill replay drains outstanding writes, loads records
-one 32-byte line at a time, and applies the same fired-post deduplication.
-Generation checks the structural bound of 18 local excitatory neurons, hence
-at most 8,100 plastic arrivals per PU per timestep (18 * 450 indegree).
+### MSHR progress and writeback
 
-## Transport and progress
+Each descriptor has a 32-byte aligned landing line, address, LTD coefficient,
+LTP coefficient, state, sequence number, and three reserved words. Normal
+unbuffered updates have only LTP; the second coefficient also supports forward
+buffer overflow without changing arithmetic ordering.
 
-The current workload **requires memory effects to follow request order** and
-uses the MemIf FIFO issue queue. It does not wait for a matching-line writeback acknowledgment
-before issuing a refill, nor serialize same-word stores by acknowledgment.
+SMT0 owns a 16-entry FIFO allocation/retirement ring. State 1 means loading;
+state 2 means its completion notification has been consumed. SMT1 is a short
+leaf completion handler: it marks ready and retires one notification credit.
+It never performs update arithmetic, waits for memory, or sends messages.
 
-Neural forward/replay messages and scatter requests/responses use priority 3
-(`0xc01`, `0xc04`, and `0xc10`), below priority-2 refills and priority-1 stores.
-Bounded control/report traffic stays at priority 0. This ordering is necessary
-for progress: the earlier priority-0 replay messages could obstruct the refills
-needed to consume those messages, deadlocking the Additive burst at step 32.
-Handler IDs, quotas, margins, and queue depths are unchanged by this correction.
+One coalesced local handler-6 event on SMT0 retires the ready ring head, applies
+the update, emits one acknowledged FP32 store, and frees its landing line. It
+reschedules itself while entries remain. Reverse handlers have higher dispatch
+priority. If the pool is full, allocation services the head inline; this avoids
+waiting for a lower-priority handler on the same SMT thread. FIFO retirement
+can wait behind the oldest outstanding read, which is measured separately from
+merely finding the pool full of ready entries.
 
-Manual line loads use tag `0x800` and words
-`{address, (5 << 16) | 0x8002, line_ident, refill_slot}`. Dirty word stores and
-spill writes use higher-priority tag `0x401` and words
-`{address, (2 << 16) | 0x8003, 0x8000, data}`. Completion handler 0 sets a refill
-slot ready or consumes a store notification. No per-write descriptor is needed.
+There are still only **12 issued-but-unconsumed memory notifications** across
+loads and stores, with a dedicated 16-entry completion queue. Sixteen descriptors
+do not imply sixteen concurrent reads. Reusing a descriptor after issuing its
+store is safe: the outgoing scalar request already contains its value. Store
+acknowledgements still occupy notification credits. The finish barrier waits
+for all MSHR events and all store acknowledgements before starting another tick.
 
-At most 12 manual requests per PU are issued but not yet consumed, reserving
-space in the dedicated 16-entry completion queue. The credit bound includes
-returned-but-unhandled notifications. SMT0 can wait; SMT1 must consume responses.
+Handler 6 uses SMT0, zero arguments, quota 2 and margin 3: at most one store and
+one local continuation. Its local event queue contains at most one notification.
+Existing reverse/work quotas remain sufficient (at most one inline retirement,
+one read, and one service event per allocating reverse handler). NoC priorities
+remain writeback 1, refill 2, neural/scatter 3; control and local messages use 0.
+Forward wait/drain handlers 11/12 use SMT0, zero arguments, quota 2 and margin
+19, leaving room for the existing higher-priority handlers.
 
-Handler quotas/margins are spike 2/2, control 3/5, report 2/4, reverse 10/17,
-and work 24/31. Completion and diagnostic marker handlers send nothing. Spike
-quota covers overflow stores even when the normal recording path sends nothing.
-Phase 1 generates spikes but no learning; phase 3 generates learning but no
-spikes. The report tree and cooperative continuations are bounded protocol
-traffic, rather than unlimited new work.
+At finish, inspect eight dirty bits per work event, emit only marked scalar
+stores, then drain acknowledgements and clear the bitmap. This flush is bounded
+by the work-handler quota and does not wait after each group of stores.
 
-Root phase markers use tag 10 addressed through the NoC to PU1's no-op handler.
-`SOFT_MNIST_PHASE_LOG=1` exposes their injection cycles using the simulator's
-existing marker hook: phases 2/3/4/5 denote forward/integrate/reverse/
-finish, and `low` is the timestep. Marker intervals include barrier/control
-traffic and differ slightly from local PU start times. The additional sampled
-profiler described below observes the rebuilt simulator without target changes.
+### Counters, profiling, and validation
 
-Global phases use a binary control/report tree. Send counts are accumulated and
-compared with receiver counts before advancing past forward or reverse traffic.
-A scatter request's acceptance or an MC idle indication is not a delivery fence.
-Finish drains manual requests, preserves pending cache entries, and publishes a
-completed timestep only after every PU reports completion.
+The former cache counter words at offsets 120–148 now count buffered update
+operations, MSHR loads, MSHR commits, overflow rows, weight stores, full-pool
+encounters, forward weights, and reverse events. Offset 252 counts full-pool
+encounters where the head was not ready. Offsets 152–180 hold buffer bytes,
+MSHR live count, head, tail, coalesced-event flag, two SMT RNG states, and peak
+MSHR occupancy. Counters are cumulative; reports express increments per timestep.
+The stream descriptor at `0x2dd0` records its state, copies, overlap checks,
+copies already complete when the preceding drain ends, and busy wait polls.
 
-PU 1 runs a 32-byte transport regression at startup: four dirty lines are written
-as individual acknowledged words, reloaded into four refill slots, and compared
-word for word. The reserved test region starts at MC0 offset `0x8000`.
+`SOFT_BRUNEL_DUMP=<directory>` writes complete timestep snapshots.
+`SOFT_BRUNEL_PROFILE=1` additionally writes:
 
-## Build and run
+- `pu-profile.csv`: sampled activity, stalls, queue pressure, MSHR occupancy,
+  and notification-credit saturation; exact issued-instruction and neuron
+  counts per SMT, AC wait cycles, BIU rejection cycles, and last plastic-send
+  injection cycle per PU and phase.
+- `mc-profile.csv`: request admission and inflight/fulfilled occupancy.
+- `pc-profile.csv`: sampled PCs in the timed interval.
+- `mshr-memory.csv`: exact accepted source-router reads and scalar responses at
+  their source PU, including timestep, PU, descriptor token and line address.
+- `ac-memory.csv`: accepted forward bulk requests and every returning beat,
+  allowing copy-latency and complete-response accounting checks.
 
-The compiler ISA is `rv32ia_zmmul_zfinx_zicsr`: the core has multiplication,
-not integer division. Recording-index division by 80 is explicitly implemented
-with multiply-high arithmetic. This also prevents Os from introducing DIVU.
-The C target uses size-controlled O3 for arithmetic/cache kernels and explicit
-Os for dispatch, reporting, and recording. The hand-written assembly target
-contains no compiled C. Both linkers require the entire payload plus the image
-header to fit the preloaded 8 KiB ICache. The C implementation remains available
-as a reference; `brunel_asm_layout.inc` names the frozen header/record ABI offsets.
+`datagen/brunel_buffer_profile.py` pairs those handshakes, checks their count
+against the runtime, and measures per-timestep line reuse, latency, and phase
+cost. Response latency excludes software issue/notification/service time.
+The four phase costs come from simulator-observed phase-marker stores and the
+completed-timestep store; the small gap between timesteps is reported separately.
+`phase-cycles.csv` contains each timed step, and `profile.json` includes the
+fraction of prefetched copies ready before the preceding half finishes draining.
+The last plastic-injecting PU is identified explicitly; it is not assumed to
+be the last PU to complete the whole forward phase, which also includes static
+scatter and barriers.
+`datagen/brunel_hotspots.py` independently checks every PU's forward work,
+buffered updates and unbuffered requests against the recorded neuron traces.
 
-The FIFO MemIf experiment uses the regenerated 512-PU configuration and copied
-simulator under `copilot/tmp/brunel-ordered-20260914/design/`. The earlier frozen
-simulator under `copilot/tmp/brunel-replay-20260914/frozen/` remains preserved as
-historical evidence, including the priority deadlock diagnostics. The following
-commands create the required 512-PU simulator configuration:
+With the shared RNG, the validator reconstructs recurrent input from reference
+weights and recorded spikes, then infers each integer external Poisson draw
+from the observed current increment. A residual check rejects non-integer
+increments. It verifies the complete deterministic neuron update, carries
+observed neuron states into the next reference step, and keeps reference weights
+independent for the entire run. Final DRAM weights are compared against those
+reference weights. Free-running reference spike counts are reported separately
+to assess the broader dynamics.
 
-Run project commands inside the Nix development shell. The Python interpreter
-used for generation and validation must provide NumPy. If the development
-shell's Python lacks it, enter a nested
-`nix-shell -p 'python3.withPackages (ps: [ps.numpy])'` for the Python commands.
+Build and run through the Nix development shell, using the existing 512-PU,
+16-MC, 256-bit, two-SMT, 8 KiB ICache elaboration:
 
 ```sh
-JAVA_TOOL_OPTIONS=-Xmx12g mill ActiveN.run --system --pu=512 --mc=16 --mem-bus-width=256 --icache-lines=128
-cmake -S sim -B sim/build -G Ninja -DENABLE_HARD_BACKEND=OFF -DUSE_BOLT=OFF
+mill --no-daemon ActiveN.run --system --pu=512 --mc=16 \
+  --mem-bus-width=256 --icache-lines=128
+make -C sim/payloads sys/brunel.bin sys/brunel_asm_numeric.bin
+cmake -S sim -B sim/build -G Ninja -DUSE_BOLT=OFF
 ninja -C sim/build -j8 sim_system
-make -C sim/payloads sys/brunel.bin sys/brunel_asm.bin
-
 python3 datagen/brunel.py --rule morrison --presim 1000 --warmup 30 --timed 30 \
   --output copilot/tmp/brunel-morrison
+python3 sim/tests/brunel_buffer_image.py copilot/tmp/brunel-morrison
 mkdir -p copilot/tmp/brunel-morrison-run
-SOFT_BRUNEL_DUMP=copilot/tmp/brunel-morrison-run sim/build/sim_system \
-  --soft --soft-threads 8 --pu 512 --mc 16 --mc-size 0x100000000 --init-icache \
+SOFT_BRUNEL_DUMP=copilot/tmp/brunel-morrison-run SOFT_BRUNEL_PROFILE=1 \
+SOFT_MNIST_PHASE_LOG=1 sim/build/sim_system --soft --soft-threads 8 \
+  --pu 512 --mc 16 --mc-size 0x100000000 --init-icache --max-cycles 30000000 \
   --ramulator-config sim/build/ramulator-hbm2-1ch.yaml \
-  --ramulator-stats copilot/tmp/brunel-morrison-run/ramulator \
-  --max-cycles 100000000 copilot/tmp/brunel-morrison/dram.{0..15} \
-  > copilot/tmp/brunel-morrison-run/run.log 2>&1
+  copilot/tmp/brunel-morrison/dram.{0..15} > copilot/tmp/brunel-morrison-run/run.log 2>&1
 python3 datagen/brunel_validate.py --images copilot/tmp/brunel-morrison \
-  --dumps copilot/tmp/brunel-morrison-run \
-  --log copilot/tmp/brunel-morrison-run/run.log \
+  --dumps copilot/tmp/brunel-morrison-run --log copilot/tmp/brunel-morrison-run/run.log \
   --output copilot/tmp/brunel-morrison-run/report.json
+riscv64-unknown-none-elf-nm -n sim/payloads/sys/brunel_asm.elf > copilot/tmp/brunel-symbols.txt
+python3 datagen/brunel_buffer_profile.py --images copilot/tmp/brunel-morrison \
+  --run copilot/tmp/brunel-morrison-run --symbols copilot/tmp/brunel-symbols.txt \
+  --output copilot/tmp/brunel-morrison-run/profile.json
 ```
 
-For Additive, change the rule/output names and add `--seek-active` when seeking
-an active cache measurement. The `hbm2-1ch` configuration has 32-byte transactions;
-the default `ramulator.yaml` has 64-byte transactions and is incompatible with
-this elaboration. `--soft` simulates the freshly elaborated RTL cores with the
-software NoC/MemIf and Ramulator memory timing; it is not full-system hard RTL.
+## Validated 8 KiB-ICache benchmark (2026-09-15)
 
-The opt-in observer writes all PU runtime state at each completed timestep and
-backing DRAM at termination. Validation reconstructs logical weights from DRAM,
-resident cache lines, and pending coefficients, using the runtime polynomial
-for pending Morrison LTP. That polynomial reconstruction is checked bit for bit
-against the C helper; the independent expected weights use `numpy.power`.
-Validation compares all neuron states at every completed timestep, cross-checks
-saved reference checkpoints at steps 1, 30, and 60, and checks all 4.05 million
-final plastic weights. Reports include
-per-step resident hit rates, resident/pending occupancy, and weighted hit rates
-for three consecutive ten-step timing blocks. The tag hit rate additionally
-counts pending-only entry matches; new tag insertions are derived from occupancy
-growth plus evictions. The resident hit rate requires an actual buffered weight,
-so a pending-only tag match is still a resident miss. A demand is one forward
-synapse lookup or one nonzero coefficient application to a synapse; these counters
-are not DRAM transaction hit rates. Cache warmup should be judged
-from these trends, not merely from the number of elapsed timesteps.
+The final pilot and benchmark use the regenerated 512-PU/16-MC/256-bit/two-SMT
+configuration with 128 64-byte ICache lines (8 KiB), HBM2 timing, eight soft
+simulator workers, 30 warm-up steps, and 30 timed steps. The simulator binary,
+payload, and each embedded `dram.0` payload were hash-checked before the run.
+Both runs returned result 0. The complete snapshots pass stochastic replay,
+integer neuron-state checks, voltage/current tolerances, final weight checks,
+SPM guard checks, and memory-transport accounting. The six generator tests and
+both initial-image checks also pass.
 
-Host regression commands:
+All traffic values below are averages per timed timestep. Phase values are
+cycles per timestep. The old column is the previous assembly implementation
+from the matching 30-step baseline; its images and initial-state hashes are
+recorded in the experiment directory.
 
-```sh
-cc -std=c11 -D_GNU_SOURCE -O2 -fno-builtin -ffp-contract=off \
-  sim/tests/brunel_cache.c -o copilot/tmp/brunel-cache-test
-copilot/tmp/brunel-cache-test
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s datagen -p test_brunel.py
-```
+| Rule | Total cycles | Old total | Change | Forward | Integration | Reverse | Flush |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Additive | 153,596.2 | 205,039.6 | −25.1% | 24,638.7 (−63.2%) | 2,522.0 (−43.7%) | 94,559.4 (−3.3%) | 31,840.7 (−11.0%) |
+| Morrison | 89,444.5 | 114,104.8 | −21.6% | 12,478.8 (−64.8%) | 2,536.1 (−45.2%) | 52,285.6 (+1.1%) | 22,108.6 (−0.7%) |
 
-The cache stress test runs actual runtime code against eager uncached updates
-with intentionally reordered memory completions, exercises eviction and pending
-materialization, and checks all backing words after draining writebacks.
+The phase-marker/timer boundary contributes 35.4 cycles per timestep. Additive
+averages 76.7 excitatory and 17.5 inhibitory spikes; Morrison averages 8.0 and
+2.17. The free-running reference realization averages 63.4/15.6 and 9.73/2.17,
+respectively. Because integration uses per-SMT xorshift states rather than the
+CPU reference generator, those free-running counts are a dynamics comparison,
+not a deterministic target. Replaying the external integer draws inferred from
+the observed current makes every integer neuron state agree and keeps the
+maximum voltage error at 1.91e-6 mV; final Additive and Morrison weights match
+the independent reference bit-for-bit.
 
-`make -C sim/payloads sys/brunel_asm_numeric.bin` builds an opt-in assembly
-startup self-test. Generate its images with `--payload` as usual. It compares
-16 polynomial and 12 update/clipping vectors against C-derived FP32 golden
-words, then runs the ordinary network; the normal assembly binary omits it.
-The C compiler stack audit reports a largest individual frame of 128 bytes;
-the deepest cache/refill call chain remains below 400 bytes, within each 2 KiB
-stack allocation.
+| Rule | Forward weights | Buffered updates | MSHR loads/commits | Scalar stores | Reverse events | Scatter/manual reverse |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Additive | 33,375.0 | 14,887.1 | 14,691.5 / 14,691.5 | 29,515.6 | 67,383.4 | 34,500.0 / 32,883.4 |
+| Morrison | 3,699.3 | 1,886.3 | 1,843.2 / 1,843.2 | 3,728.9 | 7,296.3 | 3,600.0 / 3,696.3 |
 
-`SOFT_BRUNEL_PROFILE=1`, together with `SOFT_BRUNEL_DUMP`, enables observation
-without adding target instructions. `pu-profile.csv` samples activity, stalls,
-queue pressure, and outstanding requests every 256 simulated cycles, grouped
-by PU, timestep, and global phase. `pc-profile.csv` samples each active thread's
-fetch PC over the timed interval; function attribution is approximate because
-of pipeline lookahead. `mc-profile.csv` records per-cycle MSHR occupancy and
-accepted/presented memory requests. A profile-on/off smoke comparison checks
-identical simulated timing, SPM snapshots, and final DRAM.
+The 2 KiB ping-pong staging halves hide nearly all forward copy latency:
+Additive has 296.8 copies and 222.6 overlap checks per timestep, with 99.76%
+ready before the preceding drain ends; Morrison has 32.9 copies and 24.7
+checks, all ready before drain. Additive's exceptional late-copy tail produces
+0.53 late copies per timestep and a 29,752-cycle maximum wait on one PU during
+the busiest burst, while its critical plastic-sending PU has zero BIU rejection
+cycles. Morrison has no late copies. The source-MC request backpressure fraction
+is 39.3% for Additive and 15.5% for Morrison, so the forward phase is still
+memory-controller and workload-imbalance limited even though the drain loop
+itself is short.
 
-`datagen/brunel_hotspots.py` reports work per PU and timestep. It independently
-reconstructs nonzero LTD/LTP demands from spike/trace state, and checks each PU
-against `hits + misses - forward weight reads`. It also counts arithmetic
-applications using pending-entry conservation:
-`applied updates = new update demands - change in pending coefficients`.
-This includes materializing older coefficients during reads or evictions.
-Distinct affected synapses, new demands, and applied arithmetic are separate
-quantities; clipping or FP32 rounding can leave a weight numerically unchanged.
+The dominant phase remains reverse processing: 94,559 cycles for Additive and
+52,286 for Morrison. The sampled Additive reverse path is concentrated in the
+work/reverse/record-replay and MSHR-retire handlers, while the Morrison path has
+the same structure at lower traffic. Flush is the next largest phase and is
+dominated by the dirty-word scan and scalar write acknowledgements. Integration
+now takes about 2.5K cycles; both SMT threads claim work dynamically, averaging
+14.95 and 7.02 neuron records per PU per timestep, with about 70 issued
+instructions per neuron and no BIU blocking.
+
+The timed Additive distribution has 57.8 weight updates per PU per timestep on
+average, p50 26, p95 271, and a maximum of 729. Its worst PU/timestep updated
+729 weights after three presynaptic neurons fired and forwarded 1,310 weights.
+Morrison averages 7.28 updates per PU per timestep, p50 3, p95 9, and a maximum
+of 460; that hotspot had two presynaptic neurons and 909 forward weights. The
+largest forward row observed was 1,394 weights on Additive and 909 on Morrison,
+well below the 8 KiB buffer. The 16-entry MSHR peaked at 16 descriptors for
+Additive and 4 for Morrison; no allocation wait or overflow occurred in the
+production runs.
+
+Raw reports, phase CSVs, snapshots, and exact commands are under
+`copilot/tmp/brunel-loadmanual-20260915/{additive,morrison}-resumed-run`.
+The forced stress variant (zero forward buffer, one MSHR, two record slots)
+also passes its one-step simulator and full final-weight validation, exercising
+the spill and allocation fallback paths.
+
+For transport/numeric validation, embed `brunel_asm_numeric.bin` in a short
+image and run first with flat memory. Compile-time `BR_BUFFER_LIMIT` (bytes,
+0–8192, multiple of 32) and `BR_MSHR_LIMIT` (1–16) allow forced-overflow and
+allocation-pressure tests via `BRUNEL_ASM_FLAGS`; rebuild with `make -B` when
+changing flags, and restore the normal payload afterwards. These limits affect
+capacity, not the SPM ABI. No smaller queue or alternate memory response format
+is required by this implementation.
+
+## Historical cache experiments
+
+The remaining sections record the superseded persistent-cache implementations.
+Their C-kernel and hot-cache build commands are historical, not current workflows.
 
 ## Recorded replay and ordered MemIf results (2026-09-14)
 

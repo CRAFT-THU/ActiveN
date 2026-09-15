@@ -18,9 +18,24 @@ import struct
 import numpy as np
 
 NE, NI, PU, MC, LINE = 9000, 2250, 512, 16, 32
-MAGIC = 0x42524E32
-NODE_BASE, TABLE, DATA_END = 256, 2304, 10240
+MAGIC = 0x42524E34
+NODE_BASE, DATA_END = 256, 0x3F00
+PLASTIC_CHUNK = 128
+POISSON_BASE, STREAM_BASE = 0x2DA4, 0x2DD0
 F = np.float32
+
+
+def poisson_thresholds(mean):
+    """Inverse-CDF cutoffs for one uniform U32; the tiny >=9 tail maps to 9."""
+    probability = math.exp(-float(mean))
+    cumulative = probability
+    cutoffs = []
+    for k in range(9):
+        if k:
+            probability *= float(mean) / k
+            cumulative += probability
+        cutoffs.append(min(2**32 - 1, int(cumulative * 2**32)))
+    return np.array(cutoffs, dtype=np.uint32)
 
 
 def constants(rule):
@@ -31,6 +46,8 @@ def constants(rule):
     je = 45.609600316540956
     eta, scale, ratio = (1.685, 0.47, 5.0) if rule == "additive" else (3.2, 0.32, 8.0)
     rate = 20 / (450 * tm / cm * je * math.e * tau) * eta * 450 * scale * 1000
+    syn_scale = math.e / tau * math.sqrt(20)
+    learn_scale = syn_scale if rule == "additive" else syn_scale ** 0.6
     return dict(
         p11=F(decay),
         p21=F(dt * decay),
@@ -42,9 +59,12 @@ def constants(rule):
         external_mean=F(rate * dt / 1000),
         external_limit=F(math.exp(-rate * dt / 1000)),
         external_weight=F(je),
-        dep=F(0.01 * 1.05 * 2 * je if rule == "additive" else 0.1 * 0.1026),
-        pot=F(0.01 * 2 * je if rule == "additive" else 0.1),
-        wmax=F(2 * je),
+        # The scaled matrix is used directly during delivery.  Morrison LTD
+        # is proportional to the current scaled weight, so its coefficient is
+        # not scaled; only the nonlinear LTP coefficient carries S**0.6.
+        dep=F(0.01 * 1.05 * 2 * je * learn_scale if rule == "additive" else 0.1 * 0.1026),
+        pot=F((0.01 * 2 * je if rule == "additive" else 0.1) * learn_scale),
+        wmax=F(2 * je * syn_scale),
         decay_pre=F(math.exp(-dt / 20)),
         decay_post=F(math.exp(-dt / 30)),
         inhibitory_weight=F(-ratio * je),
@@ -128,11 +148,11 @@ class Reference:
             )
             self.n[:, 8] = rng.integers(1, 2**32, size=NE + NI, dtype=np.uint32)
             self.n[:, 11] = np.arange(NE + NI)
-            self.w = np.full(len(self.pre), self.c["external_weight"], dtype=np.float32)
+            self.w = np.full(len(self.pre), F(self.c["external_weight"] * self.c["epsc"] * self.c["delivery"]), dtype=np.float32)
         else:
             self.n, self.w = state[0].copy(), state[1].copy()
 
-    def tick(self, cache=None):
+    def tick(self, cache=None, external=None):
         n = self.n
         f = n.view(np.float32)
         c = self.c
@@ -144,11 +164,10 @@ class Reference:
         static = ranges(np.flatnonzero(old), self.so)
         ei = np.zeros(NE + NI, dtype=np.float32)
         ii = ei.copy()
-        scale = F(c["epsc"] * c["delivery"])
-        np.add.at(ei, self.post[plastic], F(scale * self.w[plastic]))
+        np.add.at(ei, self.post[plastic], self.w[plastic])
         exc = self.sp[static] < NE
-        np.add.at(ei, self.st[static[exc]], F(scale * c["external_weight"]))
-        np.add.at(ii, self.st[static[~exc]], F(scale * c["inhibitory_weight"]))
+        np.add.at(ei, self.st[static[exc]], F(c["external_weight"] * c["epsc"] * c["delivery"]))
+        np.add.at(ii, self.st[static[~exc]], F(c["inhibitory_weight"] * c["epsc"] * c["delivery"]))
         v = F(
             F(F(F(c["p31"] * f[:, 2]) + F(c["p32"] * f[:, 1])) + F(c["p31"] * f[:, 4]))
             + F(c["p32"] * f[:, 3])
@@ -161,7 +180,7 @@ class Reference:
         f[:, 3] = F(F(c["p21"] * f[:, 4]) + F(c["p11"] * f[:, 3]))
         f[:, 2] = F(F(c["p11"] * f[:, 2]) + ei)
         f[:, 4] = F(F(c["p11"] * f[:, 4]) + ii)
-        ext = poisson(n[:, 8], c["external_limit"])
+        ext = poisson(n[:, 8], c["external_limit"]) if external is None else external
         f[:, 2] = F(
             f[:, 2] + F(F(c["epsc"] * c["external_weight"]) * ext.astype(np.float32))
         )
@@ -199,54 +218,61 @@ def weight_layout(ref):
     images = [bytearray(65536) for _ in range(MC)]
     addresses = np.zeros(len(ref.pre), dtype=np.uint32)
     for src in range(NE):
-        lo, hi = ref.po[src:src + 2]
+        lo, hi = ref.po[src : src + 2]
         count = hi - lo
         mc = (src % PU) // 32
-        pad = (-count) % 8
         image = images[mc]
-        ref.n[src, 12] = len(image)
+        base = len(image)
+        ref.n[src, 12] = base
         ref.n[src, 13] = count
-        image.extend(np.pad(ref.w[lo:hi], (0, pad)).tobytes())
-        ref.n[src, 14] = len(image)
-        destinations = (
-            (NODE_BASE + (ref.post[lo:hi] // PU) * 80 + 68).astype(np.uint32) << 16
-        ) | ((ref.post[lo:hi] % PU) + 1).astype(np.uint32)
-        image.extend(np.pad(destinations, (0, pad)).tobytes())
-        addresses[lo:hi] = ref.n[src, 12] + np.arange(count, dtype=np.uint32) * 4
+        # A manual AC transfer is one 1 KiB half: 128 weight words followed
+        # by 128 packed destination words.  The final chunk is padded so every
+        # chunk has the same address arithmetic in the payload.
+        for chunk in range(0, count, PLASTIC_CHUNK):
+            n = min(PLASTIC_CHUNK, count - chunk)
+            w = np.pad(
+                ref.w[lo + chunk : lo + chunk + n],
+                (0, PLASTIC_CHUNK - n),
+            )
+            destinations = (
+                (NODE_BASE + (ref.post[lo + chunk : lo + chunk + n] // PU) * 80 + 68).astype(np.uint32)
+                << 16
+            ) | ((ref.post[lo + chunk : lo + chunk + n] % PU) + 1).astype(np.uint32)
+            d = np.pad(destinations, (0, PLASTIC_CHUNK - n))
+            image.extend(w.tobytes())
+            image.extend(d.tobytes())
+            addresses[lo + chunk : lo + chunk + n] = (
+                base + (chunk // PLASTIC_CHUNK) * (2 * PLASTIC_CHUNK * 4)
+                + np.arange(n, dtype=np.uint32) * 4
+            )
+        # N_TARGETS is retained in the neuron ABI as the row storage base;
+        # the target half is selected by the chunk arithmetic in the payload.
+        ref.n[src, 14] = base
     return images, addresses
 
 
 def write_weights(images, ref):
     for src in range(NE):
-        lo, hi = ref.po[src:src + 2]
+        lo, hi = ref.po[src : src + 2]
         base = int(ref.n[src, 12])
-        images[(src % PU) // 32][base:base + (hi - lo) * 4] = ref.w[lo:hi].tobytes()
+        image = images[(src % PU) // 32]
+        for chunk in range(0, hi - lo, PLASTIC_CHUNK):
+            n = min(PLASTIC_CHUNK, hi - lo - chunk)
+            offset = base + (chunk // PLASTIC_CHUNK) * (2 * PLASTIC_CHUNK * 4)
+            image[offset : offset + n * 4] = ref.w[lo + chunk : lo + chunk + n].tobytes()
 
 
 def generate(args):
     if args.warmup < 0 or args.timed < 1 or args.presim < 0:
         raise ValueError("timed must be positive; warmup/presim nonnegative")
-    if not 0 <= args.cache_warmup <= args.presim:
-        raise ValueError("cache-warmup must be between zero and presim")
-    if args.cache_warmup and not args.cache_library:
-        raise ValueError("cache-warmup requires --cache-library")
     out = args.output
     out.mkdir(parents=True, exist_ok=False)
     edges = graph(args.seed)
     ref = Reference(edges, args.rule, seed=args.seed)
     images, addresses = weight_layout(ref)
-    cache = None
-    cache_history = []
     history = []
     for t in range(args.presim):
-        if args.cache_warmup and t == args.presim - args.cache_warmup:
-            from brunel_cache import CacheModel, summary
-            write_weights(images, ref)
-            cache = CacheModel(args.cache_library, images, args.rule, ref.c["wmax"])
-            cache.bind(ref, addresses)
-        history.append(ref.tick(cache))
-        if cache is not None:
-            cache_history.append(summary(cache.export()))
+        history.append(ref.tick())
         if (t + 1) % 100 == 0:
             print(
                 "presim",
@@ -276,9 +302,7 @@ def generate(args):
             raise RuntimeError("no active warmup+timing window within 200ms")
         ref = Reference(edges, args.rule, state=saved)
         for extra in range(chosen):
-            history.append(ref.tick(cache))
-            if cache is not None:
-                cache_history.append(summary(cache.export()))
+            history.append(ref.tick())
         args.presim += chosen
         print("selected active starting step", args.presim, flush=True)
     pre, post, sp, st = edges
@@ -293,16 +317,7 @@ def generate(args):
     )
     initial_n = ref.n.copy()
     initial_w = ref.w.copy()
-    hot = None
-    if cache is not None:
-        hot = cache.export()
-        # Keep stale backing values where resident dirty data / pending
-        # coefficients carry the logical value. Never eagerly flush this state.
-        images = [bytearray(d.tobytes()) for d in cache.drams]
-        np.savez(out / "cache-initial.npz", **hot)
-        cache.close()
-    else:
-        write_weights(images, ref)
+    write_weights(images, ref)
     payload = args.payload.read_bytes()
     if len(payload) + 16 > 0x8000:
         raise ValueError("payload overlaps reserved transport test region")
@@ -340,9 +355,9 @@ def generate(args):
         return dirs
 
     c = ref.c
-    scale = F(c["epsc"] * c["delivery"])
     staticw = np.where(
-        sp < NE, F(scale * c["external_weight"]), F(scale * c["inhibitory_weight"])
+        sp < NE, F(c["epsc"] * c["delivery"] * c["external_weight"]),
+        F(c["epsc"] * c["delivery"] * c["inhibitory_weight"])
     ).astype(np.float32)
     statdirs = csr(
         sp,
@@ -398,17 +413,11 @@ def generate(args):
             raise ValueError("spill bound requires at most 18 E neurons per PU")
         spill_base = place(pu // 32, bytes(65536))
         blob = bytearray(DATA_END)
-        struct.pack_into("<I", blob, 0x2400 + 12, spill_base)
-        struct.pack_into("<I", blob, 0x2400 + 28, 256)
+        struct.pack_into("<I", blob, 0x2D80 + 12, spill_base)
+        struct.pack_into("<I", blob, 0x2D80 + 28, 256)
         blob[:256] = header.tobytes()
         blob[NODE_BASE : NODE_BASE + rows.nbytes] = rows.tobytes()
-        if hot is not None:
-            blob[TABLE:TABLE + 6400] = hot["entries"][pu].tobytes()
-            # Reserved descriptor region: packed 2-bit usefulness sidecar.
-            u = hot["usefulness"][pu].reshape(-1, 4)
-            blob[0x2280:0x2280 + 200] = np.sum(
-                u.astype(np.uint32) << (2 * np.arange(4)), axis=1
-            ).astype(np.uint8).tobytes()
+        blob[POISSON_BASE : POISSON_BASE + 36] = poisson_thresholds(c["external_mean"]).tobytes()
         spms.append(blob)
     images[0].extend(bytes((-len(images[0])) % LINE))
     section = len(images[0])
@@ -429,12 +438,9 @@ def generate(args):
         rule=args.rule,
         seed=args.seed,
         presim=args.presim,
-        cache_warmup_steps=len(cache_history),
-        cache_policy="bounded",
-        cache_model_sha256=hashlib.sha256(args.cache_library.read_bytes()).hexdigest()
-        if hot is not None else None,
-        cache_initial=summary(hot) if hot is not None else {},
-        cache_warmup_state=cache_history,
+        kernel="timestep-buffer-mshr",
+        plastic_layout="chunk128-weights512-targets512",
+        rng="per-SMT xorshift32 inverse-CDF Poisson, capped at 9",
         warmup=args.warmup,
         timed=args.timed,
         neurons=NE + NI,
@@ -446,13 +452,20 @@ def generate(args):
         image_bytes=list(map(len, images)),
         spm=dict(
             data_end=DATA_END,
-            stack_bytes=4096,
-            cache_entries=800,
-            cache_bytes=6400,
-            cache_entry_bytes=8,
-            writeback_descriptors=0,
+            stack_bytes=256,
+            stack_bases=[0x3F00, 0x3F80],
+            forward_buffer_bytes=8192,
+            forward_weight_bytes=4,
+            mshr_entries=16,
+            mshr_entry_bytes=64,
+            replay_offset=0x2D80,
             replay_record_bytes=8,
             replay_capacity=256,
+            record_offset=0x2F00,
+            ping_pong_offset=0x3700,
+            ping_pong_bytes=2048,
+            poisson_offset=POISSON_BASE,
+            stream_offset=STREAM_BASE,
             spill_bytes_per_pu=65536,
         ),
         ordering="forward -> alpha-current integration -> reverse LTD then LTP -> trace increments",
@@ -478,9 +491,6 @@ def main():
     p.add_argument("--seed", type=int, default=20260724)
     p.add_argument("--presim", type=int, default=1000)
     p.add_argument("--warmup", type=int, default=30)
-    p.add_argument("--cache-warmup", type=int, default=0,
-                   help="simulate cache during this many final CPU presim steps")
-    p.add_argument("--cache-library", type=Path)
     p.add_argument("--timed", type=int, default=30)
     p.add_argument("--seek-active", action="store_true")
     p.add_argument("--payload", type=Path, default=Path("sim/payloads/sys/brunel.bin"))

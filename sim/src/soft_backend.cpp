@@ -738,30 +738,30 @@ void SoftSystemBackend::peek(uint64_t cycle, std::vector<MemBusOut *> out) {
         for (unsigned b = 0; b < 32; b += 8) stream.put(static_cast<char>(v >> b));
       };
       emit(0x42534431); emit(cfg.numPU);
-      std::array<uint64_t,8> counts{};
+      std::array<uint64_t,9> counts{};
       uint32_t excitatory=0,inhibitory=0,resident=0,pending=0;
       for (unsigned pu=1;pu<=cfg.numPU;pu++) {
         if (word(pu, offsetof(BrHeader,step)) != completed)
           throw runtime_error("Brunel completed before all PUs");
         emit(pu); emit(BR_DATA_END);
         for (unsigned offset=0;offset<BR_DATA_END;offset+=4) emit(word(pu,offset));
-        for(unsigned i=0;i<8;i++) counts[i]+=word(pu,offsetof(BrHeader,hits)+4*i);
+        for(unsigned i=0;i<8;i++) counts[i]+=word(pu,offsetof(BrHeader,buffer_updates)+4*i);
+        counts[8] += word(pu,offsetof(BrHeader,allocation_waits));
         for(unsigned i=0;i<word(pu,offsetof(BrHeader,nn));i++) {
           unsigned n=BR_NEURONS+i*sizeof(BrNeuron);
           if(word(pu,n+offsetof(BrNeuron,fire))) {
             if(word(pu,n+offsetof(BrNeuron,gid))<9000)excitatory++; else inhibitory++;
           }
         }
-        for(unsigned i=0;i<BR_SLOTS;i++) if(word(pu,BR_TABLE+i*sizeof(BrEntry))) {
-          if(!(word(pu,BR_TABLE+i*sizeof(BrEntry))&2u))resident++;else pending++;
-        }
+        resident += word(pu, offsetof(BrHeader,buffer_bytes)) / 4;
+        pending += word(pu, offsetof(BrHeader,mshr_count));
       }
       if(!stream) throw runtime_error("cannot write Brunel state");
       std::cerr << "[Brunel step] step=" << completed << " cycle=" << cycle
                 << " E=" << excitatory << " I=" << inhibitory;
-      const char *keys[]={"hits","misses","pending_ops","evictions","write_words","forced","probes","reverse_events"};
-      for(unsigned i=0;i<8;i++)std::cerr << ' ' << keys[i] << '=' << counts[i]-brunel_last_counts_[i];
-      std::cerr << " resident_entries=" << resident << " pending_entries=" << pending << '\n';
+      const char *keys[]={"buffer_updates","mshr_loads","mshr_commits","overflow_rows","write_words","pool_full","forward_weights","reverse_events","allocation_waits"};
+      for(unsigned i=0;i<9;i++)std::cerr << ' ' << keys[i] << '=' << counts[i]-brunel_last_counts_[i];
+      std::cerr << " buffered_words=" << resident << " live_mshrs=" << pending << '\n';
       brunel_last_counts_=counts; brunel_observed_steps_=completed;
     }
   }
@@ -790,7 +790,7 @@ void SoftSystemBackend::observeBrunelProfile(uint64_t cycle,
     const auto path = std::filesystem::path(directory) / "pu-profile.csv";
     std::ofstream out(path, completed == 1 ? std::ios::out : std::ios::app);
     if (completed == 1)
-      out << "step,phase,pu,samples,active0,active1,executing,stalled,outstanding,egress,injection_blocked,reverse_full,spike_full\n";
+      out << "step,phase,pu,samples,active0,active1,executing,stalled,outstanding,egress,injection_blocked,reverse_full,spike_full,mshr_occupancy,mshr_full,credit_full,issued0,issued1,neurons0,neurons1,ac_wait_cycles,biu_blocked_cycles,last_forward_injection\n";
     constexpr unsigned phases[] = {1, 2, 3, 6};
     for (unsigned pu = 1; pu <= cfg.numPU; ++pu)
       for (unsigned ph = 0; ph < 4; ++ph) {
@@ -800,7 +800,9 @@ void SoftSystemBackend::observeBrunelProfile(uint64_t cycle,
               << p.samples << ',' << p.active0 << ',' << p.active1 << ','
               << p.executing << ',' << p.stalled << ',' << p.outstanding << ','
               << p.egress << ',' << p.injection_blocked << ','
-              << p.reverse_full << ',' << p.spike_full << '\n';
+              << p.reverse_full << ',' << p.spike_full << ',' << p.mshr_occupancy << ',' << p.mshr_full << ',' << p.credit_full << ','
+              << p.issued0 << ',' << p.issued1 << ',' << p.neurons0 << ',' << p.neurons1 << ','
+              << p.ac_wait_cycles << ',' << p.biu_blocked_cycles << ',' << p.last_forward_injection << '\n';
         p = {};
       }
     if (!out) throw runtime_error("cannot write Brunel PU profile");
@@ -819,6 +821,20 @@ void SoftSystemBackend::observeBrunelProfile(uint64_t cycle,
         p = {};
       }
     if (!mc) throw runtime_error("cannot write Brunel MC profile");
+    std::ofstream memory(std::filesystem::path(directory) / "mshr-memory.csv",
+                         completed == 1 ? std::ios::out : std::ios::app);
+    if (completed == 1) memory << "step,cycle,pu,kind,token,address\n";
+    std::ofstream copies(std::filesystem::path(directory) / "ac-memory.csv",
+                         completed == 1 ? std::ios::out : std::ios::app);
+    if (completed == 1) copies << "step,cycle,pu,kind,lines_or_ident,address\n";
+    for (const auto &e : brunelMemoryEvents_) {
+      auto &stream = e.kind < 2 ? memory : copies;
+      stream << completed << ',' << e.cycle << ',' << e.pu << ',' << e.kind
+             << ',' << e.token << ',' << e.address << '\n';
+    }
+    if (!copies) throw runtime_error("cannot write Brunel AC profile");
+    if (!memory) throw runtime_error("cannot write Brunel memory profile");
+    brunelMemoryEvents_.clear();
     brunelProfileCompleted_ = completed;
     if (completed == last) {
       std::ofstream pc(std::filesystem::path(directory) / "pc-profile.csv");
@@ -860,6 +876,10 @@ void SoftSystemBackend::observeBrunelProfile(uint64_t cycle,
     p.executing += executing;
     p.stalled += executing && !root->Core__DOT__exec__DOT__s0step;
     p.outstanding += word(pu, offsetof(BrHeader, issued)) - word(pu, offsetof(BrHeader, consumed));
+    const auto occupancy = word(pu, offsetof(BrHeader,mshr_count));
+    p.mshr_occupancy += occupancy;
+    p.mshr_full += occupancy >= BR_MSHRS;
+    p.credit_full += word(pu, offsetof(BrHeader,issued)) - word(pu, offsetof(BrHeader,consumed)) >= BR_CREDITS;
     p.egress += root->Core__DOT__exec__DOT__biu__DOT__sendQueue__DOT__cnt;
     const auto &buf = routers[pu].buf;
     p.injection_blocked += buf.core_inject_presenting && !buf.core_inject_accepting;
@@ -872,6 +892,62 @@ void SoftSystemBackend::observeBrunelProfile(uint64_t cycle,
         if (!(idle & (1 << thread)))
           ++brunelPcProfile_[(uint64_t(phase) << 43) | (uint64_t(thread) << 42)
                             | (uint64_t(pu) << 32) | pcs[thread]];
+    }
+  }
+}
+
+// Passive observation of resolved pre-edge handshakes, with no timing changes.
+// kind 0: MSHR read accepted by the source router; kind 1: response at source PU.
+void SoftSystemBackend::observeBrunelMemory(uint64_t cycle) {
+  static const bool enabled = std::getenv("SOFT_BRUNEL_PROFILE") && std::getenv("SOFT_BRUNEL_DUMP");
+  if (!enabled) return;
+  for (unsigned pu = 1; pu <= cfg.numPU; ++pu) {
+    const auto &c = *cores[pu];
+    const auto &root = *c.rootp;
+    const auto &spm = root.Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
+    const auto word = [&](unsigned offset) {
+      return spm[offset / MEM_BUS_WIDTH_B][(offset % MEM_BUS_WIDTH_B) / 4];
+    };
+    if (word(0) != BR_MAGIC || brunelPuProfile_.empty()) continue;
+    const auto phase = word(offsetof(BrHeader, phase));
+    if (phase == 1 || phase == 2 || phase == 3 || phase == 6) {
+      auto &p = brunelPuProfile_[pu][phase == 6 ? 3 : phase - 1];
+      const bool issued = root.Core__DOT__exec__DOT__valid && root.Core__DOT__exec__DOT__s0step;
+      const auto smsel = root.Core__DOT__exec__DOT__uop_smsel;
+      p.issued0 += issued && (smsel & 1);
+      p.issued1 += issued && (smsel & 2);
+      const uint32_t address = root.Core__DOT__exec__DOT____Vcellinp__lsu__req_bits_addr;
+      if (phase == 2 && issued && root.Core__DOT__exec__DOT__uop_isMem &&
+          root.Core__DOT__exec__DOT____Vcellinp__lsu__req_bits_write &&
+          address >= BR_BASE + BR_NEURONS && address < BR_BASE + BR_BUFFER &&
+          (address - BR_BASE - BR_NEURONS) % sizeof(BrNeuron) == offsetof(BrNeuron, fire)) {
+        p.neurons0 += (smsel & 1) != 0;
+        p.neurons1 += (smsel & 2) != 0;
+      }
+      p.ac_wait_cycles += phase == 1 && word(BR_STREAM) == 1 &&
+                          root.Core__DOT__exec__DOT__lsu__DOT__acRemaining != 0;
+      p.biu_blocked_cycles += root.Core__DOT__exec__DOT__biu_msg_valid &&
+                             !root.Core__DOT__exec__DOT__biu__DOT__sendQueue__DOT__enq_ready_0;
+      if (phase == 1 && routers[pu].buf.core_inject_accepting && c.ext_out_valid &&
+          c.ext_out_bits_tag == 0xc01 && c.ext_out_bits_data_2 != 0)
+        p.last_forward_injection = cycle;
+    }
+    if (phase == 1 && word(BR_STREAM) != 0) {
+      if (routers[pu].buf.core_inject_accepting && c.ext_out_valid &&
+          (c.ext_out_bits_tag & 255) == 0x11 && (c.ext_out_bits_data_1 & 65535) == 0x8001)
+        brunelMemoryEvents_.push_back({cycle, pu, 2, c.ext_out_bits_data_1 >> 16, c.ext_out_bits_data_0});
+      if (core_mem_accept[pu].unicast && c.mem_unicast_bits_id == 0x8001)
+        brunelMemoryEvents_.push_back({cycle, pu, 3, c.mem_unicast_bits_ident, 0});
+    }
+    if (routers[pu].buf.core_inject_accepting && c.ext_out_valid &&
+        (c.ext_out_bits_tag & 255) == 0 &&
+        (c.ext_out_bits_data_1 & 65535) == 0x8002 &&
+        c.ext_out_bits_data_3 >= BR_MSHR && c.ext_out_bits_data_3 < BR_READ) {
+      brunelMemoryEvents_.push_back({cycle, pu, 0, c.ext_out_bits_data_3, c.ext_out_bits_data_0});
+    }
+    if (core_mem_accept[pu].unicast && c.mem_unicast_bits_id == 0x8002 &&
+        c.mem_unicast_bits_extra1 >= BR_MSHR && c.mem_unicast_bits_extra1 < BR_READ) {
+      brunelMemoryEvents_.push_back({cycle, pu, 1, c.mem_unicast_bits_extra1, 0});
     }
   }
 }
@@ -1098,6 +1174,7 @@ void SoftSystemBackend::step(uint64_t cycle) {
         WorkProfilePhase::StepStart)] = workProfileNowNs();
   const uint64_t statsStart = profile ? workProfileNowNs() : 0;
   accumulateStats(cycle);
+  observeBrunelMemory(cycle);
   if (profile)
     workProfileRecordUnit(cycle, WorkProfilePhase::StepStart,
                           WorkProfileUnit::Stats, 0,

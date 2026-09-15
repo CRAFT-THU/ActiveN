@@ -1,4 +1,4 @@
-/* Named offsets for the frozen BrHeader / BrNeuron / BrReplay ABI.
+/* Named offsets for the timestep-buffer BrHeader / BrNeuron / BrReplay ABI.
  * Source structs and size assertions: brunel.h. */
 .equ H_MAGIC, 0
 .equ H_PU, 4
@@ -30,22 +30,14 @@
 .equ H_EXPECTED_REVERSE, 108
 .equ H_REPORT_MCS, 112
 .equ H_JOIN_COUNT, 116
-.equ H_HITS, 120
-.equ H_MISSES, 124
-.equ H_PENDING, 128
-.equ H_EVICTIONS, 132
+.equ H_BUFFER_UPDATES, 120
+.equ H_MSHR_LOADS, 124
+.equ H_MSHR_COMMITS, 128
+.equ H_OVERFLOW_ROWS, 132
 .equ H_WRITE_WORDS, 136
-.equ H_FORCED, 140
-.equ H_PROBES, 144
+.equ H_POOL_FULL, 140
+.equ H_FORWARD_WEIGHTS, 144
 .equ H_REVERSE_EVENTS, 148
-.equ H_BUCKET0, 152
-.equ H_BUCKET1, 156
-.equ H_BUCKET2, 160
-.equ H_BUCKET3, 164
-.equ H_BUCKET4, 168
-.equ H_BUCKET5, 172
-.equ H_BUCKET6, 176
-.equ H_BUCKET7, 180
 .equ H_P11, 184
 .equ H_P21, 188
 .equ H_P31, 192
@@ -63,7 +55,7 @@
 .equ H_DECAY_POST, 240
 .equ H_DIRECTORY_LINE, 244
 .equ H_WEIGHT_LOADS, 248
-.equ H_FORWARD_PREPARED, 252
+.equ H_MSHR_WAITS, 252
 .equ N_V, 0
 .equ N_IE, 4
 .equ N_DE, 8
@@ -83,7 +75,7 @@
 .equ N_REVERSE_DIR, 64
 .equ N_INPUT_E, 68
 .equ N_INPUT_I, 72
-.equ N_PAD, 76
+.equ N_BUFFER, 76
 .equ X_COUNT, 0
 .equ X_PEAK, 4
 .equ X_CURSOR, 8
@@ -93,3 +85,13 @@
 .equ X_SCATTER_REVERSE, 24
 .equ X_CAPACITY, 28
 .equ X_SPILL_CACHED, 32
+
+/* Timestep-buffer ABI, reuses the former unused writeback buckets. */
+.equ H_BUF_USED, 152
+.equ H_MSHR_COUNT, 156
+.equ H_MSHR_HEAD, 160
+.equ H_MSHR_TAIL, 164
+.equ H_MSHR_SCHEDULED, 168
+.equ H_RNG0, 172
+.equ H_RNG1, 176
+.equ H_MSHR_PEAK, 180
