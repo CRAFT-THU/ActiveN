@@ -9,7 +9,8 @@ import koneko.bus.Encoder
 
 // Async copy operation
 object ACOps extends ChiselEnum {
-  val Load = Value
+  val Load = Value(0.U)
+  val LoadManual = Value(1.U)
 }
 
 // LSU: routes accesses to SPM (local scratchpad) or global memory
@@ -101,7 +102,7 @@ class LSU(implicit val param: CoreParameters) extends Module {
     acOp := ac.start.bits
   }
   acPending := MuxCase(acPending, Seq(
-    acNew -> true.B,
+    acNew -> (ac.start.bits =/= ACOps.LoadManual),
     acmem.fire -> false.B,
   ))
   acRemaining := MuxCase(acRemaining, Seq(

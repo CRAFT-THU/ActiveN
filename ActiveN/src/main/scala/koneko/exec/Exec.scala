@@ -388,9 +388,9 @@ class Exec(implicit val param: CoreParameters) extends Module {
   case class CSRAcCtrl(start: Valid[ACOps.Type], remaining: UInt) extends CSR {
     def read = remaining
     def write(data: UInt) = {
-      start.valid := true.B
-      // If we later introduced other AC ops, decode here
-      start.bits := ACOps.Load
+      val (ops, casted) = ACOps.safe(data(ACOps.getWidth - 1, 0))
+      start.valid := casted
+      start.bits := ops
     }
   }
 
