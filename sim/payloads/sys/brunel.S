@@ -20,7 +20,9 @@ _start:
   csrw (0x710+\id),t0
   .endm
   INSTALL 0,completion,18,0
-  INSTALL 1,br_spike,20,0x00020002
+  # Spike delivery is safe on both SMT threads: the input accumulator uses
+  # LR/SC, while the learning writeback targets are independent.
+  INSTALL 1,br_spike,28,0x00020002
   INSTALL 2,control,20,0x00030005
   INSTALL 3,report,20,0x00020004
   INSTALL 4,reverse,12,0x000a0011

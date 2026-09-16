@@ -24,6 +24,9 @@
 #ifndef BR_BUFFER_LIMIT
 #define BR_BUFFER_LIMIT 8192
 #endif
+#ifndef BR_DIAGNOSTIC
+#define BR_DIAGNOSTIC 0
+#endif
 #if BR_MSHR_LIMIT < 1 || BR_MSHR_LIMIT > 16
 #error Invalid MSHR test limit
 #endif
@@ -128,6 +131,11 @@
  addi \tmp,\tmp,1
  sw \tmp,\offset(gp)
 .endm
+.macro DINC offset,tmp
+#if BR_DIAGNOSTIC
+ INC \offset,\tmp
+#endif
+.endm
 .text
 /* Completion handler is a leaf so it can retire notifications quickly. */
 .globl br_completion
@@ -216,7 +224,7 @@ br_ac_start:
  SEND t0,t1
  ret
 br_weight_load:
- INC H_WEIGHT_LOADS,t0
+ DINC H_WEIGHT_LOADS,t0
  andi a0,a0,-32
  j br_load_start
 br_store_word:
@@ -318,8 +326,8 @@ br_mshr_retire:
 2: lw a0,32(s1)
  mv a1,s2
  call br_store_word
- INC H_WRITE_WORDS,t0
- INC H_MSHR_COMMITS,t0
+ DINC H_WRITE_WORDS,t0
+ DINC H_MSHR_COMMITS,t0
  sw zero,44(s1)
  addi s0,s0,1
  andi s0,s0,15
@@ -350,7 +358,7 @@ br_mshr_allocate:
  lw t0,H_MSHR_COUNT(gp)
  li t1,BR_MSHR_LIMIT
  bltu t0,t1,2f
- INC H_POOL_FULL,t0
+ DINC H_POOL_FULL,t0
  lw t0,H_MSHR_HEAD(gp)
  slli t0,t0,6
  li t1,MSHR
@@ -359,7 +367,7 @@ br_mshr_allocate:
  lw t0,44(t0)
  li t1,2
  beq t0,t1,1f
- INC H_MSHR_WAITS,t0
+ DINC H_MSHR_WAITS,t0
 1: call br_mshr_retire
  lw t0,H_MSHR_COUNT(gp)
  li t1,BR_MSHR_LIMIT
@@ -377,18 +385,20 @@ br_mshr_allocate:
  sw s2,40(s3)
  li t0,1
  sw t0,44(s3)
- INC H_MSHR_LOADS,t0
+ DINC H_MSHR_LOADS,t0
  sw t0,48(s3)
  lw t0,H_MSHR_COUNT(gp)
  addi t0,t0,1
  sw t0,H_MSHR_COUNT(gp)
+#if BR_DIAGNOSTIC
  lw t1,H_MSHR_PEAK(gp)
  bgeu t1,t0,3f
  sw t0,H_MSHR_PEAK(gp)
+#endif
 3: andi a0,s0,-32
  sub a1,s3,gp
  mv a2,a1
- INC H_WEIGHT_LOADS,t0
+ DINC H_WEIGHT_LOADS,t0
  call br_line_start
  lw t0,H_MSHR_SCHEDULED(gp)
  bnez t0,4f
@@ -423,7 +433,7 @@ br_reverse:
  mv a2,s3
  call br_mshr_allocate
 8: INC H_REVERSE_RECEIVED,t0
- INC H_REVERSE_EVENTS,t0
+ DINC H_REVERSE_EVENTS,t0
  LEAVE 5
 /* Range-reduced w^0.4, identical FP32 operation ordering to the C polynomial. */
 .macro HORNER bits
@@ -626,9 +636,11 @@ br_integrate:
 .globl br_spike
 br_spike:
  add t0,gp,a0
- lw t1,0(t0)
+.Lspike_accumulate:
+ lr.w t1,(t0)
  fadd.s t1,t1,a1
- sw t1,0(t0)
+ sc.w t2,t1,(t0)
+ bnez t2,.Lspike_accumulate
  beqz a2,.Lspike_done
  /* a0 points at N_INPUT_E; subtract its field offset to reach the neuron. */
  addi t0,a0,-68
@@ -663,7 +675,11 @@ br_spike:
  li t1,0x402
  SEND t0,t1
 .Lspike_done:
- INC H_RECEIVED,t0
+ /* Both SMT threads may deliver spikes; preserve the barrier count atomically. */
+ li t0,H_RECEIVED
+ add t0,t0,gp
+ li t1,1
+ amoadd.w zero,t1,(t0)
  j br_idle
 .globl br_control
 br_control:
@@ -705,7 +721,11 @@ br_control:
  SEND t0,t1
  SEND t0,t1
  ret
-6: j br_continue
+6: li t0,2
+ bne a0,t0,7f
+ /* Phase 2 reconstructs its mask while processing fired rows. */
+ sw zero,H_ACTIVE_MCS(gp)
+7: j br_continue
 2: lw a1,H_RECEIVED(gp)
  j 4f
 3: lw a1,H_REVERSE_RECEIVED(gp)
@@ -972,7 +992,6 @@ br_work:
  lw t0,36(s2)
  bnez t0,2f
  sw zero,40(s2)
- sw zero,N_BUFFER(s2)
  addi s1,s1,1
  addi s2,s2,80
  j 1b
@@ -995,8 +1014,15 @@ br_work:
  bnez t0,.Lwork_directory
  lw t0,N_FIRE(s2)
  sw t0,N_PRE_FIRE(s2)
- sw zero,N_BUFFER(s2)
  beqz t0,.Lwork_next_neuron
+ /* Every local forward row belongs to this PU's MC.  Record that bit once
+  * so the report handler does not need to rescan all neurons. */
+ lw t1,H_MC(gp)
+ li t2,1
+ sll t1,t2,t1
+ lw t2,H_ACTIVE_MCS(gp)
+ or t2,t2,t1
+ sw t2,H_ACTIVE_MCS(gp)
  lw s4,N_COUNT(s2)
  beqz s4,.Lwork_directory
 .Lforward_first:
@@ -1009,9 +1035,11 @@ br_work:
  add t0,t0,gp
  li t1,1
  sw t1,0(t0)
+#if BR_DIAGNOSTIC
  lw t1,4(t0)
  addi t1,t1,1
  sw t1,4(t0)
+#endif
  lw a0,N_WEIGHTS(s2)
  li a1,PING
  li a2,1024
@@ -1024,11 +1052,13 @@ br_work:
 br_forward_wait:
  csrr t0,0x730
  beqz t0,.Lforward_ready
+#if BR_DIAGNOSTIC
  li t0,STREAM
  add t0,t0,gp
  lw t1,16(t0)
  addi t1,t1,1
  sw t1,16(t0)
+#endif
  YIELDI 11
  j br_idle
 .Lforward_ready:
@@ -1055,9 +1085,11 @@ br_forward_wait:
  add t0,t0,gp
  li t1,2
  sw t1,0(t0)
+#if BR_DIAGNOSTIC
  lw t1,4(t0)
  addi t1,t1,1
  sw t1,4(t0)
+#endif
  addi a0,s6,1024
  xori a1,s11,1
  slli a1,a1,10
@@ -1093,9 +1125,11 @@ br_forward_drain:
  lw t0,H_SENT(gp)
  add t0,t0,s4
  sw t0,H_SENT(gp)
+#if BR_DIAGNOSTIC
  lw t0,H_FORWARD_WEIGHTS(gp)
  add t0,t0,s4
  sw t0,H_FORWARD_WEIGHTS(gp)
+#endif
  add s3,s3,s4
  sw s3,H_WORK_LINE(gp)
  li t0,STREAM
@@ -1103,6 +1137,7 @@ br_forward_drain:
  lw t1,0(t0)
  li t2,2
  bne t1,t2,.Lforward_row_done
+#if BR_DIAGNOSTIC
  lw t1,8(t0)
  addi t1,t1,1
  sw t1,8(t0)
@@ -1112,6 +1147,10 @@ br_forward_drain:
  sw t1,12(t0)
 1: li t1,1
  sw t1,0(t0)
+#else
+ li t1,1
+ sw t1,0(t0)
+#endif
  xori s11,s11,1
  YIELDI 11
  j br_idle
@@ -1130,6 +1169,13 @@ br_work_reverse_row:
  bgeu t0,t1,.Lwork_next_neuron
  lw t0,36(s2)
  beqz t0,.Lwork_next_neuron
+ /* Reverse coefficients are constant for this row across all MC entries. */
+ lw t1,H_WORK_MC(gp)
+ bnez t1,.Lwork_directory
+ lw s8,H_DEP(gp)
+ lw t1,N_Y(s2)
+ fmul.s s8,s8,t1
+ lw s9,H_POT(gp)
 br_work_directory:
 .Lwork_directory:
  lw s6,H_WORK_MC(gp)
@@ -1163,10 +1209,8 @@ br_work_directory:
  li a3,0
  li t2,2
  beq s0,t2,.Lstatic_scatter_tag
- lw t0,H_DEP(gp)
- lw t1,28(s2)
- fmul.s a2,t0,t1
- lw a3,H_POT(gp)
+ mv a2,s8
+ mv a3,s9
  li t2,0xc04
  j 4f
 .Lstatic_scatter_tag:
@@ -1207,32 +1251,21 @@ br_work_flush:
  bne t1,t2,.Lboot_bad
  lw t2,128(t0)
  bne t1,t2,.Lboot_bad
- li t0,DIRTY
- add t0,t0,gp
- addi t1,t0,256
-1: sw zero,0(t0)
- addi t0,t0,4
- bne t0,t1,1b
  addi s2,gp,256
  lw s1,H_NN(gp)
-1: lw t0,24(s2)
- lw t1,40(s2)
+1: lw t0,36(s2)
+ beqz t0,2f
+ lw t1,24(s2)
  lw t2,28(s2)
- lw t3,36(s2)
- fcvt.s.wu t1,t1
- fcvt.s.wu t3,t3
- fadd.s t0,t0,t1
- fadd.s t2,t2,t3
- sw t0,24(s2)
+ fcvt.s.wu t0,t0
+ fadd.s t1,t1,t0
+ fadd.s t2,t2,t0
+ sw t1,24(s2)
  sw t2,28(s2)
+2:
  addi s2,s2,80
  addi s1,s1,-1
  bnez s1,1b
- li t0,REPLAY
- add t0,t0,gp
- sw zero,0(t0)
- sw zero,8(t0)
- sw zero,32(t0)
  li t0,20
  csrw 0x711,t0
  INC H_STEP,t0
@@ -1245,20 +1278,7 @@ br_work_report:
  li a2,0
  li t0,2
  bne s0,t0,3f
- addi t0,gp,256
- lw t1,H_NN(gp)
- li t2,9000
-1: lw t3,44(t0)
- bgeu t3,t2,2f
- lw t3,40(t0)
- beqz t3,2f
- lw t3,H_MC(gp)
- li a2,1
- sll a2,a2,t3
- j 3f
-2: addi t0,t0,80
- addi t1,t1,-1
- bnez t1,1b
+ lw a2,H_ACTIVE_MCS(gp)
 3: mv a0,s0
  lw a1,H_SENT(gp)
 .Lwork_send_report:
@@ -1272,73 +1292,6 @@ br_work_continue:
  call br_continue
 .Lwork_return:
  j br_idle
-/* s2=replay header, four records per invocation. Spill reads are acknowledged
- * before consumption; cached entries remain on SMT0 throughout replay. */
-br_work_replay:
-.Lwork_replay:
- li s3,4
-.Lreplay_record:
- lw s4,X_CURSOR(s2)
- lw t0,X_COUNT(s2)
- bgeu s4,t0,.Lwork_continue
- addi t0,s4,1
- sw t0,X_CURSOR(s2)
- lw t0,X_CAPACITY(s2)
- bgeu s4,t0,.Lreplay_spill
- slli t0,s4,3
- li t1,RECORD
- add t0,t0,t1
- add t0,t0,gp
- lw s5,0(t0)
- lw s6,4(t0)
- j .Lreplay_dispatch
-.Lreplay_spill:
- sub t0,s4,t0
- slli t0,t0,3
- lw s7,X_SPILL_BASE(s2)
- add s7,s7,t0
- andi t0,s7,-32
- lw t1,X_SPILL_CACHED(s2)
- beq t0,t1,1f
- call br_drain
- andi a0,s7,-32
- li a1,1
- call br_load_start
- li a0,1
- call br_load_wait
- andi t0,s7,-32
- sw t0,X_SPILL_CACHED(s2)
-1: andi t0,s7,31
- li t1,READ+32
- add t0,t0,t1
- add t0,t0,gp
- lw s5,0(t0)
- lw s6,4(t0)
-.Lreplay_dispatch:
- srli t0,s6,24
- li t1,80
- mul t0,t0,t1
- add t0,t0,gp
- lw t1,292(t0)
- bnez t1,2f
- lw t1,284(t0)
- lw t2,H_DEP(gp)
- fmul.s a2,t1,t2
- srli a0,s6,16
- andi a0,a0,255
- mv a1,s5
- li a3,0
- slli t0,s6,16
- srli t0,t0,16
- li t1,0xc04
- SEND t0,t1
- INC H_SENT,t0
- lw t0,X_MANUAL_REVERSE(s2)
- addi t0,t0,1
- sw t0,X_MANUAL_REVERSE(s2)
-2: addi s3,s3,-1
- bnez s3,.Lreplay_record
- j .Lwork_continue
 /* Shared image format, hand-written boot copy. No C code in this payload. */
 .globl snn_init
 snn_init:
