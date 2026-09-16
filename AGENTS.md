@@ -291,6 +291,10 @@ Important build details:
 - The hard system backend Verilates `generated/system/`.
 - The soft backend also extracts `Core` from `generated/system/`, not
   `generated/core/`, so hard and soft cores use the same parameters.
+- The system-level simulator can be built with the full hard backend enabled
+  or disabled using CMake's `-DENABLE_HARD_BACKEND=ON|OFF` switch. Disabling
+  it skips elaboration and linking of the Verilated full `System` model; the
+  resulting `sim_system` binary supports `--soft` and rejects `--hard`.
 - CMake reads `generated/system/System.config.json`. Re-run CMake when PU/MC
   counts or other configuration values change; an incremental Ninja build is
   normally enough for RTL changes at the same configuration.
@@ -301,6 +305,16 @@ Important build details:
 - Build outputs are `sim/build/sim_single` and `sim/build/sim_system`.
 - The old standalone `sim_soft` and `sim_cosim` executables no longer exist.
   `sim_system --soft`, `--hard`, or both selects the backend mode.
+
+System-level regression tests generally use the 64-PU/2-MC configuration
+represented by the Scala system-test defaults and should run in `--soft --hard`
+cosimulation mode so that soft/hard request and timing alignment is checked.
+Workload benchmarks such as MNIST and Brunel target the 2x-HBM2-scale
+configuration with 512 PUs, 16 MCs, and a 256-bit external memory bus (32-byte
+memory lines). These workload simulators may be built with
+`-DENABLE_HARD_BACKEND=OFF` and run with `--soft --init-icache` (plus
+`--soft-threads 8`) to model a hot instruction cache without building the
+full hard backend.
 
 ## Simulator architecture and timing contract
 
