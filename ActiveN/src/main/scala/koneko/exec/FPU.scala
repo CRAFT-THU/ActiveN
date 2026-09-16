@@ -5,7 +5,7 @@ import chisel3.util._
 
 import koneko._
 
-class FPU extends BlackBox() {
+class FPU(pipelined: Boolean = false) extends BlackBox(Map("PIPELINED" -> (if (pipelined) 1 else 0))) {
   val io = IO(new Bundle {
     val clock = Input(Clock())
     val reset = Input(Reset())

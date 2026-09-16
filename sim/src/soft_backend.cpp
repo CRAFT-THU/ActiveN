@@ -1217,9 +1217,19 @@ void SoftSystemBackend::accumulateNocProfile(uint64_t cycle) {
     const bool scFailure = scAttempt
         && !root->Core__DOT__exec__DOT__lsu__DOT__reserved;
 
-    const size_t enq = root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__enq_ptr_value;
-    const size_t deq = root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__deq_ptr_value;
-    const bool maybeFull = root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__maybe_full;
+#if SYSTEM_EVENT_SRAM
+    const size_t enq = root->Core__DOT__exec__DOT__biu__DOT__evQueues_evq_1__DOT__tail;
+    const size_t deq = root->Core__DOT__exec__DOT__biu__DOT__evQueues_evq_1__DOT__head;
+    const bool maybeFull = root->Core__DOT__exec__DOT__biu__DOT__evQueues_evq_1__DOT__maybeFull;
+    const bool spikeEnqueue = root->Core__DOT__exec__DOT__biu__DOT__evQueues_evq_1__DOT__doEnq;
+    const bool spikeDequeue = root->Core__DOT__exec__DOT__biu__DOT__evQueues_evq_1__DOT__doDeq;
+#else
+    const size_t enq = root->Core__DOT__exec__DOT__biu__DOT__evQueues_evq_1__DOT__enq_ptr_value;
+    const size_t deq = root->Core__DOT__exec__DOT__biu__DOT__evQueues_evq_1__DOT__deq_ptr_value;
+    const bool maybeFull = root->Core__DOT__exec__DOT__biu__DOT__evQueues_evq_1__DOT__maybe_full;
+    const bool spikeEnqueue = root->Core__DOT__exec__DOT__biu__DOT__evQueues_evq_1__DOT__do_enq;
+    const bool spikeDequeue = root->Core__DOT__exec__DOT__biu__DOT__evQueues_evq_1__DOT__unnamedblk1__DOT__do_deq;
+#endif
     const size_t spikeQueueOccupancy = enq == deq
         ? (maybeFull ? spikeQueueDepth : 0)
         : ((enq - deq) & (spikeQueueDepth - 1));
@@ -1250,8 +1260,8 @@ void SoftSystemBackend::accumulateNocProfile(uint64_t cycle) {
     profile.spike_queue_empty_cycles += spikeQueueOccupancy == 0;
     profile.spike_queue_full_cycles += spikeQueueOccupancy == spikeQueueDepth;
     profile.idle_with_spikes_cycles += !active && spikeQueueOccupancy != 0;
-    profile.spike_enqueues += root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__do_enq;
-    profile.spike_dequeues += root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__unnamedblk1__DOT__do_deq;
+    profile.spike_enqueues += spikeEnqueue;
+    profile.spike_dequeues += spikeDequeue;
     profile.max_spike_queue_occupancy = std::max(
         profile.max_spike_queue_occupancy,
         static_cast<uint64_t>(spikeQueueOccupancy));

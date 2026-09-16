@@ -34,6 +34,7 @@ with open(os.path.join(outdir, "system_config.h"), "w") as f:
     f.write(f"inline constexpr int SYSTEM_SCRATCHPAD_SIZE = {core['scratchpadSize']};\n")
     f.write(f"inline constexpr bool SYSTEM_USE_FPU = {'true' if core['useFPU'] else 'false'};\n")
     f.write(f"inline constexpr int SYSTEM_PIPE_CNT = {core['pipeCnt']};\n\n")
+    f.write(f"#define SYSTEM_EVENT_SRAM {int(core.get('eventSram', False))}\n\n")
 
     bcast_slots = core["memBusWidth"] // 64
     f.write("// Broadcast-line accessors for the elaborated memory-line width\n")

@@ -72,9 +72,10 @@ class BIU(implicit val param: CoreParameters) extends Module {
   // Receiving
   //////////////////////////
 
-  val evQueues = for (i <- 0 until 16) yield (
-    Module(new Queue(Vec(4, UInt(32.W)), 16)).suggestName(s"evq_$i")
-  )
+  val evQueues = for (i <- 0 until 16) yield {
+    if (param.eventSram) Module(new SramEventQueue(param.eventClockGating)).suggestName(s"evq_$i").io
+    else Module(new Queue(Vec(4, UInt(32.W)), 16)).suggestName(s"evq_$i").io
+  }
   val bcastQueue = Module(new Queue(new BcastLine, param.bcastQueueDepth))
 
   bcastQueue.io.enq <> bcast
@@ -115,7 +116,7 @@ class BIU(implicit val param: CoreParameters) extends Module {
     arb.io.in(0) <> splittedLocal(i)
     arb.io.in(1) <> splittedUnicast(i)
     arb.io.in(2) <> splittedBcast(i)
-    evQueues(i).io.enq <> arb.io.out
+    evQueues(i).enq <> arb.io.out
   }
 
   //////////////////////////
@@ -127,9 +128,9 @@ class BIU(implicit val param: CoreParameters) extends Module {
     val enabled = (enmasks(i) & accepting).orR
     val marginSatisfied = sendQueue.count +& margins(i) +& liveQuota <= param.sendQueueDepth.U
     val schedulable = enabled && marginSatisfied
-    val gated = evQueues(i).io.deq.gatedBy(schedulable).suggestName(s"gated_$i")
+    val gated = evQueues(i).deq.gatedBy(schedulable).suggestName(s"gated_$i")
     scheduleArb.io.in(i) <> gated
-    schedulables(i) := marginSatisfied && evQueues(i).io.deq.valid
+    schedulables(i) := marginSatisfied && evQueues(i).deq.valid
   }
   val scheduled = scheduleArb.io.chosen
   sched.handler := scheduleArb.io.chosen

@@ -214,6 +214,12 @@ class LSU(implicit val param: CoreParameters) extends Module {
   val spmBulkWriteAddr = (mem.resp.bits.ident << log2Ceil(param.memBusWidth / 8)) + (ac.sBase - 0x20000000.U)
   spm.io.addr := Mux(respAc, spmBulkWriteAddr, spmAlignedAddr)
   spm.io.we := Mux(respAc, Fill(param.memBusWidth / 8, 1.U(1.W)), spmShortWe << spmWordOffset)
+  // CPU reads/AMO consume one word; bulk responses only write. Keep the word
+  // enabled on an AMO retry and let byte writes take precedence inside SPM.
+  spm.io.re.foreach { re =>
+    re := Mux(req.valid && isSPM && !req.bits.write && !respAc,
+      0xF.U((param.memBusWidth / 8).W) << spmWordOffset, 0.U)
+  }
   // Note: AMO necessarily takes two cycles, so if req.bits.atomic causes timing hazard,
   // we can RegNext here.
   spm.io.wdata := Mux(respAc, mem.resp.bits.data, Fill(param.memBusWidth / 32, spmShortWdata))

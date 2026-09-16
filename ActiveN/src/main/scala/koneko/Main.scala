@@ -14,6 +14,11 @@ object Main extends App {
     "memBusWidth" -> p.memBusWidth,
     "memCtrlSizes" -> p.memCtrlSizes.map(s => ujson.Str(s"0x${s.toString(16)}")),
     "scratchpadSize" -> p.scratchpadSize,
+    "spmSram" -> p.spmSram,
+    "eventSram" -> p.eventSram,
+    "spmClockGating" -> p.spmClockGating,
+    "eventClockGating" -> p.eventClockGating,
+    "fpuPipeline" -> p.fpuPipeline,
     "useFPU" -> p.useFPU,
     "pipeCnt" -> p.pipeCnt,
     "sendQueueDepth" -> p.sendQueueDepth,
@@ -39,6 +44,11 @@ object Main extends App {
   var pu: Option[Int] = None
   var mc: Option[Int] = None
   var memBusWidth: Option[Int] = None
+  var spmSram: Boolean = false
+  var eventSram: Boolean = false
+  var spmClockGating: Boolean = false
+  var eventClockGating: Boolean = false
+  var fpuPipeline: Boolean = false
   var output: Option[String] = None
   var spliter = args.indexOf("--")
   val (mainArgs, otherArgs) = if (spliter >= 0) {
@@ -57,11 +67,21 @@ object Main extends App {
         println("  --pu=<N>         Emit System with N PUs")
         println("  --mc=<N>         Emit System with N MCs")
         println("  --mem-bus-width=<bits>  Set the external memory bus width. Default: 512")
+        println("  --spm-sram       Use ASAP7 SRAM banks for the scratchpad PPA experiment")
+        println("  --event-sram     Use budgetary 2RW SRAMs for the event FIFO PPA experiment")
+        println("  --spm-clock-gating  Clock only scratchpad banks accessed by the LSU (requires --spm-sram)")
+        println("  --event-clock-gating  Clock FIFO ports only on write or head refresh (requires --event-sram)")
+        println("  --fpu-pipeline   Move the FPU output register inside CVFPU, preserving latency")
         println("  --output=<path>  Set output path for generated files. Default: ./generated/core or ./generated/system")
         sys.exit(0)
       }
       case "--core" => core = true
       case "--system" => system = true
+      case "--spm-sram" => spmSram = true
+      case "--event-sram" => eventSram = true
+      case "--spm-clock-gating" => spmClockGating = true
+      case "--event-clock-gating" => eventClockGating = true
+      case "--fpu-pipeline" => fpuPipeline = true
       case a if a.startsWith("--pu=") => {
         pu = a.stripPrefix("--pu=").toIntOption
         if (pu.isEmpty) {
@@ -109,7 +129,12 @@ object Main extends App {
   }
 
   val param = defaultParam.copy(
-    memBusWidth = memBusWidth.getOrElse(defaultParam.memBusWidth)
+    memBusWidth = memBusWidth.getOrElse(defaultParam.memBusWidth),
+    spmSram = spmSram,
+    eventSram = eventSram,
+    spmClockGating = spmClockGating,
+    eventClockGating = eventClockGating,
+    fpuPipeline = fpuPipeline
   )
 
   val subdir = if (system) "system" else "core"

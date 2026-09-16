@@ -1,4 +1,4 @@
-module FPU (
+module FPU #(parameter bit PIPELINED = 0) (
   input logic clock,
   input logic reset,
 
@@ -103,15 +103,21 @@ module FPU (
   logic fpnew_in_ready;
   logic [31:0] fpnew_result;
 
+  // PipeRegs is packed across operation groups, formats and 32-bit counts.
+  // Explicit replication avoids differing tool interpretations of defaults.
+  localparam int unsigned PIPE_STAGES = PIPELINED ? 1 : 0;
+  localparam fpnew_pkg::opgrp_fmt_unsigned_t PIPE_REGS =
+      {fpnew_pkg::NUM_OPGROUPS{{fpnew_pkg::NUM_FP_FORMATS{PIPE_STAGES}}}};
+
   fpnew_top #(
     .Features       ( fpnew_pkg::RV32F ),
     .Implementation ( '{
-      PipeRegs:   '{default: 0},  // Fully combinational
+      PipeRegs:   PIPE_REGS,
       UnitTypes:  '{'{default: fpnew_pkg::PARALLEL},  // ADDMUL
                     '{default: fpnew_pkg::DISABLED},   // DIVSQRT (not needed)
                     '{default: fpnew_pkg::PARALLEL},   // NONCOMP
                     '{default: fpnew_pkg::MERGED}},    // CONV
-      PipeConfig: fpnew_pkg::AFTER
+      PipeConfig: PIPELINED ? fpnew_pkg::INSIDE : fpnew_pkg::AFTER
     }),
     .TagType        ( logic ),
     .TrueSIMDClass  ( 0 ),
@@ -141,6 +147,11 @@ module FPU (
     .early_valid_o  ( )
   );
 
+  if (PIPELINED) begin : gen_internal_pipeline
+    // One internal stage replaces the wrapper register, preserving the
+    // execute pipeline's existing latency for every supported operation.
+    assign r = fpnew_result;
+  end else begin : gen_output_pipeline
   // Free-running output register.
   //
   // The exec pipeline consumes this value exactly one cycle later and gates the
@@ -158,5 +169,6 @@ module FPU (
     r_held <= fpnew_result;
   end
   assign r = r_held;
+  end
 
 endmodule

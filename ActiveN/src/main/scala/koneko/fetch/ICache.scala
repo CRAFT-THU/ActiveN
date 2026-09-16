@@ -97,12 +97,15 @@ class ICache(implicit val params: CoreParameters) extends Module {
   }
 
   val s0pc = input.bits
-  val s0pcidx = dontTouch((s0pc >> params.i$OffsetLen)(params.i$IndexLen - 1, 0))
+  // A single set has no address index bits; keep its memory address at zero.
+  val s0pcidx = if(params.i$Sets == 1) 0.U else
+    dontTouch((s0pc >> params.i$OffsetLen)(params.i$IndexLen - 1, 0))
   val s0pcdataidx = s0pc(params.i$IndexLen + params.i$OffsetLen - 1, 2)
   val s0step = Wire(Bool())
 
   val s1pc = RegEnable(s0pc, s0step)
-  val s1pcidx = (s1pc >> params.i$OffsetLen)(params.i$IndexLen - 1, 0)
+  val s1pcidx = if(params.i$Sets == 1) 0.U else
+    (s1pc >> params.i$OffsetLen)(params.i$IndexLen - 1, 0)
 
   val s1pctag = dontTouch(s1pc >> (params.i$OffsetLen + params.i$IndexLen))
   val s1metadata = RegEnable(metadata(s0pcidx), s0step)
@@ -118,8 +121,8 @@ class ICache(implicit val params: CoreParameters) extends Module {
   val s1hitWay = OHToUInt(s1hitmap)
 
   val s1reset = RegInit(true.B)
-  val s1rstCnt = RegInit(0.U(params.i$IndexLen.W))
-  s1reset := Mux(s1rstCnt.andR, false.B, s1reset)
+  val s1rstCnt = RegInit(0.U(params.i$IndexLen.max(1).W))
+  s1reset := Mux(s1rstCnt === (params.i$Sets - 1).U, false.B, s1reset)
   s1rstCnt := Mux(s1reset, s1rstCnt + 1.U, s1rstCnt)
 
   val s1refillCnt = RegInit(0.U((params.i$OffsetLen - 2).W))
@@ -145,7 +148,8 @@ class ICache(implicit val params: CoreParameters) extends Module {
   val s1refillCompleted = RegInit(false.B)
 
   // Request: word-aligned address for current beat
-  val refillBaseAddr = s1pctag ## s1pcidx ## 0.U(params.i$OffsetLen.W)
+  val refillBaseAddr = if(params.i$Sets == 1) s1pctag ## 0.U(params.i$OffsetLen.W) else
+    s1pctag ## s1pcidx ## 0.U(params.i$OffsetLen.W)
   val curBeat = s1refillCnt >> wordBits
   val curWordInBeat = s1refillCnt(wordBits - 1, 0)
   val beatAddr = refillBaseAddr + (curBeat << log2Ceil(params.memBusWidth / 8))
@@ -179,7 +183,7 @@ class ICache(implicit val params: CoreParameters) extends Module {
   val beatWords = VecInit(Seq.tabulate(wordsPerBeat)(i =>
     s1refillBeatData((i + 1) * 32 - 1, i * 32)
   ))
-  val dataWriteIdx = s1pcidx ## s1refillCnt
+  val dataWriteIdx = if(params.i$Sets == 1) s1refillCnt else s1pcidx ## s1refillCnt
   val dataWriteVal = beatWords(curWordInBeat)
   val dataWriteEnable = s1refillWriting
 
