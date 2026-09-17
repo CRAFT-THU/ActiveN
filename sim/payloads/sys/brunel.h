@@ -27,6 +27,7 @@
 #define BR_STACK1 0x3f80u
 #define BR_POISSON 0x2da4u
 #define BR_STREAM 0x2dd0u
+#define BR_TREE_REPORTS 0x2de4u /* boot-computed self + child report count */
 #define BR_RECORD_CAPACITY 256u
 #define BR_MAX_RECORDS 8100u /* current 512-PU graph: at most 18 E * 450 */
 #define BR_BASE 0x20000000u
@@ -68,7 +69,8 @@ typedef struct {
 } BrStream;
 BR_ASSERT(BR_RECORDS + BR_RECORD_CAPACITY * 8 == BR_PING, "record/staging boundary");
 BR_ASSERT(BR_PING + BR_PING_BYTES == BR_STACK0, "staging/stack boundary");
-BR_ASSERT(BR_STREAM + sizeof(BrStream) <= BR_DIRTY_BITMAP, "stream metadata");
+BR_ASSERT(BR_STREAM + sizeof(BrStream) <= BR_TREE_REPORTS, "stream metadata");
+BR_ASSERT(BR_TREE_REPORTS + 4 <= BR_DIRTY_BITMAP, "reduction tree constant");
 BR_ASSERT(sizeof(BrHeader) == 256, "header ABI");
 BR_ASSERT(sizeof(BrNeuron) == 80, "neuron ABI");
 BR_ASSERT(BR_NEURONS + BR_MAX_NEURONS * sizeof(BrNeuron) <= BR_BUFFER,
