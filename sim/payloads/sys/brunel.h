@@ -48,10 +48,12 @@ typedef struct {
   uint32_t p11, p21, p31, p32, p33, epsc, delivery, external_mean;
   uint32_t external_limit, external_weight, dep, pot, wmax, decay_pre,
       decay_post;
-  uint32_t directory_line, weight_loads, allocation_waits;
+  uint32_t mc_destination, weight_loads, allocation_waits;
 } BrHeader;
 typedef struct {
-  uint32_t v, ie, de, ii, di, refrac, x, y, rng, fire, pre_fire, gid;
+  /* fire is authoritative from integration through reverse learning.
+   * Offset 40 retains its image value and is reserved for ABI compatibility. */
+  uint32_t v, ie, de, ii, di, refrac, x, y, rng, fire, reserved_fire, gid;
   uint32_t weights, count, targets, static_dir, reverse_dir, input_e, input_i, buffer;
 } BrNeuron;
 typedef struct {
@@ -82,7 +84,8 @@ BR_ASSERT(offsetof(BrHeader, buffer_bytes) == 152, "buffer control ABI");
 BR_ASSERT(offsetof(BrHeader, allocation_waits) == 252, "MSHR wait counter ABI");
 BR_ASSERT(offsetof(BrMshr, state) == 44, "MSHR state ABI");
 BR_ASSERT(offsetof(BrNeuron, buffer) == 76, "row buffer pointer ABI");
-BR_ASSERT(offsetof(BrNeuron, pre_fire) == 40, "assembly pre_fire offset");
+BR_ASSERT(offsetof(BrNeuron, reserved_fire) == 40, "reserved neuron offset");
+BR_ASSERT(offsetof(BrHeader, mc_destination) == 244, "precomputed MC destination");
 BR_ASSERT(offsetof(BrHeader, reverse_received) == 68,
           "assembly receive offset");
 BR_ASSERT(offsetof(BrHeader, reverse_events) == 148, "assembly event offset");

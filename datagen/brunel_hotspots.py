@@ -54,7 +54,8 @@ def analyze(images, dumps, start, steps, output):
         delta = counts - previous_counts
         x = F(previous[:, 6].view(np.float32) * c["decay_pre"])
         y = F(previous[:, 7].view(np.float32) * c["decay_post"])
-        forward = n[pre, 10] != 0
+        fire_field = 9 if manifest.get("firing_flag") == "N_FIRE" else 10
+        forward = n[pre, fire_field] != 0
         ltd = forward & (F(c["dep"] * y[post]) != 0)
         ltp = (n[post, 9] != 0) & (F(c["pot"] * x[pre]) != 0)
         reads, down, up, unique = map(count, (forward, ltd, ltp, ltd | ltp))
@@ -84,7 +85,7 @@ def analyze(images, dumps, start, steps, output):
         else:
             np.testing.assert_array_equal(delta[:, 0] + delta[:, 1] - reads, updates)
         pre_fired = np.bincount(
-            np.arange(NE) % PU, weights=n[:NE, 10], minlength=PU
+            np.arange(NE) % PU, weights=n[:NE, fire_field], minlength=PU
         ).astype(int)
         arrivals = np.bincount(post[forward] % PU, minlength=PU)
         for pu in range(PU):

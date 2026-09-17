@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 import numpy as np
-from brunel import constants, poisson, poisson_thresholds
+from brunel import F, constants, poisson, poisson_thresholds
 from brunel_validate import pending_power
 from brunel_reuse import working_sets
 
@@ -22,7 +22,7 @@ class Numerics(unittest.TestCase):
         directory = Path(cls.temp.name)
         source = directory / "numeric.c"
         source.write_text(
-            '#include "brunel_numeric.h"\nF polynomial(F w){return pow04(w); }\n'
+            '#include "brunel_numeric.h"\nF root_power(F w){return pow04(w); }\n'
         )
         cls.library = directory / "numeric.so"
         subprocess.run(
@@ -45,10 +45,10 @@ class Numerics(unittest.TestCase):
     def tearDownClass(cls):
         cls.temp.cleanup()
 
-    def test_polynomial(self):
+    def test_iterative_power(self):
         path = self.library
         lib = ctypes.CDLL(str(path))
-        fn = lib.polynomial
+        fn = lib.root_power
         fn.argtypes = [ctypes.c_uint32]
         fn.restype = ctypes.c_uint32
         x = np.geomspace(1e-44, 3e38, 100001).astype(np.float32)
@@ -59,7 +59,9 @@ class Numerics(unittest.TestCase):
         self.assertEqual(pending_power(np.float32(0)), 0)
         reconstructed = np.array([pending_power(v) for v in x], np.float32)
         np.testing.assert_array_equal(reconstructed.view(np.uint32), y.view(np.uint32))
-        self.assertLess(np.max(np.abs(y / x.astype(float) ** 0.4 - 1)), 2e-6)
+        reference = F(np.power(x.astype(np.float64), 2 / 5))
+        ulp = np.abs(y.view(np.uint32).astype(np.int64) - reference.view(np.uint32))
+        self.assertLessEqual(int(ulp.max()), 4)
 
     def test_poisson(self):
         for rule in ("additive", "morrison"):

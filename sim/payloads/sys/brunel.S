@@ -9,7 +9,7 @@ _start:
   # Each 128-byte stack has a base guard. Steady-state work only spills on
   # the rare full-MSHR fallback; boot and numeric self-tests also use the stack.
   li sp, 0x20003f80
-  call snn_init
+  jal ra,snn_init
   li t0, 0x20000000
   csrw 0x732,t0
   .macro INSTALL id,func,cfg,margin
@@ -33,7 +33,7 @@ _start:
   INSTALL 10,idle,16,0
   INSTALL 11,br_forward_wait,8,0x00020013
   INSTALL 12,br_forward_drain,8,0x00020013
-  call br_boot
+  jal ra,br_boot
 .globl br_idle
 br_idle:
 idle:

@@ -43,46 +43,26 @@ static __attribute__((always_inline)) inline F fm_min(F a, F b) { return value(a
 static __attribute__((always_inline)) inline F fm_max(F a, F b) { return value(a) > value(b) ? a : b; }
 static __attribute__((always_inline)) inline F from_u(uint32_t a) { return bits((float)a); }
 #endif
-/* Range-reduced binomial polynomial on m in [1,2): z=(m-1.5)/1.5.
- * Degree eight, |z|<=1/3. No division, iterative root, or DRAM lookup table. */
+/* Host mirror of the assembly's positive-finite w^(2/5) operation ordering.
+ * One inverse-fifth-root refinement plus a tuned quadratic residual. Compile
+ * with FP contraction disabled; all arithmetic rounds separately to FP32. */
 static __attribute__((always_inline)) inline F pow04(F w) {
-  if (!(w & 0x7fffffffu))
+  if (w == 0)
     return 0;
-  int exponent = (int)(w >> 23) - 127;
-  if ((w >> 23) == 0) {
+  uint32_t scale = 0;
+  if (w < 0x02000000u) {
     w = fmul(w, bits(0x1p100f));
-    exponent = (int)(w >> 23) - 227;
+    scale = 40u << 23;
   }
-  F m = (w & 0x7fffffu) | 0x3f800000u;
-  F z = fmul(fsub(m, bits(1.5f)), bits(2.0f / 3.0f));
-  F p = bits(-0.015155712f);
-  p = fadd(bits(0.01837056f), fmul(z, p));
-  p = fadd(bits(-0.0229632f), fmul(z, p));
-  p = fadd(bits(0.029952f), fmul(z, p));
-  p = fadd(bits(-0.0416f), fmul(z, p));
-  p = fadd(bits(0.064f), fmul(z, p));
-  p = fadd(bits(-0.12f), fmul(z, p));
-  p = fadd(bits(0.4f), fmul(z, p));
-  p = fadd(bits(1.0f), fmul(z, p));
-  p = fmul(p, bits(1.1760790225246736f));
-  int q = 0;
-  while (exponent < 0) {
-    exponent += 5;
-    q -= 2;
-  }
-  while (exponent >= 5) {
-    exponent -= 5;
-    q += 2;
-  }
-  F scale = bits(1.0f);
-  if (exponent == 1)
-    scale = bits(1.3195079107728942f);
-  if (exponent == 2)
-    scale = bits(1.7411011265922482f);
-  if (exponent == 3)
-    scale = bits(2.29739670999407f);
-  if (exponent == 4)
-    scale = bits(3.031433133020796f);
-  return fmul(fmul(p, scale), (uint32_t)(q + 127) << 23);
+  F r = 0x4c2bac89u - w / 5u;
+  F m = fmul(w, bits(0.2f));
+  F r2 = fmul(r, r);
+  F r4 = fmul(r2, r2);
+  r = fsub(fmul(r, bits(1.20148f)), fmul(fmul(m, r2), r4));
+  r2 = fmul(r, r);
+  F q = fmul(fmul(w, r2), r);
+  F d = fsub(bits(1.0f), fmul(q, r2));
+  F correction = fadd(fmul(d, bits(0.48f)), bits(0.60002f));
+  return fadd(q, fmul(fmul(q, d), correction)) - scale;
 }
 #endif

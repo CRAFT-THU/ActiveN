@@ -2,4 +2,6 @@
 /build*
 /.vscode
 /.ccls-cache
-/tests
+/tests/*
+!/tests/brunel_asm_numeric.S
+!/tests/brunel_pow04.cpp

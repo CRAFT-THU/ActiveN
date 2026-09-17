@@ -183,6 +183,7 @@ br_line_start:
  add t0,gp,t0
  sw zero,80(t0)
 2:
+br_mshr_line_start:
 .Lload_credit_wait:
  lw t0,H_ISSUED(gp)
  lw t1,H_CONSUMED(gp)
@@ -194,9 +195,7 @@ br_line_start:
  mv a3,a1
  srli a2,a2,5
  li a1,0x58002
- lw t0,H_MC(gp)
- li t1,0x8001
- add t0,t0,t1
+ lw t0,H_MC_DEST(gp)
  SENDI t0,-2048
  ret
 br_load_wait:
@@ -205,24 +204,17 @@ br_load_wait:
 1: lw t1,80(t0)
  beqz t1,1b
  ret
-/* Arm a LoadManual AC and issue the matching bulk request to the selected MC.
- * a0=MC-local source address, a1=SPM offset, a2=byte length. */
+/* Arm the fixed 1-KiB LoadManual AC. Boot sets acLen once; scalar directory
+ * and MSHR requests never change it. a0=MC-local address, a1=SPM offset. */
 br_ac_start:
- li t0,BR_BASE
- add t0,t0,a1
+ add t0,gp,a1
  csrw 0x732,t0
- csrw 0x733,a2
  li t0,1
  csrw 0x730,t0
- srli t0,a2,5
- slli t0,t0,16
- li t1,0x8001
- or a1,t0,t1
+ li a1,0x208001             # 32 lines, manual AC response ID 0x8001
  li a2,0
  li a3,0
- lw t0,H_MC(gp)
- li t1,0x8001
- add t0,t0,t1
+ lw t0,H_MC_DEST(gp)
  SENDI t0,-2031
  ret
 br_weight_load:
@@ -240,9 +232,7 @@ br_store_word:
  mv a3,a1
  li a1,0x28003
  li a2,0x8000
- lw t0,H_MC(gp)
- li t1,0x8001
- add t0,t0,t1
+ lw t0,H_MC_DEST(gp)
  SENDI t0,1025
  ret
 br_drain:
@@ -259,35 +249,40 @@ br_halt:
  sw a0,0(t0)
 1: wfi
  j 1b
-/* update(a0=weight,a1=coefficient,a2=potentiation) -> updated/clipped a0. */
+/* Test-only generic entry; production calls rule-specific leaf addresses
+ * selected once at boot. Valid input weights and coefficients are >= 0. */
 #ifdef BR_ASM_SELFTEST
 .globl br_update
-#endif
 br_update:
  lw t0,H_RULE(gp)
- bnez t0,2f
- beqz a2,1f
- fadd.s a0,a0,a1
- j .Lclip_additive
-1: fsub.s a0,a0,a1
-.Lclip_additive:
- lw t0,H_WMAX(gp)
+ bnez t0,1f
+ beqz a2,br_ltd_additive
+ j br_ltp_additive
+1: beqz a2,br_ltd_morrison
+ j br_ltp_morrison
+#endif
+br_ltd_additive:
+ fsub.s a0,a0,a1
  fmax.s a0,a0,zero
+ ret
+br_ltp_additive:
+ fadd.s a0,a0,a1
+ lw t0,H_WMAX(gp)
  fmin.s a0,a0,t0
  ret
-2: bnez a2,3f
+br_ltd_morrison:
  fmul.s a1,a1,a0
  fsub.s a0,a0,a1
  fmax.s a0,a0,zero
  ret
-3: /* br_pow04 clobbers only a0,t0-t2,t4-t5. Keep the weight and link
+br_ltp_morrison:
+ /* br_pow04 clobbers only a0,t0-t5. Keep the weight and link
     * in its unused argument registers instead of creating a stack frame. */
  mv a2,ra
  mv a3,a0
- call br_pow04
+ jal ra,br_pow04
  fmul.s a0,a0,a1
  fadd.s a0,a0,a3
- fmax.s a0,a0,zero
  jr a2
 /* One coalesced service event; only SMT0 owns ring indices and allocation.
  * SMT1 only changes an allocated descriptor from loading(1) to ready(2).
@@ -296,6 +291,7 @@ br_update:
  * these descriptors; post-quiet updates are written at the receiving PU.
  * Private ABI: a4-a7 hold the head, descriptor, weight, and return link.
  * All callees preserve those registers and t6 (the allocator's return link).
+ * Returns the remaining descriptor count in t0 on every path.
  */
 br_mshr_retire:
  lw t0,H_MSHR_COUNT(gp)
@@ -307,7 +303,7 @@ br_mshr_retire:
  add a5,a5,gp
  lw t0,44(a5)
  li t1,2
- bne t0,t1,9f
+ bne t0,t1,.Lmshr_not_ready
  mv a7,ra
  lw t0,32(a5)
  andi t0,t0,28
@@ -316,18 +312,18 @@ br_mshr_retire:
  lw a1,36(a5)
  beqz a1,1f
  mv a0,a6
- li a2,0
- call br_update
+ csrr t0,BR_LTD_ENTRY
+ jalr ra,t0,0
  mv a6,a0
 1: lw a1,40(a5)
  beqz a1,2f
  mv a0,a6
- li a2,1
- call br_update
+ csrr t0,BR_LTP_ENTRY
+ jalr ra,t0,0
  mv a6,a0
 2: lw a0,32(a5)
  mv a1,a6
- call br_store_word
+ jal ra,br_store_word
  DINC H_WRITE_WORDS,t0
  DINC H_MSHR_COMMITS,t0
  sw zero,44(a5)
@@ -338,11 +334,12 @@ br_mshr_retire:
  addi t0,t0,-1
  sw t0,H_MSHR_COUNT(gp)
  jr a7
+.Lmshr_not_ready:
+ lw t0,H_MSHR_COUNT(gp)
 9: ret
 .globl br_mshr_service
 br_mshr_service:
- call br_mshr_retire
- lw t0,H_MSHR_COUNT(gp)
+ jal ra,br_mshr_retire
  beqz t0,1f
  SENDI zero,6
  j br_idle
@@ -356,14 +353,15 @@ br_mshr_allocate:
  mv a4,a0
  mv a5,a1
  mv a6,a2
- lw t0,H_MSHR_COUNT(gp)
+ lw t3,H_MSHR_COUNT(gp)
  li t1,BR_MSHR_LIMIT
- bltu t0,t1,2f
+ bltu t3,t1,2f
  addi sp,sp,-16
  sw a4,0(sp)
  sw a5,4(sp)
  sw a6,8(sp)
  DINC H_POOL_FULL,t0
+#if BR_DIAGNOSTIC
  lw t0,H_MSHR_HEAD(gp)
  slli t0,t0,6
  li t1,MSHR
@@ -373,10 +371,11 @@ br_mshr_allocate:
  li t1,2
  beq t0,t1,1f
  DINC H_MSHR_WAITS,t0
-1: call br_mshr_retire
- lw t0,H_MSHR_COUNT(gp)
+#endif
+1: jal ra,br_mshr_retire
  li t1,BR_MSHR_LIMIT
  bgeu t0,t1,1b
+ mv t3,t0
  lw a4,0(sp)
  lw a5,4(sp)
  lw a6,8(sp)
@@ -398,19 +397,18 @@ br_mshr_allocate:
 #if BR_DIAGNOSTIC
  sw t0,48(t2)
 #endif
- lw t0,H_MSHR_COUNT(gp)
- addi t0,t0,1
- sw t0,H_MSHR_COUNT(gp)
+ addi t3,t3,1
+ sw t3,H_MSHR_COUNT(gp)
 #if BR_DIAGNOSTIC
  lw t1,H_MSHR_PEAK(gp)
- bgeu t1,t0,3f
- sw t0,H_MSHR_PEAK(gp)
+ bgeu t1,t3,3f
+ sw t3,H_MSHR_PEAK(gp)
 #endif
 3: andi a0,a4,-32
  sub a1,t2,gp
  mv a2,a1
  DINC H_WEIGHT_LOADS,t0
- call br_line_start
+ jal ra,br_mshr_line_start
  lw t0,H_MSHR_SCHEDULED(gp)
  bnez t0,4f
  li t0,1
@@ -423,10 +421,15 @@ br_reverse:
  mul t0,a0,t0
  add t0,gp,t0
  addi t0,t0,256
- lw t1,N_PRE_FIRE(t0)
+ lw t1,N_FIRE(t0)
+ lw t2,N_X(t0)
+ /* Most no-op deliveries have neither a trace nor a current pre spike.
+  * Reject them before the FP multiply. Live traces still cover silent pres. */
+ or t0,t1,t2
+ beqz t0,8f
  bnez t1,1f
  li a2,0
-1: lw t2,N_X(t0)
+1:
  fmul.s a3,a3,t2
  or t0,a2,a3
  slli t0,t0,1
@@ -440,71 +443,50 @@ br_reverse:
 8: INC H_REVERSE_RECEIVED,t0
  DINC H_REVERSE_EVENTS,t0
  j br_idle
-/* Range-reduced w^0.4, identical FP32 operation ordering to the C polynomial. */
-.macro HORNER bits
- li t2,\bits
- fmul.s a0,a0,t1
- fadd.s a0,a0,t2
-.endm
+/* Positive finite FP32 w^(2/5), plus exact +0. Scratch a0,t0-t5 only.
+ * Bit seed for the inverse fifth root, one modified Newton step, then a
+ * quadratic correction of q=w*r^3 using d=1-q*r^2. Every FP op rounds
+ * separately. Exhaustive positive-FP32 validation bounds the error at 2 ULP.
+ * Scale tiny inputs by 2^100 and reduce the result exponent by 40. */
 #ifdef BR_ASM_SELFTEST
 .globl br_pow04
 #endif
 br_pow04:
- slli t0,a0,1
- beqz t0,9f
- srli t4,a0,23
- bnez t4,1f
+ beqz a0,9f
+ li t5,0
+ li t0,0x02000000
+ bgeu a0,t0,1f
  li t0,0x71800000
  fmul.s a0,a0,t0
- srli t4,a0,23
- addi t4,t4,-227
- j 2f
-1: addi t4,t4,-127
-2: li t0,0x7fffff
- and t0,a0,t0
- li t2,0x3f800000
- or t0,t0,t2
- li t2,0x3fc00000
- fsub.s t1,t0,t2
- li t2,0x3f2aaaab
+ li t5,0x14000000
+1: li t0,0x4c2bac89
+ li t2,0xcccccccd
+ mulhu t1,a0,t2
+ srli t1,t1,2               # exact unsigned divide by five
+ sub t1,t0,t1
+ li t0,0x3e4ccccd          # 0.2
+ fmul.s t2,a0,t0
+ fmul.s t3,t1,t1
+ fmul.s t4,t3,t3
+ fmul.s t2,t2,t3
+ fmul.s t2,t2,t4
+ li t0,0x3f99ca19          # 1.20148
+ fmul.s t1,t1,t0
+ fsub.s t1,t1,t2
+ fmul.s t3,t1,t1
+ fmul.s a0,a0,t3
+ fmul.s a0,a0,t1
+ fmul.s t1,a0,t3
+ li t0,0x3f800000
+ fsub.s t1,t0,t1
+ li t0,0x3ef5c28f          # 0.48
+ fmul.s t2,t1,t0
+ li t0,0x3f199ae9          # 0.60002
+ fadd.s t2,t2,t0
+ fmul.s t1,a0,t1
  fmul.s t1,t1,t2
- li a0,0xbc784faa
- HORNER 0x3c967ddb
- HORNER 0xbcbc1d52
- HORNER 0x3cf55de6
- HORNER 0xbd2a64c3
- HORNER 0x3d83126f
- HORNER 0xbdf5c28f
- HORNER 0x3ecccccd
- HORNER 0x3f800000
- li t2,0x3f9689c2
- fmul.s a0,a0,t2
- li t5,0
-3: bgez t4,4f
- addi t4,t4,5
- addi t5,t5,-2
- j 3b
-4: li t0,5
- blt t4,t0,5f
- addi t4,t4,-5
- addi t5,t5,2
- j 4b
-5: li t2,0x3f800000
- beqz t4,8f
- li t0,1
- li t2,0x3fa8e5a3
- beq t4,t0,8f
- li t0,2
- li t2,0x3fdedc67
- beq t4,t0,8f
- li t0,3
- li t2,0x4013088c
- beq t4,t0,8f
- li t2,0x40420300
-8: addi t5,t5,127
- slli t5,t5,23
- fmul.s a0,a0,t2
- fmul.s a0,a0,t5
+ fadd.s a0,a0,t1
+ sub a0,a0,t5
 9: ret
 /* Both SMT workers claim a neuron address with AMOADD. Constants and one
  * xorshift state stay in registers for the complete invocation. tp is the SMT
@@ -527,6 +509,7 @@ br_integrate:
  lw s7,H_EPSC(gp)
  lw t0,H_EXTERNAL_WEIGHT(gp)
  fmul.s s7,s7,t0
+ fadd.s a7,s7,s7           # two external events, private to this SMT worker
  lw s8,H_DECAY_PRE(gp)
  lw s9,H_DECAY_POST(gp)
  li s10,0x41a00000
@@ -577,12 +560,11 @@ br_integrate:
  xor s11,s11,t1
  slli t1,s11,5
  xor s11,s11,t1
- li a0,0
- bltu s11,a4,.Lintegrate_poisson_done
- li a0,1
- bltu s11,a5,.Lintegrate_poisson_done
- li a0,2
- bltu s11,a6,.Lintegrate_poisson_done
+ bltu s11,a4,.Lintegrate_no_external
+ mv a0,s7
+ bltu s11,a5,.Lintegrate_add_external
+ mv a0,a7
+ bltu s11,a6,.Lintegrate_add_external
  /* Rare tail: thresholds are generated from this rule's exact mean. */
  li a0,3
  li t1,POISSON+12
@@ -597,7 +579,9 @@ br_integrate:
 .Lintegrate_poisson_done:
  fcvt.s.wu a0,a0
  fmul.s a0,s7,a0
+.Lintegrate_add_external:
  fadd.s t0,t0,a0
+.Lintegrate_no_external:
  sw t0,N_DE(t5)
  sw t2,N_DI(t5)
  sw zero,N_INPUT_E(t5)
@@ -635,52 +619,52 @@ br_integrate:
  SENDI zero,3
 .Lintegrate_return:
  j br_idle
-/* Direct event handler.  Input a0=input offset,a1=weight,a2=weight address
- * (zero for static), a3=prePU | preLocal<<16.  A quiet postsynaptic target
+/* Direct event handlers, selected once at boot. Input a0=input offset,
+ * a1=weight,a2=weight address (zero for static),a3=source MC destination ID.
+ * A quiet postsynaptic target
  * applies LTD locally and sends a no-receipt scalar store to the source MC. */
-.globl br_spike
-br_spike:
+.macro SPIKE_BODY morrison
  add t0,gp,a0
-.Lspike_accumulate:
+1:
  lr.w t1,(t0)
  fadd.s t1,t1,a1
  sc.w t2,t1,(t0)
- bnez t2,.Lspike_accumulate
- beqz a2,.Lspike_done
+ bnez t2,1b
+ beqz a2,9f
  /* Reuse the accumulator pointer to address the other neuron fields. */
  lw t1,N_FIRE-N_INPUT_E(t0)
- bnez t1,.Lspike_done       /* post-active path handles LTD and LTP */
+ bnez t1,9f                /* post-active path handles LTD and LTP */
  lw t1,N_Y-N_INPUT_E(t0)
+ beqz t1,9f                /* no learning effect; still count this delivery */
  lw t2,H_DEP(gp)
  fmul.s t1,t1,t2
- lw t2,H_RULE(gp)
- bnez t2,.Lspike_morrison
+.if !\morrison
  fsub.s a1,a1,t1
- lw t2,H_WMAX(gp)
  fmax.s a1,a1,zero
- fmin.s a1,a1,t2
- j .Lspike_writeback
-.Lspike_morrison:
+.else
  fmul.s t2,a1,t1
  fsub.s a1,a1,t2
  fmax.s a1,a1,zero
-.Lspike_writeback:
- addi t0,a3,-1
- srli t0,t0,5
- andi t0,t0,15            # 512-PU/16-MC ABI; discard preLocal bits
- li t1,0x8001
- add t0,t0,t1
+.endif
+ mv t0,a3
  mv a0,a2
  mv a3,a1
  li a1,0x20000
  li a2,0
  SENDI t0,1026
-.Lspike_done:
+9:
  /* Both SMT threads may deliver spikes; preserve the barrier count atomically. */
  addi t0,gp,H_RECEIVED
  li t1,1
  amoadd.w zero,t1,(t0)
  j br_idle
+.endm
+.globl br_spike
+br_spike:
+ SPIKE_BODY 1
+.globl br_spike_additive
+br_spike_additive:
+ SPIKE_BODY 0
 .globl br_control
 br_control:
  sw zero,H_REPORT_COUNT(gp)
@@ -870,6 +854,30 @@ br_boot:
  lw t0,H_MAGIC(gp)
  li t1,0x42524e34
  bne t0,t1,.Lboot_bad
+ /* Fixed transport parameters and rule dispatch. Event slots 13/14 remain
+  * disabled; their address CSRs are private leaf function pointers. */
+ lw t0,H_MC(gp)
+ li t1,0x8001
+ add t0,t0,t1
+ sw t0,H_MC_DEST(gp)
+ li t0,1024
+ csrw 0x733,t0
+ lw t0,H_RULE(gp)
+ li t1,1
+ bgtu t0,t1,.Lboot_bad
+ bnez t0,.Lboot_morrison
+ la t0,br_spike_additive
+ csrw 0x701,t0
+ la t0,br_ltd_additive
+ csrw BR_LTD_ENTRY,t0
+ la t0,br_ltp_additive
+ j .Lboot_rule_ready
+.Lboot_morrison:
+ la t0,br_ltd_morrison
+ csrw BR_LTD_ENTRY,t0
+ la t0,br_ltp_morrison
+.Lboot_rule_ready:
+ csrw BR_LTP_ENTRY,t0
  /* The reduction tree is fixed: every report waits for itself plus its
   * existing children. Compute that once, rather than at every barrier. */
  lw t0,H_PU(gp)
@@ -895,7 +903,7 @@ br_boot:
  li t1,1
  bne t0,t1,.Lboot_report
 #ifdef BR_ASM_SELFTEST
- call br_asm_selftest
+ jal ra,br_asm_selftest
 #endif
  li s0,0
 .Lboot_store:
@@ -908,25 +916,25 @@ br_boot:
  add t0,t0,t1
  li a1,0x19260000
  add a1,a1,t0
- call br_store_word
+ jal ra,br_store_word
  addi s0,s0,1
  li t0,32
  bltu s0,t0,.Lboot_store
- call br_drain
+ jal ra,br_drain
  li s0,0
 .Lboot_load:
  slli a0,s0,5
  li t0,0x8000
  add a0,a0,t0
  mv a1,s0
- call br_load_start
+ jal ra,br_load_start
  addi s0,s0,1
  li t0,4
  bltu s0,t0,.Lboot_load
  li s0,0
 .Lboot_verify:
  mv a0,s0
- call br_load_wait
+ jal ra,br_load_wait
  slli s2,s0,5
  li t0,READ
  add s2,s2,t0
@@ -945,7 +953,7 @@ br_boot:
  addi s0,s0,1
  li t0,4
  bltu s0,t0,.Lboot_verify
- call br_drain
+ jal ra,br_drain
  sw zero,H_ISSUED(gp)
  sw zero,H_CONSUMED(gp)
 .Lboot_report:
@@ -981,7 +989,7 @@ br_work:
  bne s0,t0,.Lwork_skip_reverse
  lw t0,H_WORK_LINE(gp)
  bnez t0,.Lwork_select
- /* Skip inactive forward rows and clear their pre_fire flags. */
+ /* N_FIRE is authoritative through reverse learning; no shadow stores. */
  lw t2,H_NN(gp)
  li t0,80
  mul s2,s1,t0
@@ -990,7 +998,6 @@ br_work:
 1: bgeu s1,t2,2f
  lw t0,36(s2)
  bnez t0,2f
- sw zero,40(s2)
  addi s1,s1,1
  addi s2,s2,80
  j 1b
@@ -1029,9 +1036,6 @@ br_work:
  /* Start a fired row once; later work events finish its static directories. */
  lw t0,H_WORK_LINE(gp)
  bnez t0,.Lwork_directory
- lw t0,N_FIRE(s2)
- sw t0,N_PRE_FIRE(s2)
- beqz t0,.Lwork_next_neuron
  /* Every local forward row belongs to this PU's MC.  Record that bit once
   * so the report handler does not need to rescan all neurons. */
  lw t1,H_MC(gp)
@@ -1046,9 +1050,7 @@ br_work:
 .Lforward_first:
  li s3,0                     # row synapse index at chunk start
  li s11,0                    # landing half, 0 or 1
- slli s10,s1,16
- lw t0,H_PU(gp)
- or s10,s10,t0
+ lw s10,H_MC_DEST(gp)       # receiver can write back without decoding identity
 #if BR_DIAGNOSTIC
  li t0,STREAM
  add t0,t0,gp
@@ -1061,8 +1063,7 @@ br_work:
  lw s8,N_WEIGHTS(s2)      # row base stays live across all chunk continuations
  mv a0,s8
  li a1,PING
- li a2,1024
- call br_ac_start
+ jal ra,br_ac_start
  YIELDI 11
  j br_idle
 /* Frame-free local continuations preserve s0-s11. Higher-priority SMT0
@@ -1110,8 +1111,7 @@ br_forward_wait:
  slli a1,a1,10
  li t0,PING
  add a1,a1,t0
- li a2,1024
- call br_ac_start
+ jal ra,br_ac_start
  YIELDI 12
  j br_idle
 .Lforward_last_chunk:
@@ -1188,56 +1188,57 @@ br_work_reverse_row:
  lw t0,36(s2)
  beqz t0,.Lwork_next_neuron
  /* Reverse coefficients are constant for this row across all MC entries. */
- lw t1,H_WORK_MC(gp)
- bnez t1,.Lwork_directory
  lw s8,H_DEP(gp)
  lw t1,N_Y(s2)
  fmul.s s8,s8,t1
  lw s9,H_POT(gp)
 br_work_directory:
 .Lwork_directory:
- lw s6,H_WORK_MC(gp)
+ li s6,0
  li t0,2
  bne s0,t0,1f
- lw s7,60(s2)
+ lw s7,N_STATIC_DIR(s2)
+ li s8,0
+ li s9,0
+ li s11,0xc01
  j 2f
-1: lw s7,64(s2)
-2: slli t0,s6,3
- add s7,s7,t0
+1: lw s7,N_REVERSE_DIR(s2)
+ li s11,0xc04
+2:
+ /* A directory is 16 eight-byte descriptors, aligned to a 32-byte line.
+  * Issue all four scalar refills into READ[0..3], then consume each line
+  * after its completion. The 12-request credit limit covers these requests
+  * together with concurrent MSHR writebacks/refills. No AC is active here. */
+ mv a0,s7
+ li a1,0
+ jal ra,br_load_start
+ addi a0,s7,32
+ li a1,1
+ jal ra,br_load_start
+ addi a0,s7,64
+ li a1,2
+ jal ra,br_load_start
+ addi a0,s7,96
+ li a1,3
+ jal ra,br_load_start
+ li s7,READ
+ add s7,s7,gp
 .Ldirectory_resume:
  li t0,16
  bgeu s6,t0,.Lwork_next_neuron
- andi t0,s7,-32
- lw t1,H_DIRECTORY_LINE(gp)
- beq t0,t1,3f
- mv a0,t0
- li a1,2
- call br_load_start
- li a0,2
- call br_load_wait
- andi t0,s7,-32
- sw t0,H_DIRECTORY_LINE(gp)
-3: andi t0,s7,31
- li t1,READ+64
- add t0,t0,t1
- add t0,t0,gp
- lw a0,0(t0)
- lw s5,4(t0)
+ andi t0,s6,3
+ bnez t0,3f
+ srli a0,s6,2
+ jal ra,br_load_wait
+3: lw a0,0(s7)
+ lw s5,4(s7)
  beqz s5,5f
- li a2,0
- li a3,0
- li t2,2
- beq s0,t2,.Lstatic_scatter_tag
  mv a2,s8
  mv a3,s9
- li t2,0xc04
- j 4f
-.Lstatic_scatter_tag:
- li t2,0xc01
-4: addi a1,s5,3
+ addi a1,s5,3
  srli a1,a1,2
  slli a1,a1,16
- or a1,a1,t2
+ or a1,a1,s11
  li t0,0x8001
  add t0,t0,s6
  SENDI t0,-1008
@@ -1258,7 +1259,7 @@ br_work_advance:
 br_work_flush:
 .Lwork_finish:
 .Lflush_done:
- call br_drain
+ jal ra,br_drain
  lw t0,H_MSHR_COUNT(gp)
  bnez t0,.Lboot_bad
  lw t0,H_MSHR_SCHEDULED(gp)
@@ -1276,7 +1277,7 @@ br_work_flush:
  beqz t0,2f
  lw t1,24(s2)
  lw t2,28(s2)
- fcvt.s.wu t0,t0
+ li t0,0x3f800000           # the firing flag is exactly one here
  fadd.s t1,t1,t0
  fadd.s t2,t2,t0
  sw t1,24(s2)

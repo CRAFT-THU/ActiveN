@@ -11,37 +11,29 @@ from brunel import NE, NI, PU, MC, F, offsets, ranges, Reference
 
 
 def pending_power(w):
-    """Reconstruct the runtime polynomial when materializing a pending LTP.
+    """Reconstruct the FP32 runtime helper for historical cache experiments.
 
     The independent neuron/weight reference continues to use numpy.power.
     Unit tests check this reconstruction bit for bit against the C helper.
     """
+    w = F(w)
     if w == 0:
         return F(0)
-    mantissa, exponent = np.frexp(F(w))
-    exponent = int(exponent) - 1
-    z = F(F(F(2) * mantissa - F(1.5)) * F(2 / 3))
-    p = F(-0.015155712)
-    for coefficient in (
-        0.01837056,
-        -0.0229632,
-        0.029952,
-        -0.0416,
-        0.064,
-        -0.12,
-        0.4,
-        1,
-    ):
-        p = F(F(coefficient) + F(z * p))
-    p = F(p * F(1.1760790225246736))
-    scales = (
-        1,
-        1.3195079107728942,
-        1.7411011265922482,
-        2.29739670999407,
-        3.031433133020796,
-    )
-    return F(F(p * F(scales[exponent % 5])) * F(2.0 ** (2 * (exponent // 5))))
+    scale = 0
+    if w.view(np.uint32) < 0x02000000:
+        w = F(w * F(2.0**100))
+        scale = 40 << 23
+    r = np.uint32(0x4C2BAC89 - int(w.view(np.uint32)) // 5).view(F)
+    m = F(w * F(0.2))
+    r2 = F(r * r)
+    r4 = F(r2 * r2)
+    r = F(F(r * F(1.20148)) - F(F(m * r2) * r4))
+    r2 = F(r * r)
+    q = F(F(w * r2) * r)
+    d = F(F(1) - F(q * r2))
+    correction = F(F(d * F(0.48)) + F(0.60002))
+    result = F(q + F(F(q * d) * correction))
+    return np.uint32(int(result.view(np.uint32)) - scale).view(F)
 
 
 def dump(path):
@@ -67,7 +59,7 @@ def dump(path):
     return spms, neurons
 
 
-def compare_nodes(actual, expected):
+def compare_nodes(actual, expected, single_fire=False):
     out = {}
     for i, name in enumerate(
         (
@@ -85,6 +77,8 @@ def compare_nodes(actual, expected):
             "gid",
         )
     ):
+        if i == 10 and single_fire:
+            name = "reserved_fire"
         if i in (5, 8, 9, 10, 11):
             out[name] = {
                 "different": int(np.count_nonzero(actual[:, i] != expected[:, i]))
@@ -212,6 +206,7 @@ def validate_buffer(args, manifest, initial, log, steps):
     comparisons = {}
     previous = np.zeros(3, np.int64)
     shared_rng = manifest.get("rng", "").startswith("per-SMT")
+    single_fire = manifest.get("firing_flag") == "N_FIRE"
     noise_counts = np.zeros(10, np.int64)
     maximum_noise_residual = 0.0
     previous_stream = np.zeros(4, np.int64)
@@ -249,7 +244,13 @@ def validate_buffer(args, manifest, initial, log, steps):
             reference.tick(external=noise)
         else:
             reference.tick()
-        comparisons[str(s["step"])] = compare_nodes(actual, reference.n)
+        expected_nodes = reference.n
+        if single_fire:
+            # Offset 40 is no longer updated. Validate that it retains its
+            # input-image value, independently of the authoritative N_FIRE.
+            expected_nodes = reference.n.copy()
+            expected_nodes[:, 10] = initial["neurons"][:, 10]
+        comparisons[str(s["step"])] = compare_nodes(actual, expected_nodes, single_fire)
         if shared_rng:
             # Carry the observed stochastic trajectory into the next step;
             # weights remain independently computed throughout the run.
@@ -318,13 +319,15 @@ def validate_buffer(args, manifest, initial, log, steps):
             different=int(np.count_nonzero(observed != reference.w)),
         ),
         stochastic_replay=shared_rng,
+        firing_flag=manifest.get("firing_flag", "N_FIRE and N_PRE_FIRE"),
         inferred_poisson_histogram=noise_counts.tolist() if shared_rng else None,
         maximum_poisson_residual=maximum_noise_residual if shared_rng else None,
         reference_average_per_timestep={k: float(np.mean([manifest["reference_spikes"][s["step"] - 1][i] for s in timed])) for i, k in enumerate(("E", "I"))},
     )
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     for c in comparisons.values():
-        integer_fields = ("gid", "fire", "pre_fire", "refractory") if shared_rng else ("rng", "gid", "fire", "pre_fire", "refractory")
+        flag = "reserved_fire" if single_fire else "pre_fire"
+        integer_fields = ("gid", "fire", flag, "refractory") if shared_rng else ("rng", "gid", "fire", flag, "refractory")
         if any(c[k]["different"] for k in integer_fields):
             raise ValueError("integer neuron state divergence")
         if c["V"]["max_absolute"] > 0.02:

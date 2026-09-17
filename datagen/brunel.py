@@ -208,7 +208,9 @@ class Reference:
         pot = F(c["pot"] * f[self.pre[potentiated], 6])
         w = self.w[potentiated]
         if self.rule == "morrison":
-            pot = F(pot * np.power(w, F(0.4)))
+            # The numerical target is mathematical 2/5. A binary32 exponent
+            # 0.4f is a different function at extreme FP32 weights.
+            pot = F(pot * F(np.power(w.astype(np.float64), 2 / 5)))
         self.w[potentiated] = F(w + pot)
         if self.rule == "additive":
             np.minimum(self.w, c["wmax"], out=self.w)
@@ -445,6 +447,9 @@ def generate(args):
         kernel="timestep-buffer-mshr",
         plastic_layout="chunk128-weights512-targets512",
         rng="per-SMT xorshift32 inverse-CDF Poisson, capped at 9",
+        firing_flag="N_FIRE",
+        power="inverse-fifth-root-newton-quadratic",
+        forward_carried="source-mc-id",
         warmup=args.warmup,
         timed=args.timed,
         neurons=NE + NI,

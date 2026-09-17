@@ -109,7 +109,8 @@ def analyze(args):
         _, current = dump(args.dumps / f"step-{step:04}.bin")
         x = F(previous[:, 6].view(np.float32) * c["decay_pre"])
         y = F(previous[:, 7].view(np.float32) * c["decay_post"])
-        forward = current[pre, 10] != 0
+        fire_field = 9 if manifest.get("firing_flag") == "N_FIRE" else 10
+        forward = current[pre, fire_field] != 0
         ltd = forward & (F(c["dep"] * y[post]) != 0)
         ltp = (current[post, 9] != 0) & (F(c["pot"] * x[pre]) != 0)
         updated.append(np.flatnonzero(ltd | ltp))
@@ -121,7 +122,7 @@ def analyze(args):
                 I=int(current[NE:, 9].sum()),
                 EE_spike_deliveries=int(forward.sum()),
                 forward_weight_segments=int(
-                    ((degree + 7) // 8 * current[:NE, 10]).sum()
+                    ((degree + 7) // 8 * current[:NE, fire_field]).sum()
                 ),
                 LTD=int(ltd.sum()),
                 LTP=int(ltp.sum()),

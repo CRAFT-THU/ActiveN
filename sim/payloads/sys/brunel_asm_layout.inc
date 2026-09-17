@@ -53,7 +53,7 @@
 .equ H_WMAX, 232
 .equ H_DECAY_PRE, 236
 .equ H_DECAY_POST, 240
-.equ H_DIRECTORY_LINE, 244
+.equ H_MC_DEST, 244
 .equ H_WEIGHT_LOADS, 248
 .equ H_MSHR_WAITS, 252
 .equ N_V, 0
@@ -66,7 +66,7 @@
 .equ N_Y, 28
 .equ N_RNG, 32
 .equ N_FIRE, 36
-.equ N_PRE_FIRE, 40
+.equ N_RESERVED_FIRE, 40
 .equ N_GID, 44
 .equ N_WEIGHTS, 48
 .equ N_COUNT, 52
@@ -95,3 +95,8 @@
 .equ H_RNG0, 172
 .equ H_RNG1, 176
 .equ H_MSHR_PEAK, 180
+
+/* Disabled event slots hold rule-specific leaf function pointers. Their
+ * enable masks remain zero; they are never used as message destinations. */
+.equ BR_LTD_ENTRY, 0x70d
+.equ BR_LTP_ENTRY, 0x70e
