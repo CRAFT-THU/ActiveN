@@ -3,5 +3,6 @@
 /.vscode
 /.ccls-cache
 /tests/*
+!/tests/brunel_buffer_image.py
 !/tests/brunel_asm_numeric.S
 !/tests/brunel_pow04.cpp

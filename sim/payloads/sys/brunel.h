@@ -13,6 +13,8 @@
 #define BR_NEURONS 256u
 #define BR_BUFFER 0x900u
 #define BR_BUFFER_WORDS 2048u
+#define BR_FIRED_LIST BR_BUFFER /* 25 neuron pointers; count in header word 53 */
+#define BR_FIRED_COUNT 212u
 #define BR_MSHR 0x2900u
 #define BR_MSHRS 16u
 #define BR_READ 0x2d00u
@@ -27,7 +29,7 @@
 #define BR_STACK1 0x3f80u
 #define BR_POISSON 0x2da4u
 #define BR_STREAM 0x2dd0u
-#define BR_TREE_REPORTS 0x2de4u /* boot-computed self + child report count */
+#define BR_TREE_REPORTS 216u /* boot-computed self + child report count */
 #define BR_RECORD_CAPACITY 256u
 #define BR_MAX_RECORDS 8100u /* current 512-PU graph: at most 18 E * 450 */
 #define BR_BASE 0x20000000u
@@ -45,15 +47,25 @@ typedef struct {
       pool_full, forward_weights, reverse_events;
   uint32_t buffer_bytes, mshr_count, mshr_head, mshr_tail, mshr_scheduled,
       rng0, rng1, mshr_peak;
-  uint32_t p11, p21, p31, p32, p33, epsc, delivery, external_mean;
-  uint32_t external_limit, external_weight, dep, pot, wmax, decay_pre,
+  uint32_t p11, p21, p31, p32, p33, epsc;
+  /* Boot replaces these image constants with their runtime meanings. */
+  union { uint32_t delivery, external_current; };
+  union { uint32_t external_mean, fired_count; };
+  union { uint32_t external_limit, tree_reports; };
+  uint32_t external_weight, dep, pot, wmax, decay_pre,
       decay_post;
   uint32_t mc_destination, weight_loads, allocation_waits;
 } BrHeader;
 typedef struct {
   /* fire is authoritative from integration through reverse learning.
    * Offset 40 retains its image value and is reserved for ABI compatibility. */
-  uint32_t v, ie, de, ii, di, refrac, x, y, rng, fire, reserved_fire, gid;
+  /* Initial images retain split currents. Boot sums IE+II and DE+DI into the
+   * first pair; II/DI become zero reserved words in runtime snapshots. */
+  uint32_t v;
+  union { uint32_t ie, i_total; };
+  union { uint32_t de, d_total; };
+  /* Images contain raw x/y; runtime x=pot*pre_trace, y=dep*post_trace. */
+  uint32_t ii, di, refrac, x, y, rng, fire, reserved_fire, gid;
   uint32_t weights, count, targets, static_dir, reverse_dir, input_e, input_i, buffer;
 } BrNeuron;
 typedef struct {
@@ -71,16 +83,18 @@ typedef struct {
 } BrStream;
 BR_ASSERT(BR_RECORDS + BR_RECORD_CAPACITY * 8 == BR_PING, "record/staging boundary");
 BR_ASSERT(BR_PING + BR_PING_BYTES == BR_STACK0, "staging/stack boundary");
-BR_ASSERT(BR_STREAM + sizeof(BrStream) <= BR_TREE_REPORTS, "stream metadata");
-BR_ASSERT(BR_TREE_REPORTS + 4 <= BR_DIRTY_BITMAP, "reduction tree constant");
+BR_ASSERT(BR_STREAM + sizeof(BrStream) <= BR_DIRTY_BITMAP, "stream metadata");
 BR_ASSERT(sizeof(BrHeader) == 256, "header ABI");
 BR_ASSERT(sizeof(BrNeuron) == 80, "neuron ABI");
 BR_ASSERT(BR_NEURONS + BR_MAX_NEURONS * sizeof(BrNeuron) <= BR_BUFFER,
           "neuron capacity");
 BR_ASSERT(BR_BUFFER + BR_BUFFER_WORDS * 4 <= BR_MSHR, "buffer capacity");
+BR_ASSERT(BR_FIRED_LIST + BR_MAX_NEURONS * 4 <= BR_MSHR, "fired list capacity");
 BR_ASSERT(sizeof(BrMshr) == 64, "MSHR ABI");
 BR_ASSERT(BR_MSHR + BR_MSHRS * sizeof(BrMshr) == BR_READ, "MSHR capacity");
 BR_ASSERT(offsetof(BrHeader, buffer_bytes) == 152, "buffer control ABI");
+BR_ASSERT(offsetof(BrHeader, fired_count) == BR_FIRED_COUNT, "fired count ABI");
+BR_ASSERT(offsetof(BrHeader, tree_reports) == BR_TREE_REPORTS, "report count ABI");
 BR_ASSERT(offsetof(BrHeader, allocation_waits) == 252, "MSHR wait counter ABI");
 BR_ASSERT(offsetof(BrMshr, state) == 44, "MSHR state ABI");
 BR_ASSERT(offsetof(BrNeuron, buffer) == 76, "row buffer pointer ABI");

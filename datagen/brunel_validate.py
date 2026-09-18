@@ -59,7 +59,7 @@ def dump(path):
     return spms, neurons
 
 
-def compare_nodes(actual, expected, single_fire=False):
+def compare_nodes(actual, expected, single_fire=False, combined_currents=False):
     out = {}
     for i, name in enumerate(
         (
@@ -77,6 +77,8 @@ def compare_nodes(actual, expected, single_fire=False):
             "gid",
         )
     ):
+        if combined_currents and 1 <= i <= 4:
+            name = ("I_total", "dI_total", "reserved_Iin", "reserved_dIin")[i - 1]
         if i == 10 and single_fire:
             name = "reserved_fire"
         if i in (5, 8, 9, 10, 11):
@@ -95,6 +97,31 @@ def compare_nodes(actual, expected, single_fire=False):
                 "max_relative_scaled": float(np.max(err / np.maximum(1, np.abs(b)))),
             }
     return out
+
+
+def compare_combined_derivative(previous, observed, noise, c):
+    """Check the combined recurrence against FP64 with a rounding bound.
+
+    Excitation and inhibition can nearly cancel. A tolerance normalized only
+    by their final sum incorrectly rejects valid FP32 regrouping. Each term
+    passes through at most three FP32 rounding operations, so gamma(3) times
+    the sum of absolute terms bounds the error, including cancellation. The
+    small absolute term covers gradual underflow; FP64 evaluation error is
+    included separately. This does not reproduce the assembly's FP32 order.
+    """
+    f = previous.view(np.float32)
+    external_unit = float(F(c["epsc"] * c["external_weight"]))
+    terms = np.array((float(c["p11"]) * f[:, 2].astype(float),
+                      f[:, 17].astype(float), f[:, 18].astype(float),
+                      external_unit * noise.astype(float)))
+    exact = terms.sum(axis=0)
+    u = 2.0**-24
+    gamma = 3 * u / (1 - 3 * u) + 4 * np.finfo(np.float64).eps
+    bound = gamma * np.abs(terms).sum(axis=0) + 5 * float(np.nextafter(F(0), F(1)))
+    error = np.abs(observed.astype(float) - exact)
+    return dict(max_absolute=float(error.max()),
+                max_bound_fraction=float(np.max(error / bound)),
+                violations=int(np.count_nonzero(~np.isfinite(error) | (error > bound))))
 
 
 def logical_weights(spms, nodes, initial, path, rule):
@@ -207,8 +234,19 @@ def validate_buffer(args, manifest, initial, log, steps):
     previous = np.zeros(3, np.int64)
     shared_rng = manifest.get("rng", "").startswith("per-SMT")
     single_fire = manifest.get("firing_flag") == "N_FIRE"
+    combined = manifest.get("current_state") == "combined"
+    scaled_traces = manifest.get("trace_state") == "learning-scaled"
+    if combined:
+        # The image deliberately retains independently presimulated E/I state.
+        # Reproduce the one-time boot conversion, preserving the original model
+        # for subsequent independent split-current updates and learning.
+        f = reference.n.view(np.float32)
+        f[:, 1] = F(f[:, 1] + f[:, 3])
+        f[:, 2] = F(f[:, 2] + f[:, 4])
+        f[:, 3:5] = F(0)
     noise_counts = np.zeros(10, np.int64)
     maximum_noise_residual = 0.0
+    derivative_roundoff = dict(max_absolute=0.0, max_bound_fraction=0.0, violations=0)
     previous_stream = np.zeros(4, np.int64)
     for s in steps:
         s.setdefault("pool_full", s["allocation_waits"])
@@ -222,9 +260,20 @@ def validate_buffer(args, manifest, initial, log, steps):
                 raise ValueError("stack guard damaged")
             if np.any(spm[0x2900 // 4 + 11 : 0x2D00 // 4 : 16]):
                 raise ValueError("live MSHR at timestep boundary")
+            if manifest.get("fired_list"):
+                count = int(spm[manifest["spm"]["fired_count_offset"] // 4])
+                nn = int(spm[4])
+                if count > nn or count > manifest["spm"]["fired_list_capacity"]:
+                    raise ValueError("fired-neuron list overflow")
+                start = manifest["spm"]["fired_list_offset"] // 4
+                rows = spm[64 : 64 + nn * 20].reshape(nn, 20)
+                expected = 0x20000100 + 80 * np.flatnonzero(rows[:, 9])
+                if not np.array_equal(np.sort(spm[start : start + count]), expected):
+                    raise ValueError("fired-neuron list disagrees with firing flags")
         if shared_rng:
-            # Infer the independent Poisson integer from dIex. Re-run all
-            # deterministic equations, including delivery, with that integer.
+            # Infer the independent Poisson integer from the stored derivative
+            # (dIex or dI_total). Re-run the deterministic equations, including
+            # delivery, with that integer.
             # A missing/misrouted recurrent spike is not an integer noise draw
             # and fails the residual check instead of being hidden by resync.
             c = reference.c
@@ -233,28 +282,57 @@ def validate_buffer(args, manifest, initial, log, steps):
             # present in fields 17/18, so the only unknown increment is the
             # external Poisson sample.
             f = reference.n.view(np.float32)
-            base = F(F(c["p11"] * f[:, 2]) + f[:, 17])
+            recurrent = F(f[:, 17] + f[:, 18]) if combined else f[:, 17]
+            base = F(F(c["p11"] * f[:, 2]) + recurrent)
             delta = (actual[:, 2].view(np.float32).astype(float) - base) / float(F(c["epsc"] * c["external_weight"]))
             noise = np.rint(delta).astype(np.int32)
             residual = float(np.max(np.abs(delta - noise)))
             maximum_noise_residual = max(maximum_noise_residual, residual)
             if np.any(noise < 0) or np.any(noise > 9) or residual > 2e-4:
                 raise ValueError(f"invalid external Poisson increment: residual={residual}")
+            if combined:
+                check = compare_combined_derivative(reference.n, actual[:, 2].view(F), noise, c)
+                if check["violations"]:
+                    raise ValueError(f"combined derivative exceeds FP32 roundoff at step {s['step']}: {check}")
+                for key in derivative_roundoff:
+                    derivative_roundoff[key] = max(derivative_roundoff[key], check[key])
             noise_counts += np.bincount(noise, minlength=10)
             reference.tick(external=noise)
         else:
             reference.tick()
         expected_nodes = reference.n
+        if single_fire or combined or scaled_traces:
+            expected_nodes = reference.n.copy()
         if single_fire:
             # Offset 40 is no longer updated. Validate that it retains its
             # input-image value, independently of the authoritative N_FIRE.
-            expected_nodes = reference.n.copy()
             expected_nodes[:, 10] = initial["neurons"][:, 10]
-        comparisons[str(s["step"])] = compare_nodes(actual, expected_nodes, single_fire)
+        if combined:
+            # Compare the independently advanced channels through their sum.
+            # Do not replace the reference recurrence with the assembly's
+            # grouped arithmetic: this check must expose rounding/error drift.
+            f = expected_nodes.view(np.float32)
+            f[:, 1] = F(f[:, 1] + f[:, 3])
+            f[:, 2] = F(f[:, 2] + f[:, 4])
+            f[:, 3:5] = F(0)
+            if np.any(actual[:, 3:5]):
+                raise ValueError("combined-current reserved fields changed")
+        if scaled_traces:
+            # Keep the oracle in canonical trace units throughout the run.
+            # Only the comparison copy is converted to runtime units; do not
+            # reproduce the optimized recurrence or normalize observed traces.
+            f = expected_nodes.view(np.float32)
+            f[:, 6] = F(reference.c["pot"] * f[:, 6])
+            f[:, 7] = F(reference.c["dep"] * f[:, 7])
+        comparisons[str(s["step"])] = compare_nodes(actual, expected_nodes, single_fire, combined)
         if shared_rng:
             # Carry the observed stochastic trajectory into the next step;
-            # weights remain independently computed throughout the run.
+            # weights and scaled-trace learning's canonical traces remain
+            # independently computed throughout the run.
+            canonical_traces = reference.n[:, 6:8].copy() if scaled_traces else None
             reference.n = actual.copy()
+            if scaled_traces:
+                reference.n[:, 6:8] = canonical_traces
         s["reference_E"], s["reference_I"] = manifest["reference_spikes"][s["step"] - 1]
         replay = 0x2D80 // 4
         current = np.array(
@@ -320,8 +398,11 @@ def validate_buffer(args, manifest, initial, log, steps):
         ),
         stochastic_replay=shared_rng,
         firing_flag=manifest.get("firing_flag", "N_FIRE and N_PRE_FIRE"),
+        current_state=manifest.get("current_state", "separate"),
+        trace_state=manifest.get("trace_state", "unscaled"),
         inferred_poisson_histogram=noise_counts.tolist() if shared_rng else None,
         maximum_poisson_residual=maximum_noise_residual if shared_rng else None,
+        combined_derivative_roundoff=derivative_roundoff if combined and shared_rng else None,
         reference_average_per_timestep={k: float(np.mean([manifest["reference_spikes"][s["step"] - 1][i] for s in timed])) for i, k in enumerate(("E", "I"))},
     )
     args.output.write_text(json.dumps(report, indent=2) + "\n")
@@ -332,7 +413,12 @@ def validate_buffer(args, manifest, initial, log, steps):
             raise ValueError("integer neuron state divergence")
         if c["V"]["max_absolute"] > 0.02:
             raise ValueError("voltage divergence")
-        for k in ("Iex", "dIex", "Iin", "dIin", "pre_trace", "post_trace"):
+        current_keys = ("I_total", "dI_total") if combined else ("Iex", "dIex", "Iin", "dIin")
+        for k in (*current_keys, "pre_trace", "post_trace"):
+            if k == "dI_total" and shared_rng:
+                # Checked against the independent FP64 expression and its
+                # per-neuron rounding bound above, including near-zero sums.
+                continue
             if c[k]["max_relative_scaled"] > 2e-4:
                 raise ValueError("neuron state divergence: " + k)
     if not np.all(np.isfinite(observed)) or error.max() > (0.02 if shared_rng else 0.002):

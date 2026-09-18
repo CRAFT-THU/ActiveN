@@ -47,6 +47,11 @@
 .equ H_DELIVERY, 208
 .equ H_EXTERNAL_MEAN, 212
 .equ H_EXTERNAL_LIMIT, 216
+/* The image contains the original constants here. Boot replaces these three
+ * unused runtime words with derived constants and the fired-list count. */
+.equ H_EXTERNAL_CURRENT, 208
+.equ H_FIRE_COUNT, 212
+.equ H_TREE_REPORTS, 216
 .equ H_EXTERNAL_WEIGHT, 220
 .equ H_DEP, 224
 .equ H_POT, 228
@@ -61,7 +66,11 @@
 .equ N_DE, 8
 .equ N_II, 12
 .equ N_DI, 16
+/* Images hold split currents. Boot combines them into IE/DE and clears II/DI. */
+.equ N_I_TOTAL, N_IE
+.equ N_D_TOTAL, N_DE
 .equ N_REFRAC, 20
+/* Images hold raw traces; boot scales X by H_POT and Y by H_DEP. */
 .equ N_X, 24
 .equ N_Y, 28
 .equ N_RNG, 32

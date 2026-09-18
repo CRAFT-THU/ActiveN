@@ -1,6 +1,6 @@
 /* Hand-written Brunel runtime, RV32I/Zmmul/Zfinx.
  * gp = immutable local SPM base on both SMT threads.
- * Direct event handlers end at br_idle. s0-s11 retain the cooperative worker's
+ * Direct handlers yield or end at br_idle. s0-s11 retain the cooperative worker's
  * state across yields; incoming handlers and private MSHR helpers preserve
  * them. Helper-specific scratch and return-link registers are documented below.
  * SMT0 owns forward/directory/MSHR work and credited memory requests;
@@ -12,6 +12,7 @@
 #include "brunel_asm_layout.inc"
 .option norelax
 .equ BUFFER, 0x900
+.equ FIRED_LIST, BUFFER
 .equ BR_BASE, 0x20000000
 .equ MSHR, 0x2900
 .equ READ, 0x2d00
@@ -21,7 +22,6 @@
 .equ PING, 0x3700
 .equ POISSON, 0x2da4
 .equ STREAM, 0x2dd0
-.equ TREE_REPORTS, STREAM+20
 #ifndef BR_MSHR_LIMIT
 #define BR_MSHR_LIMIT 16
 #endif
@@ -130,6 +130,9 @@
 .macro YIELDI tag
  .insn i 0x2b,5,x0,zero,\tag
 .endm
+.macro YIELD_TO dst,tag
+ .insn i 0x2b,5,x0,\dst,\tag
+.endm
 .macro INC offset,tmp
  lw \tmp,\offset(gp)
  addi \tmp,\tmp,1
@@ -144,9 +147,8 @@
 /* Completion handler is a leaf so it can retire notifications quickly. */
 .globl br_completion
 br_completion:
- li t0,0x8000
- and t0,a0,t0
- bnez t0,1f
+ slli t0,a0,16
+ bltz t0,1f
  li t0,3
  bgtu a1,t0,.Lcompletion_mshr
  slli t0,a1,2
@@ -241,7 +243,7 @@ br_drain:
  bne t0,t1,1b
  ret
 br_continue:
- SENDI zero,8
+ YIELDI 8
  j br_idle
 .globl br_halt
 br_halt:
@@ -341,6 +343,9 @@ br_mshr_retire:
 br_mshr_service:
  jal ra,br_mshr_retire
  beqz t0,1f
+ /* Enqueue before becoming idle: an immediate yield can schedule an already
+  * pending drain worker before this service event is visible to the scheduler.
+  * Drain relies on service priority to finish and clear its scheduled flag. */
  SENDI zero,6
  j br_idle
 1: sw zero,H_MSHR_SCHEDULED(gp)
@@ -417,28 +422,23 @@ br_mshr_allocate:
 4: jr t6
 .globl br_reverse
 br_reverse:
- li t0,80
- mul t0,a0,t0
- add t0,gp,t0
- addi t0,t0,256
+ add t0,gp,a0              # reverse CSR carries the neuron SPM byte offset
  lw t1,N_FIRE(t0)
  lw t2,N_X(t0)
- /* Most no-op deliveries have neither a trace nor a current pre spike.
-  * Reject them before the FP multiply. Live traces still cover silent pres. */
+ /* X already contains the LTP coefficient; live traces cover silent pres. */
  or t0,t1,t2
  beqz t0,8f
  bnez t1,1f
  li a2,0
 1:
- fmul.s a3,a3,t2
- or t0,a2,a3
+ or t0,a2,t2
  slli t0,t0,1
  beqz t0,8f
  /* The forward buffer is gone.  Every post-active update uses an MSHR
   * line load, then the normal ordered scalar writeback path. */
  mv a0,a1
  mv a1,a2
- mv a2,a3
+ mv a2,t2
  jal t6,br_mshr_allocate
 8: INC H_REVERSE_RECEIVED,t0
  DINC H_REVERSE_EVENTS,t0
@@ -506,9 +506,7 @@ br_integrate:
  lw s4,H_P31(gp)
  lw s5,H_P32(gp)
  lw s6,H_P33(gp)
- lw s7,H_EPSC(gp)
- lw t0,H_EXTERNAL_WEIGHT(gp)
- fmul.s s7,s7,t0
+ lw s7,H_EXTERNAL_CURRENT(gp)
  fadd.s a7,s7,s7           # two external events, private to this SMT worker
  lw s8,H_DECAY_PRE(gp)
  lw s9,H_DECAY_POST(gp)
@@ -518,24 +516,24 @@ br_integrate:
  lw a4,0(t0)
  lw a5,4(t0)
  lw a6,8(t0)
+ addi ra,gp,H_WORK_NEURON  # private until the worker returns to the event loop
+ addi a2,gp,H_FIRE_COUNT
+ li a3,FIRED_LIST
+ add a3,a3,gp
 .Lintegrate_claim:
- addi t5,gp,H_WORK_NEURON
- amoadd.w t5,s0,(t5)
+ amoadd.w t5,s0,(ra)
  bgeu t5,s1,.Lintegrate_done
- lw t0,N_DE(t5)
- lw t1,N_IE(t5)
- lw t2,N_DI(t5)
- lw t3,N_II(t5)
+ lw t0,N_D_TOTAL(t5)
+ lw t1,N_I_TOTAL(t5)
  lw t4,N_V(t5)
  lw t6,N_REFRAC(t5)
  beqz t6,.Lintegrate_voltage
  addi t6,t6,-1
+ sw t6,N_REFRAC(t5)
  j .Lintegrate_currents
 .Lintegrate_voltage:
- fadd.s a0,t0,t2
- fmul.s a0,s4,a0
- fadd.s a1,t1,t3
- fmul.s a1,s5,a1
+ fmul.s a0,s4,t0
+ fmul.s a1,s5,t1
  fadd.s a0,a0,a1
  fmul.s t4,s6,t4
  fadd.s t4,t4,a0
@@ -543,17 +541,17 @@ br_integrate:
  fmul.s a0,s3,t0
  fmul.s t1,s2,t1
  fadd.s t1,t1,a0
- fmul.s a0,s3,t2
- fmul.s t3,s2,t3
- fadd.s t3,t3,a0
- sw t1,N_IE(t5)
- sw t3,N_II(t5)
+ sw t1,N_I_TOTAL(t5)
  lw a0,N_INPUT_E(t5)
  lw a1,N_INPUT_I(t5)
  fmul.s t0,s2,t0
- fmul.s t2,s2,t2
+ or t1,a0,a1
+ beqz t1,.Lintegrate_no_recurrent
+ fadd.s a0,a0,a1
  fadd.s t0,t0,a0
- fadd.s t2,t2,a1
+ sw zero,N_INPUT_E(t5)
+ sw zero,N_INPUT_I(t5)
+.Lintegrate_no_recurrent:
  slli t1,s11,13
  xor s11,s11,t1
  srli t1,s11,17
@@ -582,20 +580,21 @@ br_integrate:
 .Lintegrate_add_external:
  fadd.s t0,t0,a0
 .Lintegrate_no_external:
- sw t0,N_DE(t5)
- sw t2,N_DI(t5)
- sw zero,N_INPUT_E(t5)
- sw zero,N_INPUT_I(t5)
- li a0,0
+ sw t0,N_D_TOTAL(t5)
  bnez t6,.Lintegrate_no_fire
- bltz t4,.Lintegrate_no_fire
- bltu t4,s10,.Lintegrate_no_fire
- li a0,1
+ blt t4,s10,.Lintegrate_no_fire
  li t6,5
- li t4,0
-.Lintegrate_no_fire:
- sw a0,N_FIRE(t5)
  sw t6,N_REFRAC(t5)
+ li t4,0
+ li t1,1
+ sw t1,N_FIRE(t5)
+ /* Only firing neurons append; the integration join publishes the complete
+  * list before forward/reverse/trace-finalization readers can run. */
+ amoadd.w t3,t1,(a2)
+ slli t3,t3,2
+ add t3,t3,a3
+ sw t5,0(t3)
+.Lintegrate_no_fire:
  sw t4,N_V(t5)
  lw t0,N_X(t5)
  lw t1,N_Y(t5)
@@ -614,9 +613,7 @@ br_integrate:
  bne t2,t0,.Lintegrate_return
  li a0,1
  li a1,0
- li a2,0
- lw a3,H_PU(gp)
- SENDI zero,3
+ YIELDI 3
 .Lintegrate_return:
  j br_idle
 /* Direct event handlers, selected once at boot. Input a0=input offset,
@@ -636,8 +633,7 @@ br_integrate:
  bnez t1,9f                /* post-active path handles LTD and LTP */
  lw t1,N_Y-N_INPUT_E(t0)
  beqz t1,9f                /* no learning effect; still count this delivery */
- lw t2,H_DEP(gp)
- fmul.s t1,t1,t2
+ /* Y already contains the LTD coefficient, including its learning rate. */
 .if !\morrison
  fsub.s a1,a1,t1
  fmax.s a1,a1,zero
@@ -669,12 +665,9 @@ br_spike_additive:
 br_control:
  sw zero,H_REPORT_COUNT(gp)
  sw zero,H_REPORT_SUM(gp)
- sw zero,H_REPORT_MCS(gp)
  lw t2,H_PU(gp)
  lw t3,H_NUM_PU(gp)
  slli t0,t2,1
- li a2,0
- li a3,0
  bgtu t0,t3,1f
  SENDI t0,2
  addi t0,t0,1
@@ -685,9 +678,6 @@ br_control:
  li t0,5
  beq a0,t0,3f
  sw a0,H_PHASE(gp)
- sw zero,H_JOIN_COUNT(gp)
-5: sw a1,H_ACTIVE_MCS(gp)
- sw zero,H_WORK_NEURON(gp)
  sw zero,H_WORK_LINE(gp)
  sw zero,H_WORK_MC(gp)
  sw zero,H_SENT(gp)
@@ -695,27 +685,36 @@ br_control:
   * scatter.  Phase 3 remains post-active reverse learning. */
  li t0,1
  bne a0,t0,6f
+ sw zero,H_JOIN_COUNT(gp)
+ /* Clear only last step's firing flags, after the global drain and before
+  * either integration worker starts. Keep this step's flags through dumps. */
+ lw t1,H_FIRE_COUNT(gp)
+ li t0,FIRED_LIST
+ add t0,t0,gp
+ beqz t1,.Lclear_fire_done
+.Lclear_fire:
+ lw t2,0(t0)
+ sw zero,N_FIRE(t2)
+ addi t0,t0,4
+ addi t1,t1,-1
+ bnez t1,.Lclear_fire
+.Lclear_fire_done:
+ sw zero,H_FIRE_COUNT(gp)
  addi t0,gp,256
  sw t0,H_WORK_NEURON(gp)
  SENDI zero,9
- SENDI zero,9
+ YIELDI 9
  j br_idle
-6: li t0,2
- bne a0,t0,7f
- /* Phase 2 reconstructs its mask while processing fired rows. */
- sw zero,H_ACTIVE_MCS(gp)
-7: j br_continue
+6: sw zero,H_WORK_NEURON(gp)
+ j br_continue
 2: lw a1,H_RECEIVED(gp)
  j 4f
 3: lw a1,H_REVERSE_RECEIVED(gp)
-4: li a2,0
- lw a3,H_PU(gp)
- SENDI zero,3
+4: YIELDI 3
  j br_idle
 /* Root-only broadcast and the simulator's phase-marker ABI. */
 br_broadcast:
  mv a4,a0
- mv a5,a1
  li t0,4
  beq a0,t0,2f
  li t0,5
@@ -733,37 +732,36 @@ br_broadcast:
  SENDI t0,10
 2: sw zero,H_REPORT_COUNT(gp)
  sw zero,H_REPORT_SUM(gp)
- sw zero,H_REPORT_MCS(gp)
  mv a0,a4
- mv a1,a5
- li a2,0
- li a3,0
- SENDI zero,2
+ YIELDI 2
  j br_idle
 .globl br_report
 br_report:
  lw t0,H_REPORT_COUNT(gp)
  lw t1,H_REPORT_SUM(gp)
- lw t2,H_REPORT_MCS(gp)
  addi t0,t0,1
  add t1,t1,a1
- or t2,t2,a2
- sw t0,H_REPORT_COUNT(gp)
- sw t1,H_REPORT_SUM(gp)
- sw t2,H_REPORT_MCS(gp)
+ lw t6,H_TREE_REPORTS(gp)
+ bne t0,t6,.Lreport_partial
  lw t3,H_PU(gp)
- li t4,TREE_REPORTS
- add t4,t4,gp
- lw t6,0(t4)
- bne t0,t6,9f
  li t0,1
  beq t3,t0,.Lroot_report
  srli t0,t3,1
  mv a1,t1
- mv a2,t2
- mv a3,t3
- SENDI t0,3
-9: j br_idle
+ YIELD_TO t0,3
+ j br_idle
+.Lreport_partial:
+ sw t0,H_REPORT_COUNT(gp)
+ sw t1,H_REPORT_SUM(gp)
+ j br_idle
+/* Boot selects this handler for nodes without children. Their local report
+ * is already the complete aggregate; a0/a1 pass straight to the parent. */
+.globl br_report_leaf
+br_report_leaf:
+ lw t0,H_PU(gp)
+ srli t0,t0,1
+ YIELD_TO t0,3
+ j br_idle
 .Lroot_report:
  beqz a0,.Lreport_boot
  li t0,1
@@ -798,20 +796,16 @@ br_report:
  sw t1,0(t0)
 .Lnext_forward:
  li a0,1
- li a1,0
  j br_broadcast
 .Lreport_integrate:
  /* The integration barrier advances directly to phase 2 forward work. */
  li a0,2
- lw a1,H_ACTIVE_MCS(gp)
  j br_broadcast
 .Lreport_forward:
  lw t0,H_EXPECTED_FORWARD(gp)
  add t0,t0,t1
  sw t0,H_EXPECTED_FORWARD(gp)
- sw t2,H_ACTIVE_MCS(gp)
  li a0,4
- mv a1,t2
  j br_broadcast
 .Lquery_forward:
  lw t0,H_EXPECTED_FORWARD(gp)
@@ -819,18 +813,15 @@ br_report:
  li a0,4
  bne t0,t1,1f
  li a0,3
-1: lw a1,H_ACTIVE_MCS(gp)
- j br_broadcast
+1: j br_broadcast
 .Lnext_reverse:
  li a0,3
- lw a1,H_ACTIVE_MCS(gp)
  j br_broadcast
 .Lreport_reverse:
  lw t0,H_EXPECTED_REVERSE(gp)
  add t0,t0,t1
  sw t0,H_EXPECTED_REVERSE(gp)
  li a0,5
- lw a1,H_ACTIVE_MCS(gp)
  j br_broadcast
 .Lquery_reverse:
  lw t0,H_EXPECTED_REVERSE(gp)
@@ -838,8 +829,7 @@ br_report:
  li a0,5
  bne t0,t1,1f
  li a0,6
-1: lw a1,H_ACTIVE_MCS(gp)
- j br_broadcast
+1: j br_broadcast
 .Lreport_bad:
  li a0,0xb009
  j br_halt
@@ -890,9 +880,58 @@ br_boot:
  sltu t2,t1,t2
  xori t2,t2,1
  add t3,t3,t2
- li t0,TREE_REPORTS
+ sw t3,H_TREE_REPORTS(gp)
+ li t0,1
+ bne t3,t0,.Lboot_tree_ready
+ la t0,br_report_leaf
+ csrw 0x703,t0
+.Lboot_tree_ready:
+ lw t0,H_EPSC(gp)
+ lw t1,H_EXTERNAL_WEIGHT(gp)
+ fmul.s t0,t0,t1
+ sw t0,H_EXTERNAL_CURRENT(gp)
+ /* Seed the clearing list from the presimulated image's firing flags. */
+ li t0,FIRED_LIST
  add t0,t0,gp
- sw t3,0(t0)
+ li t1,0
+ addi t2,gp,256
+ lw t3,H_NN(gp)
+ li t4,25
+ bgtu t3,t4,.Lboot_bad
+ beqz t3,.Lboot_fire_done
+ lw a4,H_POT(gp)
+ lw a5,H_DEP(gp)
+.Lboot_fire_list:
+ /* Both channels have the same alpha filter. Keep their sum in two words;
+  * incoming E/I accumulators remain separate. Convert the image only once. */
+ lw t4,N_IE(t2)
+ lw t5,N_II(t2)
+ fadd.s t4,t4,t5
+ sw t4,N_I_TOTAL(t2)
+ lw t4,N_DE(t2)
+ lw t5,N_DI(t2)
+ fadd.s t4,t4,t5
+ sw t4,N_D_TOTAL(t2)
+ sw zero,N_II(t2)
+ sw zero,N_DI(t2)
+ /* Images retain canonical traces. Runtime traces carry their learning
+  * rates, avoiding repeated coefficient multiplications at receivers. */
+ lw t4,N_X(t2)
+ lw t5,N_Y(t2)
+ fmul.s t4,t4,a4
+ fmul.s t5,t5,a5
+ sw t4,N_X(t2)
+ sw t5,N_Y(t2)
+ lw t4,N_FIRE(t2)
+ beqz t4,1f
+ sw t2,0(t0)
+ addi t0,t0,4
+ addi t1,t1,1
+1: addi t2,t2,80
+ addi t3,t3,-1
+ bnez t3,.Lboot_fire_list
+.Lboot_fire_done:
+ sw t1,H_FIRE_COUNT(gp)
  li t0,REPLAY
  add t0,t0,gp
  lw t0,28(t0)
@@ -966,7 +1005,6 @@ br_boot:
  li a0,0
  li a1,0
  li a2,0
- lw a3,H_PU(gp)
  li t0,0
  li t1,3
  SEND t0,t1
@@ -985,65 +1023,20 @@ br_work:
  lw s1,H_WORK_NEURON(gp)
  li t0,6
  beq s0,t0,.Lwork_finish
- li t0,2
- bne s0,t0,.Lwork_skip_reverse
- lw t0,H_WORK_LINE(gp)
- bnez t0,.Lwork_select
- /* N_FIRE is authoritative through reverse learning; no shadow stores. */
- lw t2,H_NN(gp)
- li t0,80
- mul s2,s1,t0
- add s2,s2,gp
- addi s2,s2,256
-1: bgeu s1,t2,2f
- lw t0,36(s2)
- bnez t0,2f
- addi s1,s1,1
- addi s2,s2,80
- j 1b
-2: sw s1,H_WORK_NEURON(gp)
+ /* H_WORK_NEURON indexes the compact list throughout forward/reverse work. */
+ lw t2,H_FIRE_COUNT(gp)
  bgeu s1,t2,.Lwork_report
- j .Lwork_neuron_ready
-.Lwork_skip_reverse:
- /* No traffic is generated for an inactive row. Scan those rows together
-  * instead of scheduling a separate work event for every local neuron. */
- lw t2,H_NN(gp)
- li t0,80
- mul s2,s1,t0
- add s2,s2,gp
- addi s2,s2,256
-1: bgeu s1,t2,2f
- lw t0,N_FIRE(s2)
- bnez t0,2f
- addi s1,s1,1
- addi s2,s2,80
- j 1b
-2: sw s1,H_WORK_NEURON(gp)
- bgeu s1,t2,.Lwork_report
- j .Lwork_neuron_ready
-.Lwork_select:
- lw t0,H_NN(gp)
- bltu s1,t0,.Lwork_neuron
- j .Lwork_report
-.Lwork_neuron:
- li t0,80
- mul s2,s1,t0
- add s2,s2,gp
- addi s2,s2,256
+ slli t0,s1,2
+ li t1,FIRED_LIST
+ add t0,t0,t1
+ add t0,t0,gp
+ lw s2,0(t0)
 .Lwork_neuron_ready:
  li t0,2
  bne s0,t0,.Lwork_reverse_neuron
  /* Start a fired row once; later work events finish its static directories. */
  lw t0,H_WORK_LINE(gp)
  bnez t0,.Lwork_directory
- /* Every local forward row belongs to this PU's MC.  Record that bit once
-  * so the report handler does not need to rescan all neurons. */
- lw t1,H_MC(gp)
- li t2,1
- sll t1,t2,t1
- lw t2,H_ACTIVE_MCS(gp)
- or t2,t2,t1
- sw t2,H_ACTIVE_MCS(gp)
  lw s4,N_COUNT(s2)
  beqz s4,.Lwork_directory
  mv s7,s4
@@ -1112,6 +1105,8 @@ br_forward_wait:
  li t0,PING
  add a1,a1,t0
  jal ra,br_ac_start
+ /* Keep the affine DRAM-to-SPM delta, advancing only one pointer per spike. */
+ sub s6,s6,s5
  YIELDI 12
  j br_idle
 .Lforward_last_chunk:
@@ -1121,6 +1116,7 @@ br_forward_wait:
  li t1,3
  sw t1,0(t0)
 #endif
+ sub s6,s6,s5
  YIELDI 12
  j br_idle
 .globl br_forward_drain
@@ -1129,10 +1125,9 @@ br_forward_drain:
  lw t0,512(s5)             # destination: high 16 input offset, low 16 PU
  lw a1,0(s5)               # already scaled FP32 weight
  srli a0,t0,16
- mv a2,s6
+ add a2,s5,s6
  mv a3,s10
  addi s5,s5,4
- addi s6,s6,4
  SENDI t0,-1023            # 0xc01; destination is truncated to 16 bits
  YIELDI 12                 # replenish quota and admit higher-priority events
  j br_idle
@@ -1185,13 +1180,9 @@ br_work_reverse_row:
  lw t0,44(s2)
  li t1,9000
  bgeu t0,t1,.Lwork_next_neuron
- lw t0,36(s2)
- beqz t0,.Lwork_next_neuron
  /* Reverse coefficients are constant for this row across all MC entries. */
- lw s8,H_DEP(gp)
- lw t1,N_Y(s2)
- fmul.s s8,s8,t1
- lw s9,H_POT(gp)
+ lw s8,N_Y(s2)
+ li s9,0                 # reverse receivers already hold the scaled pre trace
 br_work_directory:
 .Lwork_directory:
  li s6,0
@@ -1271,41 +1262,37 @@ br_work_flush:
  bne t1,t2,.Lboot_bad
  lw t2,128(t0)
  bne t1,t2,.Lboot_bad
- addi s2,gp,256
- lw s1,H_NN(gp)
-1: lw t0,36(s2)
- beqz t0,2f
- lw t1,24(s2)
- lw t2,28(s2)
- li t0,0x3f800000           # the firing flag is exactly one here
- fadd.s t1,t1,t0
- fadd.s t2,t2,t0
- sw t1,24(s2)
- sw t2,28(s2)
-2:
- addi s2,s2,80
+ li s2,FIRED_LIST
+ add s2,s2,gp
+ lw s1,H_FIRE_COUNT(gp)
+ beqz s1,.Ltrace_done
+ lw t3,H_POT(gp)
+ lw t4,H_DEP(gp)
+1: lw t0,0(s2)
+ lw t1,N_X(t0)
+ lw t2,N_Y(t0)
+ fadd.s t1,t1,t3
+ fadd.s t2,t2,t4
+ sw t1,N_X(t0)
+ sw t2,N_Y(t0)
+ addi s2,s2,4
  addi s1,s1,-1
  bnez s1,1b
+.Ltrace_done:
  INC H_STEP,t0
  li a0,6
  li a1,0
- li a2,0
  j .Lwork_send_report
 br_work_report:
 .Lwork_report:
- li a2,0
- li t0,2
- bne s0,t0,3f
- lw a2,H_ACTIVE_MCS(gp)
-3: mv a0,s0
+ mv a0,s0
  lw a1,H_SENT(gp)
 .Lwork_send_report:
- lw a3,H_PU(gp)
- SENDI zero,3
+ YIELDI 3
  j .Lwork_return
 br_work_continue:
 .Lwork_continue:
- SENDI zero,8
+ YIELDI 8
 .Lwork_return:
  j br_idle
 /* Shared image format, hand-written boot copy. No C code in this payload. */

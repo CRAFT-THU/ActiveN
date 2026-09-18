@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 import numpy as np
 from brunel import F, constants, poisson, poisson_thresholds
-from brunel_validate import pending_power
+from brunel_validate import pending_power, compare_combined_derivative
 from brunel_reuse import working_sets
 
 
@@ -97,6 +97,91 @@ class Numerics(unittest.TestCase):
                     expected = (w * (1 - 0.01026 * trace) + 0.1 * trace * w**0.4) * scale
                     actual = w * scale * (1 - float(c["dep"]) * trace) + float(c["pot"]) * trace * (w * scale)**0.4
                 np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-4)
+
+    def test_combined_alpha_filter(self):
+        """Bound accumulated rounding against two independent FP64 channels.
+
+        Exercise sustained excitation, inhibition, cancellation and quiet input
+        for 500 steps without resynchronizing the combined FP32 recurrence.
+        """
+        c = constants("morrison")
+        rng = np.random.default_rng(928)
+        split = rng.uniform(0, 2000, (4, 2048)).astype(np.float64)
+        split[2:] *= -1
+        current = F(split[0] + split[2])
+        derivative = F(split[1] + split[3])
+        voltage = F(rng.uniform(-10, 20, 2048))
+        reference_v = voltage.astype(np.float64)
+        maximum = np.zeros(3)
+        for _ in range(500):
+            e = F((rng.random(2048) < 0.08) * rng.uniform(0, 2000, 2048))
+            i = F(-((rng.random(2048) < 0.08) * rng.uniform(0, 8000, 2048)))
+            ext = F(rng.poisson(float(c["external_mean"]), 2048) * F(c["epsc"] * c["external_weight"]))
+            reference_v = (float(c["p33"]) * reference_v
+                           + float(c["p31"]) * (split[1] + split[3])
+                           + float(c["p32"]) * (split[0] + split[2]))
+            split[[0, 2]] = float(c["p11"]) * split[[0, 2]] + float(c["p21"]) * split[[1, 3]]
+            split[1] = float(c["p11"]) * split[1] + e.astype(float) + ext.astype(float)
+            split[3] = float(c["p11"]) * split[3] + i.astype(float)
+            voltage = F(F(c["p33"] * voltage) + F(F(c["p31"] * derivative) + F(c["p32"] * current)))
+            current = F(F(c["p11"] * current) + F(c["p21"] * derivative))
+            derivative = F(F(F(c["p11"] * derivative) + F(e + i)) + ext)
+            maximum = np.maximum(maximum, [
+                np.max(np.abs(voltage.astype(float) - reference_v)),
+                np.max(np.abs(current.astype(float) - split[0] - split[2])),
+                np.max(np.abs(derivative.astype(float) - split[1] - split[3])),
+            ])
+        self.assertLess(maximum[0], 0.002)
+        self.assertLess(maximum[1], 0.002)
+        self.assertLess(maximum[2], 0.02)
+
+    def test_learning_scaled_trace_recurrence(self):
+        """Bound accumulated error against canonical FP32 and FP64 traces.
+
+        Include the maximum refractory-limited rate, bursts, sparse firing,
+        and silent neurons. Neither reference is resynchronized to the scaled
+        recurrence, so a changed decay or firing increment cannot be hidden.
+        """
+        for rule in ("additive", "morrison"):
+            c = constants(rule)
+            rng = np.random.default_rng(94721)
+            decay = np.array([c["decay_pre"], c["decay_post"]], F)[:, None]
+            rate = np.array([c["pot"], c["dep"]], F)[:, None]
+            raw = F(rng.random((2, 256)) / (1 - decay.astype(float)**5))
+            scaled = F(raw * rate)
+            precise = raw.astype(float)
+            phase = rng.integers(5, size=(2, 256))
+            maximum = np.zeros(2)
+            for step in range(5000):
+                fired = (step % 5 == phase)
+                fired[:, 64:128] &= step % 500 < 75
+                fired[:, 128:192] &= rng.random((2, 64)) < 0.004
+                fired[:, 192:] = False
+                raw = F(F(raw * decay) + fired.astype(F))
+                scaled = F(F(scaled * decay) + F(fired.astype(F) * rate))
+                precise = precise * decay.astype(float) + fired
+                for i, expected in enumerate((F(raw * rate), precise * rate)):
+                    maximum[i] = max(maximum[i], np.max(
+                        np.abs(scaled.astype(float) - expected)
+                        / np.maximum(1, np.abs(expected))))
+            self.assertLess(maximum[0], 2e-5)
+            self.assertLess(maximum[1], 2e-5)
+
+    def test_combined_derivative_cancellation_bound(self):
+        c = constants("morrison")
+        n = np.zeros((2, 20), np.uint32)
+        f = n.view(F)
+        f[0, 2] = F(6424.647026342573 / float(c["p11"]))
+        f[0, 17] = F(6806.7275390625)
+        f[0, 18] = F(-13613.455078125)
+        noise = np.array([1, 0])
+        observed = np.array([-1.572906494140625, 0], F)
+        result = compare_combined_derivative(n, observed, noise, c)
+        self.assertEqual(result["violations"], 0)
+        # A real missing input must not be accepted by the cancellation bound.
+        corrupted = observed.copy()
+        corrupted[0] += F(1)
+        self.assertEqual(compare_combined_derivative(n, corrupted, noise, c)["violations"], 1)
 
 
 class WorkingSets(unittest.TestCase):

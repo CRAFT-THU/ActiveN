@@ -51,6 +51,25 @@ zero. Both rules use the decayed trace snapshots from integration. The
 instruction-level optimizations retain the existing stored learning
 coefficients and phase order. Weight units are scaled as described below.
 
+Runtime traces now include their learning coefficients: `X = pot * pre_trace`
+and `Y = dep * post_trace`. They decay by the same factors; firing adds `pot`
+or `dep` instead of one. Boot converts the image's canonical traces once.
+Quiet LTD consumes Y directly, and reverse receivers use X directly, removing
+per-update coefficient multiplications. The image and `initial.npz` retain
+unscaled traces; manifests identify the runtime with `trace_state: learning-scaled`.
+Reverse scatter's fourth argument is unused and remains zero.
+
+This representation changes FP32 rounding history. Validation keeps canonical
+traces and weights independently throughout the run, converting only the
+comparison copy to runtime units. It never rescales observed traces into its
+learning oracle. A 20,000-step synthetic stress test, including refractory-limit
+firing, found at most 5.75e-6 normalized coefficient error; its largest weight
+difference was 0.03834 in scaled units (1.13e-5 of the weight range).
+Replay of 949 recorded timesteps across all 4,050,000 weights found a maximum
+difference of 0.00036622 for either learning rule. These are measured error
+bounds for those cases, not a universal few-ULP equivalence claim. The existing
+simulator validator's 0.02 absolute weight limit is unchanged.
+
 The payload evaluates `w^(2/5)` with a bit-derived inverse-fifth-root seed,
 one modified Newton step, and a quadratic residual correction. Its normal path
 uses 39 instructions, including 17 FP operations and one integer multiply-high;
@@ -74,6 +93,38 @@ selected active window if the initial 30+30 window is quiet, and records the
 actual presimulation duration. Short burst windows are not estimates of the
 long-duration population mean firing rate.
 
+## Assembly cleanup and combined-current measurements (2026-09-17)
+
+The two stages were benchmarked separately with 60 warmup and 60 timed steps,
+using the same preserved 512-PU/16-MC/two-SMT simulator, eight host threads,
+initialized I-cache, and flat memory. Payload diagnostics were disabled;
+passive simulator observation collected phase timings and full state snapshots.
+No simulator rebuild or RTL re-elaboration was performed.
+
+All timing entries are average cycles per timestep:
+
+| Phase | Previous | Lists/report/local cleanup | Also combine currents |
+| --- | ---: | ---: | ---: |
+| Integration | 2,282.07 | 2,075.05 | 1,845.35 |
+| Forward + post-quiet LTD | 7,492.62 | 7,790.37 | 6,944.08 |
+| Post-active LTD/LTP | 2,715.40 | 2,635.52 | 2,342.33 |
+| Drain + trace increments | 1,038.53 | 735.68 | 735.50 |
+| Workload timer total | 13,528.67 | 13,236.67 | 11,867.32 |
+
+The total reduction is 12.28%, but stochastic work differs: neuron firings
+average 2.50 / 3.78 / 2.83 per timestep. In steps 2–3, with identical fired
+neuron identities and the startup cache transient excluded, the first stage
+reduces total cycles 7.83%; combining currents then reduces integration 10.77%
+and total cycles a further 1.52%. This matched comparison is only two steps.
+
+Both 120-step runs pass independent deterministic replay and checks of all
+4,050,000 weights. Both learning rules pass short assembly self-test pilots.
+An all-22-neurons-on-one-PU stress case validates list population/clearing; a
+500-step filter test compares combined FP32 state against separate FP64 channels
+without resynchronization. Full results, input/binary hashes, tested source
+snapshots, and commands are under `copilot/tmp/brunel-more-20260917/`.
+The combined-current version is the current source implementation.
+
 ## Current assembly runtime: post-quiet delivery and post-active MSHRs
 
 The current payload is **assembly only**, in `brunel.S` and `brunel_runtime.S`.
@@ -91,7 +142,8 @@ CSR scatter. Neuron ownership is `PU = 1 + gid % 512`, local index `gid / 512`.
 | --- | ---: | --- |
 | `0x0000–0x0100` | 256 | Header, counters, constants |
 | `0x0100–0x0900` | 2,048 | Up to 25 neurons, 80 bytes each |
-| `0x0900–0x2900` | 8,192 | Reserved; the forward weight buffer has been removed |
+| `0x0900–0x0964` | 100 | Up to 25 fired-neuron SPM pointers |
+| `0x0964–0x2900` | 8,092 | Reserved; the forward weight buffer has been removed |
 | `0x2900–0x2d00` | 1,024 | 16 MSHRs, 64 bytes each |
 | `0x2d00–0x2d80` | 128 | Four directory/transport scratch lines |
 | `0x2d80–0x2e00` | 128 | Legacy descriptor, Poisson thresholds, stream/tree state |
@@ -109,6 +161,9 @@ base guards are checked at every timestep boundary. The work/wait/drain event
 continuations have no stack frame across a yield. Helper calls preserve the
 registers holding the forward stream's state.
 Header offset 244 stores the immutable MC destination ID, computed at boot.
+Boot repurposes the image constants at offsets 208/212/216 as the external
+current contribution (`FP32(EPSC * external_weight)`), fired-list count, and
+self-plus-children report count. The initial-image constants remain unchanged.
 The neuron firing flag at offset 36 (`N_FIRE`) remains authoritative through
 reverse learning. Offset 40 is reserved and retains its input-image value;
 there is no per-timestep duplicate flag store. New manifests identify this
@@ -122,15 +177,67 @@ SMT1. The final worker reports completion after an AMO join. Each worker loads
 shared coefficients and its RNG state once, then writes its RNG state once on
 completion. Neuron fields remain in registers until their final stores.
 
-The membrane expression factors the equal excitatory/inhibitory coefficients
-as `p31 * (dIex + dIin) + p32 * (Iex + Iin) + p33 * V`. The usual
-non-refractory, non-firing path uses 19 FP instructions when external input is
-zero, or 20 for one or two external events. Zero skips conversion and external
+Both current channels have the same alpha-filter coefficients. Boot converts
+the image's separate E/I states to `I_total=FP32(Iex+Iin)` and
+`dI_total=FP32(dIex+dIin)` in offsets 4/8. Offsets 12/16 become zero reserved
+words. Incoming E/I accumulators remain at offsets 68/72, so delivery and the
+80-byte neuron stride are unchanged. Manifests declare `current_state: combined`;
+the independent presimulation and initial image retain separate channels.
+
+The membrane expression is `p31*dI_total + p32*I_total + p33*V`.
+The current recurrence is `I_total'=p11*I_total+p21*dI_total`, followed by
+`dI_total'=p11*dI_total+(input_E+input_I)+external`. This removes six FP
+instructions, two loads, and two stores per non-refractory neuron, at the cost
+of different FP32 grouping. The usual
+non-refractory, non-firing path uses 11 FP instructions when recurrent and
+external inputs are zero, or 12 for one or two external events. Nonzero recurrent
+inputs add two FP instructions. Zero external input skips conversion and external
 arithmetic entirely. One uses the precomputed external contribution in `s7`;
 two uses `a7 = s7+s7`, computed once per worker. Counts of three or more retain
 conversion and multiplication. The first three CDF thresholds stay in registers;
 rarer cases read the remaining small table. Both threads retain dynamic AMO
 work allocation and independent register-held RNG states.
+
+Workers retain the AMO claim address in a register. Zero recurrent inputs skip
+both input additions and their clearing stores; the current decays and external
+Poisson contribution still execute. Refractory counters are stored only when
+decremented or set by firing. Only firing neurons store `N_FIRE=1` and atomically
+append their SPM pointers. Before the next integration starts, control clears
+the preceding list's firing flags and resets its count. The final integration
+join publishes all pointers before forward/reverse work can read the list.
+Boot seeds the list from the presimulated flags so the first clearing is exact.
+Forward, reverse, and trace increments iterate this bounded list instead of
+scanning every local neuron; snapshots still retain the completed step's flags.
+The validator infers the external Poisson integer from the combined derivative,
+advances the original separate-channel reference equations, and compares their
+sums with the observed state. Only then does it carry the observed state into
+the next step; synaptic weights and canonical learning traces remain independently
+computed for the whole run when `trace_state: learning-scaled` is selected.
+A separate 500-step filter test checks accumulated rounding against two FP64
+channels without any intermediate state resynchronization.
+For the combined derivative, validation also evaluates the recurrence in FP64
+and bounds rounding by `gamma(3) * sum(abs(terms))`, with an underflow allowance.
+This handles nearly cancelling excitation/inhibition without normalizing error
+only by the small final result. The 1,060-step baseline contained one such case;
+its derivative was 0.0000537 from the FP64 value and inside the rounding bound.
+Firing flags, refractory state, weight limits and the other state checks retain
+their existing requirements.
+
+The reduction tree retains its original messages, priorities, quotas, and
+completion conditions. Boot selects a direct forwarding report handler for
+leaf PUs. Internal nodes store only incomplete aggregates and load their own
+identity only when the aggregate is complete. Report arguments `a2/a3` are
+unused. The former active-MC mask and its reduction have been removed: reverse
+work visits its directory independently of that mask. Their header words remain
+reserved, so this cleanup does not change the image ABI. Integration alone
+resets the join counter; other phases initialize only their work iterators.
+Terminal report/control/work sends yield directly while retaining the existing
+handler ownership, priority, quota, and margin settings.
+The MSHR service continuation deliberately uses an ordinary send before idling:
+yielding during its enqueue can schedule an already-pending drain worker before
+the requeued service becomes visible. An extended pilot exposed that ordering
+hazard with two MSHRs still live; service priority must remain effective through
+retirement and clearing its scheduled flag.
 
 ### Forward and reverse processing
 
@@ -144,8 +251,11 @@ yielding wait polls completion. Once ready, it starts the next copy into the
 other half before draining this half. Each drain iteration loads the target
 and weight from SPM, sends
 the spike, and yields to a local drain continuation. The steady loop executes
-ten instructions through the yield, including its exit branch, remote blocking send, and local
+nine instructions through the yield, including its exit branch, remote blocking send, and local
 yield. The local yield replenishes quota and admits higher-priority handlers.
+Each chunk keeps `DRAM_start - SPM_start` in a saved register, allowing the
+message's weight address to be derived from the advancing SPM pointer without
+maintaining a second per-synapse iterator.
 After the half is consumed, the continuation waits for the next copy and
 exchanges halves. The MSHR region remains separate.
 
@@ -177,7 +287,12 @@ descriptors. Software issues all four directory-line reads into the existing
 scratch region before waiting for their individual completions. A yielding
 worker retains its directory pointer, coefficients, and tag in registers.
 
-Fired-post reverse CSR events carry `(preLocal, weightDramAddress, LTD, LTP)`.
+Fired-post reverse CSR events carry `(preSpmOffset, weightDramAddress, LTD, LTP)`.
+The first field is `256 + 80 * preLocal`, precomputed in the generator and
+identified by `reverse_index: neuron-spm-byte-offset` in the manifest. The
+receiver adds the SPM base directly. Old reverse-index images require migration
+or regeneration with the current generator, even though the outer row-layout
+magic remains `0x42524e34` for the existing simulator observer.
 The receiver suppresses LTD unless the pre also fired, and multiplies LTP by the
 decayed local pre trace. A zero trace and quiet pre reject the event before the
 FP multiply. Every nonzero update uses an MSHR. Post-quiet and post-active
