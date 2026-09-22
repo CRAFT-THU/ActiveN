@@ -41,8 +41,10 @@ typedef struct {
   uint32_t magic, pu, num_pu, rule, nn, step, completed, phase;
   uint32_t warmup, steps, mc, active_mcs, work_neuron, work_line, work_mc, sent;
   uint32_t received, reverse_received, issued, consumed, ready[4];
-  uint32_t report_count, report_sum, expected_forward, expected_reverse,
-      report_mcs, join_count;
+  uint32_t report_count, report_sum, expected_forward, expected_reverse;
+  /* The image's unused report word becomes the fixed neuron-end pointer. */
+  union { uint32_t report_mcs, neuron_end; };
+  uint32_t join_count;
   uint32_t buffer_updates, mshr_loads, mshr_commits, overflow_rows, write_words,
       pool_full, forward_weights, reverse_events;
   uint32_t buffer_bytes, mshr_count, mshr_head, mshr_tail, mshr_scheduled,
@@ -93,6 +95,7 @@ BR_ASSERT(BR_FIRED_LIST + BR_MAX_NEURONS * 4 <= BR_MSHR, "fired list capacity");
 BR_ASSERT(sizeof(BrMshr) == 64, "MSHR ABI");
 BR_ASSERT(BR_MSHR + BR_MSHRS * sizeof(BrMshr) == BR_READ, "MSHR capacity");
 BR_ASSERT(offsetof(BrHeader, buffer_bytes) == 152, "buffer control ABI");
+BR_ASSERT(offsetof(BrHeader, neuron_end) == 112, "neuron-end pointer ABI");
 BR_ASSERT(offsetof(BrHeader, fired_count) == BR_FIRED_COUNT, "fired count ABI");
 BR_ASSERT(offsetof(BrHeader, tree_reports) == BR_TREE_REPORTS, "report count ABI");
 BR_ASSERT(offsetof(BrHeader, allocation_waits) == 252, "MSHR wait counter ABI");

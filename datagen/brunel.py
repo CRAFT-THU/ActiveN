@@ -271,6 +271,10 @@ def write_weights(images, ref):
 def generate(args):
     if args.warmup < 0 or args.timed < 1 or args.presim < 0:
         raise ValueError("timed must be positive; warmup/presim nonnegative")
+    if args.payload is None:
+        args.payload = (Path(__file__).resolve().parents[1] / "sim/payloads/sys"
+                        / f"brunel_{args.rule}.bin")
+    payload = args.payload.read_bytes()
     out = args.output
     out.mkdir(parents=True, exist_ok=False)
     edges = graph(args.seed)
@@ -324,7 +328,6 @@ def generate(args):
     initial_n = ref.n.copy()
     initial_w = ref.w.copy()
     write_weights(images, ref)
-    payload = args.payload.read_bytes()
     if len(payload) + 16 > 0x8000:
         raise ValueError("payload overlaps reserved transport test region")
     images[0][16 : 16 + len(payload)] = payload
@@ -442,6 +445,7 @@ def generate(args):
             np.savez(out / f"reference-{t + 1:04}.npz", neurons=ref.n, weights=ref.w)
     manifest = dict(
         rule=args.rule,
+        rule_selection="compile-time; boot validates image H_RULE",
         seed=args.seed,
         presim=args.presim,
         kernel="timestep-buffer-mshr",
@@ -509,7 +513,8 @@ def main():
     p.add_argument("--warmup", type=int, default=30)
     p.add_argument("--timed", type=int, default=30)
     p.add_argument("--seek-active", action="store_true")
-    p.add_argument("--payload", type=Path, default=Path("sim/payloads/sys/brunel.bin"))
+    p.add_argument("--payload", type=Path,
+                   help="default: sim/payloads/sys/brunel_<rule>.bin")
     generate(p.parse_args())
 
 

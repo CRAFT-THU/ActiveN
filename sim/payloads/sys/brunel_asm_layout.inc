@@ -29,6 +29,7 @@
 .equ H_EXPECTED_FORWARD, 104
 .equ H_EXPECTED_REVERSE, 108
 .equ H_REPORT_MCS, 112
+.equ H_NEURON_END, 112 /* Boot replaces unused report_mcs with the end pointer. */
 .equ H_JOIN_COUNT, 116
 .equ H_BUFFER_UPDATES, 120
 .equ H_MSHR_LOADS, 124
@@ -104,8 +105,3 @@
 .equ H_RNG0, 172
 .equ H_RNG1, 176
 .equ H_MSHR_PEAK, 180
-
-/* Disabled event slots hold rule-specific leaf function pointers. Their
- * enable masks remain zero; they are never used as message destinations. */
-.equ BR_LTD_ENTRY, 0x70d
-.equ BR_LTP_ENTRY, 0x70e

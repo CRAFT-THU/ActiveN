@@ -128,8 +128,21 @@ The combined-current version is the current source implementation.
 ## Current assembly runtime: post-quiet delivery and post-active MSHRs
 
 The current payload is **assembly only**, in `brunel.S` and `brunel_runtime.S`.
-`make -C sim/payloads sys/brunel.bin` builds that runtime; `brunel_asm.bin` is
-also available. The C kernel has been removed. The host numerical helper and
+The shared `brunel_rule.inc` selects `SPIKE_ENTRY`, `LTD_ENTRY` and `LTP_ENTRY`
+at compile time. Build `sys/brunel_additive.bin` and/or `sys/brunel_morrison.bin`;
+datagen automatically selects the matching binary for `--rule`. Boot checks
+that the image's `H_RULE` matches the compiled rule. Production learning uses
+direct `jal` calls and does not read function pointers from handler CSRs.
+The numeric variants (`brunel_<rule>_numeric.bin`) additionally include both
+rules' numerical test routines; their workload still uses the compiled rule.
+
+Compatibility targets `sys/brunel.bin`, `sys/brunel_asm.bin`, and
+`sys/brunel_asm_numeric.bin` select `BRUNEL_RULE=additive` by default; pass
+`BRUNEL_RULE=morrison` for Morrison aliases. Changing that variable always
+refreshes the aliases, even if the selected binary was built earlier. When
+changing `BRUNEL_ASM_FLAGS` for instrumentation/stress variants, use `make -B`
+and preserve the resulting binary separately from production benchmarks.
+The C kernel has been removed. The host numerical helper and
 historical cache-policy evaluator remain independent testing/research tools.
 The image ABI is `0x42524e34`; images with older plastic-row layouts must be
 regenerated.
@@ -161,6 +174,10 @@ base guards are checked at every timestep boundary. The work/wait/drain event
 continuations have no stack frame across a yield. Helper calls preserve the
 registers holding the forward stream's state.
 Header offset 244 stores the immutable MC destination ID, computed at boot.
+Header offset 112, formerly the unused report-MC word, stores the immutable
+neuron-end pointer produced by the boot conversion loop. Integration loads it
+once per worker and retains dynamic AMO-based neuron assignment. Leaf PUs use
+a boot-selected control entry that skips child and reduction setup.
 Boot repurposes the image constants at offsets 208/212/216 as the external
 current contribution (`FP32(EPSC * external_weight)`), fired-list count, and
 self-plus-children report count. The initial-image constants remain unchanged.
@@ -335,9 +352,9 @@ remain writeback 1, refill 2, neural/scatter 3; control and local messages use 0
 Forward wait/drain handlers 11/12 use SMT0, zero arguments, quota 2 and margin
 19, leaving room for the existing higher-priority handlers.
 
-Boot selects the rule-specific spike handler and LTD/LTP leaf addresses once.
-Disabled event-address CSRs `0x70d/0x70e` hold the leaf pointers; their event
-enable masks remain zero. No handler quotas, priorities, or queue sizes change.
+The shared compile-time rule selection supplies the spike-handler symbol and
+direct LTD/LTP call targets. Boot only validates the image's rule; event slots
+13/14 remain disabled and are not used for function-pointer storage.
 Directional clamps retain only the applicable bound for nonnegative input
 weights/coefficient values. A generic rule-dispatch wrapper exists only in the
 numeric self-test build. Local direct calls use `jal`, and leaf/private-register
@@ -409,7 +426,7 @@ changed the current elaboration. Its Ramulator flag selects HBM timing and must
 be omitted when reproducing the flat-memory comparisons recorded below.
 
 ```sh
-make -C sim/payloads sys/brunel.bin sys/brunel_asm_numeric.bin
+make -C sim/payloads sys/brunel_morrison.bin sys/brunel_morrison_numeric.bin
 python3 datagen/brunel.py --rule morrison --presim 1000 --warmup 60 --timed 60 \
   --output copilot/tmp/brunel-morrison
 python3 sim/tests/brunel_buffer_image.py copilot/tmp/brunel-morrison
@@ -543,7 +560,7 @@ The forced stress variant (zero forward buffer, one MSHR, two record slots)
 also passes its one-step simulator and full final-weight validation, exercising
 the spill and allocation fallback paths.
 
-For transport/numeric validation, embed `brunel_asm_numeric.bin` in a short
+For transport/numeric validation, embed the matching `brunel_<rule>_numeric.bin` in a short
 image and run first with flat memory. Compile-time `BR_BUFFER_LIMIT` (bytes,
 0–8192, multiple of 32) and `BR_MSHR_LIMIT` (1–16) allow forced-overflow and
 allocation-pressure tests via `BRUNEL_ASM_FLAGS`; rebuild with `make -B` when

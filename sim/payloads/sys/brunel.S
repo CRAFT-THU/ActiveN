@@ -1,3 +1,4 @@
+#include "brunel_rule.inc"
 .section .text.boot
 .globl _start
 _start:
@@ -23,7 +24,7 @@ _start:
   INSTALL 0,br_completion,18,0
   # Spike delivery is safe on both SMT threads: the input accumulator uses
   # LR/SC, while the learning writeback targets are independent.
-  INSTALL 1,br_spike,28,0x00020002
+  INSTALL 1,SPIKE_ENTRY,28,0x00020002
   INSTALL 2,br_control,20,0x00030005
   INSTALL 3,br_report,20,0x00020004
   INSTALL 4,br_reverse,12,0x000a0011

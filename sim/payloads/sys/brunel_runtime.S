@@ -10,6 +10,7 @@
  * Reverse events carry full MC-local addresses. Memory effects must be ordered.
  */
 #include "brunel_asm_layout.inc"
+#include "brunel_rule.inc"
 .option norelax
 .equ BUFFER, 0x900
 .equ FIRED_LIST, BUFFER
@@ -159,9 +160,9 @@ br_completion:
  j br_idle
 .Lcompletion_mshr:
  li t0,MSHR
- bltu a1,t0,.Lbad_completion
- li t0,READ
- bgeu a1,t0,.Lbad_completion
+ sub t0,a1,t0
+ sltiu t0,t0,(READ-MSHR)
+ beqz t0,.Lbad_completion
  andi t0,a1,63
  bnez t0,.Lbad_completion
  add t0,gp,a1
@@ -177,14 +178,12 @@ br_load_start:
  slli a2,a1,5
  li t0,READ
  add a2,a2,t0
-/* a0=DRAM address, a1=completion token, a2=SPM byte offset. */
+/* Directory/boot entry: a1 is always a token in 0..3. MSHRs enter below
+ * the ready-flag reset. a0=DRAM address, a2=SPM byte offset. */
 br_line_start:
- li t0,4
- bgeu a1,t0,2f
  slli t0,a1,2
  add t0,gp,t0
  sw zero,80(t0)
-2:
 br_mshr_line_start:
 .Lload_credit_wait:
  lw t0,H_ISSUED(gp)
@@ -251,8 +250,8 @@ br_halt:
  sw a0,0(t0)
 1: wfi
  j 1b
-/* Test-only generic entry; production calls rule-specific leaf addresses
- * selected once at boot. Valid input weights and coefficients are >= 0. */
+/* Test-only generic entry exercises both rules; production calls the
+ * compile-time-selected leaves directly. Weights and coefficients are >= 0. */
 #ifdef BR_ASM_SELFTEST
 .globl br_update
 br_update:
@@ -263,6 +262,7 @@ br_update:
 1: beqz a2,br_ltd_morrison
  j br_ltp_morrison
 #endif
+#if BR_RULE == 0 || defined(BR_ASM_SELFTEST)
 br_ltd_additive:
  fsub.s a0,a0,a1
  fmax.s a0,a0,zero
@@ -272,6 +272,8 @@ br_ltp_additive:
  lw t0,H_WMAX(gp)
  fmin.s a0,a0,t0
  ret
+#endif
+#if BR_RULE == 1 || defined(BR_ASM_SELFTEST)
 br_ltd_morrison:
  fmul.s a1,a1,a0
  fsub.s a0,a0,a1
@@ -286,12 +288,13 @@ br_ltp_morrison:
  fmul.s a0,a0,a1
  fadd.s a0,a0,a3
  jr a2
+#endif
 /* One coalesced service event; only SMT0 owns ring indices and allocation.
  * SMT1 only changes an allocated descriptor from loading(1) to ready(2).
  * A full-pool allocator can retire the head itself, so it never waits for
  * its own lower-priority service event. Only fired-post scatter allocates
  * these descriptors; post-quiet updates are written at the receiving PU.
- * Private ABI: a4-a7 hold the head, descriptor, weight, and return link.
+ * Private ABI: a4-a7 hold the head, descriptor, address, and return link.
  * All callees preserve those registers and t6 (the allocator's return link).
  * Returns the remaining descriptor count in t0 on every path.
  */
@@ -300,31 +303,24 @@ br_mshr_retire:
  beqz t0,9f
  lw a4,H_MSHR_HEAD(gp)
  slli a5,a4,6
- li t0,MSHR
- add a5,a5,t0
- add a5,a5,gp
- lw t0,44(a5)
- li t1,2
- bne t0,t1,.Lmshr_not_ready
+ li t1,BR_BASE+MSHR
+ add a5,a5,t1
+ lw t1,44(a5)
+ li t2,2
+ bne t1,t2,9f             # t0 still holds the count on an unsuccessful poll
  mv a7,ra
- lw t0,32(a5)
- andi t0,t0,28
+ lw a6,32(a5)
+ andi t0,a6,28
  add t0,t0,a5
- lw a6,0(t0)
+ lw a0,0(t0)
  lw a1,36(a5)
  beqz a1,1f
- mv a0,a6
- csrr t0,BR_LTD_ENTRY
- jalr ra,t0,0
- mv a6,a0
+ jal ra,LTD_ENTRY
 1: lw a1,40(a5)
  beqz a1,2f
+ jal ra,LTP_ENTRY
+2: mv a1,a0
  mv a0,a6
- csrr t0,BR_LTP_ENTRY
- jalr ra,t0,0
- mv a6,a0
-2: lw a0,32(a5)
- mv a1,a6
  jal ra,br_store_word
  DINC H_WRITE_WORDS,t0
  DINC H_MSHR_COMMITS,t0
@@ -336,8 +332,6 @@ br_mshr_retire:
  addi t0,t0,-1
  sw t0,H_MSHR_COUNT(gp)
  jr a7
-.Lmshr_not_ready:
- lw t0,H_MSHR_COUNT(gp)
 9: ret
 .globl br_mshr_service
 br_mshr_service:
@@ -369,9 +363,8 @@ br_mshr_allocate:
 #if BR_DIAGNOSTIC
  lw t0,H_MSHR_HEAD(gp)
  slli t0,t0,6
- li t1,MSHR
+ li t1,BR_BASE+MSHR
  add t0,t0,t1
- add t0,t0,gp
  lw t0,44(t0)
  li t1,2
  beq t0,t1,1f
@@ -387,9 +380,8 @@ br_mshr_allocate:
  addi sp,sp,16
 2: lw t0,H_MSHR_TAIL(gp)
  slli t2,t0,6
- li t1,MSHR
+ li t1,BR_BASE+MSHR
  add t2,t2,t1
- add t2,t2,gp
  addi t0,t0,1
  andi t0,t0,15
  sw t0,H_MSHR_TAIL(gp)
@@ -425,15 +417,11 @@ br_reverse:
  add t0,gp,a0              # reverse CSR carries the neuron SPM byte offset
  lw t1,N_FIRE(t0)
  lw t2,N_X(t0)
- /* X already contains the LTP coefficient; live traces cover silent pres. */
- or t0,t1,t2
- beqz t0,8f
- bnez t1,1f
+ /* Nonnegative X already is the LTP coefficient. Quiet pre is fallthrough. */
+ bnez t1,.Lreverse_active
+ beqz t2,8f
  li a2,0
-1:
- or t0,a2,t2
- slli t0,t0,1
- beqz t0,8f
+.Lreverse_allocate:
  /* The forward buffer is gone.  Every post-active update uses an MSHR
   * line load, then the normal ordered scalar writeback path. */
  mv a0,a1
@@ -443,11 +431,16 @@ br_reverse:
 8: INC H_REVERSE_RECEIVED,t0
  DINC H_REVERSE_EVENTS,t0
  j br_idle
+.Lreverse_active:
+ or t0,a2,t2
+ beqz t0,8b
+ j .Lreverse_allocate
 /* Positive finite FP32 w^(2/5), plus exact +0. Scratch a0,t0-t5 only.
  * Bit seed for the inverse fifth root, one modified Newton step, then a
  * quadratic correction of q=w*r^3 using d=1-q*r^2. Every FP op rounds
  * separately. Exhaustive positive-FP32 validation bounds the error at 2 ULP.
  * Scale tiny inputs by 2^100 and reduce the result exponent by 40. */
+#if BR_RULE == 1 || defined(BR_ASM_SELFTEST)
 #ifdef BR_ASM_SELFTEST
 .globl br_pow04
 #endif
@@ -488,6 +481,7 @@ br_pow04:
  fadd.s a0,a0,t1
  sub a0,a0,t5
 9: ret
+#endif
 /* Both SMT workers claim a neuron address with AMOADD. Constants and one
  * xorshift state stay in registers for the complete invocation. tp is the SMT
  * identity set at boot; no worker frame or per-neuron RNG spill is needed. */
@@ -497,10 +491,7 @@ br_integrate:
  add t0,t0,gp
  lw s11,H_RNG0(t0)
  li s0,80
- lw s1,H_NN(gp)
- mul s1,s1,s0
- add s1,s1,gp
- addi s1,s1,256
+ lw s1,H_NEURON_END(gp)
  lw s2,H_P11(gp)
  lw s3,H_P21(gp)
  lw s4,H_P31(gp)
@@ -511,15 +502,13 @@ br_integrate:
  lw s8,H_DECAY_PRE(gp)
  lw s9,H_DECAY_POST(gp)
  li s10,0x41a00000
- li t0,POISSON
- add t0,t0,gp
+ li t0,BR_BASE+POISSON
  lw a4,0(t0)
  lw a5,4(t0)
  lw a6,8(t0)
  addi ra,gp,H_WORK_NEURON  # private until the worker returns to the event loop
  addi a2,gp,H_FIRE_COUNT
- li a3,FIRED_LIST
- add a3,a3,gp
+ li a3,BR_BASE+FIRED_LIST
 .Lintegrate_claim:
  amoadd.w t5,s0,(ra)
  bgeu t5,s1,.Lintegrate_done
@@ -616,7 +605,7 @@ br_integrate:
  YIELDI 3
 .Lintegrate_return:
  j br_idle
-/* Direct event handlers, selected once at boot. Input a0=input offset,
+/* Direct event handler, selected at compile time. Input a0=input offset,
  * a1=weight,a2=weight address (zero for static),a3=source MC destination ID.
  * A quiet postsynaptic target
  * applies LTD locally and sends a no-receipt scalar store to the source MC. */
@@ -655,12 +644,15 @@ br_integrate:
  amoadd.w zero,t1,(t0)
  j br_idle
 .endm
-.globl br_spike
-br_spike:
+#if BR_RULE == 1
+.globl SPIKE_ENTRY
+SPIKE_ENTRY:
  SPIKE_BODY 1
-.globl br_spike_additive
-br_spike_additive:
+#else
+.globl SPIKE_ENTRY
+SPIKE_ENTRY:
  SPIKE_BODY 0
+#endif
 .globl br_control
 br_control:
  sw zero,H_REPORT_COUNT(gp)
@@ -673,14 +665,14 @@ br_control:
  addi t0,t0,1
  bgtu t0,t3,1f
  SENDI t0,2
-1: li t0,4
+1:
+/* Boot selects this entry directly on nodes whose report handler is a leaf. */
+br_control_leaf:
+ li t0,4
  beq a0,t0,2f
  li t0,5
  beq a0,t0,3f
  sw a0,H_PHASE(gp)
- sw zero,H_WORK_LINE(gp)
- sw zero,H_WORK_MC(gp)
- sw zero,H_SENT(gp)
  /* Phase 1 is integration.  Phase 2 is forward delivery and static CSR
   * scatter.  Phase 3 remains post-active reverse learning. */
  li t0,1
@@ -689,8 +681,7 @@ br_control:
  /* Clear only last step's firing flags, after the global drain and before
   * either integration worker starts. Keep this step's flags through dumps. */
  lw t1,H_FIRE_COUNT(gp)
- li t0,FIRED_LIST
- add t0,t0,gp
+ li t0,BR_BASE+FIRED_LIST
  beqz t1,.Lclear_fire_done
 .Lclear_fire:
  lw t2,0(t0)
@@ -705,7 +696,10 @@ br_control:
  SENDI zero,9
  YIELDI 9
  j br_idle
-6: sw zero,H_WORK_NEURON(gp)
+6: sw zero,H_WORK_LINE(gp)
+ sw zero,H_WORK_MC(gp)
+ sw zero,H_SENT(gp)
+ sw zero,H_WORK_NEURON(gp)
  j br_continue
 2: lw a1,H_RECEIVED(gp)
  j 4f
@@ -730,9 +724,7 @@ br_broadcast:
  li a3,0
  li t0,1
  SENDI t0,10
-2: sw zero,H_REPORT_COUNT(gp)
- sw zero,H_REPORT_SUM(gp)
- mv a0,a4
+2: mv a0,a4
  YIELDI 2
  j br_idle
 .globl br_report
@@ -836,16 +828,14 @@ br_report_leaf:
 .globl br_boot
 br_boot:
  ENTER 3
- li t0,0x3f00
- add t0,t0,gp
+ li t0,BR_BASE+0x3f00
  li t1,0x19ca7ead
  sw t1,0(t0)
  sw t1,128(t0)
  lw t0,H_MAGIC(gp)
  li t1,0x42524e34
  bne t0,t1,.Lboot_bad
- /* Fixed transport parameters and rule dispatch. Event slots 13/14 remain
-  * disabled; their address CSRs are private leaf function pointers. */
+ /* Fixed transport parameters; the image must match this compiled rule. */
  lw t0,H_MC(gp)
  li t1,0x8001
  add t0,t0,t1
@@ -853,21 +843,8 @@ br_boot:
  li t0,1024
  csrw 0x733,t0
  lw t0,H_RULE(gp)
- li t1,1
- bgtu t0,t1,.Lboot_bad
- bnez t0,.Lboot_morrison
- la t0,br_spike_additive
- csrw 0x701,t0
- la t0,br_ltd_additive
- csrw BR_LTD_ENTRY,t0
- la t0,br_ltp_additive
- j .Lboot_rule_ready
-.Lboot_morrison:
- la t0,br_ltd_morrison
- csrw BR_LTD_ENTRY,t0
- la t0,br_ltp_morrison
-.Lboot_rule_ready:
- csrw BR_LTP_ENTRY,t0
+ li t1,BR_RULE
+ bne t0,t1,.Lboot_bad
  /* The reduction tree is fixed: every report waits for itself plus its
   * existing children. Compute that once, rather than at every barrier. */
  lw t0,H_PU(gp)
@@ -885,14 +862,15 @@ br_boot:
  bne t3,t0,.Lboot_tree_ready
  la t0,br_report_leaf
  csrw 0x703,t0
+ la t0,br_control_leaf
+ csrw 0x702,t0
 .Lboot_tree_ready:
  lw t0,H_EPSC(gp)
  lw t1,H_EXTERNAL_WEIGHT(gp)
  fmul.s t0,t0,t1
  sw t0,H_EXTERNAL_CURRENT(gp)
  /* Seed the clearing list from the presimulated image's firing flags. */
- li t0,FIRED_LIST
- add t0,t0,gp
+ li t0,BR_BASE+FIRED_LIST
  li t1,0
  addi t2,gp,256
  lw t3,H_NN(gp)
@@ -932,8 +910,8 @@ br_boot:
  bnez t3,.Lboot_fire_list
 .Lboot_fire_done:
  sw t1,H_FIRE_COUNT(gp)
- li t0,REPLAY
- add t0,t0,gp
+ sw t2,H_NEURON_END(gp)
+ li t0,BR_BASE+REPLAY
  lw t0,28(t0)
  beqz t0,.Lboot_bad
  li t1,256
@@ -975,9 +953,8 @@ br_boot:
  mv a0,s0
  jal ra,br_load_wait
  slli s2,s0,5
- li t0,READ
+ li t0,BR_BASE+READ
  add s2,s2,t0
- add s2,s2,gp
  li s1,0
 1: lw t0,0(s2)
  slli t1,s0,8
@@ -1027,9 +1004,8 @@ br_work:
  lw t2,H_FIRE_COUNT(gp)
  bgeu s1,t2,.Lwork_report
  slli t0,s1,2
- li t1,FIRED_LIST
+ li t1,BR_BASE+FIRED_LIST
  add t0,t0,t1
- add t0,t0,gp
  lw s2,0(t0)
 .Lwork_neuron_ready:
  li t0,2
@@ -1037,9 +1013,8 @@ br_work:
  /* Start a fired row once; later work events finish its static directories. */
  lw t0,H_WORK_LINE(gp)
  bnez t0,.Lwork_directory
- lw s4,N_COUNT(s2)
- beqz s4,.Lwork_directory
- mv s7,s4
+ lw s7,N_COUNT(s2)
+ beqz s7,.Lwork_directory
 .Lforward_first:
  li s3,0                     # row synapse index at chunk start
  li s11,0                    # landing half, 0 or 1
@@ -1080,9 +1055,8 @@ br_forward_wait:
  bleu s4,t0,1f
  mv s4,t0
 1: slli s5,s11,10
- li t0,PING
+ li t0,BR_BASE+PING
  add s5,s5,t0
- add s5,s5,gp
  slli t0,s4,2
  add s9,s5,t0              # weight-half end
  slli t0,s3,3             # chunk starts are multiples of 128 synapses
@@ -1212,8 +1186,7 @@ br_work_directory:
  addi a0,s7,96
  li a1,3
  jal ra,br_load_start
- li s7,READ
- add s7,s7,gp
+ li s7,BR_BASE+READ
 .Ldirectory_resume:
  li t0,16
  bgeu s6,t0,.Lwork_next_neuron
@@ -1255,15 +1228,13 @@ br_work_flush:
  bnez t0,.Lboot_bad
  lw t0,H_MSHR_SCHEDULED(gp)
  bnez t0,.Lboot_bad
- li t0,0x3f00
- add t0,t0,gp
+ li t0,BR_BASE+0x3f00
  li t1,0x19ca7ead
  lw t2,0(t0)
  bne t1,t2,.Lboot_bad
  lw t2,128(t0)
  bne t1,t2,.Lboot_bad
- li s2,FIRED_LIST
- add s2,s2,gp
+ li s2,BR_BASE+FIRED_LIST
  lw s1,H_FIRE_COUNT(gp)
  beqz s1,.Ltrace_done
  lw t3,H_POT(gp)

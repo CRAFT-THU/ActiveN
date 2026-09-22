@@ -206,18 +206,37 @@ clean:
 	rm -f test.single test.double test.single.bin test.double.bin
 	rm -f asm/*.bin asm/*.elf c/*.bin c/*.elf sys/*.bin sys/*.elf
 
-# Keep the cache/numeric kernels at O3, but prevent speculative code expansion.
-# The canonical Brunel target is the hand-written assembly runtime.
-sys/brunel.bin: sys/brunel_asm.bin
+# Each Brunel rule has a separate binary. Alias targets always copy the selected
+# rule, including when switching back to an older, already-built variant.
+BRUNEL_RULE ?= additive
+ifeq ($(filter $(BRUNEL_RULE),additive morrison),)
+$(error BRUNEL_RULE must be additive or morrison)
+endif
+BRUNEL_ASM_FLAGS ?=
+BRUNEL_SOURCES = Makefile sys/brunel.S sys/brunel_runtime.S sys/brunel_asm_layout.inc sys/brunel_rule.inc sys/linker_brunel.ld
+BRUNEL_BUILD_FLAGS = -mabi=ilp32 -march=rv32ia_zmmul_zfinx_zicsr -Os -msmall-data-limit=0 -ffreestanding -fno-builtin -nostdlib -nostartfiles -Wl,-T,sys/linker_brunel.ld -DMNIST_TRAIN=1 -DMEM_LINE_BYTES=32 -DBR_ASM_RUNTIME=1
+.PHONY: brunel-select-rule
+brunel-select-rule:
+
+sys/brunel.bin: sys/brunel_asm.bin brunel-select-rule
 	cp $< $@
 	cp sys/brunel_asm.elf sys/brunel.elf
 
-BRUNEL_ASM_FLAGS ?=
-sys/brunel_asm.bin: Makefile sys/brunel.S sys/brunel_runtime.S sys/brunel_asm_layout.inc sys/linker_brunel.ld
-	${PREFIX}gcc -mabi=ilp32 -march=rv32ia_zmmul_zfinx_zicsr -Os -msmall-data-limit=0 -ffreestanding -fno-builtin -nostdlib -nostartfiles -Wl,-T,sys/linker_brunel.ld -DMNIST_TRAIN=1 -DMEM_LINE_BYTES=32 -DBR_ASM_RUNTIME=1 $(BRUNEL_ASM_FLAGS) -o sys/brunel_asm.elf sys/brunel.S sys/brunel_runtime.S
-	${PREFIX}objcopy -j .text -j .data -O binary sys/brunel_asm.elf $@
+sys/brunel_asm.bin: sys/brunel_$(BRUNEL_RULE).bin brunel-select-rule
+	cp $< $@
+	cp $(<:.bin=.elf) $(@:.bin=.elf)
+
+sys/brunel_additive.bin sys/brunel_additive_numeric.bin: BR_RULE_ID = 0
+sys/brunel_morrison.bin sys/brunel_morrison_numeric.bin: BR_RULE_ID = 1
+sys/brunel_additive.bin sys/brunel_morrison.bin: $(BRUNEL_SOURCES)
+	${PREFIX}gcc $(BRUNEL_BUILD_FLAGS) -DBR_RULE=$(BR_RULE_ID) $(BRUNEL_ASM_FLAGS) -o $(@:.bin=.elf) sys/brunel.S sys/brunel_runtime.S
+	${PREFIX}objcopy -j .text -j .data -O binary $(@:.bin=.elf) $@
 
 # Opt-in startup arithmetic vectors followed by the normal generated workload.
-sys/brunel_asm_numeric.bin: Makefile sys/brunel.S sys/brunel_runtime.S sys/brunel_asm_layout.inc ../tests/brunel_asm_numeric.S sys/linker_brunel.ld
-	${PREFIX}gcc -mabi=ilp32 -march=rv32ia_zmmul_zfinx_zicsr -Os -msmall-data-limit=0 -ffreestanding -fno-builtin -nostdlib -nostartfiles -Wl,-T,sys/linker_brunel.ld -DMNIST_TRAIN=1 -DMEM_LINE_BYTES=32 -DBR_ASM_RUNTIME=1 -DBR_ASM_SELFTEST=1 -o sys/brunel_asm_numeric.elf sys/brunel.S sys/brunel_runtime.S ../tests/brunel_asm_numeric.S
-	${PREFIX}objcopy -j .text -j .data -O binary sys/brunel_asm_numeric.elf $@
+sys/brunel_additive_numeric.bin sys/brunel_morrison_numeric.bin: $(BRUNEL_SOURCES) ../tests/brunel_asm_numeric.S
+	${PREFIX}gcc $(BRUNEL_BUILD_FLAGS) -DBR_RULE=$(BR_RULE_ID) -DBR_ASM_SELFTEST=1 $(BRUNEL_ASM_FLAGS) -o $(@:.bin=.elf) sys/brunel.S sys/brunel_runtime.S ../tests/brunel_asm_numeric.S
+	${PREFIX}objcopy -j .text -j .data -O binary $(@:.bin=.elf) $@
+
+sys/brunel_asm_numeric.bin: sys/brunel_$(BRUNEL_RULE)_numeric.bin brunel-select-rule
+	cp $< $@
+	cp $(<:.bin=.elf) $(@:.bin=.elf)
