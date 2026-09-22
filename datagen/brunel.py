@@ -384,6 +384,9 @@ def generate(args):
     spms = []
     for pu in range(PU):
         rows = n[pu::PU]
+        exc_count = int(np.count_nonzero(rows[:, 11] < NE))
+        if np.any(rows[:exc_count, 11] >= NE) or np.any(rows[exc_count:, 11] < NE):
+            raise ValueError("runtime requires a contiguous E-neuron prefix per PU")
         header = np.zeros(64, dtype=np.uint32)
         header[:10] = [
             MAGIC,
@@ -458,6 +461,8 @@ def generate(args):
         fired_list="atomic-append-neuron-pointers",
         current_state="combined",
         trace_state="learning-scaled",
+        trace_population="excitatory-only",
+        inhibitory_trace_state="zero",
         warmup=args.warmup,
         timed=args.timed,
         neurons=NE + NI,

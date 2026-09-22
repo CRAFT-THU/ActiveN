@@ -39,7 +39,9 @@
 /* Fields are deliberately all words for portable observers and packers. */
 typedef struct {
   uint32_t magic, pu, num_pu, rule, nn, step, completed, phase;
-  uint32_t warmup, steps, mc, active_mcs, work_neuron, work_line, work_mc, sent;
+  uint32_t warmup, steps, mc;
+  union { uint32_t active_mcs, excitatory_end; };
+  uint32_t work_neuron, work_line, work_mc, sent;
   uint32_t received, reverse_received, issued, consumed, ready[4];
   uint32_t report_count, report_sum, expected_forward, expected_reverse;
   /* The image's unused report word becomes the fixed neuron-end pointer. */
@@ -66,7 +68,8 @@ typedef struct {
   uint32_t v;
   union { uint32_t ie, i_total; };
   union { uint32_t de, d_total; };
-  /* Images contain raw x/y; runtime x=pot*pre_trace, y=dep*post_trace. */
+  /* Images contain raw x/y; E runtime x=pot*pre_trace, y=dep*post_trace.
+   * I runtime traces are reserved zeros; only E->E synapses are plastic. */
   uint32_t ii, di, refrac, x, y, rng, fire, reserved_fire, gid;
   uint32_t weights, count, targets, static_dir, reverse_dir, input_e, input_i, buffer;
 } BrNeuron;
@@ -96,6 +99,7 @@ BR_ASSERT(sizeof(BrMshr) == 64, "MSHR ABI");
 BR_ASSERT(BR_MSHR + BR_MSHRS * sizeof(BrMshr) == BR_READ, "MSHR capacity");
 BR_ASSERT(offsetof(BrHeader, buffer_bytes) == 152, "buffer control ABI");
 BR_ASSERT(offsetof(BrHeader, neuron_end) == 112, "neuron-end pointer ABI");
+BR_ASSERT(offsetof(BrHeader, excitatory_end) == 44, "excitatory-end pointer ABI");
 BR_ASSERT(offsetof(BrHeader, fired_count) == BR_FIRED_COUNT, "fired count ABI");
 BR_ASSERT(offsetof(BrHeader, tree_reports) == BR_TREE_REPORTS, "report count ABI");
 BR_ASSERT(offsetof(BrHeader, allocation_waits) == 252, "MSHR wait counter ABI");

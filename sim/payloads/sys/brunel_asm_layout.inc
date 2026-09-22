@@ -12,6 +12,7 @@
 .equ H_STEPS, 36
 .equ H_MC, 40
 .equ H_ACTIVE_MCS, 44
+.equ H_EXCITATORY_END, 44 /* Boot replaces the unused MC mask with the E end. */
 .equ H_WORK_NEURON, 48
 .equ H_WORK_LINE, 52
 .equ H_WORK_MC, 56
@@ -71,7 +72,7 @@
 .equ N_I_TOTAL, N_IE
 .equ N_D_TOTAL, N_DE
 .equ N_REFRAC, 20
-/* Images hold raw traces; boot scales X by H_POT and Y by H_DEP. */
+/* Images hold raw traces; boot scales E X/Y by H_POT/H_DEP and zeros I X/Y. */
 .equ N_X, 24
 .equ N_Y, 28
 .equ N_RNG, 32

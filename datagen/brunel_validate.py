@@ -2,6 +2,7 @@
 """Validate observed Brunel neuron states and logical cached/backing weights."""
 
 import argparse
+import gzip
 import json
 import re
 import struct
@@ -37,7 +38,10 @@ def pending_power(w):
 
 
 def dump(path):
-    b = path.read_bytes()
+    path = Path(path)
+    if not path.exists() and path.suffix != ".gz":
+        path = path.with_suffix(path.suffix + ".gz")
+    b = gzip.decompress(path.read_bytes()) if path.suffix == ".gz" else path.read_bytes()
     magic, count = struct.unpack_from("<II", b)
     if (magic, count) != (0x42534431, PU):
         raise ValueError("not a 512-PU Brunel dump")
@@ -236,6 +240,9 @@ def validate_buffer(args, manifest, initial, log, steps):
     single_fire = manifest.get("firing_flag") == "N_FIRE"
     combined = manifest.get("current_state") == "combined"
     scaled_traces = manifest.get("trace_state") == "learning-scaled"
+    excitatory_traces = manifest.get("trace_population") == "excitatory-only"
+    if excitatory_traces and manifest.get("inhibitory_trace_state") != "zero":
+        raise ValueError("unsupported inhibitory trace contract")
     if combined:
         # The image deliberately retains independently presimulated E/I state.
         # Reproduce the one-time boot conversion, preserving the original model
@@ -251,6 +258,8 @@ def validate_buffer(args, manifest, initial, log, steps):
     for s in steps:
         s.setdefault("pool_full", s["allocation_waits"])
         spms, actual = dump(args.dumps / f"step-{s['step']:04}.bin")
+        if excitatory_traces and np.any(actual[NE:, 6:8]):
+            raise ValueError("unused inhibitory traces are not zero")
         for spm in spms:
             if spm[0] not in (0x42524E33, 0x42524E34) or spm[18] != spm[19] or spm[39] or spm[42]:
                 raise ValueError("unfinished buffer/MSHR transport")
@@ -267,6 +276,12 @@ def validate_buffer(args, manifest, initial, log, steps):
                     raise ValueError("fired-neuron list overflow")
                 start = manifest["spm"]["fired_list_offset"] // 4
                 rows = spm[64 : 64 + nn * 20].reshape(nn, 20)
+                if excitatory_traces:
+                    exc_count = int(np.count_nonzero(rows[:, 11] < NE))
+                    if (np.any(rows[:exc_count, 11] >= NE)
+                            or np.any(rows[exc_count:, 11] < NE)
+                            or int(spm[11]) != 0x20000100 + 80 * exc_count):
+                        raise ValueError("invalid excitatory-neuron extent")
                 expected = 0x20000100 + 80 * np.flatnonzero(rows[:, 9])
                 if not np.array_equal(np.sort(spm[start : start + count]), expected):
                     raise ValueError("fired-neuron list disagrees with firing flags")
@@ -301,7 +316,7 @@ def validate_buffer(args, manifest, initial, log, steps):
         else:
             reference.tick()
         expected_nodes = reference.n
-        if single_fire or combined or scaled_traces:
+        if single_fire or combined or scaled_traces or excitatory_traces:
             expected_nodes = reference.n.copy()
         if single_fire:
             # Offset 40 is no longer updated. Validate that it retains its
@@ -324,6 +339,10 @@ def validate_buffer(args, manifest, initial, log, steps):
             f = expected_nodes.view(np.float32)
             f[:, 6] = F(reference.c["pot"] * f[:, 6])
             f[:, 7] = F(reference.c["dep"] * f[:, 7])
+        if excitatory_traces:
+            # The canonical oracle still evolves all neurons' traces. I traces
+            # cannot affect this graph's E->E learning and are runtime zeros.
+            expected_nodes[NE:, 6:8] = 0
         comparisons[str(s["step"])] = compare_nodes(actual, expected_nodes, single_fire, combined)
         if shared_rng:
             # Carry the observed stochastic trajectory into the next step;
@@ -400,6 +419,7 @@ def validate_buffer(args, manifest, initial, log, steps):
         firing_flag=manifest.get("firing_flag", "N_FIRE and N_PRE_FIRE"),
         current_state=manifest.get("current_state", "separate"),
         trace_state=manifest.get("trace_state", "unscaled"),
+        trace_population=manifest.get("trace_population", "all"),
         inferred_poisson_histogram=noise_counts.tolist() if shared_rng else None,
         maximum_poisson_residual=maximum_noise_residual if shared_rng else None,
         combined_derivative_roundoff=derivative_roundoff if combined and shared_rng else None,

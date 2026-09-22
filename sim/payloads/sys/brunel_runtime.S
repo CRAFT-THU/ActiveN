@@ -144,6 +144,100 @@
  INC \offset,\tmp
 #endif
 .endm
+/* Inlined arithmetic shares the exact FP order with the numeric self-test.
+ * Reverse work reserves s3/s4/s10 for seed/divisor/Newton constants (Morrison)
+ * or s3 for WMAX (Additive). Forward completion establishes them before it
+ * reports, so reverse messages may safely arrive before local phase control.
+ * POW04 changes a0,t0-t5 only and preserves all constants and caller state. */
+.macro POW04 cached=0
+ beqz a0,.Lpow_done\@
+ li t5,0
+ li t0,0x02000000
+ bgeu a0,t0,.Lpow_normal\@
+ li t0,0x71800000
+ fmul.s a0,a0,t0
+ li t5,0x14000000
+.Lpow_normal\@:
+.if \cached
+ mulhu t1,a0,s4
+ srli t1,t1,2
+ sub t1,s3,t1
+.else
+ li t0,0x4c2bac89
+ li t2,0xcccccccd
+ mulhu t1,a0,t2
+ srli t1,t1,2
+ sub t1,t0,t1
+.endif
+ li t0,0x3e4ccccd
+ fmul.s t2,a0,t0
+ fmul.s t3,t1,t1
+ fmul.s t4,t3,t3
+ fmul.s t2,t2,t3
+ fmul.s t2,t2,t4
+.if \cached
+ fmul.s t1,t1,s10
+.else
+ li t0,0x3f99ca19
+ fmul.s t1,t1,t0
+.endif
+ fsub.s t1,t1,t2
+ fmul.s t3,t1,t1
+ fmul.s a0,a0,t3
+ fmul.s a0,a0,t1
+ fmul.s t1,a0,t3
+ li t0,0x3f800000
+ fsub.s t1,t0,t1
+ li t0,0x3ef5c28f
+ fmul.s t2,t1,t0
+ li t0,0x3f199ae9
+ fadd.s t2,t2,t0
+ fmul.s t1,a0,t1
+ fmul.s t1,t1,t2
+ fadd.s a0,a0,t1
+ sub a0,a0,t5
+.Lpow_done\@:
+.endm
+.macro LTD dst,weight,coefficient,morrison
+.if \morrison
+ fmul.s \coefficient,\coefficient,\weight
+.endif
+ fsub.s \dst,\weight,\coefficient
+ fmax.s \dst,\dst,zero
+.endm
+/* Morrison preserves its input weight in a3; output may alias a3.
+ * Additive also uses a3 in production, and keeps its upper clamp. */
+.macro LTP dst,weight,coefficient,morrison,cached=0
+.if \morrison
+ mv a0,\weight
+ POW04 \cached
+ fmul.s a0,a0,\coefficient
+ fadd.s \dst,a0,\weight
+.else
+ fadd.s \dst,\weight,\coefficient
+.if \cached
+ fmin.s \dst,\dst,s3
+.else
+ lw t0,H_WMAX(gp)
+ fmin.s \dst,\dst,t0
+.endif
+.endif
+.endm
+/* a0=DRAM address, a3=FP32 data; retain acknowledgements and credit bound. */
+.macro STORE_WORD
+.Lstore_credit_wait\@:
+ lw t0,H_ISSUED(gp)
+ lw t1,H_CONSUMED(gp)
+ sub t1,t0,t1
+ sltiu t1,t1,12
+ beqz t1,.Lstore_credit_wait\@
+ addi t0,t0,1
+ sw t0,H_ISSUED(gp)
+ li a1,0x28003
+ li a2,0x8000
+ lw t0,H_MC_DEST(gp)
+ SENDI t0,1025
+.endm
 .text
 /* Completion handler is a leaf so it can retire notifications quickly. */
 .globl br_completion
@@ -175,11 +269,9 @@ br_completion:
  j br_halt
 /* These leaf transports do not impose address-specific completion waits. */
 br_load_start:
- slli a2,a1,5
- li t0,READ
- add a2,a2,t0
+ addi a2,a1,(READ/32)
 /* Directory/boot entry: a1 is always a token in 0..3. MSHRs enter below
- * the ready-flag reset. a0=DRAM address, a2=SPM byte offset. */
+ * the ready-flag reset. a0=DRAM address, a2=SPM line index. */
 br_line_start:
  slli t0,a1,2
  add t0,gp,t0
@@ -194,7 +286,6 @@ br_mshr_line_start:
  addi t0,t0,1
  sw t0,H_ISSUED(gp)
  mv a3,a1
- srli a2,a2,5
  li a1,0x58002
  lw t0,H_MC_DEST(gp)
  SENDI t0,-2048
@@ -213,8 +304,6 @@ br_ac_start:
  li t0,1
  csrw 0x730,t0
  li a1,0x208001             # 32 lines, manual AC response ID 0x8001
- li a2,0
- li a3,0
  lw t0,H_MC_DEST(gp)
  SENDI t0,-2031
  ret
@@ -223,18 +312,8 @@ br_weight_load:
  andi a0,a0,-32
  j br_load_start
 br_store_word:
-.Lstore_credit_wait: lw t0,H_ISSUED(gp)
- lw t1,H_CONSUMED(gp)
- sub t1,t0,t1
- sltiu t1,t1,12
- beqz t1,.Lstore_credit_wait
- addi t0,t0,1
- sw t0,H_ISSUED(gp)
  mv a3,a1
- li a1,0x28003
- li a2,0x8000
- lw t0,H_MC_DEST(gp)
- SENDI t0,1025
+ STORE_WORD
  ret
 br_drain:
 1: lw t0,H_ISSUED(gp)
@@ -261,41 +340,27 @@ br_update:
  j br_ltp_additive
 1: beqz a2,br_ltd_morrison
  j br_ltp_morrison
-#endif
-#if BR_RULE == 0 || defined(BR_ASM_SELFTEST)
 br_ltd_additive:
- fsub.s a0,a0,a1
- fmax.s a0,a0,zero
+ LTD a0,a0,a1,0
  ret
 br_ltp_additive:
- fadd.s a0,a0,a1
- lw t0,H_WMAX(gp)
- fmin.s a0,a0,t0
+ LTP a0,a0,a1,0
  ret
-#endif
-#if BR_RULE == 1 || defined(BR_ASM_SELFTEST)
 br_ltd_morrison:
- fmul.s a1,a1,a0
- fsub.s a0,a0,a1
- fmax.s a0,a0,zero
+ LTD a0,a0,a1,1
  ret
 br_ltp_morrison:
- /* br_pow04 clobbers only a0,t0-t5. Keep the weight and link
-    * in its unused argument registers instead of creating a stack frame. */
- mv a2,ra
  mv a3,a0
- jal ra,br_pow04
- fmul.s a0,a0,a1
- fadd.s a0,a0,a3
- jr a2
+ LTP a0,a3,a1,1
+ ret
 #endif
 /* One coalesced service event; only SMT0 owns ring indices and allocation.
  * SMT1 only changes an allocated descriptor from loading(1) to ready(2).
  * A full-pool allocator can retire the head itself, so it never waits for
  * its own lower-priority service event. Only fired-post scatter allocates
  * these descriptors; post-quiet updates are written at the receiving PU.
- * Private ABI: a4-a7 hold the head, descriptor, address, and return link.
- * All callees preserve those registers and t6 (the allocator's return link).
+ * Private ABI: a4-a6 hold the head, descriptor and address. There are no calls;
+ * ra and t6 (the allocator's return link) survive all arithmetic and stores.
  * Returns the remaining descriptor count in t0 on every path.
  */
 br_mshr_retire:
@@ -308,20 +373,19 @@ br_mshr_retire:
  lw t1,44(a5)
  li t2,2
  bne t1,t2,9f             # t0 still holds the count on an unsuccessful poll
- mv a7,ra
  lw a6,32(a5)
  andi t0,a6,28
  add t0,t0,a5
- lw a0,0(t0)
+ lw a3,0(t0)
  lw a1,36(a5)
  beqz a1,1f
- jal ra,LTD_ENTRY
+ LTD a3,a3,a1,BR_RULE
 1: lw a1,40(a5)
  beqz a1,2f
- jal ra,LTP_ENTRY
-2: mv a1,a0
+ LTP a3,a3,a1,BR_RULE,1
+2:
  mv a0,a6
- jal ra,br_store_word
+ STORE_WORD
  DINC H_WRITE_WORDS,t0
  DINC H_MSHR_COMMITS,t0
  sw zero,44(a5)
@@ -331,7 +395,6 @@ br_mshr_retire:
  lw t0,H_MSHR_COUNT(gp)
  addi t0,t0,-1
  sw t0,H_MSHR_COUNT(gp)
- jr a7
 9: ret
 .globl br_mshr_service
 br_mshr_service:
@@ -344,14 +407,11 @@ br_mshr_service:
  j br_idle
 1: sw zero,H_MSHR_SCHEDULED(gp)
  j br_idle
-/* a0=address, a1=LTD coefficient, a2=LTP coefficient. */
+/* a4=address, a5=LTD coefficient, a6=LTP coefficient. */
 br_mshr_allocate:
  /* Called with jal t6 by br_reverse. Normal allocation keeps the update in
   * a4-a6 across br_line_start, which also preserves t6. Only the full-pool
   * path spills those inputs around retirement; s0-s11 remain untouched. */
- mv a4,a0
- mv a5,a1
- mv a6,a2
  lw t3,H_MSHR_COUNT(gp)
  li t1,BR_MSHR_LIMIT
  bltu t3,t1,2f
@@ -403,7 +463,7 @@ br_mshr_allocate:
 #endif
 3: andi a0,a4,-32
  sub a1,t2,gp
- mv a2,a1
+ srli a2,a1,5
  DINC H_WEIGHT_LOADS,t0
  jal ra,br_mshr_line_start
  lw t0,H_MSHR_SCHEDULED(gp)
@@ -424,9 +484,9 @@ br_reverse:
 .Lreverse_allocate:
  /* The forward buffer is gone.  Every post-active update uses an MSHR
   * line load, then the normal ordered scalar writeback path. */
- mv a0,a1
- mv a1,a2
- mv a2,t2
+ mv a4,a1
+ mv a5,a2
+ mv a6,t2
  jal t6,br_mshr_allocate
 8: INC H_REVERSE_RECEIVED,t0
  DINC H_REVERSE_EVENTS,t0
@@ -440,48 +500,97 @@ br_reverse:
  * quadratic correction of q=w*r^3 using d=1-q*r^2. Every FP op rounds
  * separately. Exhaustive positive-FP32 validation bounds the error at 2 ULP.
  * Scale tiny inputs by 2^100 and reduce the result exponent by 40. */
-#if BR_RULE == 1 || defined(BR_ASM_SELFTEST)
 #ifdef BR_ASM_SELFTEST
 .globl br_pow04
-#endif
 br_pow04:
- beqz a0,9f
- li t5,0
- li t0,0x02000000
- bgeu a0,t0,1f
- li t0,0x71800000
- fmul.s a0,a0,t0
- li t5,0x14000000
-1: li t0,0x4c2bac89
- li t2,0xcccccccd
- mulhu t1,a0,t2
- srli t1,t1,2               # exact unsigned divide by five
- sub t1,t0,t1
- li t0,0x3e4ccccd          # 0.2
- fmul.s t2,a0,t0
- fmul.s t3,t1,t1
- fmul.s t4,t3,t3
- fmul.s t2,t2,t3
- fmul.s t2,t2,t4
- li t0,0x3f99ca19          # 1.20148
- fmul.s t1,t1,t0
- fsub.s t1,t1,t2
- fmul.s t3,t1,t1
- fmul.s a0,a0,t3
- fmul.s a0,a0,t1
- fmul.s t1,a0,t3
- li t0,0x3f800000
- fsub.s t1,t0,t1
- li t0,0x3ef5c28f          # 0.48
- fmul.s t2,t1,t0
- li t0,0x3f199ae9          # 0.60002
- fadd.s t2,t2,t0
- fmul.s t1,a0,t1
- fmul.s t1,t1,t2
- fadd.s a0,a0,t1
- sub a0,a0,t5
-9: ret
+ POW04
+ ret
 #endif
+/* Both loops share the same neuron equations. Only E neurons carry learning
+ * traces; the I loop emits no trace loads, FP operations, or stores. */
+.macro INTEGRATE_NEURON traces
+ lw t0,N_D_TOTAL(t5)
+ lw t1,N_I_TOTAL(t5)
+ lw t4,N_V(t5)
+ lw t6,N_REFRAC(t5)
+ beqz t6,.Lneuron_voltage\@
+ addi t6,t6,-1
+ sw t6,N_REFRAC(t5)
+ j .Lneuron_currents\@
+.Lneuron_voltage\@:
+ fmul.s a0,s4,t0
+ fmul.s a1,s5,t1
+ fadd.s a0,a0,a1
+ fmul.s t4,s6,t4
+ fadd.s t4,t4,a0
+.Lneuron_currents\@:
+ fmul.s a0,s3,t0
+ fmul.s t1,s2,t1
+ fadd.s t1,t1,a0
+ sw t1,N_I_TOTAL(t5)
+ lw a0,N_INPUT_E(t5)
+ lw a1,N_INPUT_I(t5)
+ fmul.s t0,s2,t0
+ or t1,a0,a1
+ beqz t1,.Lneuron_no_recurrent\@
+ fadd.s a0,a0,a1
+ fadd.s t0,t0,a0
+ sw zero,N_INPUT_E(t5)
+ sw zero,N_INPUT_I(t5)
+.Lneuron_no_recurrent\@:
+ slli t1,s11,13
+ xor s11,s11,t1
+ srli t1,s11,17
+ xor s11,s11,t1
+ slli t1,s11,5
+ xor s11,s11,t1
+ bltu s11,a4,.Lneuron_no_external\@
+ mv a0,s7
+ bltu s11,a5,.Lneuron_add_external\@
+ mv a0,a7
+ bltu s11,a6,.Lneuron_add_external\@
+ /* Rare tail: thresholds are generated from this rule's exact mean. */
+ li a0,3
+ li t1,POISSON+12
+ add t1,t1,gp
+.Lneuron_poisson_tail\@:
+ lw t3,0(t1)
+ bltu s11,t3,.Lneuron_poisson_done\@
+ addi a0,a0,1
+ addi t1,t1,4
+ li t3,9
+ bltu a0,t3,.Lneuron_poisson_tail\@
+.Lneuron_poisson_done\@:
+ fcvt.s.wu a0,a0
+ fmul.s a0,s7,a0
+.Lneuron_add_external\@:
+ fadd.s t0,t0,a0
+.Lneuron_no_external\@:
+ sw t0,N_D_TOTAL(t5)
+ bnez t6,.Lneuron_no_fire\@
+ blt t4,s10,.Lneuron_no_fire\@
+ li t6,5
+ sw t6,N_REFRAC(t5)
+ li t4,0
+ li t1,1
+ sw t1,N_FIRE(t5)
+ /* Only firing neurons append; the integration join publishes the complete
+  * list before forward/reverse/trace-finalization readers can run. */
+ amoadd.w t3,t1,(a2)
+ slli t3,t3,2
+ add t3,t3,a3
+ sw t5,0(t3)
+.Lneuron_no_fire\@:
+ sw t4,N_V(t5)
+.if \traces
+ lw t0,N_X(t5)
+ lw t1,N_Y(t5)
+ fmul.s t0,t0,s8
+ fmul.s t1,t1,s9
+ sw t0,N_X(t5)
+ sw t1,N_Y(t5)
+.endif
+.endm
 /* Both SMT workers claim a neuron address with AMOADD. Constants and one
  * xorshift state stay in registers for the complete invocation. tp is the SMT
  * identity set at boot; no worker frame or per-neuron RNG spill is needed. */
@@ -491,7 +600,7 @@ br_integrate:
  add t0,t0,gp
  lw s11,H_RNG0(t0)
  li s0,80
- lw s1,H_NEURON_END(gp)
+ lw s1,H_EXCITATORY_END(gp)
  lw s2,H_P11(gp)
  lw s3,H_P21(gp)
  lw s4,H_P31(gp)
@@ -511,87 +620,20 @@ br_integrate:
  li a3,BR_BASE+FIRED_LIST
 .Lintegrate_claim:
  amoadd.w t5,s0,(ra)
- bgeu t5,s1,.Lintegrate_done
- lw t0,N_D_TOTAL(t5)
- lw t1,N_I_TOTAL(t5)
- lw t4,N_V(t5)
- lw t6,N_REFRAC(t5)
- beqz t6,.Lintegrate_voltage
- addi t6,t6,-1
- sw t6,N_REFRAC(t5)
- j .Lintegrate_currents
-.Lintegrate_voltage:
- fmul.s a0,s4,t0
- fmul.s a1,s5,t1
- fadd.s a0,a0,a1
- fmul.s t4,s6,t4
- fadd.s t4,t4,a0
-.Lintegrate_currents:
- fmul.s a0,s3,t0
- fmul.s t1,s2,t1
- fadd.s t1,t1,a0
- sw t1,N_I_TOTAL(t5)
- lw a0,N_INPUT_E(t5)
- lw a1,N_INPUT_I(t5)
- fmul.s t0,s2,t0
- or t1,a0,a1
- beqz t1,.Lintegrate_no_recurrent
- fadd.s a0,a0,a1
- fadd.s t0,t0,a0
- sw zero,N_INPUT_E(t5)
- sw zero,N_INPUT_I(t5)
-.Lintegrate_no_recurrent:
- slli t1,s11,13
- xor s11,s11,t1
- srli t1,s11,17
- xor s11,s11,t1
- slli t1,s11,5
- xor s11,s11,t1
- bltu s11,a4,.Lintegrate_no_external
- mv a0,s7
- bltu s11,a5,.Lintegrate_add_external
- mv a0,a7
- bltu s11,a6,.Lintegrate_add_external
- /* Rare tail: thresholds are generated from this rule's exact mean. */
- li a0,3
- li t1,POISSON+12
- add t1,t1,gp
-.Lintegrate_poisson_tail:
- lw t3,0(t1)
- bltu s11,t3,.Lintegrate_poisson_done
- addi a0,a0,1
- addi t1,t1,4
- li t3,9
- bltu a0,t3,.Lintegrate_poisson_tail
-.Lintegrate_poisson_done:
- fcvt.s.wu a0,a0
- fmul.s a0,s7,a0
-.Lintegrate_add_external:
- fadd.s t0,t0,a0
-.Lintegrate_no_external:
- sw t0,N_D_TOTAL(t5)
- bnez t6,.Lintegrate_no_fire
- blt t4,s10,.Lintegrate_no_fire
- li t6,5
- sw t6,N_REFRAC(t5)
- li t4,0
- li t1,1
- sw t1,N_FIRE(t5)
- /* Only firing neurons append; the integration join publishes the complete
-  * list before forward/reverse/trace-finalization readers can run. */
- amoadd.w t3,t1,(a2)
- slli t3,t3,2
- add t3,t3,a3
- sw t5,0(t3)
-.Lintegrate_no_fire:
- sw t4,N_V(t5)
- lw t0,N_X(t5)
- lw t1,N_Y(t5)
- fmul.s t0,t0,s8
- fmul.s t1,t1,s9
- sw t0,N_X(t5)
- sw t1,N_Y(t5)
+ bgeu t5,s1,.Lintegrate_inhibitory
+ INTEGRATE_NEURON 1
  j .Lintegrate_claim
+.Lintegrate_inhibitory:
+ /* The AMO has already claimed this I neuron. Process it before claiming
+  * again, even if the other SMT worker is still finishing its last E neuron. */
+ lw s1,H_NEURON_END(gp)
+ j .Lintegrate_inhibitory_check
+.Lintegrate_inhibitory_claim:
+ amoadd.w t5,s0,(ra)
+.Lintegrate_inhibitory_check:
+ bgeu t5,s1,.Lintegrate_done
+ INTEGRATE_NEURON 0
+ j .Lintegrate_inhibitory_claim
 .Lintegrate_done:
  slli t0,tp,2
  add t0,t0,gp
@@ -622,20 +664,12 @@ br_integrate:
  bnez t1,9f                /* post-active path handles LTD and LTP */
  lw t1,N_Y-N_INPUT_E(t0)
  beqz t1,9f                /* no learning effect; still count this delivery */
- /* Y already contains the LTD coefficient, including its learning rate. */
-.if !\morrison
- fsub.s a1,a1,t1
- fmax.s a1,a1,zero
-.else
- fmul.s t2,a1,t1
- fsub.s a1,a1,t2
- fmax.s a1,a1,zero
-.endif
+ /* Save the destination before computing directly into the store payload.
+  * Y already contains the LTD coefficient, including its learning rate. */
  mv t0,a3
+ LTD a3,a1,t1,\morrison
  mv a0,a2
- mv a3,a1
  li a1,0x20000
- li a2,0
  SENDI t0,1026
 9:
  /* Both SMT threads may deliver spikes; preserve the barrier count atomically. */
@@ -873,6 +907,7 @@ br_boot:
  li t0,BR_BASE+FIRED_LIST
  li t1,0
  addi t2,gp,256
+ sw t2,H_EXCITATORY_END(gp)
  lw t3,H_NN(gp)
  li t4,25
  bgtu t3,t4,.Lboot_bad
@@ -892,7 +927,16 @@ br_boot:
  sw t4,N_D_TOTAL(t2)
  sw zero,N_II(t2)
  sw zero,N_DI(t2)
- /* Images retain canonical traces. Runtime traces carry their learning
+ /* E records must be a contiguous prefix. Keep its end for both dynamic
+  * integration workers; I traces are unused by this E->E plastic graph. */
+ lw t4,N_GID(t2)
+ li t5,9000
+ bgeu t4,t5,.Lboot_inhibitory_traces
+ lw t4,H_EXCITATORY_END(gp)
+ bne t4,t2,.Lboot_bad
+ addi t4,t2,80
+ sw t4,H_EXCITATORY_END(gp)
+ /* Images retain canonical traces. E runtime traces carry their learning
   * rates, avoiding repeated coefficient multiplications at receivers. */
  lw t4,N_X(t2)
  lw t5,N_Y(t2)
@@ -900,6 +944,11 @@ br_boot:
  fmul.s t5,t5,a5
  sw t4,N_X(t2)
  sw t5,N_Y(t2)
+ j .Lboot_traces_ready
+.Lboot_inhibitory_traces:
+ sw zero,N_X(t2)
+ sw zero,N_Y(t2)
+.Lboot_traces_ready:
  lw t4,N_FIRE(t2)
  beqz t4,1f
  sw t2,0(t0)
@@ -1110,9 +1159,6 @@ br_forward_drain:
 #if BR_DIAGNOSTIC
  csrr t3,0x730
 #endif
- lw t0,H_SENT(gp)
- add t0,t0,s4
- sw t0,H_SENT(gp)
 #if BR_DIAGNOSTIC
  lw t0,H_FORWARD_WEIGHTS(gp)
  add t0,t0,s4
@@ -1138,6 +1184,9 @@ br_forward_drain:
  j br_idle
 br_forward_row_done:
 .Lforward_row_done:
+ lw t0,H_SENT(gp)
+ add t0,t0,s3
+ sw t0,H_SENT(gp)
 #if BR_DIAGNOSTIC
  li t0,STREAM
  add t0,t0,gp
@@ -1156,15 +1205,14 @@ br_work_reverse_row:
  bgeu t0,t1,.Lwork_next_neuron
  /* Reverse coefficients are constant for this row across all MC entries. */
  lw s8,N_Y(s2)
- li s9,0                 # reverse receivers already hold the scaled pre trace
 br_work_directory:
 .Lwork_directory:
+ lw s9,H_SENT(gp)         # accumulator persists across directory continuations
  li s6,0
  li t0,2
  bne s0,t0,1f
  lw s7,N_STATIC_DIR(s2)
  li s8,0
- li s9,0
  li s11,0xc01
  j 2f
 1: lw s7,N_REVERSE_DIR(s2)
@@ -1189,7 +1237,7 @@ br_work_directory:
  li s7,BR_BASE+READ
 .Ldirectory_resume:
  li t0,16
- bgeu s6,t0,.Lwork_next_neuron
+ bgeu s6,t0,.Ldirectory_done
  andi t0,s6,3
  bnez t0,3f
  srli a0,s6,2
@@ -1198,7 +1246,6 @@ br_work_directory:
  lw s5,4(s7)
  beqz s5,5f
  mv a2,s8
- mv a3,s9
  addi a1,s5,3
  srli a1,a1,2
  slli a1,a1,16
@@ -1206,13 +1253,13 @@ br_work_directory:
  li t0,0x8001
  add t0,t0,s6
  SENDI t0,-1008
- lw t0,H_SENT(gp)
- add t0,t0,s5
- sw t0,H_SENT(gp)
+ add s9,s9,s5
 5: addi s6,s6,1
  addi s7,s7,8
  sw s6,H_WORK_MC(gp)
  j .Lwork_continue
+.Ldirectory_done:
+ sw s9,H_SENT(gp)
 br_work_advance:
 .Lwork_next_neuron:
  addi s1,s1,1
@@ -1239,14 +1286,16 @@ br_work_flush:
  beqz s1,.Ltrace_done
  lw t3,H_POT(gp)
  lw t4,H_DEP(gp)
+ lw t5,H_EXCITATORY_END(gp)
 1: lw t0,0(s2)
+ bgeu t0,t5,2f
  lw t1,N_X(t0)
  lw t2,N_Y(t0)
  fadd.s t1,t1,t3
  fadd.s t2,t2,t4
  sw t1,N_X(t0)
  sw t2,N_Y(t0)
- addi s2,s2,4
+2: addi s2,s2,4
  addi s1,s1,-1
  bnez s1,1b
 .Ltrace_done:
@@ -1256,6 +1305,18 @@ br_work_flush:
  j .Lwork_send_report
 br_work_report:
 .Lwork_report:
+ /* Establish reverse-only constants before reporting forward completion.
+  * Another PU may scatter reverse events before our phase-3 control arrives. */
+ li t0,2
+ bne s0,t0,.Lwork_constants_ready
+#if BR_RULE == 1
+ li s3,0x4c2bac89
+ li s4,0xcccccccd
+ li s10,0x3f99ca19
+#else
+ lw s3,H_WMAX(gp)
+#endif
+.Lwork_constants_ready:
  mv a0,s0
  lw a1,H_SENT(gp)
 .Lwork_send_report:

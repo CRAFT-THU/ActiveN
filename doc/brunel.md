@@ -53,11 +53,15 @@ coefficients and phase order. Weight units are scaled as described below.
 
 Runtime traces now include their learning coefficients: `X = pot * pre_trace`
 and `Y = dep * post_trace`. They decay by the same factors; firing adds `pot`
-or `dep` instead of one. Boot converts the image's canonical traces once.
+or `dep` instead of one. Boot converts excitatory canonical traces once and
+zeros inhibitory traces, which are unused by the E-to-E plastic graph.
 Quiet LTD consumes Y directly, and reverse receivers use X directly, removing
 per-update coefficient multiplications. The image and `initial.npz` retain
 unscaled traces; manifests identify the runtime with `trace_state: learning-scaled`.
-Reverse scatter's fourth argument is unused and remains zero.
+Reverse scatter's fourth argument is unused and need not be initialized.
+Manifests declare `trace_population: excitatory-only` and
+`inhibitory_trace_state: zero`; initial images retain canonical traces for all
+neurons, while completed runtime snapshots must have zero inhibitory traces.
 
 This representation changes FP32 rounding history. Validation keeps canonical
 traces and weights independently throughout the run, converting only the
@@ -128,11 +132,12 @@ The combined-current version is the current source implementation.
 ## Current assembly runtime: post-quiet delivery and post-active MSHRs
 
 The current payload is **assembly only**, in `brunel.S` and `brunel_runtime.S`.
-The shared `brunel_rule.inc` selects `SPIKE_ENTRY`, `LTD_ENTRY` and `LTP_ENTRY`
+The shared `brunel_rule.inc` selects the spike handler and learning rule
 at compile time. Build `sys/brunel_additive.bin` and/or `sys/brunel_morrison.bin`;
 datagen automatically selects the matching binary for `--rule`. Boot checks
-that the image's `H_RULE` matches the compiled rule. Production learning uses
-direct `jal` calls and does not read function pointers from handler CSRs.
+that the image's `H_RULE` matches the compiled rule. Production retirement
+inlines the selected arithmetic and credited store; it does not read function
+pointers from handler CSRs or call separate learning helpers.
 The numeric variants (`brunel_<rule>_numeric.bin`) additionally include both
 rules' numerical test routines; their workload still uses the compiled rule.
 
@@ -175,8 +180,10 @@ continuations have no stack frame across a yield. Helper calls preserve the
 registers holding the forward stream's state.
 Header offset 244 stores the immutable MC destination ID, computed at boot.
 Header offset 112, formerly the unused report-MC word, stores the immutable
-neuron-end pointer produced by the boot conversion loop. Integration loads it
-once per worker and retains dynamic AMO-based neuron assignment. Leaf PUs use
+neuron-end pointer produced by the boot conversion loop. Header offset 44,
+formerly the unused active-MC mask, holds the end of the contiguous excitatory
+prefix. Boot checks this ordering. Integration retains dynamic AMO assignment,
+first using the excitatory end and then the total end. Leaf PUs use
 a boot-selected control entry that skips child and reduction setup.
 Boot repurposes the image constants at offsets 208/212/216 as the external
 current contribution (`FP32(EPSC * external_weight)`), fired-list count, and
@@ -193,6 +200,14 @@ record, so static SMT0 priority does not leave a fixed partition stranded on
 SMT1. The final worker reports completion after an AMO join. Each worker loads
 shared coefficients and its RNG state once, then writes its RNG state once on
 completion. Neuron fields remain in registers until their final stores.
+Each worker transitions from an E loop to an I loop, processing the first I
+record it already claimed before claiming another. The shared assembly macro
+emits identical membrane/current/RNG equations for both loops. Only the E loop
+emits trace decay: this saves two loads, two FP multiplies, and two stores per
+I neuron, without a per-neuron type check in either loop. Trace finalization
+also skips fired I neurons; their firing flags and outgoing static traffic
+remain fully active. The validator checks zero I trace words and each PU's
+E-end pointer while preserving the independent canonical trace oracle.
 
 Both current channels have the same alpha-filter coefficients. Boot converts
 the image's separate E/I states to `I_total=FP32(Iex+Iin)` and
@@ -206,13 +221,14 @@ The current recurrence is `I_total'=p11*I_total+p21*dI_total`, followed by
 `dI_total'=p11*dI_total+(input_E+input_I)+external`. This removes six FP
 instructions, two loads, and two stores per non-refractory neuron, at the cost
 of different FP32 grouping. The usual
-non-refractory, non-firing path uses 11 FP instructions when recurrent and
+non-refractory, non-firing E path uses 11 FP instructions when recurrent and
 external inputs are zero, or 12 for one or two external events. Nonzero recurrent
 inputs add two FP instructions. Zero external input skips conversion and external
 arithmetic entirely. One uses the precomputed external contribution in `s7`;
 two uses `a7 = s7+s7`, computed once per worker. Counts of three or more retain
 conversion and multiplication. The first three CDF thresholds stay in registers;
-rarer cases read the remaining small table. Both threads retain dynamic AMO
+rarer cases read the remaining small table. I paths use two fewer FP
+instructions. Both threads retain dynamic AMO
 work allocation and independent register-held RNG states.
 
 Workers retain the AMO claim address in a register. Zero recurrent inputs skip
@@ -245,8 +261,9 @@ completion conditions. Boot selects a direct forwarding report handler for
 leaf PUs. Internal nodes store only incomplete aggregates and load their own
 identity only when the aggregate is complete. Report arguments `a2/a3` are
 unused. The former active-MC mask and its reduction have been removed: reverse
-work visits its directory independently of that mask. Their header words remain
-reserved, so this cleanup does not change the image ABI. Integration alone
+work visits its directory independently of that mask. Their header words now
+hold the E and total-neuron end pointers without changing the image ABI size.
+Integration alone
 resets the join counter; other phases initialize only their work iterators.
 Terminal report/control/work sends yield directly while retaining the existing
 handler ownership, priority, quota, and margin settings.
@@ -303,16 +320,20 @@ Every fired neuron has a 128-byte directory of sixteen `(rowAddress,count)`
 descriptors. Software issues all four directory-line reads into the existing
 scratch region before waiting for their individual completions. A yielding
 worker retains its directory pointer, coefficients, and tag in registers.
+It also retains the sent-event accumulator in `s9`, publishing it once the
+directory is complete. Plastic delivery adds its sent count once per completed
+row. Directory/MSHR refills pass the SPM line index directly to the transport.
 
-Fired-post reverse CSR events carry `(preSpmOffset, weightDramAddress, LTD, LTP)`.
+Fired-post reverse CSR events carry `(preSpmOffset, weightDramAddress, LTD, unused)`.
 The first field is `256 + 80 * preLocal`, precomputed in the generator and
 identified by `reverse_index: neuron-spm-byte-offset` in the manifest. The
 receiver adds the SPM base directly. Old reverse-index images require migration
 or regeneration with the current generator, even though the outer row-layout
 magic remains `0x42524e34` for the existing simulator observer.
-The receiver suppresses LTD unless the pre also fired, and multiplies LTP by the
-decayed local pre trace. A zero trace and quiet pre reject the event before the
-FP multiply. Every nonzero update uses an MSHR. Post-quiet and post-active
+The receiver suppresses LTD unless the pre also fired, and takes its LTP
+coefficient from the decayed, learning-scaled local pre trace. A zero trace and
+quiet pre reject the event before allocation. Every nonzero update uses an
+MSHR. Post-quiet and post-active
 updates are disjoint, including parallel edges with distinct addresses; multiple
 outstanding MSHRs cannot update the same weight. Different words sharing a DDR
 line remain independent because writeback changes only one FP32 word.
@@ -353,13 +374,20 @@ Forward wait/drain handlers 11/12 use SMT0, zero arguments, quota 2 and margin
 19, leaving room for the existing higher-priority handlers.
 
 The shared compile-time rule selection supplies the spike-handler symbol and
-direct LTD/LTP call targets. Boot only validates the image's rule; event slots
+inline LTD/LTP arithmetic. Boot only validates the image's rule; event slots
 13/14 remain disabled and are not used for function-pointer storage.
 Directional clamps retain only the applicable bound for nonnegative input
 weights/coefficient values. A generic rule-dispatch wrapper exists only in the
-numeric self-test build. Local direct calls use `jal`, and leaf/private-register
-contracts avoid call frames. MSHR retirement returns its remaining count to its
-caller, removing repeated count loads.
+numeric self-test build. MSHR retirement keeps the weight in outgoing store-data
+register `a3`, preserves both return links, and returns the remaining count.
+Allocation receives address/LTD/LTP directly in `a4`/`a5`/`a6`; only its full-pool
+fallback spills them. Reverse work reserves `s3`/`s4`/`s10` for Morrison's seed,
+division multiplier, and Newton constant, or `s3` for Additive's upper clamp.
+Each PU initializes these before reporting forward completion, so reverse
+events arriving ahead of local phase control already see valid constants.
+Incoming handlers preserve the saved registers. The spike receiver also computes
+directly into `a3`; unused no-receipt-store and bulk/scatter carried words do not
+need initialization because their receivers do not inspect them.
 
 The final phase drains acknowledgements, checks descriptor and stack guards,
 increments the traces of fired neurons, and completes the reduction barrier.

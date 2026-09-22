@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 import numpy as np
-from brunel import F, constants, poisson, poisson_thresholds
+from brunel import F, NE, Reference, constants, poisson, poisson_thresholds
 from brunel_validate import pending_power, compare_combined_derivative
 from brunel_reuse import working_sets
 
@@ -97,6 +97,37 @@ class Numerics(unittest.TestCase):
                     expected = (w * (1 - 0.01026 * trace) + 0.1 * trace * w**0.4) * scale
                     actual = w * scale * (1 - float(c["dep"]) * trace) + float(c["pot"]) * trace * (w * scale)**0.4
                 np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-4)
+
+    def test_inhibitory_trace_elision(self):
+        """Unused I traces must not affect currents, spikes, or E->E learning.
+
+        Include parallel plastic edges, both directions of static E/I traffic,
+        nonzero starting traces, and firing I neurons. The oracle retains the
+        canonical all-neuron recurrence throughout this comparison.
+        """
+        edges = tuple(np.array(x, dtype=np.int32) for x in (
+            [0, 0, 1, 2, 3], [1, 1, 2, 3, 0],
+            [0, 1, NE, NE + 1], [NE, NE + 1, 0, 3]))
+        rng = np.random.default_rng(710)
+        for rule in ("additive", "morrison"):
+            canonical = Reference(edges, rule)
+            f = canonical.n.view(F)
+            f[:, 6:8] = rng.uniform(0, 3, f[:, 6:8].shape)
+            f[[0, 1, NE, NE + 1], 0] = F(25)
+            elided = Reference(edges, rule, state=(canonical.n, canonical.w))
+            elided.n[NE:, 6:8] = 0
+            inhibitory_firings = 0
+            for _ in range(50):
+                noise = rng.poisson(float(canonical.c["external_mean"]), len(f)).astype(np.int32)
+                spikes = canonical.tick(external=noise)
+                self.assertEqual(spikes, elided.tick(external=noise))
+                inhibitory_firings += spikes[1]
+                elided.n[NE:, 6:8] = 0
+                expected = canonical.n.copy()
+                expected[NE:, 6:8] = 0
+                np.testing.assert_array_equal(elided.n, expected)
+                np.testing.assert_array_equal(elided.w, canonical.w)
+            self.assertGreater(inhibitory_firings, 0)
 
     def test_combined_alpha_filter(self):
         """Bound accumulated rounding against two independent FP64 channels.
