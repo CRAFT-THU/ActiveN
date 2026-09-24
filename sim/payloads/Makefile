@@ -213,7 +213,7 @@ ifeq ($(filter $(BRUNEL_RULE),additive morrison),)
 $(error BRUNEL_RULE must be additive or morrison)
 endif
 BRUNEL_ASM_FLAGS ?=
-BRUNEL_SOURCES = Makefile sys/brunel.S sys/brunel_runtime.S sys/brunel_asm_layout.inc sys/brunel_rule.inc sys/linker_brunel.ld
+BRUNEL_SOURCES = Makefile sys/brunel.S sys/brunel_runtime.S sys/brunel_asm_layout.inc sys/brunel_rule.inc sys/brunel_proxy_config.h sys/linker_brunel.ld
 BRUNEL_BUILD_FLAGS = -mabi=ilp32 -march=rv32ia_zmmul_zfinx_zicsr -Os -msmall-data-limit=0 -ffreestanding -fno-builtin -nostdlib -nostartfiles -Wl,-T,sys/linker_brunel.ld -DMNIST_TRAIN=1 -DMEM_LINE_BYTES=32 -DBR_ASM_RUNTIME=1
 .PHONY: brunel-select-rule
 brunel-select-rule:
@@ -226,11 +226,25 @@ sys/brunel_asm.bin: sys/brunel_$(BRUNEL_RULE).bin brunel-select-rule
 	cp $< $@
 	cp $(<:.bin=.elf) $(@:.bin=.elf)
 
-sys/brunel_additive.bin sys/brunel_additive_numeric.bin: BR_RULE_ID = 0
-sys/brunel_morrison.bin sys/brunel_morrison_numeric.bin: BR_RULE_ID = 1
+sys/brunel_additive.bin sys/brunel_additive_numeric.bin sys/brunel_additive_proxy.bin: BR_RULE_ID = 0
+sys/brunel_morrison.bin sys/brunel_morrison_numeric.bin sys/brunel_morrison_proxy.bin: BR_RULE_ID = 1
 sys/brunel_additive.bin sys/brunel_morrison.bin: $(BRUNEL_SOURCES)
 	${PREFIX}gcc $(BRUNEL_BUILD_FLAGS) -DBR_RULE=$(BR_RULE_ID) $(BRUNEL_ASM_FLAGS) -o $(@:.bin=.elf) sys/brunel.S sys/brunel_runtime.S
 	${PREFIX}objcopy -j .text -j .data -O binary $(@:.bin=.elf) $@
+
+# Distinct filenames prevent a group/update-owner switch from reusing stale code.
+define BRUNEL_PROXY_VARIANT
+sys/brunel_additive_proxy_$(1)_g$(2).bin: BR_RULE_ID = 0
+sys/brunel_morrison_proxy_$(1)_g$(2).bin: BR_RULE_ID = 1
+sys/brunel_additive_proxy_$(1)_g$(2).bin sys/brunel_morrison_proxy_$(1)_g$(2).bin: $$(BRUNEL_SOURCES)
+	$${PREFIX}gcc $$(BRUNEL_BUILD_FLAGS) -DBR_RULE=$$(BR_RULE_ID) -DBR_PROXY=1 -DBR_PROXY_SIZE=$(2) -DBR_PROXY_TRACES=$(if $(filter replicated,$(1)),1,0) $$(BRUNEL_ASM_FLAGS) -o $$(@:.bin=.elf) sys/brunel.S sys/brunel_runtime.S
+	$${PREFIX}objcopy -j .text -j .data -O binary $$(@:.bin=.elf) $$@
+endef
+$(foreach variant,replicated home,$(foreach size,2 4 8,$(eval $(call BRUNEL_PROXY_VARIANT,$(variant),$(size)))))
+
+sys/brunel_%_proxy.bin: sys/brunel_%_proxy_replicated_g4.bin brunel-select-rule
+	cp $< $@
+	cp $(<:.bin=.elf) $(@:.bin=.elf)
 
 # Opt-in startup arithmetic vectors followed by the normal generated workload.
 sys/brunel_additive_numeric.bin sys/brunel_morrison_numeric.bin: $(BRUNEL_SOURCES) ../tests/brunel_asm_numeric.S

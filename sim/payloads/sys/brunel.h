@@ -4,6 +4,7 @@
 #define BRUNEL_H
 #include <stddef.h>
 #include <stdint.h>
+#include "brunel_proxy_config.h"
 #ifdef __cplusplus
 #define BR_ASSERT static_assert
 #else
@@ -71,12 +72,13 @@ typedef struct {
   /* Images contain raw x/y; E runtime x=pot*pre_trace, y=dep*post_trace.
    * I runtime traces are reserved zeros; only E->E synapses are plastic. */
   uint32_t ii, di, refrac, x, y, rng, fire, reserved_fire, gid;
+  /* buffer is unused normally; proxy images store the local descriptor offset. */
   uint32_t weights, count, targets, static_dir, reverse_dir, input_e, input_i, buffer;
 } BrNeuron;
 typedef struct {
   uint32_t line[8];
   uint32_t address, depression, potentiation, state;
-  uint32_t sequence, reserved[3];
+  uint32_t sequence, mc_destination, reserved[2];
 } BrMshr;
 /* Per-timestep incoming-spike recording descriptor. */
 typedef struct {
@@ -86,6 +88,19 @@ typedef struct {
 typedef struct {
   uint32_t state, copies, overlap_checks, overlap_ready, wait_polls;
 } BrStream;
+/* Optional proxy placement. Home-update variants leave x unused and zero. */
+typedef struct {
+  uint32_t x, fire, gid, weights, count, static_dir, reserved[2];
+} BrProxyRow;
+typedef struct {
+  uint32_t peers[8], count, excitatory_end, jobs, markers, expected, trace_work;
+  uint32_t magic, notify_cursor;
+} BrProxyConfig;
+BR_ASSERT(sizeof(BrProxyRow) == 32, "proxy descriptor ABI");
+BR_ASSERT(sizeof(BrProxyConfig) == 64, "proxy control ABI");
+BR_ASSERT(BR_FIRED_LIST + BR_MAX_NEURONS * 4 <= BR_PROXY_CONFIG, "home fired list");
+BR_ASSERT(BR_PROXY_JOBS + BR_PROXY_CAPACITY * 4 <= BR_PROXY_ROWS, "proxy job list");
+BR_ASSERT(BR_PROXY_ROWS + BR_PROXY_CAPACITY * sizeof(BrProxyRow) <= BR_MSHR, "proxy descriptors");
 BR_ASSERT(BR_RECORDS + BR_RECORD_CAPACITY * 8 == BR_PING, "record/staging boundary");
 BR_ASSERT(BR_PING + BR_PING_BYTES == BR_STACK0, "staging/stack boundary");
 BR_ASSERT(BR_STREAM + sizeof(BrStream) <= BR_DIRTY_BITMAP, "stream metadata");

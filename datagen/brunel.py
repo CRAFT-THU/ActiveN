@@ -272,14 +272,23 @@ def generate(args):
     if args.warmup < 0 or args.timed < 1 or args.presim < 0:
         raise ValueError("timed must be positive; warmup/presim nonnegative")
     if args.payload is None:
+        variant = (f"_proxy_{args.proxy_updates}_g{args.proxy_size}"
+                   if getattr(args, "proxy_groups", "none") != "none" else "")
         args.payload = (Path(__file__).resolve().parents[1] / "sim/payloads/sys"
-                        / f"brunel_{args.rule}.bin")
+                        / f"brunel_{args.rule}{variant}.bin")
     payload = args.payload.read_bytes()
     out = args.output
     out.mkdir(parents=True, exist_ok=False)
     edges = graph(args.seed)
     ref = Reference(edges, args.rule, seed=args.seed)
-    images, addresses = weight_layout(ref)
+    proxy_mode = getattr(args, "proxy_groups", "none")
+    proxy = None
+    if proxy_mode == "none":
+        images, addresses = weight_layout(ref)
+    else:
+        import brunel_proxy
+        images, addresses, proxy = brunel_proxy.layout(
+            ref, proxy_mode, args.proxy_size, args.proxy_updates)
     history = []
     for t in range(args.presim):
         history.append(ref.tick())
@@ -316,6 +325,9 @@ def generate(args):
         args.presim += chosen
         print("selected active starting step", args.presim, flush=True)
     pre, post, sp, st = edges
+    proxy_arrays = {} if proxy is None else dict(weight_address=addresses,
+        weight_owner=proxy["owners"], static_owner=proxy["static_owners"],
+        proxy_members=proxy["members"], proxy_slots=proxy["slots"])
     np.savez(
         out / "initial.npz",
         neurons=ref.n,
@@ -324,10 +336,14 @@ def generate(args):
         post=post,
         static_pre=sp,
         static_post=st,
+        **proxy_arrays,
     )
     initial_n = ref.n.copy()
     initial_w = ref.w.copy()
-    write_weights(images, ref)
+    if proxy is None:
+        write_weights(images, ref)
+    else:
+        brunel_proxy.write_weights(images, ref, addresses, proxy["owners"])
     if len(payload) + 16 > 0x8000:
         raise ValueError("payload overlaps reserved transport test region")
     images[0][16 : 16 + len(payload)] = payload
@@ -368,17 +384,33 @@ def generate(args):
         sp < NE, F(c["epsc"] * c["delivery"] * c["external_weight"]),
         F(c["epsc"] * c["delivery"] * c["inhibitory_weight"])
     ).astype(np.float32)
+    group_size = 1 if proxy is None else proxy["size"]
+    static_sources = sp if proxy is None else sp * group_size + proxy["rank"][proxy["static_owners"]]
     statdirs = csr(
-        sp,
+        static_sources,
         st,
         staticw.view(np.uint32),
         NODE_BASE + (st // PU) * 80 + np.where(sp < NE, 68, 72),
-        NE + NI,
+        (NE + NI) * group_size,
     )
-    revdirs = csr(post, pre, addresses, NODE_BASE + (pre // PU) * 80, NE)
+    if proxy is None:
+        revdirs = csr(post, pre, addresses, NODE_BASE + (pre // PU) * 80, NE)
+    elif proxy["updates"] == "home":
+        # All neuron offsets are multiples of 16. Encode the remote weight MC
+        # in their spare low nibble; retain the complete MC-local weight address.
+        index = (NODE_BASE + (pre // PU) * 80) | (proxy["owners"] // 32)
+        revdirs = csr(post, pre, addresses, index, NE)
+    else:
+        revdirs = csr(post, proxy["owners"], addresses,
+                      brunel_proxy.ROWS + proxy["slots"][pre] * 32, NE)
     for src in range(NE + NI):
         mc = (src % PU) // 32
-        n[src, 15] = place(mc, statdirs[src].tobytes())
+        if proxy is None:
+            n[src, 15] = place(mc, statdirs[src].tobytes())
+        else:
+            for rank, owner in enumerate(proxy["members"][src % PU]):
+                proxy["rows"][owner, proxy["slots"][src], 5] = place(
+                    owner // 32, statdirs[src * group_size + rank].tobytes())
         if src < NE:
             n[src, 16] = place(mc, revdirs[src].tobytes())
     spms = []
@@ -429,6 +461,8 @@ def generate(args):
         struct.pack_into("<I", blob, 0x2D80 + 28, 256)
         blob[:256] = header.tobytes()
         blob[NODE_BASE : NODE_BASE + rows.nbytes] = rows.tobytes()
+        if proxy is not None:
+            brunel_proxy.initialize_spm(blob, pu, proxy, initial_n)
         blob[POISSON_BASE : POISSON_BASE + 36] = poisson_thresholds(c["external_mean"]).tobytes()
         spms.append(blob)
     images[0].extend(bytes((-len(images[0])) % LINE))
@@ -448,6 +482,16 @@ def generate(args):
             np.savez(out / f"reference-{t + 1:04}.npz", neurons=ref.n, weights=ref.w)
     manifest = dict(
         rule=args.rule,
+        proxy_groups=proxy_mode,
+        proxy_size=group_size,
+        proxy_updates=None if proxy is None else proxy["updates"],
+        proxy_placement=None if proxy is None else proxy["placement"],
+        proxy_spm=None if proxy is None else dict(config_offset=brunel_proxy.CONFIG,
+            jobs_offset=brunel_proxy.JOBS, rows_offset=brunel_proxy.ROWS,
+            row_bytes=32, capacity=brunel_proxy.capacity(group_size),
+            used_bytes=64 + brunel_proxy.capacity(group_size) * (32 + 4),
+            state=("learning-scaled pre trace and job flag" if proxy["updates"] == "replicated"
+                   else "forward job flag; learning traces stay at neuron home")),
         rule_selection="compile-time; boot validates image H_RULE",
         seed=args.seed,
         presim=args.presim,
@@ -457,7 +501,9 @@ def generate(args):
         firing_flag="N_FIRE",
         power="inverse-fifth-root-newton-quadratic",
         forward_carried="source-mc-id",
-        reverse_index="neuron-spm-byte-offset",
+        reverse_index=("neuron-spm-byte-offset" if proxy is None else
+                       "neuron-spm-byte-offset-with-mc-nibble" if proxy["updates"] == "home" else
+                       "proxy-spm-byte-offset"),
         fired_list="atomic-append-neuron-pointers",
         current_state="combined",
         trace_state="learning-scaled",
@@ -519,7 +565,12 @@ def main():
     p.add_argument("--timed", type=int, default=30)
     p.add_argument("--seek-active", action="store_true")
     p.add_argument("--payload", type=Path,
-                   help="default: sim/payloads/sys/brunel_<rule>.bin")
+                   help="default: matching rule/group/update-owner payload")
+    p.add_argument("--proxy-groups", choices=("none", "consecutive", "distant"), default="none",
+                   help="synapse placement; requires a matching BR_PROXY=1 payload")
+    p.add_argument("--proxy-size", type=int, choices=(2, 4, 8), default=4)
+    p.add_argument("--proxy-updates", choices=("replicated", "home"), default="replicated",
+                   help="post-active learning at the trace-replicating proxy or neuron home")
     generate(p.parse_args())
 
 

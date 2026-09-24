@@ -9,6 +9,37 @@ import numpy as np
 from brunel import F, NE, Reference, constants, poisson, poisson_thresholds
 from brunel_validate import pending_power, compare_combined_derivative
 from brunel_reuse import working_sets
+from brunel_proxy import topology, groups, assign
+
+
+class ProxyPlacement(unittest.TestCase):
+    def test_topology_and_groups(self):
+        xy = topology()
+        self.assertEqual(len(np.unique(xy, axis=0)), 512)
+        np.testing.assert_array_equal(np.abs(np.diff(xy, axis=0)).sum(axis=1), 1)
+        self.assertEqual(tuple(xy.max(axis=0)), (15, 31))
+        for mode in ("consecutive", "distant"):
+            for size in (2, 4, 8):
+                members, ranks = groups(mode, size)
+                np.testing.assert_array_equal(members[np.arange(512), ranks], np.arange(512))
+                for pu in range(512):
+                    for peer in members[pu]:
+                        np.testing.assert_array_equal(members[peer], members[pu])
+
+    def test_balance_and_destination_locality(self):
+        # Destinations exactly at each distant proxy have a unique best owner.
+        for size in (2, 4, 8):
+            members, _ = groups("distant", size)
+            n = size * 3
+            pre = np.repeat([0, 1], [n, n + 1]).astype(np.int32)
+            post = np.r_[np.tile(members[0], 3), np.tile(members[1], 3), members[1, 0]]
+            owners, hops = assign(pre, post, members)
+            for src in (0, 1):
+                counts = [np.count_nonzero(owners[pre == src] == p) for p in members[src]]
+                self.assertLessEqual(max(counts) - min(counts), 1)
+            np.testing.assert_array_equal(owners[:n], post[:n])
+            self.assertLess(hops["proxy_mean_hops"], hops["home_mean_hops"])
+            np.testing.assert_array_equal(owners, assign(pre, post, members)[0])
 
 
 class Numerics(unittest.TestCase):

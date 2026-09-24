@@ -1,5 +1,6 @@
 /* Named offsets for the timestep-buffer BrHeader / BrNeuron / BrReplay ABI.
  * Source structs and size assertions: brunel.h. */
+#include "brunel_proxy_config.h"
 .equ H_MAGIC, 0
 .equ H_PU, 4
 .equ H_NUM_PU, 8
@@ -86,7 +87,7 @@
 .equ N_REVERSE_DIR, 64
 .equ N_INPUT_E, 68
 .equ N_INPUT_I, 72
-.equ N_BUFFER, 76
+.equ N_BUFFER, 76 /* BR_PROXY: descriptor offset shared by the group members */
 .equ X_COUNT, 0
 .equ X_PEAK, 4
 .equ X_CURSOR, 8
@@ -106,3 +107,23 @@
 .equ H_RNG0, 172
 .equ H_RNG1, 176
 .equ H_MSHR_PEAK, 180
+
+/* BR_PROXY=1: compact synapse descriptors, not duplicated neuron state. */
+.equ PROXY_CONFIG, BR_PROXY_CONFIG
+.equ PROXY_JOBS, BR_PROXY_JOBS
+.equ PROXY_ROWS, BR_PROXY_ROWS
+.equ PROXY_CAPACITY, BR_PROXY_CAPACITY
+.equ G_COUNT, 32
+.equ G_EXC_END, 36
+.equ G_JOBS, 40
+.equ G_MARKERS, 44
+.equ G_EXPECTED, 48
+.equ G_TRACE_WORK, 52
+.equ G_MAGIC, 56
+.equ G_NOTIFY_CURSOR, 60
+.equ P_X, 0
+.equ P_FIRE, 4
+.equ P_GID, 8
+.equ P_WEIGHTS, 12
+.equ P_COUNT, 16
+.equ P_STATIC_DIR, 20

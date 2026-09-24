@@ -130,6 +130,15 @@ def compare_combined_derivative(previous, observed, noise, c):
 
 def logical_weights(spms, nodes, initial, path, rule):
     drams = [np.fromfile(path / f"dram.{mc}", dtype="<u4") for mc in range(MC)]
+    if "weight_owner" in initial:
+        owners, addresses = initial["weight_owner"], initial["weight_address"]
+        w = np.empty(len(owners), np.float32)
+        for mc in range(MC):
+            mask = owners // 32 == mc
+            w[mask] = drams[mc][addresses[mask] // 4].view(np.float32)
+        if any(s[18] != s[19] or s[39] or s[42] for s in spms):
+            raise ValueError("unfinished proxy transport")
+        return w, {"persistent_cache": False, "proxy_groups": True}
     off = offsets(initial["pre"], NE)
     w = np.empty(len(initial["pre"]), np.float32)
     scalar = int(spms[0][0]) == 0x42524E32
@@ -254,10 +263,33 @@ def validate_buffer(args, manifest, initial, log, steps):
     noise_counts = np.zeros(10, np.int64)
     maximum_noise_residual = 0.0
     derivative_roundoff = dict(max_absolute=0.0, max_bound_fraction=0.0, violations=0)
+    delivery_error = dict(max_absolute=0.0, max_relative_scaled=0.0)
     previous_stream = np.zeros(4, np.int64)
     for s in steps:
         s.setdefault("pool_full", s["allocation_waits"])
         spms, actual = dump(args.dumps / f"step-{s['step']:04}.bin")
+        if manifest.get("proxy_groups", "none") != "none":
+            from brunel_proxy import CONFIG, JOBS, ROWS, capacity, magic
+            group_size = manifest["proxy_size"]
+            replicated = manifest["proxy_updates"] == "replicated"
+            for spm in spms:
+                cfg = spm[CONFIG // 4:CONFIG // 4 + 16]
+                rows = spm[ROWS // 4:ROWS // 4 + capacity(group_size) * 8].reshape(-1, 8)[:int(cfg[8])]
+                gids = rows[:, 2]
+                if not np.array_equal(rows[:, 1], actual[gids, 9]):
+                    raise ValueError("proxy job flags differ from authoritative home")
+                if replicated and not np.array_equal(rows[:, 0], actual[gids, 6]):
+                    raise ValueError("proxy trace differs from authoritative home")
+                if not replicated and np.any(rows[:, 0]):
+                    raise ValueError("home-update variant unexpectedly replicated traces")
+                if cfg[11] != group_size or cfg[10] != cfg[12] or cfg[15]:
+                    raise ValueError("incomplete group notification exchange")
+                if cfg[14] != magic(group_size, manifest["proxy_updates"]):
+                    raise ValueError("wrong proxy variant magic")
+                jobs = spm[JOBS // 4:JOBS // 4 + int(cfg[10])]
+                expected_jobs = 0x20000000 + ROWS + np.flatnonzero(rows[:, 1]) * 32
+                if not np.array_equal(np.sort(jobs), expected_jobs):
+                    raise ValueError("proxy fired-job list mismatch")
         if excitatory_traces and np.any(actual[NE:, 6:8]):
             raise ValueError("unused inhibitory traces are not zero")
         for spm in spms:
@@ -289,8 +321,8 @@ def validate_buffer(args, manifest, initial, log, steps):
             # Infer the independent Poisson integer from the stored derivative
             # (dIex or dI_total). Re-run the deterministic equations, including
             # delivery, with that integer.
-            # A missing/misrouted recurrent spike is not an integer noise draw
-            # and fails the residual check instead of being hidden by resync.
+            # Recurrent delivery is independently checked below before resync;
+            # this conditional integration check alone cannot establish it.
             c = reference.c
             # Integration now consumes the one-step input fields populated by
             # the preceding forward phase.  Recurrent deliveries are already
@@ -344,6 +376,17 @@ def validate_buffer(args, manifest, initial, log, steps):
             # cannot affect this graph's E->E learning and are runtime zeros.
             expected_nodes[NE:, 6:8] = 0
         comparisons[str(s["step"])] = compare_nodes(actual, expected_nodes, single_fire, combined)
+        # Compare this step's delivered currents before importing observed state.
+        # The oracle uses independently advanced weights and a different FP32
+        # reduction order. A missing spike is much larger than this tolerance.
+        delivered = actual[:, 17:19].view(F).astype(float)
+        expected_delivery = expected_nodes[:, 17:19].view(F).astype(float)
+        delta = np.abs(delivered - expected_delivery)
+        relative = delta / np.maximum(1, np.abs(expected_delivery))
+        delivery_error["max_absolute"] = max(delivery_error["max_absolute"], float(delta.max()))
+        delivery_error["max_relative_scaled"] = max(delivery_error["max_relative_scaled"], float(relative.max()))
+        if not np.all(np.isfinite(delivered)) or np.any(relative > 2e-5):
+            raise ValueError(f"recurrent delivery mismatch at step {s['step']}")
         if shared_rng:
             # Carry the observed stochastic trajectory into the next step;
             # weights and scaled-trace learning's canonical traces remain
@@ -423,6 +466,7 @@ def validate_buffer(args, manifest, initial, log, steps):
         inferred_poisson_histogram=noise_counts.tolist() if shared_rng else None,
         maximum_poisson_residual=maximum_noise_residual if shared_rng else None,
         combined_derivative_roundoff=derivative_roundoff if combined and shared_rng else None,
+        independent_delivery_error=delivery_error,
         reference_average_per_timestep={k: float(np.mean([manifest["reference_spikes"][s["step"] - 1][i] for s in timed])) for i, k in enumerate(("E", "I"))},
     )
     args.output.write_text(json.dumps(report, indent=2) + "\n")

@@ -97,6 +97,275 @@ selected active window if the initial 30+30 window is quiet, and records the
 actual presimulation duration. Short burst windows are not estimates of the
 long-duration population mean firing rate.
 
+## Proxy synapse ownership (updated 2026-09-24)
+
+The optional `--proxy-groups consecutive|distant --proxy-size 2|4|8` layout
+separates neuron ownership from outgoing-synapse ownership. Home PU IDs
+remain `1 + gid % 512`; membrane/current state, RNG, integration and
+postsynaptic traces stay in their original 80-byte home records.
+
+Consecutive groups contain adjacent PU IDs. Distant groups contain
+`i + k * (512 / G)`, for `i=1..512/G` and `k=0..G-1`. Each neuron's plastic
+and static rows are independently divided into shares differing by at most
+one synapse. The deterministic placement heuristic prefers nearby targets
+under these quotas, using Hilbert coordinates and Manhattan distance.
+Plastic weights reside in the selected proxy's MC, in the existing
+128-weight/128-target, 1-KiB chunk format. Static weights retain target-MC
+CSR scatter, with a directory per proxy shard. Quiet postsynaptic recipients
+perform LTD and write directly to the originating MC with no receipt.
+
+`--proxy-updates` selects the post-active learning owner at compile time:
+
+- `replicated`: reverse CSR entries name the synapse proxy, its descriptor
+  offset and the full MC-local weight address. Each proxy maintains a copy
+  of its group neurons' learning-scaled pre trace. Both integration workers
+  decay these copies with the home's exact FP32 recurrence, and firing adds
+  the same increment at the end of the timestep. The proxy uses its local
+  MC and acknowledged scalar writeback, as in the original four-PU pilot.
+- `home`: reverse CSR entries name the presynaptic neuron owner. Their
+  16-bit index is `neuronSpmOffset | weightMC`, using the four spare low bits
+  of the 16-byte-aligned neuron record offset. The full 32-bit MC-local
+  weight address is unchanged. The handler reads X and the firing flag from
+  its home neuron, issues the manual scalar refill to the encoded remote MC,
+  and stores that MC destination at MSHR offset 52. Retirement applies the
+  same LTD/LTP arithmetic and sends a no-receipt FP32 write directly to that
+  MC. Proxy X words remain zero; proxy trace initialization, decay and
+  increment code are absent. Thus this comparison also removes post-active
+  store acknowledgements, in addition to trace replication and concentrated
+  reverse ownership.
+
+The home of a fired postsynaptic neuron initiates reverse scatter in both
+variants. A quiet presynaptic neuron can still receive LTP: the home variant
+has its authoritative trace, and the replicated variant decays all group E
+traces every timestep, not just those that recently fired.
+
+After integration, each home sends firing-job offsets to all group members;
+the replicated variant also carries the decayed pre trace. The last job
+carries the sender's total job count, and a silent home sends an empty end
+marker. SMT1 receives jobs without sending messages. SMT0 waits for all G
+markers and their aggregate job count, without assuming arrival order.
+Eight-member notifications use two invocations of at most four sends plus
+one continuation, preserving the existing quota of five and margin of eight.
+The job flag is forward-work bookkeeping in the home variant, not learning
+trace state. The same global barriers and four measured phases remain.
+
+Group control uses 64 bytes at `0x980`; up to `22*G` job pointers start at
+`0xa00`, and 32-byte descriptors start at `0xd00`. The allocations total
+1,648 / 3,232 / 6,400 bytes for G=2/4/8, excluding alignment gaps. Even G=8
+ends at `0x2300`, below the unchanged MSHR region at `0x2900`. The 16 MSHRs,
+2-KiB ping-pong area and two 128-byte stacks remain separate. At G=16 the
+current descriptor format does not fit alongside these required regions.
+
+Build `sys/brunel_<rule>_proxy_<replicated|home>_g<2|4|8>.bin` with
+`BRUNEL_ASM_FLAGS=-DBR_DIAGNOSTIC=0`. Datagen chooses this filename from the
+three proxy arguments. Legacy `brunel_<rule>_proxy.bin` targets alias the
+replicated G=4 binary. Ordinary targets retain ungrouped operation. Boot
+checks a magic encoding both the group size and learning owner, so mismatched
+images fail rather than silently using another variant.
+
+`initial.npz` records physical weight addresses/owners, static owners, group
+members and descriptor slots. Image checks cover every plastic target,
+static entry, reverse route/MC/address, row balance and unique weight storage.
+Runtime validation checks notification completion, exact proxy job flags,
+replicated trace equality or absent home-variant traces, and the independent
+neuron/delivery/learning oracle. No RTL or simulator rebuild is required.
+
+### Group-size and learning-owner sweep (2026-09-24)
+
+All twelve distant-group cases passed four-step smoke tests and matched
+60-warmup/60-timed pilots. Diagnostics were disabled, using the preserved
+512-PU simulator, hot I-cache, flat memory, and at most two eight-thread jobs.
+Seed 20260724, graph, initial weights and numerical neuron state match within
+each rule; Morrison uses presim1000 and Additive the prior presim1120 checkpoint.
+
+Average cycles per timestep:
+
+| Group size | Morrison replicated | Morrison home | Additive replicated | Additive home |
+| ---: | ---: | ---: | ---: | ---: |
+| 2 | 11,019.37 | 10,724.87 | 12,745.75 | 12,940.38 |
+| 4 | 10,269.88 | 9,524.82 | **11,856.70** | 12,104.80 |
+| 8 | 11,312.73 | **9,466.30** | 12,714.02 | 12,262.70 |
+
+The selected cases reduce cost by 28.23% for Morrison and 17.86% for Additive
+relative to the matched ungrouped pilots. Morrison home G8 only beats G4 by
+0.61%, while doubling much of the per-shard traffic and increasing per-PU
+group storage from 3,232 to 6,400 bytes. These are measured choices among
+G=2/4/8, rather than a claim of a universal optimum. Both selected configurations
+passed follow-up 60-warmup/1,000-timed benchmarks. An additional consecutive
+Additive home G4 pilot and two matched Additive home-owner long runs also
+passed, bringing the total to seventeen benchmarks.
+
+All twelve pilots have identical firing identities, refractory states, worker
+RNG states and all final logical weights to the corresponding ungrouped run.
+The largest voltage difference is 1.1444e-5 mV. Independent neuron, recurrent
+delivery, canonical learning and transport checks pass. The full phase table
+and traffic statistics are in `copilot/tmp/brunel-groups-20260924/results.md`.
+
+Trace replication costs about 508 integration cycles/timestep at G4 and 1,001
+at G8. Home ownership removes this cost and spreads post-active arithmetic
+back across the original presynaptic owners. It also requires remote line
+responses: G4 mean refill request-to-response latency is 158 cycles for
+Morrison and 760 for Additive, versus about 8.2 for proxy-local reads. All
+presented flat-memory frontend requests are accepted; fulfilled MemIf slots
+accumulate, locating the observed waiting after external memory completion.
+This does not establish HBM2 bandwidth utilization. The home variant also
+removes store receipts, so these are comparisons of the complete requested
+designs, not an isolation of trace maintenance alone.
+
+G8 halves the average outgoing share again, but fixed 1-KiB chunks contain more
+padding and notification/directory work grows. Morrison home G4 to G8 reduces
+the average per-step busiest outgoing count from 168.58 to 93.70, yet forward
+cost only falls from 4,229.72 to 4,034.03 cycles/timestep. Plastic copy bytes
+double from 20,889.60 to 41,779.20 per timestep. The incoming spike workload
+is unchanged. These costs limit further benefit from larger groups.
+
+Completed long runs use 60 warmup and 1,000 timed steps. All numbers below are
+average cycles per timestep; totals include three timer bookend cycles over
+the full timed interval, in addition to the phase sums.
+
+| Rule | Placement / learning owner / group | Integration | Forward + quiet LTD | Post-active | Drain | Total |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Morrison | distant / home / 8 | 1,742.596 | 3,971.769 | 3,349.034 | 644.174 | 9,707.576 |
+| Additive | distant / replicated / 4 | 2,201.673 | 2,320.286 | 1,846.171 | 649.692 | 7,017.825 |
+| Additive | distant / home / 4 | 1,693.115 | 2,318.604 | 2,144.050 | 638.865 | 6,794.637 |
+| Additive | consecutive / home / 4 | 1,693.114 | 2,380.411 | 1,702.191 | 638.692 | **6,414.411** |
+
+Morrison averages 5.108 E and 1.322 I firings/timestep and matches the archived
+ungrouped first 1,000 timed steps' firing identities, refractory and worker RNG
+states through all 1,060 steps. Maximum voltage difference is 5.72205e-6 mV;
+cycle cost is 24.99% below the archived 12,941.963. That archive differs in
+175 initial weights by one FP32 step, despite identical graph/neuron state.
+Independent delivery and canonical learning checks pass for all four new long
+runs. Measured post-active refill counts equal independent graph/state-derived
+update counts in all seventeen benchmarks, with no unmatched MSHR requests.
+
+Additive averages only 3.243 E / 0.814 I firings per timestep over the long
+window, versus 12.700 / 3.250 in the active pilot. Its smaller long cycle count
+is therefore not an additional implementation gain. This activity difference
+also makes fixed trace-maintenance overhead more important: distant home G4
+beats distant replicated G4 by 3.18% over the long window, saving 508.558
+integration cycles while adding 297.879 post-active cycles per timestep.
+
+Home ownership also reopens the placement tradeoff. A consecutive G4 group
+stays within one MC zone, eliminating remote scalar refills. An additional
+Additive home G4 consecutive pilot passed at 10,915.30 cycles/timestep, with
+phases 1,718.32 / 5,172.70 / 3,384.15 / 640.08, identical firing and final weights,
+and 8.0% lower total cost than the distant replicated G4 pilot winner. Its
+completed long run beats distant replicated G4 by 8.60% and distant home G4
+by 5.60%. Compared with distant home G4, consecutive placement costs 61.807
+extra forward cycles but saves 441.859 post-active cycles per timestep. Mean
+refill response latency falls from 1,182.198 to 8.309 cycles/request; remote
+post-active reads fall from 634.035 to zero per timestep. All presented
+flat-memory requests were accepted, so this measures the remote response
+transport/queueing cost, not HBM2 bandwidth saturation.
+
+Across all 1,060 steps, the three Additive long runs have identical firing,
+refractory, RNG and trace words; maximum voltage difference is 1.1444092e-5 mV.
+All 4,050,000 final logical weights are bitwise identical, as are the starting
+graphs, weights and neuron states. Each averages 1,458.773 plastic deliveries,
+820.471 static deliveries, 828.258 quiet LTD updates and 846.212 post-active
+updates per timestep. These savings therefore do not come from less activity.
+
+The measured choices favor home-owned learning: distant G8 for Morrison's
+pilot, with G4 only 0.61% slower and using much less group storage/traffic;
+consecutive G4 for Additive in both windows. Only Morrison G8 received a long
+run, and only consecutive G4 was checked, so this is not a full long-window or
+consecutive-size search. The earlier distant-placement preference cannot be
+generalized to home-owned learning. Defaults and legacy aliases are unchanged.
+
+### Original four-PU pilot results (2026-09-23)
+
+These measurements used the original replicated-trace layout with descriptors
+at `0xc00`; current images use the parameterized layout described above.
+
+All six runs used 60 warmup and 60 timed steps, disabled payload diagnostics,
+the preserved 512-PU simulator with eight host threads, hot I-cache and flat
+memory. At most two simulators ran concurrently. Morrison uses the 1,000-step
+presimulation checkpoint; Additive uses the same activity-selected 1,120-step
+checkpoint for all placements.
+
+All timing values below are average cycles per timestep:
+
+| Rule | Placement | Integration | Forward + quiet LTD | Post-active | Drain | Total |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Morrison | Ungrouped | 1,730.33 | 8,120.03 | 2,699.20 | 639.52 | 13,189.13 |
+| Morrison | Consecutive | 2,241.43 | 4,432.42 | 3,268.13 | 653.17 | 10,595.20 |
+| Morrison | Distant | 2,249.82 | 4,242.47 | 3,116.47 | 667.93 | 10,276.73 |
+| Additive | Ungrouped | 1,705.35 | 8,468.83 | 3,622.05 | 638.00 | 14,434.28 |
+| Additive | Consecutive | 2,218.85 | 5,182.40 | 4,068.28 | 652.60 | 12,122.18 |
+| Additive | Distant | 2,226.17 | 5,000.47 | 3,981.23 | 652.53 | 11,860.45 |
+
+Distant grouping reduces total cost by **22.08% for Morrison and 17.83% for
+Additive**. Consecutive grouping reduces it by 19.67% and 16.02%. Within each
+rule, all placements have identical firing decisions through all 120 steps and
+identical final values for all 4,050,000 weights. The gains do not come from
+reduced activity. Morrison averages 5.100 E / 1.283 I firings and 2,300.73 plastic
+deliveries per timestep; Additive averages 12.700 E / 3.250 I firings and
+5,713.75 plastic deliveries per timestep.
+
+Average per-step maximum outgoing synapse counts fall from 616.75 to 181.85 /
+168.58 for Morrison and from 684.52 to 219.82 / 210.93 for Additive
+(consecutive / distant). Mean plastic-route distance falls from 15.942 hops to
+15.443 / 7.050. Static deliveries retain their MC scatter transport, so these
+hop figures describe plastic delivery, not all NoC traffic.
+
+The tradeoffs are visible: trace replication adds about 511–521 integration
+cycles/timestep, and post-active work becomes more concentrated near firing
+targets. The busiest PU's post-active updates rise from 8.77 to 12.08 / 11.87
+per timestep for Morrison and from 15.45 to 17.73 / 17.98 for Additive. Group
+completion sends about 2,048 / 2,050 notifications per timestep, mostly empty
+end markers. Static directory reads grow fourfold, while plastic AC bytes are
+essentially unchanged. These are remaining optimization opportunities.
+
+All grouped proxy traces/flags equal their home values bit for bit. Worker RNGs,
+home traces and refractory states also match the baseline across all steps.
+The largest voltage difference is 1.1444e-5 mV, from changed FP32 summation order.
+Independent delivery, deterministic neuron replay, canonical trace/weight
+validation and the FP64 derivative bound all pass. The maximum final-weight
+error against the independent oracle is 0.00024414 in scaled units.
+
+Full results and provenance are in `copilot/tmp/brunel-proxy-20260923/results.md`.
+Raw runs are on CRAFT-A100 under `/data/meow/ActiveN-stdp/brunel-proxy-20260923/`.
+These matched short pilots establish the performance change; they do not replace
+the longer GeNN dynamics comparison below.
+
+## Morrison seed investigation (completed 2026-09-23)
+
+Five seeds, each with 60 warmup and 10,000 measured timesteps, resolve the
+earlier single-seed activity concern. The five-seed means are:
+
+| Implementation | E firings/timestep | I firings/timestep | Cycles/timestep |
+| --- | ---: | ---: | ---: |
+| Older V1 | 5.33390 | 1.34802 | 13,863.74 |
+| Latest ungrouped V3 | 5.27658 | 1.33982 | 13,163.27 |
+| GeNN | 5.27302 | 1.33790 | — |
+
+V3 differs from GeNN by +0.068% E and +0.144% I activity in the ensemble. Its
+mean cycle cost is 5.05% lower than V1, and is lower in every seed, including
+the three seeds where V3 does more spike work. The paired V3-minus-V1 E-activity
+change is -1.044%, with a 95% confidence interval of [-4.746%, +2.658%].
+The original low-activity V3 seed was not representative of the ensemble.
+V3/GeNN mean final weights are 45.45534/45.45726, standard deviations
+0.44613/0.44525, ISI CVs 0.71207/0.70599, and Fano factors 43.1684/43.1890.
+GeNN weight statistics use its 100,000-weight sample.
+
+V3's four phase costs average 1,730.06 integration, 7,735.98 forward,
+3,043.01 post-active, and 654.21 drain cycles/timestep. These runs disabled
+payload diagnostics for both V1 and V3. New short pilots still need their own
+matched baseline because their activity window differs from the long ensemble.
+
+Deterministic replay, canonical trace/weight checks, and all final weights pass.
+The old derivative-relative-error check was replaced by the existing FP64
+gamma(3) cancellation bound; all 50,300 V1 steps pass, with maximum bound
+fraction 0.7221. This historical replay conditions on observed recurrent input
+accumulators and does not independently establish their delivery correctness.
+The current validator additionally compares newly delivered E/I inputs against
+the independently advanced reference before importing observed state.
+
+The detailed report is `copilot/tmp/brunel-morrison-seeds-20260920/results.md`;
+raw server runs are under `/data/meow/ActiveN-stdp/brunel-morrison-seeds-20260920`
+on CRAFT-A100. Future jobs are limited to two concurrent eight-thread simulators.
+
 ## Assembly cleanup and combined-current measurements (2026-09-17)
 
 The two stages were benchmarked separately with 60 warmup and 60 timed steps,
@@ -161,7 +430,7 @@ CSR scatter. Neuron ownership is `PU = 1 + gid % 512`, local index `gid / 512`.
 | `0x0000–0x0100` | 256 | Header, counters, constants |
 | `0x0100–0x0900` | 2,048 | Up to 25 neurons, 80 bytes each |
 | `0x0900–0x0964` | 100 | Up to 25 fired-neuron SPM pointers |
-| `0x0964–0x2900` | 8,092 | Reserved; the forward weight buffer has been removed |
+| `0x0964–0x2900` | 8,092 | Reserved in ungrouped images; proxy control/jobs/descriptors use 1,648–6,400 bytes |
 | `0x2900–0x2d00` | 1,024 | 16 MSHRs, 64 bytes each |
 | `0x2d00–0x2d80` | 128 | Four directory/transport scratch lines |
 | `0x2d80–0x2e00` | 128 | Legacy descriptor, Poisson thresholds, stream/tree state |
@@ -325,7 +594,7 @@ directory is complete. Plastic delivery adds its sent count once per completed
 row. Directory/MSHR refills pass the SPM line index directly to the transport.
 
 Fired-post reverse CSR events carry `(preSpmOffset, weightDramAddress, LTD, unused)`.
-The first field is `256 + 80 * preLocal`, precomputed in the generator and
+In ungrouped images the first field is `256 + 80 * preLocal`, precomputed in the generator and
 identified by `reverse_index: neuron-spm-byte-offset` in the manifest. The
 receiver adds the SPM base directly. Old reverse-index images require migration
 or regeneration with the current generator, even though the outer row-layout
@@ -341,7 +610,8 @@ line remain independent because writeback changes only one FP32 word.
 ### MSHR progress and writeback
 
 Each descriptor has a 32-byte aligned landing line, address, LTD coefficient,
-LTP coefficient, state, diagnostic sequence number, and three reserved words.
+LTP coefficient, state, diagnostic sequence number, optional remote MC
+destination at offset 52, and two reserved words.
 A post-active update has LTP and may also have LTD if the pre fired this step.
 Retirement applies LTD before LTP.
 
@@ -351,7 +621,9 @@ leaf completion handler: it marks ready and retires one notification credit.
 It never performs update arithmetic, waits for memory, or sends messages.
 
 One coalesced local handler-6 event on SMT0 retires the ready ring head, applies
-the update, emits one acknowledged FP32 store, and frees its landing line. It
+the update, emits one FP32 store, and frees its landing line. Ungrouped and
+replicated variants request a store receipt; home-update proxy variants use
+a no-receipt store to the descriptor's MC. It
 reschedules itself while entries remain. Reverse handlers have higher dispatch
 priority. If the pool is full, allocation services the head inline; this avoids
 waiting for a lower-priority handler on the same SMT thread. FIFO retirement
@@ -362,8 +634,10 @@ There are still only **12 issued-but-unconsumed memory notifications** across
 loads and stores, with a dedicated 16-entry completion queue. Sixteen descriptors
 do not imply sixteen concurrent reads. Reusing a descriptor after issuing its
 store is safe: the outgoing scalar request already contains its value. Store
-acknowledgements still occupy notification credits. The finish barrier waits
-for all MSHR events and all store acknowledgements before starting another tick.
+acknowledgements occupy notification credits in the acknowledged variants;
+home-update variants consume credits only for reads. The finish barrier waits
+for all MSHR events and issued notifications. No-receipt writes use the existing
+writeback-priority transport; their completion is not counted by software.
 
 Handler 6 uses SMT0, zero arguments, quota 2 and margin 3: at most one store and
 one local continuation. Its local event queue contains at most one notification.
@@ -374,8 +648,9 @@ Forward wait/drain handlers 11/12 use SMT0, zero arguments, quota 2 and margin
 19, leaving room for the existing higher-priority handlers.
 
 The shared compile-time rule selection supplies the spike-handler symbol and
-inline LTD/LTP arithmetic. Boot only validates the image's rule; event slots
-13/14 remain disabled and are not used for function-pointer storage.
+inline LTD/LTP arithmetic. Boot validates the image's rule and proxy variant.
+Event slots 13/14 are proxy notifier/wait handlers in grouped builds, and
+remain disabled in ungrouped builds; neither stores a function pointer.
 Directional clamps retain only the applicable bound for nonnegative input
 weights/coefficient values. A generic rule-dispatch wrapper exists only in the
 numeric self-test build. MSHR retirement keeps the weight in outgoing store-data

@@ -1,4 +1,5 @@
 #include "brunel_rule.inc"
+#include "brunel_proxy_config.h"
 .section .text.boot
 .globl _start
 _start:
@@ -28,6 +29,12 @@ _start:
   INSTALL 2,br_control,20,0x00030005
   INSTALL 3,br_report,20,0x00020004
   INSTALL 4,br_reverse,12,0x000a0011
+#if BR_PROXY
+  # Notifications only write metadata; SMT1 can receive while SMT0 sends.
+  INSTALL 5,br_proxy_receive,19,0
+  INSTALL 13,br_proxy_notify,8,0x00050008
+  INSTALL 14,br_proxy_wait,8,0x00010002
+#endif
   INSTALL 6,br_mshr_service,8,0x00020003
   INSTALL 8,br_work,8,0x0018001f
   INSTALL 9,br_integrate,24,0x00010002

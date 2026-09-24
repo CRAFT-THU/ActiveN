@@ -273,6 +273,10 @@ br_load_start:
 /* Directory/boot entry: a1 is always a token in 0..3. MSHRs enter below
  * the ready-flag reset. a0=DRAM address, a2=SPM line index. */
 br_line_start:
+#if BR_HOME_UPDATES
+ /* Directory/boot reads are local; the MSHR entry below receives a7 explicitly. */
+ lw a7,H_MC_DEST(gp)
+#endif
  slli t0,a1,2
  add t0,gp,t0
  sw zero,80(t0)
@@ -287,7 +291,11 @@ br_mshr_line_start:
  sw t0,H_ISSUED(gp)
  mv a3,a1
  li a1,0x58002
+#if BR_HOME_UPDATES
+ mv t0,a7
+#else
  lw t0,H_MC_DEST(gp)
+#endif
  SENDI t0,-2048
  ret
 br_load_wait:
@@ -385,7 +393,14 @@ br_mshr_retire:
  LTP a3,a3,a1,BR_RULE,1
 2:
  mv a0,a6
+#if BR_HOME_UPDATES
+ /* The descriptor remembers the proxy's MC. No receipt or write credit. */
+ li a1,0x20000
+ lw t0,52(a5)
+ SENDI t0,1026
+#else
  STORE_WORD
+#endif
  DINC H_WRITE_WORDS,t0
  DINC H_MSHR_COMMITS,t0
  sw zero,44(a5)
@@ -407,7 +422,8 @@ br_mshr_service:
  j br_idle
 1: sw zero,H_MSHR_SCHEDULED(gp)
  j br_idle
-/* a4=address, a5=LTD coefficient, a6=LTP coefficient. */
+/* a4=address, a5=LTD coefficient, a6=LTP coefficient; home updates use a7=MC.
+ * Retirement preserves a7 as well as t6, including the full-pool fallback. */
 br_mshr_allocate:
  /* Called with jal t6 by br_reverse. Normal allocation keeps the update in
   * a4-a6 across br_line_start, which also preserves t6. Only the full-pool
@@ -448,6 +464,9 @@ br_mshr_allocate:
  sw a4,32(t2)
  sw a5,36(t2)
  sw a6,40(t2)
+#if BR_HOME_UPDATES
+ sw a7,52(t2)
+#endif
  li t0,1
  sw t0,44(t2)
  DINC H_MSHR_LOADS,t0
@@ -474,14 +493,31 @@ br_mshr_allocate:
 4: jr t6
 .globl br_reverse
 br_reverse:
+#if BR_HOME_UPDATES
+ /* Neuron offsets are 16-byte aligned: reverse CSR packs the remote MC in
+  * their spare low nibble, retaining the complete 32-bit weight address. */
+ andi t0,a0,-16
+ add t0,gp,t0
+#else
  add t0,gp,a0              # reverse CSR carries the neuron SPM byte offset
+#endif
+#if BR_PROXY && BR_PROXY_TRACES
+ lw t1,P_FIRE(t0)
+ lw t2,P_X(t0)
+#else
  lw t1,N_FIRE(t0)
  lw t2,N_X(t0)
+#endif
  /* Nonnegative X already is the LTP coefficient. Quiet pre is fallthrough. */
  bnez t1,.Lreverse_active
  beqz t2,8f
  li a2,0
 .Lreverse_allocate:
+#if BR_HOME_UPDATES
+ andi a7,a0,15
+ li t0,0x8001
+ add a7,a7,t0
+#endif
  /* The forward buffer is gone.  Every post-active update uses an MSHR
   * line load, then the normal ordered scalar writeback path. */
  mv a4,a1
@@ -635,6 +671,22 @@ br_integrate:
  INTEGRATE_NEURON 0
  j .Lintegrate_inhibitory_claim
 .Lintegrate_done:
+#if BR_PROXY && BR_PROXY_TRACES
+ /* Both SMT workers also decay the group's E traces, with exactly the
+  * home neuron's FP32 recurrence. Only trace metadata is replicated. */
+ li a4,BR_BASE+PROXY_CONFIG
+ lw a5,G_EXC_END(a4)
+ addi a4,a4,G_TRACE_WORK
+ li a6,32
+.Lproxy_trace_claim:
+ amoadd.w t0,a6,(a4)
+ bgeu t0,a5,.Lproxy_trace_done
+ lw t1,P_X(t0)
+ fmul.s t1,t1,s8
+ sw t1,P_X(t0)
+ j .Lproxy_trace_claim
+.Lproxy_trace_done:
+#endif
  slli t0,tp,2
  add t0,t0,gp
  sw s11,H_RNG0(t0)
@@ -725,6 +777,27 @@ br_control_leaf:
  bnez t1,.Lclear_fire
 .Lclear_fire_done:
  sw zero,H_FIRE_COUNT(gp)
+#if BR_PROXY
+ li t0,BR_BASE+PROXY_CONFIG
+ lw t1,G_JOBS(t0)
+ li t2,BR_BASE+PROXY_JOBS
+ beqz t1,.Lproxy_clear_done
+.Lproxy_clear:
+ lw t3,0(t2)
+ sw zero,P_FIRE(t3)
+ addi t2,t2,4
+ addi t1,t1,-1
+ bnez t1,.Lproxy_clear
+.Lproxy_clear_done:
+ sw zero,G_JOBS(t0)
+ sw zero,G_MARKERS(t0)
+ sw zero,G_EXPECTED(t0)
+ sw zero,G_NOTIFY_CURSOR(t0)
+#if BR_PROXY_TRACES
+ li t1,BR_BASE+PROXY_ROWS
+ sw t1,G_TRACE_WORK(t0)
+#endif
+#endif
  addi t0,gp,256
  sw t0,H_WORK_NEURON(gp)
  SENDI zero,9
@@ -734,7 +807,16 @@ br_control_leaf:
  sw zero,H_WORK_MC(gp)
  sw zero,H_SENT(gp)
  sw zero,H_WORK_NEURON(gp)
+#if BR_PROXY
+ li t0,2
+ beq a0,t0,.Lproxy_start
+#endif
  j br_continue
+#if BR_PROXY
+.Lproxy_start:
+ YIELDI 13
+ j br_idle
+#endif
 2: lw a1,H_RECEIVED(gp)
  j 4f
 3: lw a1,H_REVERSE_RECEIVED(gp)
@@ -960,6 +1042,30 @@ br_boot:
 .Lboot_fire_done:
  sw t1,H_FIRE_COUNT(gp)
  sw t2,H_NEURON_END(gp)
+ li t0,BR_BASE+PROXY_CONFIG
+ lw t1,G_MAGIC(t0)
+#if BR_PROXY
+ li t2,BR_PROXY_MAGIC
+ bne t1,t2,.Lboot_bad
+ lw t1,G_COUNT(t0)
+ li t2,PROXY_CAPACITY
+ bgtu t1,t2,.Lboot_bad
+#if BR_PROXY_TRACES
+ lw t1,G_EXC_END(t0)
+ li t0,BR_BASE+PROXY_ROWS
+ lw t3,H_POT(gp)
+.Lboot_proxy_traces:
+ bgeu t0,t1,.Lboot_proxy_done
+ lw t2,P_X(t0)
+ fmul.s t2,t2,t3
+ sw t2,P_X(t0)
+ addi t0,t0,32
+ j .Lboot_proxy_traces
+.Lboot_proxy_done:
+#endif
+#else
+ bnez t1,.Lboot_bad
+#endif
  li t0,BR_BASE+REPLAY
  lw t0,28(t0)
  beqz t0,.Lboot_bad
@@ -1038,6 +1144,111 @@ br_boot:
 .Lboot_bad:
  li a0,0xb00b
  j br_halt
+#if BR_PROXY
+/* One sender per home PU, one receiver thread per proxy. Last notification
+ * carries the sender's total job count (a2); -1 means more will follow.
+ * Waiting for all group end markers and their total job count does not
+ * assume that different NoC paths or queues preserve arrival order. */
+.globl br_proxy_notify
+br_proxy_notify:
+ lw t0,H_WORK_NEURON(gp)
+ lw t1,H_FIRE_COUNT(gp)
+ li a0,0
+ li a1,0
+ li a2,0
+ beqz t1,.Lproxy_notify_send
+ slli t2,t0,2
+ li t3,BR_BASE+FIRED_LIST
+ add t2,t2,t3
+ lw t2,0(t2)
+ lw a0,N_BUFFER(t2)
+#if BR_PROXY_TRACES
+ lw a1,N_X(t2)
+#endif
+ addi t0,t0,1
+ li a2,-1
+ bne t0,t1,.Lproxy_notify_send
+ mv a2,t1
+.Lproxy_notify_send:
+ li t2,BR_BASE+PROXY_CONFIG
+#if BR_PROXY_SIZE == 8
+ lw t3,G_NOTIFY_CURSOR(t2)
+ add t2,t2,t3
+#endif
+ lw t3,0(t2)
+ SENDI t3,-1019              # 0xc05, same traffic class as spike delivery
+ lw t3,4(t2)
+ SENDI t3,-1019
+#if BR_PROXY_SIZE >= 4
+ lw t3,8(t2)
+ SENDI t3,-1019
+ lw t3,12(t2)
+ SENDI t3,-1019
+#endif
+#if BR_PROXY_SIZE == 8
+ /* Four sends plus the continuation fit the unchanged quota of five. */
+ li t2,BR_BASE+PROXY_CONFIG
+ lw t3,G_NOTIFY_CURSOR(t2)
+ xori t3,t3,16
+ sw t3,G_NOTIFY_CURSOR(t2)
+ bnez t3,.Lproxy_notify_more
+#endif
+ lw t0,H_WORK_NEURON(gp)
+ addi t0,t0,1
+ sw t0,H_WORK_NEURON(gp)
+ bltz a2,.Lproxy_notify_more
+ sw zero,H_WORK_NEURON(gp)
+ YIELDI 14
+ j br_idle
+.Lproxy_notify_more:
+ YIELDI 13
+ j br_idle
+.globl br_proxy_receive
+br_proxy_receive:
+ li t0,BR_BASE+PROXY_CONFIG
+ beqz a0,.Lproxy_receive_marker
+ add t1,gp,a0
+ lw t2,P_FIRE(t1)
+ bnez t2,.Lboot_bad        # each neuron is notified once per timestep
+#if BR_PROXY_TRACES
+ sw a1,P_X(t1)
+#endif
+ li t2,1
+ sw t2,P_FIRE(t1)
+ lw t2,G_JOBS(t0)
+ li t3,PROXY_CAPACITY
+ bgeu t2,t3,.Lboot_bad
+ slli t3,t2,2
+ li t4,BR_BASE+PROXY_JOBS
+ add t3,t3,t4
+ sw t1,0(t3)
+ addi t2,t2,1
+ sw t2,G_JOBS(t0)
+.Lproxy_receive_marker:
+ bltz a2,.Lproxy_receive_done
+ lw t1,G_MARKERS(t0)
+ addi t1,t1,1
+ sw t1,G_MARKERS(t0)
+ lw t1,G_EXPECTED(t0)
+ add t1,t1,a2
+ sw t1,G_EXPECTED(t0)
+.Lproxy_receive_done:
+ j br_idle
+.globl br_proxy_wait
+br_proxy_wait:
+ li t0,BR_BASE+PROXY_CONFIG
+ lw t1,G_MARKERS(t0)
+ li t2,BR_PROXY_SIZE
+ bne t1,t2,.Lproxy_wait_again
+ lw t1,G_EXPECTED(t0)
+ lw t2,G_JOBS(t0)
+ bne t1,t2,.Lproxy_wait_again
+ YIELDI 8
+ j br_idle
+.Lproxy_wait_again:
+ YIELDI 14
+ j br_idle
+#endif
 /* Cooperative work: bounded sends per invocation, descriptor ownership on
  * SMT0. All intervening handlers preserve s0-s11, so an unfinished directory
  * keeps its row pointer, coefficients, and next MC in registers. */
@@ -1050,10 +1261,22 @@ br_work:
  li t0,6
  beq s0,t0,.Lwork_finish
  /* H_WORK_NEURON indexes the compact list throughout forward/reverse work. */
+#if BR_PROXY
+ li t0,2
+ bne s0,t0,.Lhome_fired_list
+ li t1,BR_BASE+PROXY_CONFIG
+ lw t2,G_JOBS(t1)
+ li t1,BR_BASE+PROXY_JOBS
+ j .Lfired_list_ready
+.Lhome_fired_list:
+#endif
  lw t2,H_FIRE_COUNT(gp)
+ li t1,BR_BASE+FIRED_LIST
+#if BR_PROXY
+.Lfired_list_ready:
+#endif
  bgeu s1,t2,.Lwork_report
  slli t0,s1,2
- li t1,BR_BASE+FIRED_LIST
  add t0,t0,t1
  lw s2,0(t0)
 .Lwork_neuron_ready:
@@ -1062,7 +1285,11 @@ br_work:
  /* Start a fired row once; later work events finish its static directories. */
  lw t0,H_WORK_LINE(gp)
  bnez t0,.Lwork_directory
+#if BR_PROXY
+ lw s7,P_COUNT(s2)
+#else
  lw s7,N_COUNT(s2)
+#endif
  beqz s7,.Lwork_directory
 .Lforward_first:
  li s3,0                     # row synapse index at chunk start
@@ -1077,7 +1304,11 @@ br_work:
  addi t1,t1,1
  sw t1,4(t0)
 #endif
+#if BR_PROXY
+ lw s8,P_WEIGHTS(s2)
+#else
  lw s8,N_WEIGHTS(s2)      # row base stays live across all chunk continuations
+#endif
  mv a0,s8
  li a1,PING
  jal ra,br_ac_start
@@ -1211,7 +1442,11 @@ br_work_directory:
  li s6,0
  li t0,2
  bne s0,t0,1f
+#if BR_PROXY
+ lw s7,P_STATIC_DIR(s2)
+#else
  lw s7,N_STATIC_DIR(s2)
+#endif
  li s8,0
  li s11,0xc01
  j 2f
@@ -1299,6 +1534,26 @@ br_work_flush:
  addi s1,s1,-1
  bnez s1,1b
 .Ltrace_done:
+#if BR_PROXY && BR_PROXY_TRACES
+ li t0,BR_BASE+PROXY_CONFIG
+ lw t1,G_JOBS(t0)
+ li t0,BR_BASE+PROXY_JOBS
+ lw t5,H_POT(gp)
+ beqz t1,.Lproxy_increment_done
+.Lproxy_increment:
+ lw t2,0(t0)
+ lw t3,P_GID(t2)
+ li t4,9000
+ bgeu t3,t4,.Lproxy_increment_next
+ lw t3,P_X(t2)
+ fadd.s t3,t3,t5
+ sw t3,P_X(t2)
+.Lproxy_increment_next:
+ addi t0,t0,4
+ addi t1,t1,-1
+ bnez t1,.Lproxy_increment
+.Lproxy_increment_done:
+#endif
  INC H_STEP,t0
  li a0,6
  li a1,0
