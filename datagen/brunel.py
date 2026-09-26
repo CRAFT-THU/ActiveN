@@ -395,10 +395,13 @@ def generate(args):
     )
     if proxy is None:
         revdirs = csr(post, pre, addresses, NODE_BASE + (pre // PU) * 80, NE)
-    elif proxy["updates"] == "home":
-        # All neuron offsets are multiples of 16. Encode the remote weight MC
-        # in their spare low nibble; retain the complete MC-local weight address.
-        index = (NODE_BASE + (pre // PU) * 80) | (proxy["owners"] // 32)
+    elif proxy["updates"] in ("home", "relay"):
+        # All neuron offsets are multiples of 16. Home updates encode the
+        # weight MC; relayed updates encode its group rank for a targeted send.
+        # In both cases the complete MC-local weight address is retained.
+        owner = (proxy["owners"] // 32 if proxy["updates"] == "home" else
+                 proxy["rank"][proxy["owners"]])
+        index = (NODE_BASE + (pre // PU) * 80) | owner
         revdirs = csr(post, pre, addresses, index, NE)
     else:
         revdirs = csr(post, proxy["owners"], addresses,
@@ -503,6 +506,7 @@ def generate(args):
         forward_carried="source-mc-id",
         reverse_index=("neuron-spm-byte-offset" if proxy is None else
                        "neuron-spm-byte-offset-with-mc-nibble" if proxy["updates"] == "home" else
+                       "neuron-spm-byte-offset-with-proxy-rank" if proxy["updates"] == "relay" else
                        "proxy-spm-byte-offset"),
         fired_list="atomic-append-neuron-pointers",
         current_state="combined",
@@ -569,8 +573,8 @@ def main():
     p.add_argument("--proxy-groups", choices=("none", "consecutive", "distant"), default="none",
                    help="synapse placement; requires a matching BR_PROXY=1 payload")
     p.add_argument("--proxy-size", type=int, choices=(2, 4, 8), default=4)
-    p.add_argument("--proxy-updates", choices=("replicated", "home"), default="replicated",
-                   help="post-active learning at the trace-replicating proxy or neuron home")
+    p.add_argument("--proxy-updates", choices=("replicated", "home", "relay"), default="replicated",
+                   help="post-active learning: replicated proxy trace, neuron home, or home trace relayed to proxy")
     generate(p.parse_args())
 
 

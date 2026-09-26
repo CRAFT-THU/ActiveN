@@ -28,7 +28,14 @@ _start:
   INSTALL 1,SPIKE_ENTRY,28,0x00020002
   INSTALL 2,br_control,20,0x00030005
   INSTALL 3,br_report,20,0x00020004
+#if BR_RELAY_UPDATES
+  # SMT1 relays immutable home traces while SMT0 updates proxy weights. The
+  # relay reserves one send, leaving the existing update margin of 17 free.
+  INSTALL 4,br_proxy_update,11,0x000a0011
+  INSTALL 7,br_reverse,19,0x00010012
+#else
   INSTALL 4,br_reverse,12,0x000a0011
+#endif
 #if BR_PROXY
   # Notifications only write metadata; SMT1 can receive while SMT0 sends.
   INSTALL 5,br_proxy_receive,19,0

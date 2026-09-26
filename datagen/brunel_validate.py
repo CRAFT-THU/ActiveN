@@ -265,6 +265,8 @@ def validate_buffer(args, manifest, initial, log, steps):
     derivative_roundoff = dict(max_absolute=0.0, max_bound_fraction=0.0, violations=0)
     delivery_error = dict(max_absolute=0.0, max_relative_scaled=0.0)
     previous_stream = np.zeros(4, np.int64)
+    reverse_expected = 0
+    reverse_degree = np.bincount(initial["post"], minlength=NE)
     for s in steps:
         s.setdefault("pool_full", s["allocation_waits"])
         spms, actual = dump(args.dumps / f"step-{s['step']:04}.bin")
@@ -281,7 +283,7 @@ def validate_buffer(args, manifest, initial, log, steps):
                 if replicated and not np.array_equal(rows[:, 0], actual[gids, 6]):
                     raise ValueError("proxy trace differs from authoritative home")
                 if not replicated and np.any(rows[:, 0]):
-                    raise ValueError("home-update variant unexpectedly replicated traces")
+                    raise ValueError("non-replicating variant unexpectedly replicated traces")
                 if cfg[11] != group_size or cfg[10] != cfg[12] or cfg[15]:
                     raise ValueError("incomplete group notification exchange")
                 if cfg[14] != magic(group_size, manifest["proxy_updates"]):
@@ -290,6 +292,11 @@ def validate_buffer(args, manifest, initial, log, steps):
                 expected_jobs = 0x20000000 + ROWS + np.flatnonzero(rows[:, 1]) * 32
                 if not np.array_equal(np.sort(jobs), expected_jobs):
                     raise ValueError("proxy fired-job list mismatch")
+            # Each reverse CSR entry must complete exactly once, including
+            # zero-effect events. Relay events count only at the final proxy.
+            reverse_expected += int(reverse_degree[actual[:NE, 9] != 0].sum())
+            if sum(int(spm[17]) for spm in spms) != reverse_expected:
+                raise ValueError("reverse barrier counted an event early, twice, or not at all")
         if excitatory_traces and np.any(actual[NE:, 6:8]):
             raise ValueError("unused inhibitory traces are not zero")
         for spm in spms:

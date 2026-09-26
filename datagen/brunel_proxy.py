@@ -12,7 +12,7 @@ def capacity(size):
 
 
 def magic(size, updates):
-    return 0x50580000 | ((updates == "replicated") << 8) | size
+    return 0x50580000 | ({"home": 0, "replicated": 1, "relay": 2}[updates] << 8) | size
 
 
 def topology():

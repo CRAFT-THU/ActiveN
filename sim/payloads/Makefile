@@ -237,10 +237,10 @@ define BRUNEL_PROXY_VARIANT
 sys/brunel_additive_proxy_$(1)_g$(2).bin: BR_RULE_ID = 0
 sys/brunel_morrison_proxy_$(1)_g$(2).bin: BR_RULE_ID = 1
 sys/brunel_additive_proxy_$(1)_g$(2).bin sys/brunel_morrison_proxy_$(1)_g$(2).bin: $$(BRUNEL_SOURCES)
-	$${PREFIX}gcc $$(BRUNEL_BUILD_FLAGS) -DBR_RULE=$$(BR_RULE_ID) -DBR_PROXY=1 -DBR_PROXY_SIZE=$(2) -DBR_PROXY_TRACES=$(if $(filter replicated,$(1)),1,0) $$(BRUNEL_ASM_FLAGS) -o $$(@:.bin=.elf) sys/brunel.S sys/brunel_runtime.S
+	$${PREFIX}gcc $$(BRUNEL_BUILD_FLAGS) -DBR_RULE=$$(BR_RULE_ID) -DBR_PROXY=1 -DBR_PROXY_SIZE=$(2) -DBR_PROXY_TRACES=$(if $(filter replicated,$(1)),1,0) -DBR_PROXY_RELAY=$(if $(filter relay,$(1)),1,0) $$(BRUNEL_ASM_FLAGS) -o $$(@:.bin=.elf) sys/brunel.S sys/brunel_runtime.S
 	$${PREFIX}objcopy -j .text -j .data -O binary $$(@:.bin=.elf) $$@
 endef
-$(foreach variant,replicated home,$(foreach size,2 4 8,$(eval $(call BRUNEL_PROXY_VARIANT,$(variant),$(size)))))
+$(foreach variant,replicated home relay,$(foreach size,2 4 8,$(eval $(call BRUNEL_PROXY_VARIANT,$(variant),$(size)))))
 
 sys/brunel_%_proxy.bin: sys/brunel_%_proxy_replicated_g4.bin brunel-select-rule
 	cp $< $@

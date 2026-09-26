@@ -38,7 +38,7 @@ def check(images):
             assert not np.any(s[0x900 // 4:CONFIG // 4])
             assert not np.any(s[0xA00 // 4:ROWS // 4])
             assert not np.any(s[(ROWS + capacity(group_size) * 32) // 4:0x2D80 // 4])
-            if manifest["proxy_updates"] == "home":
+            if manifest["proxy_updates"] != "replicated":
                 assert not np.any(s[ROWS // 4:(ROWS + capacity(group_size) * 32) // 4:8])
         else:
             assert not np.any(s[0x900 // 4 : 0x2D80 // 4])
@@ -101,6 +101,13 @@ def check(images):
     if proxy:
         if manifest["proxy_updates"] == "home":
             local = (256 + (pre // pus) * 80) | (owner // 32)
+            owner = pre % pus
+        elif manifest["proxy_updates"] == "relay":
+            local = (256 + (pre // pus) * 80) | rank[owner]
+            # Decode exactly the destination used by the home handler; this
+            # must name the physical weight owner even within a shared MC.
+            np.testing.assert_array_equal(members[pre % pus, local & 15], owner)
+            np.testing.assert_array_equal(local & ~15, 256 + (pre // pus) * 80)
             owner = pre % pus
         else:
             local = ROWS + initial["proxy_slots"][pre] * 32

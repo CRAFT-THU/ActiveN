@@ -296,7 +296,13 @@ br_mshr_line_start:
 #else
  lw t0,H_MC_DEST(gp)
 #endif
+#if BR_RELAY_UPDATES
+ /* Priority 3 scatter -> priority 2 relay -> priority 1 scalar read.
+  * Completion uses the dedicated, bounded queue on SMT1 as before. */
+ SENDI t0,1024
+#else
  SENDI t0,-2048
+#endif
  ret
 br_load_wait:
  slli t0,a0,2
@@ -398,6 +404,12 @@ br_mshr_retire:
  li a1,0x20000
  lw t0,52(a5)
  SENDI t0,1026
+#elif BR_RELAY_UPDATES
+ /* Updates execute at the weight owner, with a local no-receipt write.
+  * Priority 0 leaves stores independent of the request/relay queues. */
+ li a1,0x20000
+ lw t0,H_MC_DEST(gp)
+ SENDI t0,2
 #else
  STORE_WORD
 #endif
@@ -493,9 +505,9 @@ br_mshr_allocate:
 4: jr t6
 .globl br_reverse
 br_reverse:
-#if BR_HOME_UPDATES
- /* Neuron offsets are 16-byte aligned: reverse CSR packs the remote MC in
-  * their spare low nibble, retaining the complete 32-bit weight address. */
+#if BR_HOME_UPDATES || BR_RELAY_UPDATES
+ /* Aligned neuron offsets pack the weight MC (home) or proxy rank (relay)
+  * in their spare low nibble, retaining the full MC-local weight address. */
  andi t0,a0,-16
  add t0,gp,t0
 #else
@@ -513,6 +525,23 @@ br_reverse:
  beqz t2,8f
  li a2,0
 .Lreverse_allocate:
+#if BR_RELAY_UPDATES
+ /* One targeted packet per useful update; the address already identifies
+  * the synapse, so no post ID or CSR search is needed. a0=weight address,
+  * a1=conditional LTD coefficient, a2=LTP coefficient, a3 unused.
+  * Do not count receipt here: the proxy must accept the update before the
+  * global reverse barrier may complete and home traces may advance. */
+ andi t0,a0,15
+ slli t0,t0,2
+ li t1,BR_BASE+PROXY_CONFIG
+ add t0,t0,t1
+ lw t0,0(t0)
+ mv a0,a1
+ mv a1,a2
+ mv a2,t2
+ SENDI t0,-2044          # 0x804, priority 2, proxy update handler 4
+ j br_idle
+#else
 #if BR_HOME_UPDATES
  andi a7,a0,15
  li t0,0x8001
@@ -524,13 +553,38 @@ br_reverse:
  mv a5,a2
  mv a6,t2
  jal t6,br_mshr_allocate
-8: INC H_REVERSE_RECEIVED,t0
+#endif
+8:
+.Lreverse_received:
+#if BR_RELAY_UPDATES
+ /* SMT1 counts home no-ops; SMT0 counts accepted proxy updates. */
+ addi t0,gp,H_REVERSE_RECEIVED
+ li t1,1
+ amoadd.w zero,t1,(t0)
+#if BR_DIAGNOSTIC
+ addi t0,gp,H_REVERSE_EVENTS
+ amoadd.w zero,t1,(t0)
+#endif
+#else
+ INC H_REVERSE_RECEIVED,t0
  DINC H_REVERSE_EVENTS,t0
+#endif
  j br_idle
 .Lreverse_active:
  or t0,a2,t2
  beqz t0,8b
  j .Lreverse_allocate
+#if BR_RELAY_UPDATES
+.globl br_proxy_update
+br_proxy_update:
+ /* Same SMT0 ownership, allocator and arithmetic as ordinary proxy updates.
+  * Persistent learning traces are absent; this event holds their snapshot. */
+ mv a4,a0
+ mv a5,a1
+ mv a6,a2
+ jal t6,br_mshr_allocate
+ j .Lreverse_received
+#endif
 /* Positive finite FP32 w^(2/5), plus exact +0. Scratch a0,t0-t5 only.
  * Bit seed for the inverse fifth root, one modified Newton step, then a
  * quadratic correction of q=w*r^3 using d=1-q*r^2. Every FP op rounds
@@ -1451,7 +1505,11 @@ br_work_directory:
  li s11,0xc01
  j 2f
 1: lw s7,N_REVERSE_DIR(s2)
+#if BR_RELAY_UPDATES
+ li s11,0xc07           # scatter to the home trace relay, not weight handler
+#else
  li s11,0xc04
+#endif
 2:
  /* A directory is 16 eight-byte descriptors, aligned to a 32-byte line.
   * Issue all four scalar refills into READ[0..3], then consume each line
