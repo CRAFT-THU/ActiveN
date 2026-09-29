@@ -214,6 +214,7 @@ $(error BRUNEL_RULE must be additive or morrison)
 endif
 BRUNEL_ASM_FLAGS ?=
 BRUNEL_SOURCES = Makefile sys/brunel.S sys/brunel_runtime.S sys/brunel_asm_layout.inc sys/brunel_rule.inc sys/brunel_proxy_config.h sys/linker_brunel.ld
+BRUNEL_SOURCES += sys/morrison_layout.h
 BRUNEL_BUILD_FLAGS = -mabi=ilp32 -march=rv32ia_zmmul_zfinx_zicsr -Os -msmall-data-limit=0 -ffreestanding -fno-builtin -nostdlib -nostartfiles -Wl,-T,sys/linker_brunel.ld -DMNIST_TRAIN=1 -DMEM_LINE_BYTES=32 -DBR_ASM_RUNTIME=1
 .PHONY: brunel-select-rule
 brunel-select-rule:
@@ -241,6 +242,15 @@ sys/brunel_additive_proxy_$(1)_g$(2).bin sys/brunel_morrison_proxy_$(1)_g$(2).bi
 	$${PREFIX}objcopy -j .text -j .data -O binary $$(@:.bin=.elf) $$@
 endef
 $(foreach variant,replicated home relay,$(foreach size,2 4 8,$(eval $(call BRUNEL_PROXY_VARIANT,$(variant),$(size)))))
+
+# Full Morrison uses a distinct, versioned compact image ABI. Both variants keep
+# learning traces at neuron homes; the MC count is read from the image.
+define MORRISON_VARIANT
+sys/morrison_g$(1).bin: $$(BRUNEL_SOURCES)
+	$${PREFIX}gcc $$(BRUNEL_BUILD_FLAGS) -DBR_RULE=1 -DBR_MORRISON=1 -DBR_PROXY=1 -DBR_PROXY_SIZE=$(1) -DBR_PROXY_TRACES=0 $$(BRUNEL_ASM_FLAGS) -o $$(@:.bin=.elf) sys/brunel.S sys/brunel_runtime.S
+	$${PREFIX}objcopy -j .text -j .data -O binary $$(@:.bin=.elf) $$@
+endef
+$(foreach size,1 4,$(eval $(call MORRISON_VARIANT,$(size))))
 
 sys/brunel_%_proxy.bin: sys/brunel_%_proxy_replicated_g4.bin brunel-select-rule
 	cp $< $@

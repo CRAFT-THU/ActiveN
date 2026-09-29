@@ -1,4 +1,5 @@
 #include "../payloads/sys/brunel.h"
+#include "../payloads/sys/morrison_layout.h"
 /**
  * Software NoC system simulator.
  *
@@ -726,20 +727,28 @@ void SoftSystemBackend::peek(uint64_t cycle, std::vector<MemBusOut *> out) {
       return spm[offset / MEM_BUS_WIDTH_B][(offset % MEM_BUS_WIDTH_B) / 4];
     };
     const auto completed = word(1, offsetof(BrHeader, completed));
-    if (word(1, 0) == BR_MAGIC)
+    const bool compact = word(1, 0) == MR_MAGIC;
+    const bool recognized = compact || word(1, 0) == BR_MAGIC;
+    const bool summaryOnly = std::getenv("SOFT_BRUNEL_SUMMARY_ONLY") != nullptr;
+    if (recognized)
       observeBrunelProfile(cycle, directory, completed);
-    if (word(1, 0) == BR_MAGIC && completed != brunel_observed_steps_) {
+    if (recognized && completed != brunel_observed_steps_) {
       if (completed != brunel_observed_steps_ + 1)
         throw runtime_error("Brunel observer missed step");
       std::ostringstream name;
       name << directory << "/step-" << std::setfill('0') << std::setw(4) << completed << ".bin";
-      std::ofstream stream(name.str(), std::ios::binary);
+      std::ofstream stream;
+      if (!summaryOnly) stream.open(name.str(), std::ios::binary);
       auto emit = [&](uint32_t v) {
-        for (unsigned b = 0; b < 32; b += 8) stream.put(static_cast<char>(v >> b));
+        if (!summaryOnly)
+          for (unsigned b = 0; b < 32; b += 8) stream.put(static_cast<char>(v >> b));
       };
       emit(0x42534431); emit(cfg.numPU);
       std::array<uint64_t,9> counts{};
       uint32_t excitatory=0,inhibitory=0,resident=0,pending=0;
+      uint64_t forwardReceipts=0, reverseReceipts=0;
+      std::vector<uint32_t> firedIds;
+      const unsigned ne = compact ? word(1, MR_PARAMETERS) : 9000;
       for (unsigned pu=1;pu<=cfg.numPU;pu++) {
         if (word(pu, offsetof(BrHeader,step)) != completed)
           throw runtime_error("Brunel completed before all PUs");
@@ -748,16 +757,40 @@ void SoftSystemBackend::peek(uint64_t cycle, std::vector<MemBusOut *> out) {
         for(unsigned i=0;i<8;i++) counts[i]+=word(pu,offsetof(BrHeader,buffer_updates)+4*i);
         counts[8] += word(pu,offsetof(BrHeader,allocation_waits));
         for(unsigned i=0;i<word(pu,offsetof(BrHeader,nn));i++) {
-          unsigned n=BR_NEURONS+i*sizeof(BrNeuron);
-          if(word(pu,n+offsetof(BrNeuron,fire))) {
-            if(word(pu,n+offsetof(BrNeuron,gid))<9000)excitatory++; else inhibitory++;
+          unsigned n=BR_NEURONS+i*(compact ? sizeof(MrNeuron) : sizeof(BrNeuron));
+          const unsigned fired = compact ? ((word(pu,n+28) >> 8) & 255)
+                                         : word(pu,n+offsetof(BrNeuron,fire));
+          if(fired) {
+            const unsigned gid = compact ? (pu-1+i*cfg.numPU)
+                                         : word(pu,n+offsetof(BrNeuron,gid));
+            if(gid<ne) excitatory++; else inhibitory++;
+            if (compact) firedIds.push_back(gid);
           }
         }
+        forwardReceipts += word(pu, offsetof(BrHeader,received));
+        reverseReceipts += word(pu, offsetof(BrHeader,reverse_received));
         resident += word(pu, offsetof(BrHeader,buffer_bytes)) / 4;
         pending += word(pu, offsetof(BrHeader,mshr_count));
       }
-      if(!stream) throw runtime_error("cannot write Brunel state");
-      std::cerr << "[Brunel step] step=" << completed << " cycle=" << cycle
+      if(!summaryOnly && !stream) throw runtime_error("cannot write Brunel state");
+      if (compact) {
+        const auto mode = completed == 1 ? std::ios::out : std::ios::app;
+        std::ofstream activity(std::filesystem::path(directory) / "morrison-activity.csv", mode);
+        if (completed == 1) activity << "step,cycle,e_spikes,i_spikes,forward_deliveries,reverse_visits\n";
+        activity << completed << ',' << cycle << ',' << excitatory << ',' << inhibitory
+                 << ',' << forwardReceipts << ',' << reverseReceipts << '\n';
+        std::ofstream spikes(std::filesystem::path(directory) / "morrison-spikes.bin", mode | std::ios::binary);
+        const auto write = [&](uint32_t value) {
+          for (unsigned b=0; b<32; b+=8) spikes.put(static_cast<char>(value >> b));
+        };
+        if (completed == 1) {
+          write(MR_MAGIC); write(ne); write(word(1, MR_PARAMETERS+4)); write(cfg.numPU);
+        }
+        write(completed); write(firedIds.size());
+        for (auto gid : firedIds) write(gid);
+        if (!activity || !spikes) throw runtime_error("cannot write Morrison activity");
+      }
+      std::cerr << (compact ? "[Morrison step] step=" : "[Brunel step] step=") << completed << " cycle=" << cycle
                 << " E=" << excitatory << " I=" << inhibitory;
       const char *keys[]={"buffer_updates","mshr_loads","mshr_commits","overflow_rows","write_words","pool_full","forward_weights","reverse_events","allocation_waits"};
       for(unsigned i=0;i<9;i++)std::cerr << ' ' << keys[i] << '=' << counts[i]-brunel_last_counts_[i];
@@ -790,7 +823,9 @@ void SoftSystemBackend::observeBrunelProfile(uint64_t cycle,
     const auto path = std::filesystem::path(directory) / "pu-profile.csv";
     std::ofstream out(path, completed == 1 ? std::ios::out : std::ios::app);
     if (completed == 1)
-      out << "step,phase,pu,samples,active0,active1,executing,stalled,outstanding,egress,injection_blocked,reverse_full,spike_full,mshr_occupancy,mshr_full,credit_full,issued0,issued1,neurons0,neurons1,ac_wait_cycles,biu_blocked_cycles,last_forward_injection\n";
+      out << "step,phase,pu,samples,active0,active1,executing,stalled,outstanding,egress,injection_blocked,reverse_full,spike_full,mshr_occupancy,mshr_full,credit_full,issued0,issued1,neurons0,neurons1,"
+          << (word(1,0) == MR_MAGIC ? "ac_active_cycles" : "ac_wait_cycles")
+          << ",biu_blocked_cycles,last_forward_injection\n";
     constexpr unsigned phases[] = {1, 2, 3, 6};
     for (unsigned pu = 1; pu <= cfg.numPU; ++pu)
       for (unsigned ph = 0; ph < 4; ++ph) {
@@ -908,7 +943,8 @@ void SoftSystemBackend::observeBrunelMemory(uint64_t cycle) {
     const auto word = [&](unsigned offset) {
       return spm[offset / MEM_BUS_WIDTH_B][(offset % MEM_BUS_WIDTH_B) / 4];
     };
-    if (word(0) != BR_MAGIC || brunelPuProfile_.empty()) continue;
+    const bool compact = word(0) == MR_MAGIC;
+    if ((!compact && word(0) != BR_MAGIC) || brunelPuProfile_.empty()) continue;
     const auto phase = word(offsetof(BrHeader, phase));
     if (phase == 1 || phase == 2 || phase == 3 || phase == 6) {
       auto &p = brunelPuProfile_[pu][phase == 6 ? 3 : phase - 1];
@@ -917,22 +953,24 @@ void SoftSystemBackend::observeBrunelMemory(uint64_t cycle) {
       p.issued0 += issued && (smsel & 1);
       p.issued1 += issued && (smsel & 2);
       const uint32_t address = root.Core__DOT__exec__DOT____Vcellinp__lsu__req_bits_addr;
-      if (phase == 2 && issued && root.Core__DOT__exec__DOT__uop_isMem &&
+      const unsigned neuronBytes = compact ? sizeof(MrNeuron) : sizeof(BrNeuron);
+      const unsigned neuronEnd = compact ? word(offsetof(BrHeader,neuron_end)) : BR_BASE + BR_BUFFER;
+      if (phase == (compact ? 1u : 2u) && issued && root.Core__DOT__exec__DOT__uop_isMem &&
           root.Core__DOT__exec__DOT____Vcellinp__lsu__req_bits_write &&
-          address >= BR_BASE + BR_NEURONS && address < BR_BASE + BR_BUFFER &&
-          (address - BR_BASE - BR_NEURONS) % sizeof(BrNeuron) == offsetof(BrNeuron, fire)) {
+          address >= BR_BASE + BR_NEURONS && address < neuronEnd &&
+          (address - BR_BASE - BR_NEURONS) % neuronBytes == (compact ? 0u : offsetof(BrNeuron, fire))) {
         p.neurons0 += (smsel & 1) != 0;
         p.neurons1 += (smsel & 2) != 0;
       }
-      p.ac_wait_cycles += phase == 1 && word(BR_STREAM) == 1 &&
+      p.ac_wait_cycles += (compact ? phase == 2 : phase == 1 && word(BR_STREAM) == 1) &&
                           root.Core__DOT__exec__DOT__lsu__DOT__acRemaining != 0;
       p.biu_blocked_cycles += root.Core__DOT__exec__DOT__biu_msg_valid &&
                              !root.Core__DOT__exec__DOT__biu__DOT__sendQueue__DOT__enq_ready_0;
-      if (phase == 1 && routers[pu].buf.core_inject_accepting && c.ext_out_valid &&
+      if (phase == (compact ? 2u : 1u) && routers[pu].buf.core_inject_accepting && c.ext_out_valid &&
           c.ext_out_bits_tag == 0xc01 && c.ext_out_bits_data_2 != 0)
         p.last_forward_injection = cycle;
     }
-    if (phase == 1 && word(BR_STREAM) != 0) {
+    if (compact ? phase == 2 : phase == 1 && word(BR_STREAM) != 0) {
       if (routers[pu].buf.core_inject_accepting && c.ext_out_valid &&
           (c.ext_out_bits_tag & 255) == 0x11 && (c.ext_out_bits_data_1 & 65535) == 0x8001)
         brunelMemoryEvents_.push_back({cycle, pu, 2, c.ext_out_bits_data_1 >> 16, c.ext_out_bits_data_0});

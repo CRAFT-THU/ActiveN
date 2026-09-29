@@ -40,6 +40,7 @@ object Main extends App {
   var mc: Option[Int] = None
   var iCacheLines: Option[Int] = None
   var memBusWidth: Option[Int] = None
+  var mcSize: Option[BigInt] = None
   var output: Option[String] = None
   var spliter = args.indexOf("--")
   val (mainArgs, otherArgs) = if (spliter >= 0) {
@@ -59,6 +60,7 @@ object Main extends App {
         println("  --mc=<N>         Emit System with N MCs")
         println("  --icache-lines=<N>  Set I-cache line count. Default: 32")
         println("  --mem-bus-width=<bits>  Set the external memory bus width. Default: 512")
+        println("  --mc-size=<bytes>  Physical bytes per MC (decimal or 0x hex). Default: 4 GiB")
         println("  --output=<path>  Set output path for generated files. Default: ./generated/core or ./generated/system")
         sys.exit(0)
       }
@@ -100,6 +102,17 @@ object Main extends App {
           output = Some(stripped)
         }
       }
+      case a if a.startsWith("--mc-size=") => {
+        val raw = a.stripPrefix("--mc-size=")
+        mcSize = scala.util.Try {
+          if (raw.startsWith("0x")) BigInt(raw.drop(2), 16) else BigInt(raw)
+        }.toOption
+        if (mcSize.isEmpty || mcSize.get <= 0 || mcSize.get > (BigInt(1) << 32)
+            || (mcSize.get & (mcSize.get - 1)) != 0) {
+          println(s"Invalid MC size: $raw (require a power of two, at most 4 GiB)")
+          sys.exit(1)
+        }
+      }
       case _ => {
         println(s"Unknown argument: $arg")
         sys.exit(1)
@@ -119,7 +132,8 @@ object Main extends App {
 
   val param = defaultParam.copy(
     i$Lines = iCacheLines.getOrElse(defaultParam.i$Lines),
-    memBusWidth = memBusWidth.getOrElse(defaultParam.memBusWidth)
+    memBusWidth = memBusWidth.getOrElse(defaultParam.memBusWidth),
+    memCtrlSizes = defaultParam.memCtrlSizes.map(_ => mcSize.getOrElse(defaultParam.memCtrlSizes.head))
   )
 
   val subdir = if (system) "system" else "core"

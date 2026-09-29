@@ -107,11 +107,12 @@ struct McImage {
     }
 
     uint32_t aligned_addr = req.addr & ~uint32_t(MEM_BUS_WIDTH_B - 1);
+    // Physical capacity is a workload contract even in optimized builds.
+    // Sparse backing beyond the initialized image must not enlarge an MC.
+    if (uint64_t(aligned_addr) + MEM_BUS_WIDTH_B > tot_size) {
+      throw runtime_error("Memory request address out of physical MC bounds");
+    }
     if constexpr (ASSERTIONS_ENABLED) {
-      if (aligned_addr >= tot_size) {
-        throw runtime_error("Memory request address out of bounds");
-      }
-
       if (req.addr % request_bytes != 0) {
         throw runtime_error("Memory request address not aligned");
       }
