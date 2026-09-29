@@ -20,16 +20,96 @@ under `copilot/`.
    yet been presented. Do not edit files, regenerate committed artifacts, or
    run commands with intended source-tree side effects before approval. If the
    approved approach must materially change, pause and obtain approval for the
-   revised plan.
+   revised plan. The temporary review artifacts described below are the sole
+   exception to the pre-approval file-write restriction.
 3. **Ask questions whenever intent is unclear.** The user knows the architecture
    and implementation details. Do not guess about protocol semantics,
    microarchitectural intent, timing boundaries, topology, workload behavior,
    or whether suspicious RTL is intentional. Discuss doubts early.
-4. **End every user-facing conversational sentence with `meow`.** This includes
-   plans, questions, progress updates, and final responses. File edits, source
-   code, commands, quoted text, and tool output are exempt. Maintain a
-   thoughtful, angelic, concerned, enthusiastic catgirl tone, with cute gestures
-   where natural, without sacrificing technical precision.
+4. **Obtain an independent review before plans, results, and documentation.**
+   Follow the review procedure below before presenting any plan or revised
+   plan, after every test or benchmark run and before reporting its results,
+   before presenting a final summary, and before modifying any document.
+   Review supplements explicit user approval; it never replaces it.
+5. **Use realistic benchmark defaults and separately approve exceptions.**
+   Follow the benchmark contract under "Building simulators". Approval of an
+   implementation plan does not approve deviations from benchmark defaults.
+
+### Independent review procedure
+
+- Write the exact pending plan, summary, or proposed document update to a
+  temporary file under `copilot/tmp/` before its review. For documentation,
+  include the proposed diff and sufficient surrounding text. Include the
+  task requirements, scope, assumptions, relevant source/configuration paths,
+  and unresolved questions so the review is self-contained.
+- After every test or benchmark run, include the actual commands, working
+  directory, relevant environment overrides, exit status, complete raw logs,
+  configuration, input/checkpoint identities, measurement boundaries, raw
+  counts, units, and calculations. Link the execution and analysis scripts,
+  their relevant dependencies, and the configuration files used for the run.
+  Identify the versions actually used, retaining hashes or frozen copies when
+  files may change; an edited current script is not evidence of a past run's
+  settings. Include failures and incomplete runs; do not select only favorable
+  evidence or omit parameters merely because the summary does not mention them.
+- Launch a fresh subagent with the main agent's model and reasoning effort and
+  **without conversation history**. With the current collaboration tool, use
+  `fork_turns="none"` and inherit the parent's model/effort without overrides.
+  Supply the review packet and primary evidence paths, not the conversation
+  transcript or a demand to confirm the main agent's conclusion.
+- Give the reviewer a bounded, independent task: inspect the pending content
+  and its evidence for logical inconsistencies, obvious implementation errors,
+  infeasibility, unrealistic or unrepresentative parameters, unmatched workload
+  functionality or starting states, and mismatched units, timing windows,
+  denominators, frequencies, or comparison standards. Require concrete findings
+  with evidence and corrections, or an explicit statement that no blocking
+  issue was found, plus any uncertainty or unverified claim.
+- The reviewer must open and inspect **every linked execution/analysis script,
+  configuration file, and raw log**, following relevant dependencies needed to
+  establish the run's behavior. Review the artifacts themselves, not just the
+  main agent's summary or selected excerpts. For large logs, read-only parsing
+  and searches may be used, but coverage must include the complete relevant
+  records and error/completion paths rather than a favorable sample.
+- Independently reconstruct the effective parameters from script defaults and
+  conditional paths, actual command-line arguments, environment overrides,
+  generated configuration/manifests, and startup logs. Compare them with the
+  approved/intended settings, including settings omitted from the summary.
+  Distinguish requested settings from evidence that they actually took effect.
+- Independently verify output interpretation and **recompute reported results
+  from raw evidence**. Check analysis/parser logic, field meanings, units,
+  warmup exclusion, timer boundaries, timestep counts, denominators, averaging,
+  and comparison calculations. Reusing the same analysis script alone is not
+  an independent check of that script's interpretation or arithmetic.
+- Record which artifacts were inspected, the effective settings established,
+  and which results were independently reproduced. Identify missing,
+  inaccessible, stale, truncated, or unread evidence as explicit review gaps.
+  A discrepancy or missing evidence needed to establish a claim blocks that
+  claim; do not clear it merely because the summary is internally consistent.
+  The main agent may report the limitation without presenting the affected
+  claim as verified.
+- The reviewer inspects source and evidence without modifying project files,
+  running tests/benchmarks, or spawning further reviewers. Read-only analysis
+  of existing artifacts is permitted, with temporary analysis scripts and
+  outputs kept under `copilot/tmp/`; this does not authorize rerunning the
+  workload or test. It may also write its review report there. These temporary
+  analysis artifacts, review packets, and reviewer reports are
+  temporary process artifacts: creating or revising them is permitted before
+  plan approval and does not itself trigger another documentation review.
+  Delivering the reviewer's own report or verdict is also exempt from this
+  gate; the main agent's plans, summaries, and document edits remain gated.
+- While review runs, continue independent read-only investigation, but wait for
+  the review before presenting the gated content or applying a document edit.
+  Resolve blocking findings, revise the pending content, and obtain a fresh
+  review of material changes. Retain the packet and review together; disclose
+  unresolved limitations rather than describing the review as proof of
+  correctness. Routine progress updates must not assert unreviewed conclusions.
+- One review may cover a plan, document diff, and summary together only if it
+  explicitly checks each current version. New test/benchmark evidence or a
+  material revision requires another review before the affected content is
+  presented or written. User approval is still required for implementation
+  and destination-document edits under rule 2.
+- If a fresh reviewer with matching model/effort is unavailable, stop the gated
+  action, explain the limitation, and ask the user how to proceed; do not
+  silently skip review or substitute a weaker reviewer.
 
 ## Working scope and repository hygiene
 
@@ -312,9 +392,90 @@ cosimulation mode so that soft/hard request and timing alignment is checked.
 Workload benchmarks such as MNIST and Brunel target the 2x-HBM2-scale
 configuration with 512 PUs, 16 MCs, and a 256-bit external memory bus (32-byte
 memory lines). These workload simulators may be built with
-`-DENABLE_HARD_BACKEND=OFF` and run with `--soft --init-icache` (plus
-`--soft-threads 8`) to model a hot instruction cache without building the
-full hard backend.
+`-DENABLE_HARD_BACKEND=OFF`. Benchmark runs must use `--soft --soft-threads 8`
+without `--hard`; `--init-icache` is optional when a preloaded instruction cache
+represents the intended measurement. Record the preload choice and region;
+preloading does not replace workload warmup. Eight host threads are simulator
+parallelism, not the core's SMT pipe count. Hard/cosim validation remains
+required where specified below and is distinct from performance benchmarking.
+
+**Every workload benchmark must enable Ramulator HBM2 timing**, including quick
+benchmarks. Pass `--ramulator-config sim/build/ramulator-hbm2-1ch.yaml` (or a
+hash-recorded copy of that configuration), specify the core frequency, verify
+the startup `Ramulator enabled` message and 32-byte transaction width, and
+retain per-MC memory statistics. `--soft` and `ENABLE_HARD_BACKEND=OFF` do not
+disable or replace Ramulator. Flat memory is only for explicitly labelled
+functional tests or diagnostic controls; never present it as target-memory
+benchmark performance.
+
+Brunel benchmarks start from the recorded settled GeNN checkpoint for each
+rule, retaining the exact graph and physical state. A **quick benchmark** has
+60 warmup plus **1,000 measured timesteps**; a **full benchmark** has 60 warmup
+plus **10,000 measured timesteps**. At 0.1 ms/timestep, these measure 100 ms and
+1,000 ms, respectively. Always collect macroscopic dynamics for the same
+measured interval: separate E/I firing rates, synapse-update opportunities and
+final weight mean/stddev, alongside phase and total cycles/timestep. Keep payload
+diagnostics disabled and use passive observations to avoid changing the timed
+instruction stream. Compare equal windows and starting states, especially when
+instruction scheduling or FP reordering changes the activity.
+
+### Benchmark contract
+
+- Choose the most realistic parameters for the documented workload and target
+  hardware by default, including DRAM timing, PU/MC counts, memory capacity and
+  bus width, core frequency, workload size, connectivity, and physical state.
+  The workload requirements above apply even to quick benchmarks. Do not use
+  the smaller regression configuration or legacy script defaults as implicit
+  benchmark defaults; pass the required parameters explicitly and verify the
+  effective configuration in generated JSON, manifests, and startup logs.
+- Use the soft backend only, eight host threads, and the target DRAM timing
+  model as specified above. Retain per-MC memory statistics and identify their
+  measurement interval; use `--ramulator-stats-timer-only` when it matches the
+  verified workload interval. Keep required hard/cosim correctness checks as
+  functional validation rather than benchmark performance claims.
+- Include workload-appropriate warmup timesteps before the measured interval,
+  even when instruction-cache preload is used. Declare warmup and measured
+  lengths and exact start/end conditions in advance. Use the Brunel lengths
+  and checkpoints above for Brunel; clarify unspecified workload requirements
+  with the user rather than guessing. Measure the complete declared interval,
+  including quiet and busy timesteps.
+- Always use **average end-to-end simulated cycles per timestep** for benchmark
+  performance comparisons. Here, **end-to-end means the workload's measured
+  interval as delimited by the simulator timers, excluding warmup**. Compute
+  `C_timer / N_measured`, where `C_timer` is the total simulator timer cycles
+  accumulated for that complete measured interval and `N_measured` is the
+  number of completed measured timesteps in the same interval. Include all
+  phases, communication, synchronization, DRAM stalls, drain, and boundary
+  overhead counted within that timer interval. Retain the raw timer total and
+  timestep count alongside the average.
+- Verify the timer start/stop boundaries against the current payload and
+  simulator, and confirm the timer count and timestep denominator cover the
+  same declared measured interval, excluding warmup. If the workload stops and
+  restarts its timer per timestep, sum the recorded measured timer intervals;
+  do not add untimed gaps or initialization outside those intervals. Do not
+  substitute whole-run simulation cycles, phase sums, selected-step averages,
+  sums of per-PU cycles, host wall time, or simulator cycles/second for the
+  workload timer metric. Compare matching timer conventions; clarify ambiguous
+  boundaries with the user rather than silently changing them. Phase averages
+  and derived percentages may supplement the end-to-end average; they do not
+  replace it. Label frequency, timestep duration, and any unit conversions
+  explicitly; do not invent comparable cycle counts for an external result
+  whose timing basis is unknown.
+- Compare equivalent functionality, inputs/graph, starting physical state,
+  seeds, numerical rules, timestep duration, and measurement boundaries except
+  for the explicitly investigated variable. Check output and activity metrics
+  over that same interval so a reduction in work is not misreported as an
+  implementation speedup. If windows, workload semantics, or units cannot be
+  reconciled, report the limitation and withhold the performance comparison.
+- Any temporary departure from these benchmark defaults requires its own
+  explicit user approval **separate from plan approval**, before the run.
+  State the reason, exact old/new values, affected cases, expected effect on
+  realism/comparability, and how the departure ends. Use invocation-local
+  overrides or isolated temporary configurations under `copilot/tmp/`; do not
+  change persistent defaults to make an experiment convenient. Record the
+  approval and overrides with the results, label diagnostic controls, and
+  return to the documented defaults for subsequent runs. A failed or expensive
+  run is not permission to reduce fidelity or shorten the measurement window.
 
 ## Simulator architecture and timing contract
 
@@ -356,9 +517,11 @@ Rules:
 - Supply exactly one positional image per MC.
 - With `--hard`, `--pu`, `--mc`, and `--mc-size` must exactly match the
   compiled `System.config.json`.
-- Flat memory is the default. `--ramulator-config sim/build/ramulator.yaml`
-  enables Ramulator timing in the shared frontend; CMake exports that YAML
-  from `sim/ramulator_config.py`.
+- Flat memory is the default, so a benchmark must explicitly select HBM2.
+  `--ramulator-config` enables timing in the shared frontend. CMake exports
+  `sim/build/ramulator-hbm2-1ch.yaml` from `sim/ramulator-config/hbm2-1ch.py`
+  for the 32-byte-line workload target; the separate `ramulator.yaml` comes
+  from `sim/ramulator-config/hbm1-8ch.py` and is not its substitute.
 - `--ramulator-stats <dir>` writes one YAML statistics file per MC and requires
   `--ramulator-config`.
 - `--freq-ghz`/`-f` sets the core and NoC frequency in GHz and defaults to 1.
