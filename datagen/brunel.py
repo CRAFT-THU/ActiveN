@@ -279,8 +279,17 @@ def generate(args):
     payload = args.payload.read_bytes()
     out = args.output
     out.mkdir(parents=True, exist_ok=False)
-    edges = graph(args.seed)
-    ref = Reference(edges, args.rule, seed=args.seed)
+    checkpoint = getattr(args, "load_genn_checkpoint", None)
+    checkpoint_meta = None
+    if checkpoint is not None:
+        if args.presim or args.seek_active:
+            raise ValueError("checkpoint import requires --presim 0 and no --seek-active")
+        from brunel_checkpoint import load_checkpoint
+        edges, state, checkpoint_meta = load_checkpoint(checkpoint, args.rule, args.seed)
+        ref = Reference(edges, args.rule, state=state, seed=args.seed)
+    else:
+        edges = graph(args.seed)
+        ref = Reference(edges, args.rule, seed=args.seed)
     proxy_mode = getattr(args, "proxy_groups", "none")
     proxy = None
     if proxy_mode == "none":
@@ -498,6 +507,7 @@ def generate(args):
         rule_selection="compile-time; boot validates image H_RULE",
         seed=args.seed,
         presim=args.presim,
+        source_checkpoint=checkpoint_meta,
         kernel="timestep-buffer-mshr",
         plastic_layout="chunk128-weights512-targets512",
         rng="per-SMT xorshift32 inverse-CDF Poisson, capped at 9",
@@ -544,7 +554,8 @@ def generate(args):
             spill_bytes_per_pu=65536,
         ),
         ordering="alpha-current integration -> forward/static delivery with post-side quiet LTD -> reverse LTP/LTD -> trace increments",
-        graph_rng="numpy.default_rng; fixed indegree with replacement, recurrent autapses excluded",
+        graph_rng=("imported GeNN sparse multigraph" if checkpoint_meta else
+                   "numpy.default_rng; fixed indegree with replacement, recurrent autapses excluded"),
         numpy_version=np.__version__,
         payload_sha256=hashlib.sha256(payload).hexdigest(),
         initial_state_sha256=hashlib.sha256(
@@ -565,6 +576,8 @@ def main():
     p.add_argument("--rule", choices=("additive", "morrison"), default="additive")
     p.add_argument("--seed", type=int, default=20260724)
     p.add_argument("--presim", type=int, default=1000)
+    p.add_argument("--load-genn-checkpoint", type=Path,
+                   help="complete GeNN phase checkpoint; requires --presim 0")
     p.add_argument("--warmup", type=int, default=30)
     p.add_argument("--timed", type=int, default=30)
     p.add_argument("--seek-active", action="store_true")

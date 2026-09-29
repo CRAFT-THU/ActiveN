@@ -64,6 +64,23 @@
 .equ H_MC_DEST, 244
 .equ H_WEIGHT_LOADS, 248
 .equ H_MSHR_WAITS, 252
+#if BR_MORRISON
+.equ N_BYTES, MR_NEURON_BYTES
+.equ N_V, 0
+.equ N_I_TOTAL, 4
+.equ N_D_TOTAL, 8
+.equ N_X, 12
+.equ N_Y, 16
+.equ N_INPUT_E, 20
+.equ N_INPUT_I, 24
+.equ N_REFRAC, MR_STATUS_REFRAC
+.equ N_FIRE, MR_STATUS_FIRE
+#define STATUS_LOAD lbu
+#define STATUS_STORE sb
+#else
+.equ N_BYTES, 80
+#define STATUS_LOAD lw
+#define STATUS_STORE sw
 .equ N_V, 0
 .equ N_IE, 4
 .equ N_DE, 8
@@ -88,6 +105,7 @@
 .equ N_INPUT_E, 68
 .equ N_INPUT_I, 72
 .equ N_BUFFER, 76 /* BR_PROXY: descriptor offset shared by the group members */
+#endif
 .equ X_COUNT, 0
 .equ X_PEAK, 4
 .equ X_CURSOR, 8

@@ -13,7 +13,11 @@
 #include "brunel_rule.inc"
 .option norelax
 .equ BUFFER, 0x900
+#if BR_MORRISON
+.equ FIRED_LIST, MR_FIRED_LIST
+#else
 .equ FIRED_LIST, BUFFER
+#endif
 .equ BR_BASE, 0x20000000
 .equ MSHR, 0x2900
 .equ READ, 0x2d00
@@ -21,7 +25,11 @@
 .equ RECORD, 0x2f00
 .equ DIRTY, 0x2e00
 .equ PING, 0x3700
+#if BR_MORRISON
+.equ POISSON, MR_POISSON
+#else
 .equ POISSON, 0x2da4
+#endif
 .equ STREAM, 0x2dd0
 #ifndef BR_MSHR_LIMIT
 #define BR_MSHR_LIMIT 16
@@ -310,14 +318,32 @@ br_load_wait:
 1: lw t1,80(t0)
  beqz t1,1b
  ret
-/* Arm the fixed 1-KiB LoadManual AC. Boot sets acLen once; scalar directory
- * and MSHR requests never change it. a0=MC-local address, a1=SPM offset. */
+/* Arm LoadManual AC: fixed 1 KiB for Brunel, compact final block for Morrison.
+ * a0=MC-local address, a1=SPM offset, a2=remaining edges for Morrison. */
 br_ac_start:
  add t0,gp,a1
  csrw 0x732,t0
+#if BR_MORRISON
+ /* a2 is the number of remaining edges. The final two arrays are padded
+  * separately to 32 bytes; request length must equal acLen. */
+ li t0,128
+ bleu a2,t0,1f
+ mv a2,t0
+1: addi a2,a2,7
+ srli a2,a2,3
+ slli a2,a2,1              # two lines for each group of eight edges
+ slli t0,a2,5
+ csrw 0x733,t0
+ slli a1,a2,16
+ li t0,0x8001
+ or a1,a1,t0
+ li t0,1
+ csrw 0x730,t0
+#else
  li t0,1
  csrw 0x730,t0
  li a1,0x208001             # 32 lines, manual AC response ID 0x8001
+#endif
  lw t0,H_MC_DEST(gp)
  SENDI t0,-2031
  ret
@@ -517,7 +543,7 @@ br_reverse:
  lw t1,P_FIRE(t0)
  lw t2,P_X(t0)
 #else
- lw t1,N_FIRE(t0)
+ STATUS_LOAD t1,N_FIRE(t0)
  lw t2,N_X(t0)
 #endif
  /* Nonnegative X already is the LTP coefficient. Quiet pre is fallthrough. */
@@ -602,10 +628,10 @@ br_pow04:
  lw t0,N_D_TOTAL(t5)
  lw t1,N_I_TOTAL(t5)
  lw t4,N_V(t5)
- lw t6,N_REFRAC(t5)
+ STATUS_LOAD t6,N_REFRAC(t5)
  beqz t6,.Lneuron_voltage\@
  addi t6,t6,-1
- sw t6,N_REFRAC(t5)
+ STATUS_STORE t6,N_REFRAC(t5)
  j .Lneuron_currents\@
 .Lneuron_voltage\@:
  fmul.s a0,s4,t0
@@ -634,22 +660,43 @@ br_pow04:
  xor s11,s11,t1
  slli t1,s11,5
  xor s11,s11,t1
+#if BR_MORRISON
+ bleu s11,a4,.Lneuron_no_external\@
+#else
  bltu s11,a4,.Lneuron_no_external\@
+#endif
  mv a0,s7
+#if BR_MORRISON
+ bleu s11,a5,.Lneuron_add_external\@
+#else
  bltu s11,a5,.Lneuron_add_external\@
+#endif
  mv a0,a7
+#if BR_MORRISON
+ bleu s11,a6,.Lneuron_add_external\@
+#else
  bltu s11,a6,.Lneuron_add_external\@
+#endif
  /* Rare tail: thresholds are generated from this rule's exact mean. */
  li a0,3
  li t1,POISSON+12
  add t1,t1,gp
 .Lneuron_poisson_tail\@:
  lw t3,0(t1)
+#if BR_MORRISON
+ bleu s11,t3,.Lneuron_poisson_done\@
+#else
  bltu s11,t3,.Lneuron_poisson_done\@
+#endif
  addi a0,a0,1
  addi t1,t1,4
+#if BR_MORRISON
+ /* The last table entry is UINT32_MAX and is necessarily taken. */
+ j .Lneuron_poisson_tail\@
+#else
  li t3,9
  bltu a0,t3,.Lneuron_poisson_tail\@
+#endif
 .Lneuron_poisson_done\@:
  fcvt.s.wu a0,a0
  fmul.s a0,s7,a0
@@ -660,10 +707,10 @@ br_pow04:
  bnez t6,.Lneuron_no_fire\@
  blt t4,s10,.Lneuron_no_fire\@
  li t6,5
- sw t6,N_REFRAC(t5)
+ STATUS_STORE t6,N_REFRAC(t5)
  li t4,0
  li t1,1
- sw t1,N_FIRE(t5)
+ STATUS_STORE t1,N_FIRE(t5)
  /* Only firing neurons append; the integration join publishes the complete
   * list before forward/reverse/trace-finalization readers can run. */
  amoadd.w t3,t1,(a2)
@@ -689,7 +736,7 @@ br_integrate:
  slli t0,tp,2
  add t0,t0,gp
  lw s11,H_RNG0(t0)
- li s0,80
+ li s0,N_BYTES
  lw s1,H_EXCITATORY_END(gp)
  lw s2,H_P11(gp)
  lw s3,H_P21(gp)
@@ -766,7 +813,7 @@ br_integrate:
  bnez t2,1b
  beqz a2,9f
  /* Reuse the accumulator pointer to address the other neuron fields. */
- lw t1,N_FIRE-N_INPUT_E(t0)
+ STATUS_LOAD t1,N_FIRE-N_INPUT_E(t0)
  bnez t1,9f                /* post-active path handles LTD and LTP */
  lw t1,N_Y-N_INPUT_E(t0)
  beqz t1,9f                /* no learning effect; still count this delivery */
@@ -818,6 +865,14 @@ br_control_leaf:
  li t0,1
  bne a0,t0,6f
  sw zero,H_JOIN_COUNT(gp)
+#if BR_MORRISON
+ /* Prior phase 6 completed globally. New deliveries cannot start until
+  * every PU has reported this integration, so these resets cannot race. */
+ sw zero,H_RECEIVED(gp)
+ sw zero,H_REVERSE_RECEIVED(gp)
+ sw zero,H_EXPECTED_FORWARD(gp)
+ sw zero,H_EXPECTED_REVERSE(gp)
+#endif
  /* Clear only last step's firing flags, after the global drain and before
   * either integration worker starts. Keep this step's flags through dumps. */
  lw t1,H_FIRE_COUNT(gp)
@@ -825,7 +880,7 @@ br_control_leaf:
  beqz t1,.Lclear_fire_done
 .Lclear_fire:
  lw t2,0(t0)
- sw zero,N_FIRE(t2)
+ STATUS_STORE zero,N_FIRE(t2)
  addi t0,t0,4
  addi t1,t1,-1
  bnez t1,.Lclear_fire
@@ -833,12 +888,19 @@ br_control_leaf:
  sw zero,H_FIRE_COUNT(gp)
 #if BR_PROXY
  li t0,BR_BASE+PROXY_CONFIG
+#if BR_MORRISON
+ li t1,MR_PROXY_SEEN_WORDS
+ li t2,BR_BASE+MR_PROXY_SEEN
+.Lproxy_clear:
+ sw zero,0(t2)
+#else
  lw t1,G_JOBS(t0)
  li t2,BR_BASE+PROXY_JOBS
  beqz t1,.Lproxy_clear_done
 .Lproxy_clear:
  lw t3,0(t2)
  sw zero,P_FIRE(t3)
+#endif
  addi t2,t2,4
  addi t1,t1,-1
  bnez t1,.Lproxy_clear
@@ -1003,7 +1065,11 @@ br_boot:
  sw t1,0(t0)
  sw t1,128(t0)
  lw t0,H_MAGIC(gp)
+#if BR_MORRISON
+ li t1,MR_MAGIC
+#else
  li t1,0x42524e34
+#endif
  bne t0,t1,.Lboot_bad
  /* Fixed transport parameters; the image must match this compiled rule. */
  lw t0,H_MC(gp)
@@ -1045,12 +1111,33 @@ br_boot:
  addi t2,gp,256
  sw t2,H_EXCITATORY_END(gp)
  lw t3,H_NN(gp)
+#if BR_MORRISON
+ li t4,MR_MAX_NEURONS
+#else
  li t4,25
+#endif
  bgtu t3,t4,.Lboot_bad
  beqz t3,.Lboot_fire_done
  lw a4,H_POT(gp)
  lw a5,H_DEP(gp)
+#if BR_MORRISON
+ li t4,BR_BASE+MR_PARAMETERS
+ lw t5,16(t4)
+ li t6,MR_ABI_VERSION
+ bne t5,t6,.Lboot_bad
+ lw t5,20(t4)
+ li t6,BR_PROXY_SIZE
+ bne t5,t6,.Lboot_bad
+ lw t5,8(t4)
+ beqz t5,.Lboot_bad
+ li t6,16
+ bgtu t5,t6,.Lboot_bad
+ lw a6,H_PU(gp)
+ addi a6,a6,-1
+ lw a7,H_NUM_PU(gp)
+#endif
 .Lboot_fire_list:
+#if !BR_MORRISON
  /* Both channels have the same alpha filter. Keep their sum in two words;
   * incoming E/I accumulators remain separate. Convert the image only once. */
  lw t4,N_IE(t2)
@@ -1063,15 +1150,24 @@ br_boot:
  sw t4,N_D_TOTAL(t2)
  sw zero,N_II(t2)
  sw zero,N_DI(t2)
+#endif
  /* E records must be a contiguous prefix. Keep its end for both dynamic
   * integration workers; I traces are unused by this E->E plastic graph. */
+#if BR_MORRISON
+ mv t4,a6
+ add a6,a6,a7
+ li t5,BR_BASE+MR_PARAMETERS
+ lw t5,0(t5)
+#else
  lw t4,N_GID(t2)
  li t5,9000
+#endif
  bgeu t4,t5,.Lboot_inhibitory_traces
  lw t4,H_EXCITATORY_END(gp)
  bne t4,t2,.Lboot_bad
- addi t4,t2,80
+ addi t4,t2,N_BYTES
  sw t4,H_EXCITATORY_END(gp)
+#if !BR_MORRISON
  /* Images retain canonical traces. E runtime traces carry their learning
   * rates, avoiding repeated coefficient multiplications at receivers. */
  lw t4,N_X(t2)
@@ -1080,17 +1176,18 @@ br_boot:
  fmul.s t5,t5,a5
  sw t4,N_X(t2)
  sw t5,N_Y(t2)
+#endif
  j .Lboot_traces_ready
 .Lboot_inhibitory_traces:
  sw zero,N_X(t2)
  sw zero,N_Y(t2)
 .Lboot_traces_ready:
- lw t4,N_FIRE(t2)
+ STATUS_LOAD t4,N_FIRE(t2)
  beqz t4,1f
  sw t2,0(t0)
  addi t0,t0,4
  addi t1,t1,1
-1: addi t2,t2,80
+1: addi t2,t2,N_BYTES
  addi t3,t3,-1
  bnez t3,.Lboot_fire_list
 .Lboot_fire_done:
@@ -1120,11 +1217,13 @@ br_boot:
 #else
  bnez t1,.Lboot_bad
 #endif
+#if !BR_MORRISON
  li t0,BR_BASE+REPLAY
  lw t0,28(t0)
  beqz t0,.Lboot_bad
  li t1,256
  bgtu t0,t1,.Lboot_bad
+#endif
  lw t0,H_PU(gp)
  li t1,1
  bne t0,t1,.Lboot_report
@@ -1182,12 +1281,20 @@ br_boot:
  sw zero,H_ISSUED(gp)
  sw zero,H_CONSUMED(gp)
 .Lboot_report:
+#if !BR_MORRISON
  addi t0,gp,256
  lw t1,N_RNG(t0)
  sw t1,H_RNG0(gp)
- addi t0,t0,80
+ addi t0,t0,N_BYTES
  lw t1,N_RNG(t0)
  sw t1,H_RNG1(gp)
+#else
+ /* Compact images seed the two workers directly, with nonzero states. */
+ lw t0,H_RNG0(gp)
+ beqz t0,.Lboot_bad
+ lw t0,H_RNG1(gp)
+ beqz t0,.Lboot_bad
+#endif
  li a0,0
  li a1,0
  li a2,0
@@ -1215,7 +1322,21 @@ br_proxy_notify:
  li t3,BR_BASE+FIRED_LIST
  add t2,t2,t3
  lw t2,0(t2)
+#if BR_MORRISON
+ /* Local source slot + 1, reserving zero for an empty notification. */
+ sub a0,t2,gp
+ addi a0,a0,-256
+ srli a0,a0,5
+ li t2,BR_PROXY_SIZE
+ mul a0,a0,t2
+ lw t2,H_PU(gp)
+ addi t2,t2,-1
+ andi t2,t2,(BR_PROXY_SIZE-1)
+ add a0,a0,t2
+ addi a0,a0,1
+#else
  lw a0,N_BUFFER(t2)
+#endif
 #if BR_PROXY_TRACES
  lw a1,N_X(t2)
 #endif
@@ -1231,8 +1352,10 @@ br_proxy_notify:
 #endif
  lw t3,0(t2)
  SENDI t3,-1019              # 0xc05, same traffic class as spike delivery
+#if BR_PROXY_SIZE >= 2
  lw t3,4(t2)
  SENDI t3,-1019
+#endif
 #if BR_PROXY_SIZE >= 4
  lw t3,8(t2)
  SENDI t3,-1019
@@ -1261,6 +1384,23 @@ br_proxy_notify:
 br_proxy_receive:
  li t0,BR_BASE+PROXY_CONFIG
  beqz a0,.Lproxy_receive_marker
+#if BR_MORRISON
+ addi t1,a0,-1
+ li t2,PROXY_CAPACITY
+ bgeu t1,t2,.Lboot_bad
+ srli t2,t1,5
+ slli t2,t2,2
+ li t3,BR_BASE+MR_PROXY_SEEN
+ add t2,t2,t3
+ andi t1,t1,31
+ li t3,1
+ sll t3,t3,t1
+ lw t1,0(t2)
+ and t4,t1,t3
+ bnez t4,.Lboot_bad
+ or t1,t1,t3
+ sw t1,0(t2)
+#else
  add t1,gp,a0
  lw t2,P_FIRE(t1)
  bnez t2,.Lboot_bad        # each neuron is notified once per timestep
@@ -1269,13 +1409,22 @@ br_proxy_receive:
 #endif
  li t2,1
  sw t2,P_FIRE(t1)
+#endif
  lw t2,G_JOBS(t0)
  li t3,PROXY_CAPACITY
  bgeu t2,t3,.Lboot_bad
+#if BR_MORRISON
+ slli t3,t2,1
+#else
  slli t3,t2,2
+#endif
  li t4,BR_BASE+PROXY_JOBS
  add t3,t3,t4
+#if BR_MORRISON
+ sh a0,0(t3)
+#else
  sw t1,0(t3)
+#endif
  addi t2,t2,1
  sw t2,G_JOBS(t0)
 .Lproxy_receive_marker:
@@ -1330,6 +1479,21 @@ br_work:
 .Lfired_list_ready:
 #endif
  bgeu s1,t2,.Lwork_report
+#if BR_MORRISON
+ li t0,2
+ bne s0,t0,.Lcompact_home_row
+ slli t0,s1,1
+ add t0,t0,t1
+ lhu a0,0(t0)
+ addi a0,a0,-1
+ lw t0,H_WORK_LINE(gp)
+ bnez t0,.Lcompact_descriptor_ready
+ jal ra,br_descriptor
+.Lcompact_descriptor_ready:
+ li s2,BR_BASE+MR_DESCRIPTOR
+ j .Lwork_neuron_ready
+.Lcompact_home_row:
+#endif
  slli t0,s1,2
  add t0,t0,t1
  lw s2,0(t0)
@@ -1365,6 +1529,9 @@ br_work:
 #endif
  mv a0,s8
  li a1,PING
+#if BR_MORRISON
+ mv a2,s7
+#endif
  jal ra,br_ac_start
  YIELDI 11
  j br_idle
@@ -1388,7 +1555,15 @@ br_forward_wait:
  li t0,128
  bleu s4,t0,1f
  mv s4,t0
-1: slli s5,s11,10
+1:
+#if BR_MORRISON
+ /* Descriptor is no longer needed while draining. Keep the target-half
+  * displacement in s2; the work continuation reacquires the staged row. */
+ addi s2,s4,7
+ andi s2,s2,-8
+ slli s2,s2,2
+#endif
+ slli s5,s11,10
  li t0,BR_BASE+PING
  add s5,s5,t0
  slli t0,s4,2
@@ -1412,6 +1587,10 @@ br_forward_wait:
  slli a1,a1,10
  li t0,PING
  add a1,a1,t0
+#if BR_MORRISON
+ add a2,s3,s4
+ sub a2,s7,a2
+#endif
  jal ra,br_ac_start
  /* Keep the affine DRAM-to-SPM delta, advancing only one pointer per spike. */
  sub s6,s6,s5
@@ -1430,7 +1609,12 @@ br_forward_wait:
 .globl br_forward_drain
 br_forward_drain:
  bgeu s5,s9,.Lforward_chunk_done
+#if BR_MORRISON
+ add t0,s5,s2
+ lw t0,0(t0)
+#else
  lw t0,512(s5)             # destination: high 16 input offset, low 16 PU
+#endif
  lw a1,0(s5)               # already scaled FP32 weight
  srli a0,t0,16
  add a2,s5,s6
@@ -1485,11 +1669,28 @@ br_forward_row_done:
  j .Lwork_continue
 br_work_reverse_row:
 .Lwork_reverse_neuron:
+#if BR_MORRISON
+ lw t0,H_EXCITATORY_END(gp)
+ bgeu s2,t0,.Lwork_next_neuron
+ lw s8,N_Y(s2)
+ sub a0,s2,gp
+ addi a0,a0,-256
+ srli a0,a0,5
+ li t0,BR_PROXY_SIZE
+ mul a0,a0,t0
+ lw t0,H_PU(gp)
+ addi t0,t0,-1
+ andi t0,t0,(BR_PROXY_SIZE-1)
+ add a0,a0,t0
+ jal ra,br_descriptor
+ li s2,BR_BASE+MR_DESCRIPTOR
+#else
  lw t0,44(s2)
  li t1,9000
  bgeu t0,t1,.Lwork_next_neuron
  /* Reverse coefficients are constant for this row across all MC entries. */
  lw s8,N_Y(s2)
+#endif
 br_work_directory:
 .Lwork_directory:
  lw s9,H_SENT(gp)         # accumulator persists across directory continuations
@@ -1504,7 +1705,12 @@ br_work_directory:
  li s8,0
  li s11,0xc01
  j 2f
-1: lw s7,N_REVERSE_DIR(s2)
+1:
+#if BR_MORRISON
+ lw s7,24(s2)
+#else
+ lw s7,N_REVERSE_DIR(s2)
+#endif
 #if BR_RELAY_UPDATES
  li s11,0xc07           # scatter to the home trace relay, not weight handler
 #else
@@ -1515,6 +1721,20 @@ br_work_directory:
   * Issue all four scalar refills into READ[0..3], then consume each line
   * after its completion. The 12-request credit limit covers these requests
   * together with concurrent MSHR writebacks/refills. No AC is active here. */
+#if BR_MORRISON
+ li t0,BR_BASE+MR_PARAMETERS
+ lw s5,8(t0)
+ addi s5,s5,3
+ srli s5,s5,2
+.Ldirectory_load:
+ slli a0,s6,5
+ add a0,a0,s7
+ mv a1,s6
+ jal ra,br_load_start
+ addi s6,s6,1
+ bltu s6,s5,.Ldirectory_load
+ li s6,0
+#else
  mv a0,s7
  li a1,0
  jal ra,br_load_start
@@ -1527,9 +1747,15 @@ br_work_directory:
  addi a0,s7,96
  li a1,3
  jal ra,br_load_start
+#endif
  li s7,BR_BASE+READ
 .Ldirectory_resume:
+#if BR_MORRISON
+ li t0,BR_BASE+MR_PARAMETERS
+ lw t0,8(t0)
+#else
  li t0,16
+#endif
  bgeu s6,t0,.Ldirectory_done
  andi t0,s6,3
  bnez t0,3f
@@ -1640,6 +1866,22 @@ br_work_continue:
  YIELDI 8
 .Lwork_return:
  j br_idle
+#if BR_MORRISON
+/* a0=zero-based group source slot. Scalar ID-2 loads use the live AC base;
+ * wait for completion before returning to a caller that may start streaming. */
+br_descriptor:
+ ENTER 0
+ slli a0,a0,5
+ li t0,BR_BASE+MR_PARAMETERS
+ lw t0,12(t0)
+ add a0,a0,t0
+ li a1,0
+ li a2,(MR_DESCRIPTOR/32)
+ jal ra,br_line_start
+ li a0,0
+ jal ra,br_load_wait
+ LEAVE 0
+#endif
 /* Shared image format, hand-written boot copy. No C code in this payload. */
 .globl snn_init
 snn_init:

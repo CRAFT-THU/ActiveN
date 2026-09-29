@@ -1,113 +1,465 @@
 # Sparse Brunel training
 
-## Final performance and macroscopic check (2026-09-26)
+## Benchmark contract
 
-**Selected configuration: consecutive home G4 for both rules; seed 20260724.**
-The final benchmarks use 512 PUs, 16 MCs, two SMT threads, 32-byte memory
-lines, hot I-cache, eight simulator host threads, flat memory, and disabled
-payload diagnostics. Each has **60 warmup + 1,000 timed steps** at 0.1 ms/step.
-Additive starts after 1,120 presimulation steps and measures physical time
-**118–218 ms**; Morrison starts after 1,000 and measures **106–206 ms**.
+All benchmarks enable Ramulator **HBM2 timing** using the preserved
+`ramulator-hbm2-1ch.yaml`, one instance per MC, 32-byte transactions and an
+explicit 1 GHz core frequency. Verify `Ramulator enabled` in the simulator log
+and retain per-MC statistics. Flat-memory runs are diagnostic controls only.
+The soft backend and disabling the full hard backend are compatible with HBM2.
 
-| Final rule | Integration | Forward + quiet LTD | Post-active LTD/LTP | Drain | Total cycles/timestep |
+Both rules use their settled GeNN checkpoints listed below and seed 20260724.
+A **quick benchmark** has 60 warmup plus **1,000 timed steps**; a **full
+benchmark** has 60 warmup plus **10,000 timed steps**. With dt 0.1 ms, the timed
+intervals are 100 ms and 1,000 ms. Always collect phase/total cycles, E/I
+firing rates, synapse-update opportunities, and final weight mean/stddev over
+the same complete measured interval. Payload diagnostics stay disabled;
+passive simulator snapshots/profiles provide the dynamics and validation data.
+Compare the same interval of the same starting checkpoint when reporting a
+change, since FP reordering or SMT scheduling can alter the spike workload.
+
+The first corrective experiment repeated both final consecutive-home-G4
+payloads as quick HBM2 benchmarks, without a simulator or payload rebuild.
+Its flat-memory controls are steps 61–1,060 of the completed settled runs,
+not their full 10,000-step averages.
+
+## Full HBM2 benchmark results (2026-09-29)
+
+Both final **consecutive home G4** runs completed **60 warmup + 10,000 timed
+steps**, with seed **20260724**, their recorded settled GeNN checkpoints,
+512 PUs/16 MCs, two SMT pipes, 32-byte memory transactions, hot I-cache and
+1 GHz. Each measured interval is one simulated second at dt 0.1 ms. They
+ran sequentially on CRAFT-A100 with eight host threads, the same frozen
+payloads/simulator as the quick comparisons, explicit Ramulator HBM2 timing
+and disabled payload diagnostics. The startup log confirms an I-cache preload
+of 128 lines per PU at 0x80000000 and Ramulator tCK=1 ns / 32-byte transactions.
+
+| Rule | Raw timer cycles | Measured steps | Average cycles/timestep | Matching full flat control | HBM increase |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Additive | 1,693.114 | 2,380.411 | 1,702.191 | 638.692 | **6,414.411** |
-| Morrison | 1,742.243 | 4,262.263 | 2,705.465 | 644.491 | **9,354.465** |
+| Additive | 57632097 | 10000 | **5763.2097** | 5663.2455 | **1.765%** |
+| Morrison | 76523023 | 10000 | **7652.3023** | 7399.0577 | **3.423%** |
 
-The total includes three timer bookend cycles across the entire timed window.
+The end-to-end metric is the complete simulator timer total divided by 10,000,
+including communication, synchronization, memory stalls, drain and measured
+boundary overhead. The timer starts after warmup step 60 and stops after
+step 10,060. Observed inclusive timer ranges are 826583–58458679 for Additive
+and 952971–77475993 for Morrison. Phase counters below cover the same measured
+steps and sum to three cycles less than each timer, a difference of 0.0003
+cycles/timestep; they do not replace the timer metric.
 
-**Exact-window GeNN comparison.** The final check reused the preserved CUDA
-baseline binaries on CRAFT-A100, with the same model parameters and seed,
-and collected the exact intervals above. Both reruns reproduce the saved
-baseline’s complete 10,000-step firing and structural traversal counters.
-Weight moments below cover **all 4,050,000 plastic weights** on both sides,
-in original pA units; ActiveN stored weights are divided by
-`epsc * delivery = 37.30973184964796`. Standard deviations are population
-standard deviations. Percentage differences use GeNN as denominator.
+| Rule | Integration | Forward + quiet LTD | Post-active LTD/LTP | Drain |
+| --- | ---: | ---: | ---: | ---: |
+| Additive | 1690.5240 | 2013.0785 | 1420.5428 | 639.0641 |
+| Morrison | 1729.1249 | 3381.8970 | 1900.8538 | 640.4263 |
 
-| Metric | Additive ActiveN | Additive GeNN | Difference | Morrison ActiveN | Morrison GeNN | Difference |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| E firings/timestep | 3.243 | 5.059 | -35.90% | 5.108 | 5.271 | -3.09% |
-| I firings/timestep | 0.814 | 1.256 | -35.19% | 1.322 | 1.332 | -0.75% |
-| Mean E neuron rate, Hz | 3.6033 | 5.6211 | -35.90% | 5.6756 | 5.8567 | -3.09% |
-| Mean I neuron rate, Hz | 3.6178 | 5.5822 | -35.19% | 5.8756 | 5.9200 | -0.75% |
-| Plastic forward deliveries/timestep | 1,458.773 | 2,278.252 | -35.97% | 2,298.146 | 2,371.702 | -3.10% |
-| Plastic reverse traversals/timestep | 1,459.350 | 2,276.550 | -35.90% | 2,298.600 | 2,371.950 | -3.09% |
-| Quiet nonzero-trace updates/timestep | 828.258 | 1,437.163 | -42.37% | 1,458.718 | 1,455.162 | +0.24% |
-| Post-active nonzero-trace updates/timestep | 846.212 | 1,467.252 | -42.33% | 1,468.926 | 1,466.025 | +0.20% |
-| Total nonzero-trace updates/timestep | 1,674.470 | 2,904.415 | -42.35% | 2,927.644 | 2,921.187 | +0.22% |
-| Final weight mean, pA | 45.592928 | 45.586325 | +0.01% | 45.584923 | 45.587583 | -0.01% |
-| Final weight standard deviation, pA | 0.429724 | 0.503607 | -14.67% | 0.197111 | 0.190241 | +3.61% |
+These full-window results support retaining consecutive home G4 as the common
+configuration. They do not extend the group-size ranking to every alternative
+over 10,000 steps: the other configurations were compared only in the quick
+HBM experiment below. All individual spike identities/timesteps and all seven
+per-step activity columns match the corresponding full flat-memory controls
+exactly. Their reported final weight moments also match, so the HBM-versus-flat
+performance comparison has the same observed workload.
 
-An update here counts an edge once in a timestep if an LTD or LTP term has
-a nonzero prior partner trace; quiet and post-active sets are disjoint.
-GeNN opportunities are reconstructed from its recorded spikes and actual
-graph using the same definition, including parallel edges and excluding
-zero-lag trace increments. The same reconstruction exactly reproduces both
-ActiveN runs’ saved update counts. This measures learning work, not GPU
-kernel invocations, two separate counts for LTD and LTP on one edge, or
-weights whose FP32 bits changed. Counts are associated with firings in the
-stated interval; GeNN executes the corresponding synapse kernels on the
-following step. Weight moments are measured at each stated endpoint.
+The macroscopic comparison uses all 10,000 measured timesteps from the same
+settled checkpoint for each rule. GeNN retains its native RNG; ActiveN uses
+its existing per-SMT RNG and reordered/compensated learning implementation.
+The baseline below is the existing GeNN A100 continuation, not a new GPU run.
+Updates are synapse-update opportunities, not counts of bitwise weight changes.
+Weight mean and population standard deviation cover all 4,050,000 plastic
+weights after conversion from stored current units to pA.
 
-**Assessment: Morrison agrees closely over the final window; the final
-Additive window does not by itself establish close macroscopic agreement.**
-Morrison differs by −3.09% in E firing, −0.75% in I firing, +0.22% in update
-work, −0.002659 pA in mean weight, and +3.61% in weight spread. Additive has
-−35.90% E firing, −35.19% I firing, −42.35% update work and −14.67% weight
-spread, despite its close mean weight (+0.006603 pA). Its lower benchmark
-cost therefore must not be presented as a measurement with GeNN-matched
-activity, or as a one-second steady-state result.
+| Rule | Implementation | E spikes/step | I spikes/step | E Hz | I Hz | Updates/step | Final mean, pA | Final σ, pA |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Additive | ActiveN HBM2 | 0.6897 | 0.3114 | 0.766333 | 1.384000 | 551.8401 | 36.630781 | 24.142651 |
+| Additive | GeNN A100 | 0.6651 | 0.3027 | 0.739000 | 1.345333 | 533.5647 | 36.630713 | 24.142576 |
+| Morrison | ActiveN HBM2 | 1.1215 | 0.6457 | 1.246111 | 2.869778 | 983.3579 | 31.115592 | 3.881498 |
+| Morrison | GeNN A100 | 1.1522 | 0.6493 | 1.280222 | 2.885778 | 1011.3510 | 31.115529 | 3.881446 |
 
-Additive is strongly bursty: the ten nonoverlapping 100-ms windows of this
-GeNN baseline range from **2.060 to 7.404 E firings/timestep**, encompassing
-the final run’s 3.243. This supports short-window variability as a plausible
-explanation; it is not an equivalence test or proof that the final trajectory
-will converge. The implementations use different graph/noise realizations
-even with the same numeric seed.
+Relative to GeNN, E/I firing and update differences are respectively
++3.699% / +2.874% / +3.425% for Additive and
+-2.664% / -0.554% / -2.768% for Morrison. Final weight means differ by less
+than 0.00007 pA and standard deviations by less than 0.00008 pA. The prior
+close macroscopic agreement persists, as does Morrison's 2.77% favorable
+update-workload difference. This single-seed result does not prove exact
+stochastic equivalence or that all residual differences are random noise.
 
-**Longer validation remains supporting evidence, not a new G4 measurement.**
-The previously validated, ungrouped V3 runs cover physical 100–1,100 ms
-(10,000 steps) for both rules. Comparing those saved ActiveN trajectories
-with the reproduced GeNN baseline gives:
+Both simulator processes exit with result zero. Saved numerical replay reports
+cover every one of the 10,060 snapshots per rule: voltage and total-current
+integration are exact against one-step replay, firing/refractory checks have
+zero mismatches, and the combined-derivative roundoff bound has no violations.
+Maximum final-weight replay errors are 0.00048828125 for Additive and
+0.000244140625 for Morrison in stored current units. These are checks using
+observed randomness, not equality of free-running ActiveN and GeNN trajectories.
 
-| Earlier 10,000-step validation | Additive ActiveN | Additive GeNN | Difference | Morrison ActiveN | Morrison GeNN | Difference |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| E firings/timestep | 4.1404 | 3.9755 | +4.15% | 5.1454 | 5.3597 | -4.00% |
-| I firings/timestep | 1.0404 | 1.0141 | +2.59% | 1.3221 | 1.3492 | -2.01% |
-| Nonzero-trace updates/timestep | 3,256.718 | 3,229.265 | +0.85% | 4,241.668 | 4,403.083 | -3.67% |
-| Final weight mean, pA | 45.477458 | 45.476285 | +0.00% | 45.460167 | 45.453724 | +0.01% |
-| Final weight standard deviation, pA | 1.036851 | 1.013320 | +2.32% | 0.438639 | 0.449642 | -2.45% |
+The complete run artifacts remain on CRAFT-A100 under
+`/data/meow/ActiveN-stdp/brunel-hbm-full-20260928-v1/`.
+The local `copilot/tmp/brunel-hbm-full-20260928-v1/review-20260929-v1/`
+contains collected complete simulator logs, MC profiles, timer/dynamics
+accounting, configuration and provenance, the proposed update and its
+independent review. Raw snapshots, initial images and final DRAM dumps remain
+available on the server. No workload or simulator was rebuilt for this run.
 
-The new GeNN weight statistics use the full population from the preserved
-A100 binaries; older tables below used the original 100,000-weight samples.
-The earlier five-seed Morrison comparison also found only +0.068% E and
-+0.144% I activity in the ActiveN ensemble, with closely matching weight
-moments. These results support broad macroscopic agreement of the learning
-implementation. Grouped Morrison preserves all firing identities over the
-1,060-step overlap with V3; all tested final grouped layouts preserve their
-matched trajectories and final weights. Additive’s final checkpoint differs
-from the old long run, so its old statistics cannot be relabeled as G4 results.
+## HBM2 quick retest (2026-09-27)
 
-The optimization and configuration selection are recorded as complete, with
-the final numerical checks passing. A blanket claim that **both final
-1,000-step benchmarks** match GeNN’s macroscopic activity is not supported.
-A direct long-duration check of the final Additive G4 configuration would be
-needed to remove that qualification; the final cycle figures remain valid
-for their explicitly measured activity and flat-memory conditions.
+Both unchanged consecutive-home-G4 payloads completed **60 warmup and
+1,000 timed steps** with HBM2 enabled and passed numerical validation. They
+ran sequentially on the same frozen simulator, using **seed 20260724**,
+their recorded settled checkpoints, 512 PUs/16 MCs, 32-byte memory lines,
+two SMT pipes, hot I-cache, 1 GHz and eight host threads. Payload diagnostics
+are disabled; passive snapshots provide the activity and validation data.
 
-Reproducibility: the final payload SHA-256 values are
-`101154d6eb73b056994b61601dcb3d54ea4e33b24b2d653bb97e4f39e524a665`
-(Additive) and
-`450c86e6a633cc40b1914e4e7a665763e8773eb04f3f7c8db52f7e1046ed1bc3`
-(Morrison). Final performance sources are the dated configuration section
-below. This check’s scripts, baseline/build identities, complete comparison
-JSON and independent count checks are in
-[`copilot/tmp/brunel-final-macros-20260926/`](../copilot/tmp/brunel-final-macros-20260926/);
-GPU spike/graph diagnostics are preserved at the matching directory under
-`/data/meow/ActiveN-stdp/` on CRAFT-A100. Earlier long and seed validation
-sources are `copilot/tmp/brunel-v3-long-20260919/both-comparison.json` and
-`copilot/tmp/brunel-morrison-seeds-20260920/ensemble-comparison.json`.
+| Rule / memory | Integration | Forward + quiet LTD | Post-active LTD/LTP | Drain | Cycles/timestep |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Additive / HBM2 | 1690.726 | 2035.254 | 1427.761 | 639.019 | **5792.763** |
+| Additive / flat, same 1,000 steps | 1690.703 | 1973.781 | 1389.789 | 638.951 | 5693.224 |
+| Morrison / HBM2 | 1729.460 | 3417.294 | 1908.667 | 640.584 | **7696.008** |
+| Morrison / flat, same 1,000 steps | 1729.445 | 3236.096 | 1834.691 | 639.328 | 7439.560 |
+
+HBM2 adds **1.748% for Additive** and **3.447% for Morrison** to the matched
+phase totals. The measured HBM timers include three bookend cycles each
+(0.003 cycles/timestep); the flat subsets and percentage comparisons use
+phase sums. Almost all of the increase is in forward and post-active work:
+61.473 + 37.972 cycles/timestep for Additive, and 181.198 + 73.976 for Morrison.
+
+The preliminary **first 300 timed steps**, after the same 60-step warmup,
+averaged 6323.707 versus 6181.013 cycles/timestep for Additive (+2.309%),
+and 7917.433 versus 7625.330 for Morrison (+3.831%). The complete 1,000-step
+means include the subsequent activity rather than extrapolating those prefixes.
+
+Quiet steps dilute the overall memory penalty. The following rows select
+only timesteps with at least one nonzero learning-update opportunity; HBM
+and flat runs select exactly the same steps:
+
+| Rule | Fraction of all steps | HBM cycles/selected timestep | Flat cycles/selected timestep | Increase |
+| --- | ---: | ---: | ---: | ---: |
+| Additive | 13.5% | 10358.919 | 9627.570 | 7.596% |
+| Morrison | 66.5% | 8834.480 | 8452.438 | 4.520% |
+
+For **both rules**, spike identities/timesteps and all seven per-step activity
+columns match their flat controls exactly throughout the measured window.
+The HBM-versus-flat timing comparison therefore uses the same recorded work.
+Macroscopic measures below are arithmetic means over all 1,000 timed steps:
+
+| Rule | E spikes/step | I spikes/step | E Hz | I Hz | Updates/step | Final mean, pA | Final σ, pA |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Additive | 0.769 | 0.344 | 0.85444 | 1.52889 | 591.167 | 36.631170 | 24.140582 |
+| Morrison | 1.132 | 0.654 | 1.25778 | 2.90667 | 976.048 | 31.116449 | 3.881355 |
+
+Additive averages 345.585 plastic deliveries, 311.220 quiet updates and
+279.947 post-active updates/timestep; Morrison averages 509.125, 499.292 and
+476.756, respectively. Starting weight mean/σ are 36.631188/24.140264 pA
+for Additive and 31.116564/3.881331 pA for Morrison. Weight moments cover all
+4,050,000 plastic weights; σ is the population standard deviation.
+
+For context, the existing GeNN A100 diagnostics over the same first 1,000
+timed steps average 0.737 E spikes, 0.319 I spikes and 567.876 updates/step
+for Additive, and 1.212, 0.656 and 1045.099 for Morrison. ActiveN's differences
+are +4.342%/+7.837%/+4.101% and -6.601%/-0.305%/-6.607%, respectively.
+These short-window differences already exist in the matched flat controls;
+enabling HBM has not changed the spike workload. They do not replace the
+longer GeNN comparison below. No new GPU runs were performed, and the saved
+GeNN final weight moments at 10,000 steps are not compared to these 1,000-step
+final weights.
+
+All 1,060 snapshots **per rule** pass deterministic replay and transport checks. Voltage
+and total-current integration match the replay exactly; firing/refractory
+checks have no mismatches, and the combined-derivative roundoff bound has no
+violations. Maximum final-weight replay errors are 0.00048828125 for Additive
+and 0.0001220703125 for Morrison, in stored current units, across all weights.
+
+Memory statistics cover the same timed windows:
+
+| Rule | Reads/step | Writes/step | Rejected MC cycles/step, summed across MCs | Mean request latency, cycles | Accepted bandwidth, GB/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Additive | 583.059 | 591.167 | 692.287 | 92.467 | 6.487 |
+| Morrison | 949.032 | 976.048 | 260.973 | 51.601 | 8.004 |
+
+The write counts equal the independently reconstructed update counts, and
+all timed requests have completed at timer stop. Bandwidth sums all 16 MCs
+and counts 32-byte transactions, including masked scalar writes. Rejected MC
+cycles may overlap across controllers and are not extra elapsed phase cycles.
+These control measurements establish this configuration's HBM performance
+for this window. The group comparison below tests alternative configurations;
+the full HBM results above cover the longer measured interval.
+
+Artifacts: `copilot/tmp/brunel-hbm-quick-20260927-v1/` and the matching
+CRAFT-A100 directory. `command.json` records explicit HBM/frequency flags and
+binary/input hashes; `hbm-startup.json`, all 16 MC statistics files,
+`comparison.json` and `completion-audit.json` preserve the timing and matched
+workload checks. The simulator and payloads were not rebuilt or modified.
+
+### HBM bandwidth and MemIf occupancy
+
+The following measurements use the complete **1,000 timed steps** of the
+consecutive-home-G4 HBM controls above. The preserved HBM2 configuration has
+two 64-bit pseudochannels at 2 GT/s per controller: **32 GB/s per MC** and
+**512 GB/s across 16 MCs**. Bandwidth utilization is served DRAM transaction
+bytes divided by this peak and elapsed time; it is not the fraction of cycles
+spent on commands, refresh or other DRAM activity.
+
+| Rule | Served bandwidth, GB/s | Fraction of peak bandwidth | Average occupied MemIf slots / MC | Average slot-capacity use | Peak occupied slots / MC |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Additive | 6.487 | 1.267% | 2.211 | 0.864% | 256 / 256 |
+| Morrison | 8.004 | 1.563% | 0.935 | 0.365% | 256 / 256 |
+
+MemIf occupancy comes from `mc-profile.csv`, which accumulates
+`allocated.count()` every cycle in the frozen software backend. These are
+time-weighted averages over controllers and all measured phases, including
+idle intervals. They are not Ramulator queue occupancy or just accepted
+requests awaiting a DRAM response. Allocated slots include requests not yet
+issued, requests waiting for responses, and fulfilled requests awaiting
+retirement:
+
+| Rule | Unissued / MC | Issued, awaiting response / MC | Fulfilled, not retired / MC | Forward-phase total / MC | Post-active-phase total / MC |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Additive | 1.013 | 1.172 | 0.0265 | 1.942 | 6.204 |
+| Morrison | 0.120 | 0.807 | 0.0077 | 0.762 | 2.404 |
+
+The averages conceal bursts: **1.8% of Additive timesteps** and **0.2% of
+Morrison timesteps** reach 256 occupied slots in at least one MC. The highest
+average occupancy within one MC/phase/timestep interval is 155.069 slots for
+Additive and 73.513 for Morrison, both in the forward phase. The profile
+records interval maxima but not the number of cycles spent at full capacity.
+Low average bandwidth and occupancy therefore do not exclude localized
+request backpressure or latency stalls. The busiest controller's whole-window
+bandwidth utilization is only 1.444% for Additive and 1.725% for Morrison.
+
+Ramulator's own average queue occupancy is 0.984 entries/MC for Additive and
+0.585 for Morrison. Served-byte accounting excludes Additive's 0.005
+write-buffer-forwarded reads/timestep; Morrison has none. Neither run has
+coalesced writes. Both accepted and served bandwidth round to the values
+shown above, and all timed requests complete before the timer stops.
+
+Reproduction: `copilot/tmp/brunel-hbm-groups-20260927-v1/analyze_memory.py`
+reads the controls' raw MC profiles and all 16 Ramulator YAML files.
+`memory-utilization.json` preserves overall, phase and per-MC statistics,
+including peak-occupancy interval identities.
+
+### Completed HBM group comparison (checked 2026-09-28)
+
+All **ten additional quick benchmarks completed and passed validation** on
+CRAFT-A100, running one simulator at a time with eight host threads. Each
+uses 60 warmup + 1,000 timed steps, seed 20260724, the same settled checkpoint
+for its rule, hot I-cache, 1 GHz, HBM2 and disabled payload diagnostics.
+The simulator and existing payload variants were not rebuilt. The two
+completed consecutive-home-G4 HBM runs above serve as controls.
+
+These are arithmetic means over the complete 1,000 measured steps; percentage
+differences use the same rule's consecutive-home-G4 HBM control:
+
+| Configuration | Additive cycles/timestep | Difference | Morrison cycles/timestep | Difference |
+| --- | ---: | ---: | ---: | ---: |
+| Consecutive home G4 | 5792.763 | control | **7696.008** | control |
+| Consecutive home G2 | **5766.419** | -0.455% | 8352.026 | +8.524% |
+| Consecutive home G8 | 6259.965 | +8.065% | 7990.657 | +3.829% |
+| Distant home G4 | 5841.253 | +0.837% | 7718.662 | +0.294% |
+| Distant home G8 | 6231.080 | +7.567% | 7781.546 | +1.111% |
+| Distant relay G4 | 5874.748 | +1.415% | 8169.054 | +6.147% |
+
+Consecutive home G4 is the fastest tested configuration for Morrison and
+remains the preferred common configuration. Additive's G2 advantage is only
+26.344 cycles/timestep, while G2 costs Morrison 656.018 cycles/timestep.
+Thus G4 is close to the Additive optimum in this window, rather than literally
+the fastest for both rules. This remains a single-checkpoint, 1,000-step
+comparison of selected contenders, not an exhaustive topology search or a
+10,000-step HBM benchmark.
+
+All values below are average cycles/timestep. Timers include an additional
+0.003 cycles/timestep beyond the four phase sums:
+
+| Rule | Configuration | Integration | Forward + quiet LTD | Post-active LTD/LTP | Drain |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Additive | Consecutive home G4 | 1690.726 | 2035.254 | 1427.761 | 639.019 |
+| Additive | Consecutive home G2 | 1690.692 | 2008.914 | 1427.837 | 638.973 |
+| Additive | Consecutive home G8 | 1690.788 | 2490.590 | 1439.629 | 638.955 |
+| Additive | Distant home G4 | 1690.741 | 1967.094 | 1543.997 | 639.418 |
+| Additive | Distant home G8 | 1690.772 | 2294.906 | 1603.240 | 642.159 |
+| Additive | Distant relay G4 | 1690.830 | 1965.079 | 1579.663 | 639.173 |
+| Morrison | Consecutive home G4 | 1729.460 | 3417.294 | 1908.667 | 640.584 |
+| Morrison | Consecutive home G2 | 1729.433 | 4077.084 | 1904.825 | 640.681 |
+| Morrison | Consecutive home G8 | 1729.498 | 3716.767 | 1903.290 | 641.099 |
+| Morrison | Distant home G4 | 1729.492 | 3291.929 | 2054.404 | 642.834 |
+| Morrison | Distant home G8 | 1729.547 | 3227.763 | 2162.031 | 662.202 |
+| Morrison | Distant relay G4 | 1729.632 | 3289.959 | 2509.711 | 639.749 |
+
+Compared with consecutive home G4, distant home G4 saves 68.160 forward
+cycles/timestep for Additive and 125.365 for Morrison, but adds 116.236 and
+145.737 post-active cycles, respectively. Morrison's distant home G8 saves
+189.531 forward cycles but adds 253.364 post-active and 21.618 drain cycles.
+These measured tradeoffs explain why the forwarding improvement does not
+produce the lowest whole-step time.
+
+Before launch, every case checked that its graph, weights and physical neuron
+state matched its control exactly; only the layout-dependent proxy-row
+descriptor was excluded from the state comparison. Every case completes all
+1,060 snapshots with exit/result zero and passes independent numerical replay.
+The derivative-roundoff checks have no violations. **Spike identities,
+timesteps and all seven measured per-step activity columns match the G4
+control exactly for every configuration.** Reported final weight means,
+standard deviations and quantiles also match their respective controls.
+The performance ranking therefore does not result from different spike or
+update workloads. Activity remains 0.769 E spikes, 0.344 I spikes and 591.167
+updates/timestep for Additive; Morrison averages 1.132, 0.654 and 976.048.
+
+Across all six tested configurations, average HBM bandwidth utilization ranges
+from 1.240% to 1.303% for Additive and 1.418% to 1.682% for Morrison.
+Time-weighted occupied MemIf slots per MC range from 2.102 to 3.592 and
+0.827 to 1.957, respectively. Whole-window averages remain low; all Additive
+configurations reach 256 slots in at least one burst. Morrison's consecutive
+home G2 and distant relay G4 peak at 205 and 140; its other configurations
+reach 256. Per-phase and per-MC details are retained in the analysis artifact.
+
+The controller and artifacts reside in
+`copilot/tmp/brunel-hbm-groups-20260927-v1/`, mirrored at
+`/data/meow/ActiveN-stdp/brunel-hbm-groups-20260927-v1/` on CRAFT-A100.
+The local `collected/` directory contains the completed `status.json`, all
+ten results, per-case validation/provenance/dynamics and Ramulator statistics,
+`completion-audit.json`, and the updated `memory-utilization.json` covering
+all twelve runs including controls. Raw snapshots and MC profiles remain
+on the server. No 10,000-step HBM run was launched as part of this queue.
+
+## Previous full-length flat-memory diagnostics (2026-09-27)
+
+**The preceding full-length ActiveN runs omitted `--ramulator-config`. Their cycle counts
+use flat memory and are not the final 2×HBM2 performance benchmark. The GPU
+speedup interpretation from those flat runs remains withdrawn; full HBM timings are reported above.**
+The completed state/learning validation and macroscopic comparison remain
+evidence for the flat-memory executions; the quick HBM retest above validates
+its own shorter interval. Consecutive home G4 is the best common configuration among
+the recorded flat-memory comparisons, not a demonstrated HBM optimum.
+
+The September 15 LoadManual/ping-pong benchmark used Ramulator HBM2 timing.
+The September 16 safe-assembly benchmark, September 17 iterative-power
+benchmark, later group-selection comparisons, and these settled continuations
+used flat memory. Consequently, reductions across the HBM-to-flat transition
+must not be attributed entirely to workload or assembly optimization.
+The settled launcher explicitly records `memory='flat'`; its omission of the
+Ramulator argument was carried forward from earlier runs. This is an
+experiment-configuration error, not a requirement of the software backend or
+of building with `ENABLE_HARD_BACKEND=OFF`.
+
+In flat mode, `System::Impl::serveFlatMemReq` handles an accepted request
+immediately and queues its response for the following frontend cycle. Core,
+NoC, MemIf and response-transport timing remain modeled, but DRAM access
+latency, bank/row timing, refresh and DRAM scheduling/bandwidth constraints
+are absent. Inferences about latency hiding, MSHR sufficiency, memory
+bottlenecks and configuration rankings therefore require HBM measurements.
+
+**Consecutive home G4 for both rules; seed 20260724; 60 warmup + 10,000
+timed steps (6 ms + 1,000 ms).** Both runs use the frozen 512-PU/16-MC
+simulator, two SMT pipes, 32-byte memory lines, hot I-cache, flat memory,
+eight host threads and disabled payload diagnostics. No RTL or simulator
+changes are part of this experiment. All accumulation figures below are
+averages over the same complete timed interval.
+
+| Rule | Integration | Forward + quiet LTD | Post-active LTD/LTP | Drain | Cycles/timestep |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Additive | 1690.5304 | 1952.6442 | 1381.0809 | 638.9897 | **5663.2455** |
+| Morrison | 1729.1306 | 3201.8456 | 1828.6638 | 639.4174 | **7399.0577** |
+
+The timer includes three bookend cycles across the complete measured window.
+These cycle counts apply to the stated flat-memory simulator configuration.
+Both runs completed all 10,060 steps with result zero and passed independent
+numerical validation. Every phase has exactly 10,000 measured intervals.
+The ten consecutive 100-ms block means range from 5603.766 to 5726.053
+cycles/timestep for Additive and 7274.009 to 7473.153 for Morrison; the headline
+means include every measured step.
+
+The corresponding GPU wall times are arithmetic means of **all five**
+unprofiled repetitions, including the slower first repetition:
+
+| Rule | GeNN A100, µs/timestep | GeNN RTX 3090, µs/timestep |
+| --- | ---: | ---: |
+| Additive | 19.395 | 30.447 |
+| Morrison | 25.638 | 33.954 |
+
+No hardware speedup conclusion is drawn from the flat-memory ActiveN cycles.
+The earlier reported GPU/ActiveN ratios do not establish HBM-system speedups.
+Relative to the earlier 60+1,000-step flat-memory home
+G4 results (6414.411 Additive, 9354.465 Morrison cycles/timestep), cycles fall
+11.71% and 20.90%. The payload and simulator are unchanged: those earlier
+windows started from a much more active, early network state. This is a
+starting-state/workload difference, not another kernel optimization gain.
+
+| Rule | Implementation | E spikes/step | I spikes/step | E Hz | I Hz | Updates/step | Final mean, pA | Final σ, pA |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Additive | ActiveN | 0.6897 | 0.3114 | 0.7663 | 1.3840 | 551.840 | 36.630781 | 24.142651 |
+| Additive | GeNN A100 | 0.6651 | 0.3027 | 0.7390 | 1.3453 | 533.565 | 36.630713 | 24.142576 |
+| Additive | GeNN RTX 3090 | 0.6651 | 0.3027 | 0.7390 | 1.3453 | 533.565 | 36.630713 | 24.142576 |
+| Morrison | ActiveN | 1.1215 | 0.6457 | 1.2461 | 2.8698 | 983.358 | 31.115592 | 3.881498 |
+| Morrison | GeNN A100 | 1.1522 | 0.6493 | 1.2802 | 2.8858 | 1011.351 | 31.115529 | 3.881446 |
+| Morrison | GeNN RTX 3090 | 1.1522 | 0.6493 | 1.2802 | 2.8858 | 1011.351 | 31.115529 | 3.881446 |
+
+Relative differences below use the matched GeNN A100 diagnostic as the
+denominator; no assertion of exact stochastic equivalence is implied.
+
+| Rule | E firing difference | I firing difference | Update difference | Mean-weight difference | Weight-σ difference |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Additive | +3.699% | +2.874% | +3.425% | +0.000186% | +0.000312% |
+| Morrison | -2.664% | -0.554% | -2.768% | +0.000200% | +0.001349% |
+
+The complete one-second continuations show close macroscopic agreement:
+all E/I firing differences are below 3.70%, update differences below 3.43%,
+and final weight means differ by less than 0.00007 pA. The sampled 1st, 5th,
+25th, 50th, 75th, 95th and 99th weight percentiles differ by at most 0.003102
+pA for Additive and 0.002295 pA for Morrison. A100 and RTX 3090 diagnostic
+spike identities and per-step activity histories agree exactly with each other.
+
+Additive performs slightly more learning work than GeNN; Morrison performs
+2.77% fewer updates, which is a small favorable workload difference for ActiveN.
+It would be incorrect to claim that both ActiveN measurements do at least as
+much work as GeNN. This single-seed comparison does not establish that the
+remaining differences are purely random, nor that the learning laws are
+identical over arbitrarily long continuations. Final weight moments also
+largely reflect the shared settled starting distribution.
+
+An update counts each synapse once per timestep when a prior partner trace
+makes LTD or LTP nonzero, including parallel edges. It is an opportunity
+count rather than a bit-change count. Weight moments cover every plastic
+weight, converted back from stored current units to pA; σ is the population
+standard deviation. Numerical checks independently replay deterministic
+neuron/learning operations using observed external samples and verify final
+DRAM weights and each delivery, with the recorded FP32 error bounds.
+Across all 10,060 steps, voltage and total-current updates match the independent
+one-step replay exactly; firing and refractory checks have zero mismatches.
+There are no violations of the combined current-derivative rounding bound.
+Maximum final-weight errors against the replay are 0.00048828125 (Additive)
+and 0.000244140625 (Morrison), in stored current units, over all 4,050,000
+weights. This validates deterministic operations with observed randomness,
+not agreement of the free-running random trajectories. Disabled payload
+counters are not used to infer zero traffic: activity is reconstructed from
+passive state snapshots and the exact graph.
+
+Both implementations start from the same graph, weights, membrane/current
+states, refractory counters, STDP history and pending inputs. GeNN retains
+its native RNG; ActiveN uses its established independent per-SMT RNG.
+Lazy edge traces are normalized to per-neuron traces with measured conversion
+error. The benchmark preserves the established ActiveN event-order
+approximations, so the table is a macroscopic comparison, not a bitwise
+trajectory match.
+
+| Rule | Settled checkpoint time, s | Checkpoint SHA-256 |
+| --- | ---: | --- |
+| Additive | 4500.0 | `7cee2f6308035ef8ed18ba6e2fa48489a3dbff1ba6a7a741c4868c8eb6e609a0` |
+| Morrison | 3000.0 | `e04d0e1a16dffd7d40786cc148c09499343e620e7b89e2ebf3253ffd7f015f02` |
+
+The initial 2,000-second preparation diagnostics failed the declared
+settling checks and were retained. Extended runs used the same thresholds,
+with a 20,000-second preparation limit. Final checkpoints passed two
+successive checks of a trailing 100-second window for weight spread, mean,
+distribution and E/I firing-rate stability. Current GeNN uses integer STDP
+timestamps. The full protocol and A100/RTX 3090 timing results are in
+`../stdp-experiments/BASELINE.md`; power and new A800/H800 data remain pending.
+Artifacts and full per-window results: `copilot/tmp/brunel-settled-20260927/`
+and the matching CRAFT-A100 directory. `completion-audit.json` records the
+remote completion markers, validation and timer totals; `final-audit-v1.json`
+checks all six reports, shared checkpoint hashes, full-window activity,
+GPU means and 100-ms blocks. Earlier sections below are historical
+configuration-selection results, not the settled-checkpoint measurements.
+The full 60+10,000-step HBM2 runs, detailed memory-stall attribution and HBM
+configuration comparison remain outstanding; quick-window memory statistics
+are reported above. Preserve the flat-memory
+artifacts as controls rather than overwriting or relabeling them.
 
 The hand-written `sim/payloads/sys/brunel_runtime.S` implements
 Additive and Morrison training on
@@ -116,19 +468,21 @@ Additive and Morrison training on
 `datagen/brunel_validate.py` compares simulator snapshots against that reference.
 This is a separate payload; it does not change the existing MNIST formats.
 
-## Final configuration and completed optimization (2026-09-25)
+## Historical configuration selection (2026-09-25)
 
 Use **consecutive groups of four PUs with home-owned post-active learning**
 for both Additive and Morrison:
 `--proxy-groups consecutive --proxy-size 4 --proxy-updates home`.
-This concludes the current Brunel optimization campaign. It is the best common
-configuration supported by the tested layouts and windows, and has the lowest
+This was the selected common configuration for the flat-memory campaign;
+the quick HBM retest above measures it, but its HBM configuration ranking
+remains unverified. It is the best
+common configuration supported by those tested layouts and windows, and has the lowest
 cost among the completed long-run configurations for each rule. Morrison's
 short pilot was only 0.19% behind distant home G8; the missing longer comparison
 now favors consecutive home G4 by **3.64%**. A separate Morrison G8 recommendation
 is therefore unnecessary for these workloads.
 
-Both final benchmarks use **60 warmup and 1,000 timed steps**, the same frozen
+Both historical selection benchmarks use **60 warmup and 1,000 timed steps**, the same frozen
 512-PU/16-MC simulator, 32-byte memory lines, two SMT pipes, hot I-cache and flat
 memory. Payload diagnostics are **off**; passive simulator profiles are on.
 Seed 20260724 and each rule's starting checkpoint match the earlier comparisons:
@@ -157,7 +511,7 @@ lower absolute cost than the active pilot; the compared layouts have identical
 activity within each window. The full report includes 100-step block comparisons,
 so a favorable whole-window mean is not a claim of winning every short interval.
 
-Average **events per timestep** for the final configurations:
+Average **events per timestep** for those historical selection runs:
 
 | Rule | E firings | I firings | Plastic deliveries | Static deliveries | Quiet LTD updates | Post-active updates | Remote post-active loads |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -236,10 +590,11 @@ from the reported simulated cycles per timestep.
 
 This configuration conclusion applies to the tested checkpoints and flat-memory
 frontend; it does not establish an optimum for every seed or a detailed HBM
-timing model. The prior multi-seed GeNN comparison remains the macroscopic
-dynamics evidence, while the grouping experiments establish matched workload
-and numerical preservation over the benchmark windows. Earlier dated sections
-below retain the measurements and interpretations at each stage of the campaign.
+timing model. The settled shared-checkpoint comparison at the top is the current
+macroscopic dynamics result; the prior multi-seed checks remain historical
+evidence. The grouping experiments establish matched workload and numerical
+preservation over their benchmark windows. Earlier dated sections below retain
+the measurements and interpretations at each stage of the campaign.
 
 ## Model and comparison contract
 
@@ -263,8 +618,15 @@ The model follows the selected sparse, zero-delay alpha-current Brunel cases in
 | External-rate scale, Additive / Morrison | 0.47 / 0.32 |
 
 Connections are sampled with replacement, excluding recurrent autapses.
-The NumPy RNG realization is recorded in the manifest: using the same seed does
-**not** reproduce GeNN's graph RNG stream. External input is Poisson-distributed.
+The default generator records its NumPy RNG realization in the manifest:
+using the same seed does **not** reproduce GeNN's graph RNG stream. The shared
+checkpoint path instead imports GeNN's exact multigraph, including parallel
+edges and their individual weights. Use `--load-genn-checkpoint PATH --presim 0`
+with `--warmup 60 --timed 10000 --proxy-groups consecutive --proxy-size 4
+--proxy-updates home`; `--seek-active` is incompatible with checkpoint import.
+The manifest records the checkpoint SHA-256 and the independent future RNG.
+The importer checks the phase boundary, clocks, topology and state before
+generating images. External input is Poisson-distributed.
 The payload keeps one xorshift32 state per SMT thread in a register during
 integration and uses one draw per neuron with a generated inverse-CDF table.
 The nine thresholds represent counts 0–8; the very small remaining tail is
@@ -1091,8 +1453,11 @@ Build and run through the Nix development shell, using an already-built 512-PU,
 16-MC, 256-bit, two-SMT, 8 KiB ICache simulator. Workload-only changes need no
 simulator rebuild or re-elaboration. The following example assumes `sim_system`
 is that matching binary; use a preserved binary path if another session has
-changed the current elaboration. Its Ramulator flag selects HBM timing and must
-be omitted when reproducing the flat-memory comparisons recorded below.
+changed the current elaboration. Its Ramulator flag selects HBM timing and is
+required for target-memory performance benchmarks. Omit it only when explicitly
+reproducing a labelled flat-memory control. Hard-backend selection is independent
+of Ramulator. Verify the startup `Ramulator enabled` message and preserve the
+exact YAML, simulator hash and memory statistics with each HBM result.
 
 ```sh
 make -C sim/payloads sys/brunel_morrison.bin sys/brunel_morrison_numeric.bin
