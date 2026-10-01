@@ -148,13 +148,16 @@ def fresh_graph(directory, spec, seed):
 
 
 def checkpoint_graph(path, directory, spec):
-    """Extract only needed NPZ members into mmap-able files, then validate.
+    """Import a native directory or extract portable NPZ members, then validate.
 
     The producer must bind the complete model dictionary to checkpoint metadata.
     An old sparse checkpoint or a histogram cannot establish the model identity.
     Canonical traces are recomputed from lazy edge states at 20/20 ms.
     """
     path, directory = Path(path), Path(directory)
+    if path.is_dir():
+        from morrison_native import native_checkpoint_graph
+        return native_checkpoint_graph(path, directory, spec)
     directory.mkdir(parents=True, exist_ok=False)
     needed = {"metadata"}
     needed.update(f"{g}_{v}" for g in GROUPS for v in ("pre", "post", "input"))
@@ -171,51 +174,23 @@ def checkpoint_graph(path, directory, spec):
             or meta.get("rule") != "morrison" or meta.get("dt_ms") != .1
             or meta.get("delay_steps") != 0 or meta.get("precision") != "float32"):
         raise ValueError("incompatible full Morrison checkpoint contract")
-    actual_model = meta.get("model", {})
-    for key, value in spec.model().items():
-        if actual_model.get(key) != value:
-            raise ValueError(f"checkpoint must record matching model.{key}: {value!r}")
-    tick = meta.get("timestep")
-    if not isinstance(tick, int) or not 0 <= tick < 2**32:
-        raise ValueError("invalid checkpoint timestep")
-    for pop, n in (("exc", spec.ne), ("inh", spec.ni)):
-        clock = data[f"{pop}_tick"]
-        if clock.shape != (n,) or clock.dtype != np.dtype("<u4"):
-            raise ValueError(f"invalid {pop}_tick shape/type")
-        if np.any(clock != np.uint32(tick)):
-            raise ValueError("neuron clock differs from checkpoint boundary")
+    tick = checkpoint_clock(meta, data, spec)
     # Validate the graph before IDs are used for trace accumulation.
     graph = Graph(directory, spec, None, {})
-    traces, errors = {}, {}
     last = data["ee_lastTraceTick"]
-    for name, index in (("pre", "ee_pre"), ("post", "ee_post")):
+    for name in ("pre", "post"):
         lazy = data[f"ee_{name}Trace"]
         if last.shape != lazy.shape or last.shape != graph.arrays["ee"][0].shape:
             raise ValueError("invalid lazy trace shape")
         if last.dtype != np.dtype("<u4") or lazy.dtype != np.dtype("<f4"):
             raise ValueError("invalid lazy trace/timestamp type")
-        sums, counts = np.zeros(spec.ne, np.float64), np.zeros(spec.ne, np.int64)
+
+    def blocks():
         for sl in slices(len(last)):
-            if np.any(last[sl] > tick) or np.any(lazy[sl] < 0) or np.any(~np.isfinite(lazy[sl])):
-                raise ValueError("invalid lazy trace/timestamp")
-            values = lazy[sl].astype(np.float64) * np.exp(-(tick - last[sl].astype(np.int64)) * .1 / 20.)
-            ids = data[index][sl]
-            sums += np.bincount(ids, weights=values, minlength=spec.ne)
-            counts += np.bincount(ids, minlength=spec.ne)
-        if np.any(counts == 0):
-            raise ValueError("cannot reconstruct trace for an unrepresented neuron")
-        mean = (sums / counts).astype(F)
-        peak, squared = 0., 0.
-        for sl in slices(len(last)):
-            values = lazy[sl].astype(np.float64) * np.exp(-(tick - last[sl].astype(np.int64)) * .1 / 20.)
-            expected = mean[data[index][sl]]
-            error = np.abs(values - expected)
-            if np.any(error > 2e-5 * np.maximum(1., np.abs(expected))):
-                raise ValueError("edge trace copies disagree beyond conversion tolerance")
-            peak = max(peak, float(error.max(initial=0.)))
-            squared += float(np.dot(error, error))
-        traces[name] = mean
-        errors[name] = dict(max_absolute=peak, rms=math_sqrt(squared / len(last)))
+            yield (data["ee_pre"][sl], data["ee_post"][sl], last[sl],
+                   data["ee_preTrace"][sl], data["ee_postTrace"][sl])
+
+    traces, errors = canonical_traces(spec, tick, blocks)
     graph.state = hot_state(data, spec, traces)
     graph.provenance = dict(kind="checkpoint", path=str(path.resolve()), sha256=sha256(path),
                             metadata=meta, canonical_trace_error=errors,
@@ -223,5 +198,58 @@ def checkpoint_graph(path, directory, spec):
     return graph
 
 
-def math_sqrt(value):
-    return float(np.sqrt(value))
+def checkpoint_clock(meta, data, spec):
+    """Bind the model and exact integer neuron clocks to the saved boundary."""
+    actual_model = meta.get("model", {})
+    for key, value in spec.model().items():
+        if actual_model.get(key) != value:
+            raise ValueError(f"checkpoint must record matching model.{key}: {value!r}")
+    tick = meta.get("timestep")
+    if type(tick) is not int or not 0 <= tick < 2**32:
+        raise ValueError("invalid checkpoint timestep")
+    for pop, n in (("exc", spec.ne), ("inh", spec.ni)):
+        clock = data[f"{pop}_tick"]
+        if clock.shape != (n,) or clock.dtype != np.dtype("<u4"):
+            raise ValueError(f"invalid {pop}_tick shape/type")
+        if np.any(clock != np.uint32(tick)):
+            raise ValueError("neuron clock differs from checkpoint boundary")
+    return tick
+
+
+def canonical_traces(spec, tick, blocks):
+    """Two bounded passes over real edges; blocks is a repeatable iterator.
+
+    The caller validates shapes, types and IDs. Native padding never enters
+    this iterator. Float64 elapsed-time decay avoids rounding uint32 clocks.
+    """
+    sums = {name: np.zeros(spec.ne, np.float64) for name in ("pre", "post")}
+    counts = {name: np.zeros(spec.ne, np.int64) for name in sums}
+    for pre, post, last, pre_lazy, post_lazy in blocks():
+        if np.any(last > tick):
+            raise ValueError("invalid lazy trace/timestamp")
+        decay = np.exp(-(tick - last.astype(np.int64)) * .1 / 20.)
+        for name, ids, lazy in (("pre", pre, pre_lazy), ("post", post, post_lazy)):
+            if np.any(lazy < 0) or np.any(~np.isfinite(lazy)):
+                raise ValueError("invalid lazy trace/timestamp")
+            values = lazy.astype(np.float64) * decay
+            sums[name] += np.bincount(ids, weights=values, minlength=spec.ne)
+            counts[name] += np.bincount(ids, minlength=spec.ne)
+    traces, errors, squared = {}, {}, {}
+    for name in sums:
+        if np.any(counts[name] == 0):
+            raise ValueError("cannot reconstruct trace for an unrepresented neuron")
+        traces[name] = (sums[name] / counts[name]).astype(F)
+        errors[name], squared[name] = dict(max_absolute=0.), 0.
+    for pre, post, last, pre_lazy, post_lazy in blocks():
+        decay = np.exp(-(tick - last.astype(np.int64)) * .1 / 20.)
+        for name, ids, lazy in (("pre", pre, pre_lazy), ("post", post, post_lazy)):
+            values = lazy.astype(np.float64) * decay
+            expected = traces[name][ids]
+            error = np.abs(values - expected)
+            if np.any(error > 2e-5 * np.maximum(1., np.abs(expected))):
+                raise ValueError("edge trace copies disagree beyond conversion tolerance")
+            errors[name]["max_absolute"] = max(errors[name]["max_absolute"], float(error.max(initial=0.)))
+            squared[name] += float(np.dot(error, error))
+    for name in errors:
+        errors[name]["rms"] = float(np.sqrt(squared[name] / counts[name].sum()))
+    return traces, errors

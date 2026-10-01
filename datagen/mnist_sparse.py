@@ -77,11 +77,16 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
     relevant_masks = getattr(args, "relevant_masks", False)
     mask = structural_mask(args.connection_rate, args.connectivity_seed)
     fan_in, weight_caps = fan_in_caps(mask)
+    weight_max_policy = getattr(args, "weight_max_policy", POLICY)
+    if weight_max_policy == "connection-rate":
+        weight_caps = [dense.f32(1.0 / args.connection_rate)] * dense.N_EXC
+    elif weight_max_policy != POLICY:
+        raise ValueError("unsupported weight cap policy")
     params = parameters(args.rule, args.connection_rate)
     snapshot = dense.load_runtime_snapshot(args.runtime_snapshot) if args.runtime_snapshot else None
     if snapshot:
         meta = snapshot.metadata
-        if (meta.get("weight_max_policy") != POLICY or
+        if (meta.get("weight_max_policy") != weight_max_policy or
                 meta.get("weight_max_sha256") != caps_sha256(weight_caps)):
             raise ValueError("snapshot weight cap policy or fan-in differs from sparse image")
         variant = meta.get("variant", {})
@@ -314,7 +319,7 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
         input_owner_groups=[[pu + 1 for pu in group] for group in input_groups],
         neuron_owner_groups=[[pu + 1 for pu in group] for group in neuron_groups],
         logical_owners=logical_owners, post_targets=targets, spm_usage=usage,
-        parameters=params, weight_max_policy=POLICY, fan_in=fan_in,
+        parameters=params, weight_max_policy=weight_max_policy, fan_in=fan_in,
         weight_max_by_post=weight_caps, weight_max_sha256=caps_sha256(weight_caps),
         initial_weight_checksum=checksum,
         runtime_snapshot=snapshot.metadata if snapshot else None, warmup_steps=args.warmup_steps,
@@ -332,6 +337,8 @@ def parse_args():
     parser.add_argument("--connection-rate", type=float, default=0.125)
     parser.add_argument("--connectivity-seed", type=int, default=20260723)
     parser.add_argument("--weight-seed", type=int, default=19260817)
+    parser.add_argument("--weight-max-policy", choices=(POLICY, "connection-rate"), default=POLICY,
+                        help="explicit legacy scalar-cap profile; default retains realized fan-in caps")
     parser.add_argument("--poisson-seed", type=lambda value: int(value, 0), default=0x19260817)
     parser.add_argument("--runtime-snapshot", type=Path)
     parser.add_argument("--input-intensity", type=float, default=2.0)

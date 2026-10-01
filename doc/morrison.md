@@ -51,6 +51,8 @@ Plastic rows retain 128-edge full chunks. In the final partial chunk, weight and
 
 For the generated G4 graph with seed 92713 and graph SHA-256 `fbbd03d8de0fb56afa3162300508cba0394196a56a51847b01d1bbcb67833183`, all images together occupy 16,794,867,616 bytes (15.641439 GiB). They leave 367.166107 MiB in aggregate. The largest image is MC0 at 1,058,062,656 bytes, leaving 15,679,168 bytes (14.952820 MiB) in that controller. These figures include padding, row metadata, directories, code and SPM initialization. Each controller must fit independently; the aggregate margin cannot be reassigned between controllers. The generator rejects an overflowing image, and the simulator enforces physical request bounds in optimized builds. This establishes capacity for the recorded graph/layout, not every possible graph or measured throughput.
 
+The imported settled native checkpoint at tick 12,000,000 (1,200 s) uses state-manifest SHA-256 `7598a8351bc690fb099db5f36fe9891c3a6159dcc6a6ab034a6bf3f689608b80` and canonical graph SHA-256 `c672d31e75e5637cc59fb289d3f8d66f58da1a8a62f8f494c8cd52dea179b7a4`. Its G4 images occupy 16,794,934,720 bytes (15.641502 GiB). MC0 remains the tightest controller: 1,057,995,648 bytes used, leaving 15,746,176 bytes (15.016724 MiB). This is a separate graph from the earlier fresh seed-92713 capacity case. Input provenance, conversion errors and per-controller sizes are retained in the [imported manifest](../copilot/tmp/morrison-native-20260929-v1/settled-g4/manifest.json), with complete generation and edge-validation records in that task directory.
+
 Model constants are separate from sparse Brunel: initial E weight 45.61 pA, inhibitory ratio 5, external rate 20,880 Hz/neuron, both trace constants 20 ms, depression ratio 0.1057, learning rate 0.1, exponent 0.4 and no upper weight cap. Stored plastic weights are delivery coefficients `W=(e/0.33)*w`; LTP uses the correspondingly scaled coefficient. The sampler uses an inclusive inverse CDF over nonzero xorshift32 draws with twenty cutoffs, including counts above nine, at 32-bit uniform resolution.
 
 Build the payloads and target through the development shell:
@@ -79,14 +81,28 @@ The output directory must not exist. Graph generation, sorting and reverse-index
 
 `datagen/morrison_cold.py SOURCE OUTPUT` can reuse a full fresh graph/image with normal time-zero voltages and zero currents, traces, inputs and refractory state. It copies MC0 and shares immutable remaining images through symlinks. It rejects checkpoint-weight sources and disabled external drive. It does not generate a checkpoint or rewind settled weights. Its defaults are also 60 warmup and 1,000 measured steps. Graph and state seeds are recorded separately when they differ.
 
-Checkpoint generation is deferred to the baseline run; the agreed destination is `./ckpts/morrison`. Once a complete file exists, `datagen/morrison.py --checkpoint PATH --output OUTPUT --group 4 --warmup 60 --timed 1000` imports it. The importer currently requires an NPZ containing:
+Checkpoint generation belongs to the baseline run. `datagen/morrison.py --checkpoint PATH --output OUTPUT --group 4 --warmup 60 --timed 1000` accepts either its native state directory or a complete portable NPZ. The input checkpoint and graph are read without modification.
+
+Native directories use `genn-native-phase-checkpoint-v1`. The state manifest names the graph directory and its manifest hash; relative paths such as `../graph` resolve from the state directory. Keep both directories when copying a checkpoint. The importer verifies the manifest contract and all forty array files against their recorded SHA-256, byte size, dtype and shape. It requires the matching model, FP32 scalars, exact uint32 neuron clocks, zero axonal/back-propagation delays and the `after-synapses-before-neurons` boundary.
+
+The native graph stores padded source rows. The importer removes padding using `rowLength`, preserving the order and individual weight of every real edge, including parallel edges. It rebuilds ActiveN's reverse references from that forward graph; the native reverse remap is hash-checked but is not used to construct ActiveN's reverse index. Native lazy traces are traversed directly in bounded blocks, avoiding three extra full-size unpadded trace arrays on disk.
+
+Native `outPost` arrays contain pending EPSC-scaled delivery coefficients. They enter ActiveN's pending input fields directly, without another scaling or delivery pass. Voltage, refractory state and the combined E/I alpha current/derivative are retained. Native spike counters, tie-order bookkeeping and CUDA RNG state are checked as input files but do not replace ActiveN's approved event order or worker RNG.
+
+The portable NPZ path remains supported and requires:
 
 - Complete source-major `ee/ei/ie/ii_pre` and `_post` arrays, individual FP32 `ee_g`, and all four pending `_input` arrays.
 - E/I `V`, `Iex`, `Iin`, `dIex`, `dIin`, refractory state and one-dimensional uint32 per-neuron tick arrays.
 - FP32 `ee_preTrace` and `ee_postTrace`, and uint32 `ee_lastTraceTick` arrays for every plastic edge.
 - JSON metadata with format `brunel-genn-phase-checkpoint-v1`, boundary `after-synapses-before-neurons`, Morrison rule, FP32 precision, 0.1 ms timestep, zero configured delay, checkpoint timestep and a complete matching `model` dictionary from `Spec.model()`.
 
-The importer normalizes lazy trace copies to the checkpoint boundary using 20 ms for both traces and rejects disagreement beyond its conversion tolerance. Parallel edges retain their individual weights. Future ActiveN random draws use independent per-SMT xorshift32 streams. The sibling checkpoint producer's earlier unbound metadata is insufficient for this importer; the eventual full checkpoint must bind the full model. Synthetic small NPZ fixtures used by the unit tests are not baseline checkpoints. `benchmark_ready` identifies complete checkpoint imports; a fresh image remains labelled as fresh even when used for a user-authorized startup estimate.
+Both paths normalize lazy trace copies to the checkpoint boundary using 20 ms for each trace, then check every real copy against the reconstructed FP32 per-neuron trace. The allowed absolute error is `2e-5 * max(1, abs(trace))`; the manifest records the observed maximum and RMS errors. Future ActiveN random draws use independent per-SMT xorshift32 streams. `benchmark_ready` identifies a complete checkpoint import, not verified macroscopic agreement with GeNN. Synthetic small test checkpoints are functional fixtures and are not baseline checkpoints.
+
+Host validation includes a padded native fixture with nonzero currents and pending inputs, varied lazy timestamps, clocks beyond FP32's exact integer range, distinct weights on parallel edges and invalid padding. It checks analytic state expectations, native/portable image equivalence, and rejection of corrupt or incompatible inputs. Run both test modules with new artifact directories:
+
+```sh
+nix develop --command bash -c 'cd /root/workspace/ActiveN && MR_TEST_DIR=copilot/tmp/morrison-unit MR_NATIVE_TEST_DIR=copilot/tmp/morrison-native-unit python3 -B -m unittest discover -s datagen -p "test_morrison*.py" -v'
+```
 
 For a standard target measurement, use a new output directory and the full declared interval:
 
@@ -99,6 +115,8 @@ nix develop --command bash -c 'cd /root/workspace/ActiveN && python3 datagen/mor
 ```
 
 Retain exact commands, exit statuses, environment overrides, raw logs, configuration and source/binary hashes. Require the startup `Ramulator enabled` line with 32-byte transactions and all sixteen MC statistics. The example preloads `[0x80000000,0x80002000)`; cache preload does not replace warmup. Passive observations produce per-step E/I counts, spike IDs and phase markers without adding payload instructions. `SUMMARY_ONLY` omits per-step SPM snapshots but retains the final initialized DRAM images for full weight moments. Omit it for functional state-oracle runs.
+
+Add `SOFT_BRUNEL_PROFILE=1` to collect passive PC, PU, MC and memory-event profiles. These files can be large; reserve space for them and the complete final DRAM dump. Filter per-step profiles to the measured steps. PC observations sample active-thread fetch PCs every 256 simulated cycles and give approximate code attribution. Profile phase/completion boundaries supplement the exact peripheral timer; their totals must not replace that timer or be treated as identical measurement windows.
 
 The performance metric is total peripheral timer cycles divided by all completed measured timesteps. The timer excludes warmup and includes the measured phases, barriers, drain and boundary overhead; boot before the timer is excluded. Report the raw total and denominator, frequency, E/I rates, LTD/LTP opportunities, final weight mean/stddev and per-MC statistics over that same interval. Phase differences are supplementary. Standard windows remain 60+1,000 or 60+10,000. Any shorter startup window requires separate approval under `AGENTS.md`; zero initial learning traces also make the first step skip effective weight updates. No cold-start result should be presented as settled throughput or a matched baseline comparison.
 
