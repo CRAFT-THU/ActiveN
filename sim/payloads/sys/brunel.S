@@ -22,6 +22,30 @@ _start:
   li t0,\cfg
   csrw (0x710+\id),t0
   .endm
+#if BR_BULK
+  INSTALL 0,br_completion,18,0
+  INSTALL 1,mb_memory_idle,17,0x00010001
+#if BR_BULK_TREE
+  INSTALL 2,mb_range_done,17,0
+  INSTALL 3,mb_producer_closed,16,0
+#endif
+  INSTALL 4,br_reverse,4,0x000a0011
+  INSTALL 5,SPIKE_ENTRY,28,0x00010003
+  INSTALL 6,br_control,20,0x00040006
+  INSTALL 7,br_report,20,0x00020004
+  INSTALL 8,mb_copy_ready,1,0x00010001
+  INSTALL 9,mb_dispatch,0,0x00030012
+  INSTALL 10,idle,16,0
+  INSTALL 11,br_integrate,24,0x00010002
+  INSTALL 12,mb_job,4,0x00010012
+  INSTALL 13,mb_produce,0,0x00030018
+  INSTALL 14,mb_check,8,0x00010001
+#if BR_BULK_TREE
+  INSTALL 15,mb_emit,0,0x0006000b
+#else
+  INSTALL 15,mb_emit,0,0x0005000a
+#endif
+#else
   INSTALL 0,br_completion,18,0
   # Spike delivery is safe on both SMT threads: the input accumulator uses
   # LR/SC, while the learning writeback targets are independent.
@@ -48,6 +72,7 @@ _start:
   INSTALL 10,idle,16,0
   INSTALL 11,br_forward_wait,8,0x00020013
   INSTALL 12,br_forward_drain,8,0x00020013
+#endif
   jal ra,br_boot
 .globl br_idle
 br_idle:

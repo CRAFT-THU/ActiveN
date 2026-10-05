@@ -361,7 +361,7 @@ br_drain:
  bne t0,t1,1b
  ret
 br_continue:
- YIELDI 8
+ YIELDI BR_WORK_ID
  j br_idle
 .globl br_halt
 br_halt:
@@ -425,7 +425,12 @@ br_mshr_retire:
  LTP a3,a3,a1,BR_RULE,1
 2:
  mv a0,a6
-#if BR_HOME_UPDATES
+#if BR_BULK
+ /* The timestep marker/idle barrier closes posted stores before reuse. */
+ li a1,0x20000
+ lw t0,52(a5)
+ SENDI t0,2
+#elif BR_HOME_UPDATES
  /* The descriptor remembers the proxy's MC. No receipt or write credit. */
  li a1,0x20000
  lw t0,52(a5)
@@ -456,7 +461,7 @@ br_mshr_service:
  /* Enqueue before becoming idle: an immediate yield can schedule an already
   * pending drain worker before this service event is visible to the scheduler.
   * Drain relies on service priority to finish and clear its scheduled flag. */
- SENDI zero,6
+ SENDI zero,BR_SERVICE_ID
  j br_idle
 1: sw zero,H_MSHR_SCHEDULED(gp)
  j br_idle
@@ -527,7 +532,7 @@ br_mshr_allocate:
  bnez t0,4f
  li t0,1
  sw t0,H_MSHR_SCHEDULED(gp)
- SENDI zero,6
+ SENDI zero,BR_SERVICE_ID
 4: jr t6
 .globl br_reverse
 br_reverse:
@@ -797,14 +802,14 @@ br_integrate:
  bne t2,t0,.Lintegrate_return
  li a0,1
  li a1,0
- YIELDI 3
+ YIELDI BR_REPORT_ID
 .Lintegrate_return:
  j br_idle
 /* Direct event handler, selected at compile time. Input a0=input offset,
  * a1=weight,a2=weight address (zero for static),a3=source MC destination ID.
  * A quiet postsynaptic target
  * applies LTD locally and sends a no-receipt scalar store to the source MC. */
-.macro SPIKE_BODY morrison
+.macro SPIKE_BODY morrison,notify=0
  add t0,gp,a0
 1:
  lr.w t1,(t0)
@@ -822,13 +827,28 @@ br_integrate:
  mv t0,a3
  LTD a3,a1,t1,\morrison
  mv a0,a2
+#if BR_BULK
+ li a1,0x20000
+ SENDI t0,2
+#else
  li a1,0x20000
  SENDI t0,1026
+#endif
 9:
  /* Both SMT threads may deliver spikes; preserve the barrier count atomically. */
  addi t0,gp,H_RECEIVED
  li t1,1
  amoadd.w zero,t1,(t0)
+.if \notify
+ /* A bounded local yield remains usable after the posted store uses quota.
+  * Only the receiver-closing entry executes this tail. */
+ li t0,BR_BASE+MB_CONTROL+B_RX_PENDING
+ li t1,1
+ amoor.w t1,t1,(t0)
+ bnez t1,8f
+ YIELDI 13
+8:
+.endif
  j br_idle
 .endm
 #if BR_RULE == 1
@@ -840,6 +860,12 @@ SPIKE_ENTRY:
 SPIKE_ENTRY:
  SPIKE_BODY 0
 #endif
+#if BR_BULK_TREE
+.globl mb_spike_receipt
+mb_spike_receipt:
+ SPIKE_BODY 1,1
+#endif
+#if !BR_BULK
 .globl br_control
 br_control:
  sw zero,H_REPORT_COUNT(gp)
@@ -936,7 +962,7 @@ br_control_leaf:
 2: lw a1,H_RECEIVED(gp)
  j 4f
 3: lw a1,H_REVERSE_RECEIVED(gp)
-4: YIELDI 3
+4: YIELDI BR_REPORT_ID
  j br_idle
 /* Root-only broadcast and the simulator's phase-marker ABI. */
 br_broadcast:
@@ -1057,6 +1083,7 @@ br_report_leaf:
 .Lreport_bad:
  li a0,0xb009
  j br_halt
+#endif
 .globl br_boot
 br_boot:
  ENTER 3
@@ -1097,9 +1124,9 @@ br_boot:
  li t0,1
  bne t3,t0,.Lboot_tree_ready
  la t0,br_report_leaf
- csrw 0x703,t0
+ csrw (0x700+BR_REPORT_ID),t0
  la t0,br_control_leaf
- csrw 0x702,t0
+ csrw (0x700+BR_CONTROL_ID),t0
 .Lboot_tree_ready:
  lw t0,H_EPSC(gp)
  lw t1,H_EXTERNAL_WEIGHT(gp)
@@ -1123,11 +1150,49 @@ br_boot:
 #if BR_MORRISON
  li t4,BR_BASE+MR_PARAMETERS
  lw t5,16(t4)
+#if BR_BULK
+ li t6,MB_ABI_VERSION
+#else
  li t6,MR_ABI_VERSION
+#endif
  bne t5,t6,.Lboot_bad
  lw t5,20(t4)
+#if BR_BULK
+ beqz t5,.Lboot_bad
+ addi t6,t5,-1
+ and t6,t6,t5
+ bnez t6,.Lboot_bad
+ lw t6,32(t4)
+ beqz t6,.Lboot_bulk_legacy_width
+ li a6,MB_DISPATCH_BALANCED
+ bne t6,a6,.Lboot_bad
+ lw a6,H_NUM_PU(gp)
+ lw a7,8(t4)
+ beqz a7,.Lboot_bad
+ addi t6,a7,-1
+ and t6,t6,a7
+ bnez t6,.Lboot_bad
+.Lboot_bulk_domain_width:
+ srli a7,a7,1
+ beqz a7,.Lboot_bulk_width_ready
+ srli a6,a6,1
+ j .Lboot_bulk_domain_width
+.Lboot_bulk_width_ready:
+ bgtu t5,a6,.Lboot_bad
+ j .Lboot_bulk_width_done
+.Lboot_bulk_legacy_width:
+ li t6,4
+ bgtu t5,t6,.Lboot_bad
+.Lboot_bulk_width_done:
+#if BR_BULK_TREE
+ lw t6,36(t4)
+ li a6,MB_FORWARD_TREE
+ bne t6,a6,.Lboot_bad
+#endif
+#else
  li t6,BR_PROXY_SIZE
  bne t5,t6,.Lboot_bad
+#endif
  lw t5,8(t4)
  beqz t5,.Lboot_bad
  li t6,16
@@ -1299,12 +1364,13 @@ br_boot:
  li a1,0
  li a2,0
  li t0,0
- li t1,3
+ li t1,BR_REPORT_ID
  SEND t0,t1
  LEAVE 3
 .Lboot_bad:
  li a0,0xb00b
  j br_halt
+#if !BR_BULK
 #if BR_PROXY
 /* One sender per home PU, one receiver thread per proxy. Last notification
  * carries the sender's total job count (a2); -1 means more will follow.
@@ -1446,7 +1512,7 @@ br_proxy_wait:
  lw t1,G_EXPECTED(t0)
  lw t2,G_JOBS(t0)
  bne t1,t2,.Lproxy_wait_again
- YIELDI 8
+ YIELDI BR_WORK_ID
  j br_idle
 .Lproxy_wait_again:
  YIELDI 14
@@ -1859,11 +1925,11 @@ br_work_report:
  mv a0,s0
  lw a1,H_SENT(gp)
 .Lwork_send_report:
- YIELDI 3
+ YIELDI BR_REPORT_ID
  j .Lwork_return
 br_work_continue:
 .Lwork_continue:
- YIELDI 8
+ YIELDI BR_WORK_ID
 .Lwork_return:
  j br_idle
 #if BR_MORRISON
@@ -1881,6 +1947,7 @@ br_descriptor:
  li a0,0
  jal ra,br_load_wait
  LEAVE 0
+#endif
 #endif
 /* Shared image format, hand-written boot copy. No C code in this payload. */
 .globl snn_init
@@ -1911,3 +1978,7 @@ snn_init:
 .Linit_bad:
  li a0,0xbad30000
  j br_halt
+
+#if BR_BULK
+#include "morrison_bulk_runtime.inc"
+#endif

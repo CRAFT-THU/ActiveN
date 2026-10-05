@@ -1,0 +1,68 @@
+/* ABI 2: whole CSR rows, direct directories and a two-bank bulk coroutine.
+ * MB_* offsets are relative to scratchpad; B_* to scratchpad + 0x2000. */
+#ifndef MORRISON_BULK_LAYOUT_H
+#define MORRISON_BULK_LAYOUT_H
+#define MB_ABI_VERSION 2
+#define MB_ROW_POINTERS 0x2ea0
+#define MB_ROW_POINTER_WORDS 221
+#define MB_CONTROL 0x2000
+#define MB_DISPATCH_POLICY (MR_PARAMETERS + 32)
+#define MB_DISPATCH_LEGACY 0
+#define MB_DISPATCH_BALANCED 1
+#define MB_FORWARD_POLICY (MR_PARAMETERS + 36)
+#define MB_FORWARD_TREE 1
+#define B_ISSUING 64
+#define B_COPY 68
+#define B_EMITTING 72
+#define B_CHECK_PENDING 76
+#define B_EXPANDED 80
+#define B_PRODUCED 84
+#define B_EXPECTED 88
+#define B_HOME_INDEX 92
+#define B_HOME_STAGE 96
+#define B_HOME_CUR 100
+#define B_HOME_END 104
+#define B_HOME_SPAN 108
+#define B_HOME_RANK 112
+#define B_HOME_AUX 116
+#define B_HOME_KIND 120
+#define B_GROUP_LOG 124
+#define B_DIR_STRIDE 128
+#define B_STATIC_BASE 132
+#define B_REVERSE_BASE 136
+#define B_COMPLETE_PENDING 164
+#define B_REVERSE_STARTED 168
+#define B_GROUP_BASE 172
+#define B_GROUP_RANK 176
+#define B_QUERY 180
+#define B_HOME_REMAINDER 184
+#define B_HOME_WIDTH 188
+#define B_BANK0 192
+#define B_BANK1 224
+#define B_BANK_BYTES 32
+#define B_STATE 0
+#define B_ADDRESS 4
+#define B_LENGTH 8
+#define B_MC 12
+#define B_KIND 16
+#define B_AUX 20
+#define B_LANDING 24
+#define B_RETURN 28
+#define B_RETURN_LAST 0x10000
+#define B_HOME_CLOSED 256
+#define B_HOME_RETURNED 260
+#define B_HOME_SENT 264
+#define B_RX_PENDING 268
+#define B_RX_INITIAL 272
+#define B_RX_LAST 276
+#define B_RX_CHILD_DELTA 280
+#define B_RX_BASE 284
+#define B_RX_LATE 288
+#define B_RX_BASE_READY 292
+#define B_RX_DONE 296
+#define B_FREE 0
+#define B_FILLING 1
+#define B_READY 2
+#define B_DRAINING 3
+#define MB_STATIC_JOB 0x10000
+#endif

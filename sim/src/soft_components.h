@@ -375,4 +375,14 @@ public:
   size_t inputQueueSize(size_t input) const {
     return _input_queues.at(input).size();
   }
+
+  // Inspect every resident flit, including those hidden behind arbitration.
+  template <typename Predicate>
+  size_t countFlits(Predicate predicate) const {
+    size_t count = 0;
+    for (const auto &queue : _input_queues)
+      for (size_t slot = 0; slot < Q_DEPTH; ++slot)
+        if (queue.occupiedAt(slot) && predicate(*queue[slot])) ++count;
+    return count;
+  }
 };

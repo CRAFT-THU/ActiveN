@@ -38,13 +38,21 @@ class Image:
     def __init__(self, directory, backing=None, hashes=True):
         self.directory = Path(directory)
         self.manifest = json.loads((self.directory / "manifest.json").read_text())
-        if self.manifest["format"] != "activen-morrison-image-v1":
+        if self.manifest["format"] not in ("activen-morrison-image-v1", "activen-morrison-image-v2"):
             raise ValueError("unknown image ABI")
+        self.bulk = self.manifest["format"] == "activen-morrison-image-v2"
         self.spec = Spec(**self.manifest["spec"])
         self.spec.validate(self.manifest["functional"])
         self.group = self.manifest["group_size"]
         if self.group not in (1, 4):
             raise ValueError("invalid group")
+        if self.bulk:
+            width = self.manifest['dispatch_width']
+            policy = self.manifest.get('dispatch_policy', 'legacy')
+            completion = self.manifest.get('forward_completion','poll')
+            if (completion not in ('poll','tree') or policy not in ('legacy', 'balanced') or width < 1 or width & (width-1)
+                    or width > self.spec.pu_per_mc or (policy == 'legacy' and width > 4)):
+                raise ValueError('invalid bulk dispatch policy/width')
         base = self.directory if backing is None else Path(backing)
         self.memory = []
         for mc in range(self.spec.mc):
@@ -59,6 +67,9 @@ class Image:
         if tuple(boot[[0, 2, 3]]) != (0x0100006F, self.spec.mc, self.spec.pu):
             raise ValueError("bad boot header")
         self.spms, self.rows = [], []
+        degrees = np.load(self.directory / 'plastic-outdegree.npy') if self.bulk else None
+        if self.bulk and (degrees.shape != (self.spec.ne,) or degrees.dtype != np.dtype('<u4')):
+            raise ValueError('invalid ABI2 outdegree array')
         for pu in range(self.spec.pu):
             offset, size = self.read(0, int(boot[1])+pu*8, 2)
             if size != INIT_END or offset % 32:
@@ -68,6 +79,37 @@ class Image:
             if tuple(spm[:5]) != (MAGIC, pu+1, self.spec.pu, 1, local):
                 raise ValueError("bad PU header")
             params = spm[PARAMETERS//4:PARAMETERS//4+8]
+            if self.bulk:
+                stride = max(32, self.spec.mc*8)
+                if tuple(params[[0,1,2,4,5,7]]) != (self.spec.ne,self.spec.ni,self.spec.mc,2,self.manifest['dispatch_width'],stride):
+                    raise ValueError('bad ABI2 parameters')
+                if int(spm[PARAMETERS//4+8]) != (1 if self.manifest.get('dispatch_policy', 'legacy') == 'balanced' else 0):
+                    raise ValueError('bulk dispatch policy disagrees with manifest')
+                if int(spm[PARAMETERS//4+9]) != int(self.manifest.get('forward_completion','poll') == 'tree'):
+                    raise ValueError('forward completion policy disagrees with manifest')
+                gids = np.arange(pu, self.spec.n, self.spec.pu, dtype=np.uint32)
+                exc = int((gids < self.spec.ne).sum())
+                pointers = spm[0x2ea0//4:0x2ea0//4+exc+1].astype(np.uint64)
+                counts = degrees[gids[:exc]].astype(np.uint64)
+                if np.any(pointers%32) or np.any(np.diff(pointers) != ((counts+8)//8)*64):
+                    raise ValueError('bad consecutive CSR boundaries')
+                rows = np.zeros((len(gids),8), '<u4')
+                rows[:,2] = gids
+                rows[:exc,3] = pointers[:-1]
+                rows[:exc,4] = counts
+                rows[:,5] = int(params[3]) + np.arange(len(gids))*stride
+                rows[:exc,6] = int(params[6]) + np.arange(exc)*stride
+                mc = pu//self.spec.pu_per_mc
+                for base,n in zip(pointers[:-1],counts):
+                    base,n = int(base),int(n)
+                    slots = (n%128+8)//8*8
+                    tail = base+n//128*1024
+                    w = self.read(mc,tail,slots)
+                    d = self.read(mc,tail+slots*4,slots)
+                    if np.any(w[n%128:]) or np.any(d[n%128:] != 0xffffffff):
+                        raise ValueError('missing sentinel or invalid tail padding')
+                self.spms.append(spm); self.rows.append(rows)
+                continue
             if tuple(params[[0, 1, 2, 4, 5, 6, 7]]) != (self.spec.ne, self.spec.ni, self.spec.mc, 1, self.group, 0, 0):
                 raise ValueError("bad compact parameters")
             config = spm[CONFIG//4:CONFIG//4+16]
@@ -100,8 +142,9 @@ class Image:
         index = np.arange(n, dtype=np.uint32)
         address = base + index//128*1024 + index%128*4
         # Independent decode of the compact tail geometry.
-        last = n//128*128
-        delta = np.where(index < last, 512, ((n % 128 + 7)//8)*32)
+        stored = n + int(self.bulk)
+        last = stored//128*128
+        delta = np.where(index < last, 512, ((stored % 128 + 7)//8)*32)
         target_address = address.astype(np.int64) + delta
         if int(target_address.max())//4 >= len(self.memory[mc]):
             raise ValueError("plastic row outside image")
@@ -243,8 +286,8 @@ def check_images(directory, compare_graph=True):
             if len(np.unique(logical)) != len(logical) or np.any(seen[logical]):
                 raise ValueError("duplicate reverse reference to a plastic edge")
             seen[logical] = True
-            delta = np.where(within < counts[row_index]//128*128, 512,
-                             (counts[row_index]%128+7)//8*32)
+            stored = counts[row_index] + int(image.bulk)
+            delta = np.where(within < stored//128*128, 512, (stored%128+7)//8*32)
             target = image.memory[mc][(address.astype(np.uint64)+delta)//4]
             target_gid = ((target>>16)-NODE_BASE-20)//NODE_BYTES*spec.pu+(target&65535)-1
             if np.any(target_gid != post):

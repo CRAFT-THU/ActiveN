@@ -30,7 +30,16 @@ def check(directory, run):
     state = np.load(Path(directory)/"neurons.npy").copy()
     c = constants()
     report = []
+    late_receipts = []
     observed_rows = list(csv.DictReader((run/"morrison-activity.csv").open()))
+    copy_profiles = {}
+    profile_path = run/'pu-profile.csv'
+    if image.bulk and profile_path.exists():
+        for row in csv.DictReader(profile_path.open()):
+            if int(row['phase']) == 2:
+                key = (int(row['step']),int(row['pu'])-1)
+                if key in copy_profiles: raise ValueError('duplicate copy profile')
+                copy_profiles[key] = (int(row['bulk_commands']),int(row['bulk_lines']))
     for step in range(1, manifest["warmup"]+manifest["timed"]+1):
         f = state.view(F)
         # Independently express the documented combined-alpha recurrence. Each
@@ -86,6 +95,36 @@ def check(directory, run):
                 changed[mc].update((int(a), w) for a, w in zip(addresses, weights))
                 reverse += int(count)
         expected_forward, expected_reverse = forward, reverse
+        if copy_profiles:
+            # Reconstruct destination ownership and actual read volume from the
+            # fired source rows, independently of the emitter's local counters.
+            commands = np.zeros(spec.pu,np.uint64)
+            copy_lines = np.zeros(spec.pu,np.uint64)
+            width = manifest['dispatch_width']
+            balanced = manifest.get('dispatch_policy','legacy') == 'balanced'
+            override = spec.pu//2 if manifest.get('fixture',{}).get('cross_mc_jobs') else 0
+            for source in np.flatnonzero(fired):
+                home = int(source % spec.pu)
+                sizes = [(max(32,spec.mc*8),32,min(width,4))]
+                if source < spec.ne:
+                    n = int(image.rows[home][source//spec.pu,4])
+                    sizes.append((((n+8)//8)*64,1024,width))
+                for size,unit,workers in sizes:
+                    units = (size+unit-1)//unit
+                    cuts = ([units//workers+(rank<units%workers) for rank in range(workers)] if balanced
+                            else [min((units+workers-1)//workers,max(0,units-rank*((units+workers-1)//workers))) for rank in range(workers)])
+                    offset = 0
+                    for rank,count in enumerate(cuts):
+                        if not count: continue
+                        owner = ((home//workers*workers)^override)+(home%workers+rank)%workers
+                        length = min(size-offset,count*unit)
+                        commands[owner] += (length+1023)//1024
+                        copy_lines[owner] += length//32
+                        offset += length
+                    if offset != size: raise ValueError('incomplete expected copy partition')
+            for pu in range(spec.pu):
+                if copy_profiles.get((step,pu)) != (int(commands[pu]),int(copy_lines[pu])):
+                    raise ValueError(f'step{step} PU{pu+1}: bulk copy placement/count mismatch')
         exc_fire = np.flatnonzero(fired[:spec.ne])
         ef[exc_fire, 3] = F(ef[exc_fire, 3]+c["pot"])
         ef[exc_fire, 4] = F(ef[exc_fire, 4]+c["dep"])
@@ -94,6 +133,7 @@ def check(directory, run):
         if (magic, pus) != (0x42534431, spec.pu):
             raise ValueError("bad snapshot header")
         cursor, forward, reverse = 8, 0, 0
+        jobs_produced = jobs_expanded = 0
         actual = np.empty_like(state)
         next_rng = np.empty_like(rng_state)
         for pu in range(spec.pu):
@@ -118,16 +158,51 @@ def check(directory, run):
             pointers = spm[FIRED_LIST//4:FIRED_LIST//4+count]
             if not np.array_equal(np.sort(pointers), 0x20000000+NODE_BASE+expected_local*NODE_BYTES):
                 raise ValueError("fired list mismatch or overflow")
-            config = spm[CONFIG//4:CONFIG//4+16]
-            jobs = np.frombuffer(blob, dtype="<u2", count=int(config[10]), offset=cursor-size+JOBS)
-            peers = pu//image.group*image.group+np.arange(image.group)
-            ids = (np.arange(220)[:, None]*spec.pu+peers).ravel()
-            valid = ids < spec.n
-            expected_jobs = np.flatnonzero(valid & fired[np.minimum(ids, spec.n-1)])+1
-            if not np.array_equal(np.sort(jobs), expected_jobs) or config[11] != image.group or config[12] != len(jobs):
-                raise ValueError("proxy notification/compact job mismatch")
+            if image.bulk:
+                control = spm[0x2000//4:0x2100//4]
+                for offset in (64,68,72,164,192,224):
+                    if control[offset//4]: raise ValueError('live bulk cursor/copy/bank at completion')
+                if spm[56//4] != spec.mc or control[180//4] != 15:
+                    raise ValueError('incomplete route-marker/MC-idle barrier')
+                jobs_produced += int(control[84//4])
+                jobs_expanded += int(control[80//4])
+                if manifest.get('forward_completion','poll')=='tree':
+                    tree=spm[(0x2000+256)//4:(0x2000+300)//4]
+                    if int(tree[0])!=2 or int(tree[1])!=int(control[84//4]) or int(tree[3]):
+                        raise ValueError('incomplete home/receiver completion tree')
+                    if pu==0:
+                        if int(tree[7])+int(tree[8])!=expected_forward or tuple(tree[9:11])!=(1,1):
+                            raise ValueError('root receiver reduction does not match deliveries')
+                        late_receipts.append(int(tree[8]))
+                width = manifest['dispatch_width']
+                balanced = manifest.get('dispatch_policy', 'legacy') == 'balanced'
+                expected_jobs = 0
+                lines = max(32,spec.mc*8)//32
+                static_width = min(width, 4)
+                span = (lines+static_width-1)//static_width
+                for local in expected_local:
+                    src = pu+int(local)*spec.pu
+                    expected_jobs += min(lines,static_width) if balanced else (lines+span-1)//span
+                    if src < spec.ne:
+                        n = int(image.rows[pu][local,4])
+                        chunks = (((n+8)//8)*64+1023)//1024
+                        block = (chunks+width-1)//width
+                        expected_jobs += min(chunks,width) if balanced else (chunks+block-1)//block
+                if int(control[84//4]) != expected_jobs:
+                    raise ValueError('home range production count mismatch')
+            else:
+                config = spm[CONFIG//4:CONFIG//4+16]
+                jobs = np.frombuffer(blob, dtype="<u2", count=int(config[10]), offset=cursor-size+JOBS)
+                peers = pu//image.group*image.group+np.arange(image.group)
+                ids = (np.arange(220)[:, None]*spec.pu+peers).ravel()
+                valid = ids < spec.n
+                expected_jobs = np.flatnonzero(valid & fired[np.minimum(ids, spec.n-1)])+1
+                if not np.array_equal(np.sort(jobs), expected_jobs) or config[11] != image.group or config[12] != len(jobs):
+                    raise ValueError("proxy notification/compact job mismatch")
             forward += int(spm[16])
             reverse += int(spm[17])
+        if image.bulk and jobs_produced != jobs_expanded:
+            raise ValueError("global range accounting mismatch")
         if cursor != len(blob):
             raise ValueError("trailing snapshot data")
         if not np.array_equal(actual[:, 7], expected[:, 7]):
@@ -208,7 +283,11 @@ def check(directory, run):
                 touched_plastic_weights_checked=sum(map(len, changed)),
                 weight_max_absolute_error=peak_error,
                 other_initialized_image_words_unchanged=True,
-                all_neuron_fields_and_job_lists_checked=True)
+                all_neuron_fields_checked=True,
+                proxy_job_lists_checked=not image.bulk,
+                range_accounting_checked=image.bulk,
+                forward_tree_checked=manifest.get('forward_completion','poll')=='tree',
+                late_forward_deliveries=late_receipts)
 
 
 def main():

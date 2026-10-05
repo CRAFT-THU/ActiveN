@@ -8,3 +8,4 @@
 !/tests/brunel_pow04.cpp
 !/tests/morrison_images.py
 !/tests/morrison_check.py
+!/tests/morrison_learning_check.py

@@ -243,6 +243,15 @@ sys/brunel_additive_proxy_$(1)_g$(2).bin sys/brunel_morrison_proxy_$(1)_g$(2).bi
 endef
 $(foreach variant,replicated home relay,$(foreach size,2 4 8,$(eval $(call BRUNEL_PROXY_VARIANT,$(variant),$(size)))))
 
+# Whole-row range jobs with two 1 KiB bulk-copy banks; ABI2.
+sys/morrison_bulk.bin: $(BRUNEL_SOURCES) sys/morrison_bulk_layout.h sys/morrison_bulk_runtime.inc sys/morrison_tree_runtime.inc
+	${PREFIX}gcc $(BRUNEL_BUILD_FLAGS) -DBR_RULE=1 -DBR_MORRISON=1 -DBR_PROXY=1 -DBR_PROXY_SIZE=4 -DBR_PROXY_TRACES=0 -DBR_BULK=1 $(BRUNEL_ASM_FLAGS) -o $(@:.bin=.elf) sys/brunel.S sys/brunel_runtime.S
+	${PREFIX}objcopy -j .text -j .data -O binary $(@:.bin=.elf) $@
+
+sys/morrison_bulk_tree.bin: $(BRUNEL_SOURCES) sys/morrison_bulk_layout.h sys/morrison_bulk_runtime.inc sys/morrison_tree_runtime.inc
+	${PREFIX}gcc $(BRUNEL_BUILD_FLAGS) -DBR_RULE=1 -DBR_MORRISON=1 -DBR_PROXY=1 -DBR_PROXY_SIZE=4 -DBR_PROXY_TRACES=0 -DBR_BULK=1 -DBR_BULK_TREE=1 $(BRUNEL_ASM_FLAGS) -o $(@:.bin=.elf) sys/brunel.S sys/brunel_runtime.S
+	${PREFIX}objcopy -j .text -j .data -O binary $(@:.bin=.elf) $@
+
 # Full Morrison uses a distinct, versioned compact image ABI. Both variants keep
 # learning traces at neuron homes; the MC count is read from the image.
 define MORRISON_VARIANT

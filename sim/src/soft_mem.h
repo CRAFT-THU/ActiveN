@@ -331,6 +331,14 @@ public:
     return allocated.count();
   }
 
+  // Passive timestep-boundary validation; includes unissued posted stores.
+  size_t postedStoreCount() const noexcept {
+    size_t count = 0;
+    for (size_t slot = 0; slot < inflight; ++slot)
+      count += allocated.test(slot) && mshrs[slot].write && mshrs[slot].isNoReceipt();
+    return count;
+  }
+
   size_t mshrUnissuedCount() const noexcept {
     return issueQueue.size();
   }
@@ -341,6 +349,15 @@ public:
 
   size_t mshrFulfilledCount() const noexcept {
     return allocated.countAnd(fulfilled);
+  }
+
+  // Passive sampled occupancy: ordinary/bulk unicast versus scatter returns.
+  std::array<size_t, 2> mshrFulfilledByClass() const noexcept {
+    std::array<size_t, 2> counts{};
+    for (size_t slot = 0; slot < inflight; ++slot)
+      if (allocated.test(slot) && fulfilled.test(slot))
+        ++counts[mshrs[slot].isBroadcast() ? 1 : 0];
+    return counts;
   }
 
   std::optional<uint8_t> mshrAllocSlot() const noexcept __attribute__((always_inline)) {
@@ -576,6 +593,7 @@ class DRAMIf : public MemIf {
   struct CycleEvents {
     bool externalRequestPresented = false;
     bool externalRequestAccepted = false;
+    bool externalRequestWrite = false;
     bool externalResponseAccepted = false;
     bool mshrUnicastLocalRetired = false;
     bool mshrUnicastRemoteInjected = false;
@@ -863,6 +881,8 @@ public:
     const bool issueFire = mem.reqAccepting && issueSlot.has_value();
     lastCycleEvents.externalRequestPresented = issueSlot.has_value();
     lastCycleEvents.externalRequestAccepted = issueFire;
+    // Capture the same head as the handshake, before commits can reuse its slot.
+    lastCycleEvents.externalRequestWrite = issueSlot && mshrs[*issueSlot].write;
     lastCycleEvents.externalResponseAccepted = mem.resp.has_value();
     if (issueFire) MemIf::mshrReqCommit(*issueSlot);
     if (mem.resp) MemIf::mshrRespAccept(*mem.resp);

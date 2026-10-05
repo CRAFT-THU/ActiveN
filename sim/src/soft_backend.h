@@ -286,6 +286,7 @@ class SoftSystemBackend : public SystemBackend {
   uint64_t timer_stats_intervals_ = 0;
   uint32_t sparse_observed_steps_ = 0;
   uint32_t brunel_observed_steps_ = 0;
+  uint32_t brunelBoundaryPending_ = 0;
   // Optional observation only: sampled target cycles, never host wall time.
   struct BrunelPuProfile {
     uint64_t samples = 0, active0 = 0, active1 = 0;
@@ -296,18 +297,45 @@ class SoftSystemBackend : public SystemBackend {
     uint64_t issued0 = 0, issued1 = 0, neurons0 = 0, neurons1 = 0;
     uint64_t ac_wait_cycles = 0, biu_blocked_cycles = 0;
     uint64_t last_forward_injection = 0;
+    uint64_t bulk_banks = 0, bulk_emitting = 0, bulk_wait = 0;
+    uint64_t bulk_commands = 0, bulk_lines = 0, bulk_overlap = 0, cross_job_overlap = 0;
   };
   std::vector<std::array<BrunelPuProfile, 4>> brunelPuProfile_;
   struct BrunelMcProfile {
     uint64_t cycles = 0, presented = 0, accepted = 0, responses = 0;
     uint64_t inflight = 0, unissued = 0, fulfilled = 0, max_inflight = 0;
+    uint64_t accepted_reads = 0, accepted_writes = 0;
+    uint64_t refused_reads = 0, refused_writes = 0;
+    uint64_t return_samples = 0, returned_total = 0, returned_unicast = 0, returned_scatter = 0;
   };
   std::vector<std::array<BrunelMcProfile, 4>> brunelMcProfile_;
+  struct BrunelMshrProfile {
+    uint64_t samples = 0, full = 0, transient = 0, head_ready = 0;
+    uint64_t head_loading_younger_ready = 0, head_loading_none_ready = 0;
+    std::array<uint64_t, 17> ready_entries{};
+  };
+  std::vector<BrunelMshrProfile> brunelMshrProfile_;
+  // Eight little-endian words per full-pool observation; schema in the writer.
+  std::vector<std::array<uint32_t, 8>> brunelMshrSamples_;
+  struct BrunelExecutionProfile {
+    uint64_t cycles = 0, advanced0 = 0, advanced1 = 0;
+    uint64_t stalled0 = 0, stalled1 = 0, no_valid = 0;
+    uint64_t fp0 = 0, fp1 = 0, memory = 0, message = 0, delayed = 0;
+    uint64_t active0 = 0, active1 = 0;
+  };
+  std::vector<BrunelExecutionProfile> brunelExecutionProfile_;
+  // Reverse only, indexed by SMT, 8KiB payload word, advance/stall.
+  std::array<std::array<std::array<uint64_t, 2>, 2048>, 2> brunelExecutionPcs_{};
+  // cycle low/high, step, PU, count/head/tail, masks, exec PC/flags, fetch PCs.
+  std::vector<std::array<uint32_t, 12>> brunelExecutionSamples_;
   std::unordered_map<uint64_t, uint64_t> brunelPcProfile_;
   uint32_t brunelProfileCompleted_ = 0;
   struct BrunelMemoryEvent { uint64_t cycle; uint32_t pu, kind, token, address; };
   std::vector<BrunelMemoryEvent> brunelMemoryEvents_;
+  std::vector<std::array<uint32_t,4>> brunelBulkBanks_; // state0/1, issuing-job ticket0/1
   void observeBrunelMemory(uint64_t cycle);
+  void observeMorrisonBoundary(uint64_t cycle, const char *directory,
+                                uint32_t completed);
   void observeBrunelProfile(uint64_t cycle, const char *directory,
                            uint32_t completed);
   std::array<uint64_t, 9> brunel_last_counts_{};

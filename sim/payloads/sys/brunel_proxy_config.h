@@ -1,6 +1,24 @@
 /* Shared compile-time proxy geometry. The ordinary neuron/header ABI stays fixed. */
 #ifndef BRUNEL_PROXY_CONFIG_H
 #define BRUNEL_PROXY_CONFIG_H
+#ifndef BR_BULK
+#define BR_BULK 0
+#endif
+#ifndef BR_BULK_TREE
+#define BR_BULK_TREE 0
+#endif
+#if BR_BULK
+#include "morrison_bulk_layout.h"
+#define BR_CONTROL_ID 6
+#define BR_REPORT_ID 7
+#define BR_SERVICE_ID 8
+#define BR_WORK_ID 9
+#else
+#define BR_CONTROL_ID 2
+#define BR_REPORT_ID 3
+#define BR_SERVICE_ID 6
+#define BR_WORK_ID 8
+#endif
 #ifndef BR_MORRISON
 #define BR_MORRISON 0
 #endif
