@@ -1,8 +1,28 @@
-/* ABI 2: whole CSR rows, direct directories and a two-bank bulk coroutine.
+/* ABI 3: whole CSR rows, two 2 KiB forward/reverse banks and a ready queue.
  * MB_* offsets are relative to scratchpad; B_* to scratchpad + 0x2000. */
 #ifndef MORRISON_BULK_LAYOUT_H
 #define MORRISON_BULK_LAYOUT_H
-#define MB_ABI_VERSION 2
+#define MB_ABI_VERSION 3
+#define MB_SHARED0 0x2500
+#define MB_SHARED1 0x3700
+#define MB_SHARED_BYTES 2048
+#define MB_COPY_BYTES 1024
+#define MB_MSHRS 64
+#define MB_READ_CREDITS 16
+#define MB_READY_CONTROL 0x2140
+#define R_HEAD 0
+#define R_TAIL 32
+#define R_CREDIT 64
+#define R_ALLOC 96
+#define R_PENDING 100
+#define R_ADDRESS 104
+#define R_LTD 108
+#define R_LTP 112
+#define R_MC 116
+#define R_DIR_ACTIVE 120
+#define R_DIR_STAGE 124
+#define R_CLOSING 128
+#define MB_READY_RING 0x2240
 #define MB_ROW_POINTERS 0x2ea0
 #define MB_ROW_POINTER_WORDS 221
 #define MB_CONTROL 0x2000

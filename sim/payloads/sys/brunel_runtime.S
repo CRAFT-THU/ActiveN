@@ -5,7 +5,8 @@
  * them. Helper-specific scratch and return-link registers are documented below.
  * SMT0 owns forward/directory/MSHR work and credited memory requests;
  * integration and spike reception use both SMT threads.
- * Forward delivery uses only the 2 KiB ping-pong staging area; quiet LTD is
+ * Brunel stages forward delivery in 2 KiB; bulk Morrison shares two 2 KiB
+ * banks with its reverse descriptors. Quiet LTD is
  * committed at the postsynaptic PU with a fire-and-forget scalar store.
  * Reverse events carry full MC-local addresses. Memory effects must be ordered.
  */
@@ -234,6 +235,14 @@
 /* a0=DRAM address, a3=FP32 data; retain acknowledgements and credit bound. */
 .macro STORE_WORD
 .Lstore_credit_wait\@:
+#if BR_BULK
+ li t0,BR_BASE+MB_READY_CONTROL+R_CREDIT
+ lw t1,0(t0)
+ sltiu t1,t1,MB_READ_CREDITS
+ beqz t1,.Lstore_credit_wait\@
+ li t1,1
+ amoadd.w zero,t1,(t0)
+#else
  lw t0,H_ISSUED(gp)
  lw t1,H_CONSUMED(gp)
  sub t1,t0,t1
@@ -241,6 +250,7 @@
  beqz t1,.Lstore_credit_wait\@
  addi t0,t0,1
  sw t0,H_ISSUED(gp)
+#endif
  li a1,0x28003
  li a2,0x8000
  lw t0,H_MC_DEST(gp)
@@ -250,6 +260,19 @@
 /* Completion handler is a leaf so it can retire notifications quickly. */
 .globl br_completion
 br_completion:
+#if BR_BULK
+ # Ordinary boot/directory completion; reverse installs the cached producer.
+ slli t0,a0,16
+ bltz t0,1f
+ slli t0,a1,2
+ add t0,gp,t0
+ li t1,1
+ sw t1,H_READY0(t0)
+1: li t0,BR_BASE+MB_READY_CONTROL+R_CREDIT
+ li t1,-1
+ amoadd.w zero,t1,(t0)
+ j br_idle
+#else
  slli t0,a0,16
  bltz t0,1f
  li t0,3
@@ -275,6 +298,7 @@ br_completion:
 .Lbad_completion:
  li a0,0xb002
  j br_halt
+#endif
 /* These leaf transports do not impose address-specific completion waits. */
 br_load_start:
  addi a2,a1,(READ/32)
@@ -290,6 +314,15 @@ br_line_start:
  sw zero,80(t0)
 br_mshr_line_start:
 .Lload_credit_wait:
+#if BR_BULK
+ li t2,BR_BASE+MB_READY_CONTROL
+ lw t1,R_CREDIT(t2)
+ sltiu t1,t1,MB_READ_CREDITS
+ beqz t1,.Lload_credit_wait
+ addi t2,t2,R_CREDIT
+ li t1,1
+ amoadd.w zero,t1,(t2)
+#else
  lw t0,H_ISSUED(gp)
  lw t1,H_CONSUMED(gp)
  sub t1,t0,t1
@@ -297,6 +330,7 @@ br_mshr_line_start:
  beqz t1,.Lload_credit_wait
  addi t0,t0,1
  sw t0,H_ISSUED(gp)
+#endif
  mv a3,a1
  li a1,0x58002
 #if BR_HOME_UPDATES
@@ -356,9 +390,15 @@ br_store_word:
  STORE_WORD
  ret
 br_drain:
+#if BR_BULK
+ li t0,BR_BASE+MB_READY_CONTROL+R_CREDIT
+1: lw t1,0(t0)
+ bnez t1,1b
+#else
 1: lw t0,H_ISSUED(gp)
  lw t1,H_CONSUMED(gp)
  bne t0,t1,1b
+#endif
  ret
 br_continue:
  YIELDI BR_WORK_ID
@@ -403,6 +443,9 @@ br_ltp_morrison:
  * ra and t6 (the allocator's return link) survive all arithmetic and stores.
  * Returns the remaining descriptor count in t0 on every path.
  */
+#if BR_BULK
+#include "morrison_ready_runtime.inc"
+#else
 br_mshr_retire:
  lw t0,H_MSHR_COUNT(gp)
  beqz t0,9f
@@ -534,6 +577,7 @@ br_mshr_allocate:
  sw t0,H_MSHR_SCHEDULED(gp)
  SENDI zero,BR_SERVICE_ID
 4: jr t6
+#endif
 .globl br_reverse
 br_reverse:
 #if BR_HOME_UPDATES || BR_RELAY_UPDATES
@@ -556,6 +600,9 @@ br_reverse:
  beqz t2,8f
  li a2,0
 .Lreverse_allocate:
+#if BR_BULK
+ j mr_accept
+#else
 #if BR_RELAY_UPDATES
  /* One targeted packet per useful update; the address already identifies
   * the synapse, so no post ID or CSR search is needed. a0=weight address,
@@ -584,6 +631,7 @@ br_reverse:
  mv a5,a2
  mv a6,t2
  jal t6,br_mshr_allocate
+#endif
 #endif
 8:
 .Lreverse_received:

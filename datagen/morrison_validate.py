@@ -38,9 +38,10 @@ class Image:
     def __init__(self, directory, backing=None, hashes=True):
         self.directory = Path(directory)
         self.manifest = json.loads((self.directory / "manifest.json").read_text())
-        if self.manifest["format"] not in ("activen-morrison-image-v1", "activen-morrison-image-v2"):
+        if self.manifest["format"] not in ("activen-morrison-image-v1", "activen-morrison-image-v2", "activen-morrison-image-v3"):
             raise ValueError("unknown image ABI")
-        self.bulk = self.manifest["format"] == "activen-morrison-image-v2"
+        self.abi = int(self.manifest["format"].rsplit("v",1)[1])
+        self.bulk = self.abi >= 2
         self.spec = Spec(**self.manifest["spec"])
         self.spec.validate(self.manifest["functional"])
         self.group = self.manifest["group_size"]
@@ -81,7 +82,7 @@ class Image:
             params = spm[PARAMETERS//4:PARAMETERS//4+8]
             if self.bulk:
                 stride = max(32, self.spec.mc*8)
-                if tuple(params[[0,1,2,4,5,7]]) != (self.spec.ne,self.spec.ni,self.spec.mc,2,self.manifest['dispatch_width'],stride):
+                if tuple(params[[0,1,2,4,5,7]]) != (self.spec.ne,self.spec.ni,self.spec.mc,self.abi,self.manifest['dispatch_width'],stride):
                     raise ValueError('bad ABI2 parameters')
                 if int(spm[PARAMETERS//4+8]) != (1 if self.manifest.get('dispatch_policy', 'legacy') == 'balanced' else 0):
                     raise ValueError('bulk dispatch policy disagrees with manifest')

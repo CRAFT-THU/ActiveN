@@ -118,7 +118,8 @@ def check(directory, run):
                         if not count: continue
                         owner = ((home//workers*workers)^override)+(home%workers+rank)%workers
                         length = min(size-offset,count*unit)
-                        commands[owner] += (length+1023)//1024
+                        bank_bytes = manifest.get("forward_copy_bytes",manifest.get("forward_bank_bytes",1024))
+                        commands[owner] += (length+bank_bytes-1)//bank_bytes
                         copy_lines[owner] += length//32
                         offset += length
                     if offset != size: raise ValueError('incomplete expected copy partition')
@@ -150,7 +151,15 @@ def check(directory, run):
                 raise ValueError("incomplete step/memory/MSHR drain")
             if spm[0x3f00//4] != 0x19ca7ead or spm[0x3f80//4] != 0x19ca7ead:
                 raise ValueError("stack guard overwritten")
-            pool = spm[0x2900//4:0x2d00//4].reshape(16, 16)
+            if image.abi >= 3:
+                pool = np.concatenate((spm[0x2500//4:0x2d00//4],spm[0x3700//4:0x3f00//4])).reshape(64,16)
+                ready = spm[0x2140//4:0x21c0//4]
+                if ready[0] != ready[8] or any(ready[i//4] for i in (64,100,120)):
+                    raise ValueError('live ready queue/credit/job/directory at completion')
+                if manifest.get('reverse_schedule') == 'ready-queue-chains-v1' and spm[0x21c0//4] != 1:
+                    raise ValueError('updater chains were not closed')
+            else:
+                pool = spm[0x2900//4:0x2d00//4].reshape(16, 16)
             if np.any(pool[:, 11]):
                 raise ValueError("live MSHR at completion")
             expected_local = np.flatnonzero(fired[pu::spec.pu])

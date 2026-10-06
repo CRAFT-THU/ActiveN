@@ -69,6 +69,7 @@
 #include <ramulator/base/request.h>
 #include <ramulator/frontend/i_frontend.h>
 #include <ramulator/memory_system/i_memory_system.h>
+#include "morrison_hbm_probe.h"
 #include <verilated_fst_c.h>
 
 using namespace std;
@@ -279,6 +280,16 @@ struct System::Impl {
     float tck_ns = 0.0f;
     for (int i = 0; i < num_mc; ++i) {
       auto config = Ramulator::Config::parse_config_file(rcfg.configFile);
+      if (morrison_probe::enabled()) {
+        auto mem=config["memory_system"];
+        auto controllers=mem["controllers"];
+        Ramulator::ConfigNode observed;
+        if (controllers.size()!=1 || controllers.seq()[0]["impl"].as<string>()!="HBM12")
+          throw runtime_error("Morrison probe requires one native HBM12 controller per MC");
+        auto controller=controllers.seq()[0];
+        controller.set("impl","MorrisonHBMProbe"); observed.push_back(controller);
+        mem.set("controllers",observed); config.set("memory_system",mem);
+      }
       auto &r = ramulator_mcs[i];
       r.frontend.reset(Ramulator::Factory::create_frontend(config));
       r.memory.reset(Ramulator::Factory::create_memory_system(config));
@@ -502,6 +513,7 @@ struct System::Impl {
       ramulator_tick_phase += ramulator_ticks_per_core_cycle;
       while (ramulator_tick_phase + 1e-12L >= 1.0L) {
         for (auto &r : ramulator_mcs) {
+          morrison_probe::mc=&r-ramulator_mcs.data();
           r.memory->tick();
         }
         ramulator_tick_phase -= 1.0L;
@@ -762,6 +774,10 @@ bool System::run(uint64_t maxCycles) {
     if (exiting) break;
 
     // Phase 2: tick frontend memory + build bus_in + serve presented requests.
+    if (morrison_probe::enabled()) {
+      const auto [step,phase]=impl_->backends.front()->morrisonProbePhase();
+      morrison_probe::cycle=cycle; morrison_probe::step=step; morrison_probe::phase=phase;
+    }
     impl_->tickMemory(cycle);
     impl_->buildBusInAndServe(cycle);
 

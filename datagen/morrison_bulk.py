@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ABI2 Morrison images: whole chunked rows and runtime range delegation."""
+"""ABI3 Morrison images: whole chunked rows and runtime range delegation."""
 import argparse
 from dataclasses import asdict
 import json
@@ -12,7 +12,7 @@ from morrison_graph import Graph, partition, sha256, BLOCK
 from morrison_model import (Spec, F, MAGIC, NODE_BASE, NODE_BYTES, CONFIG,
     PARAMETERS, POISSON, INIT_END, MC_BYTES, LINE, constants, poisson_thresholds)
 
-ROW_POINTERS, ABI_VERSION = 0x2ea0, 2
+ROW_POINTERS, ABI_VERSION = 0x2ea0, 3
 DISPATCH_POLICIES = {'legacy': 0, 'balanced': 1}
 
 
@@ -173,10 +173,10 @@ def write_images(graph, output, payload, *, dispatch_width=4, dispatch_policy='b
     np.save(output/'neurons.npy', graph.state)
     np.save(output/'plastic-outdegree.npy', np.diff(graph.offsets['ee']).astype('<u4'))
     sizes = [p.stat().st_size for p in images.paths]
-    manifest = dict(format='activen-morrison-image-v2', model=spec.model(), spec=asdict(spec), system=spec.system(),
+    manifest = dict(format='activen-morrison-image-v3', model=spec.model(), spec=asdict(spec), system=spec.system(),
         functional=functional, source=graph.provenance, group_size=1, dispatch_width=dispatch_width,
         dispatch_policy=dispatch_policy,
-        forward_completion=forward_completion,
+        forward_completion=forward_completion, forward_bank_bytes=2048, forward_copy_bytes=1024, reverse_schedule="ready-queue-chains-v1", mshr_entries=64, read_credits=16,
         warmup=warmup, timed=timed, seed=seed, external_drive=external,
         constants={k:float(v) for k,v in c.items()}, plastic_edges=plastic_count, static_edges=static_count,
         graph_sha256=graph.graph_hash.hexdigest(), neuron_sha256=sha256(output/'neurons.npy'), payload_sha256=sha256(payload),

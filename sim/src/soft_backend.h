@@ -150,6 +150,7 @@ class SoftSystemBackend : public SystemBackend {
   static constexpr size_t ROUTER_Q_DEPTH = 8;
 
  public:
+  std::pair<uint32_t, uint32_t> morrisonProbePhase() const override;
   // Per-period stats. Counters are running totals; periodic prints emit
   // delta vs. the prior snapshot. cur_* fields are instantaneous and
   // are not subtracted.
@@ -324,6 +325,13 @@ class SoftSystemBackend : public SystemBackend {
     uint64_t active0 = 0, active1 = 0;
   };
   std::vector<BrunelExecutionProfile> brunelExecutionProfile_;
+  struct MorrisonReadyProfile {
+    uint64_t cycles=0, credit_sum=0, ready_sum=0, occupied_sum=0;
+    uint64_t max_credit=0, max_ready=0, max_occupied=0, max_tail=0;
+    uint64_t pending=0, next_busy=0, credit_full=0;
+    uint64_t lr=0, sc0=0, sc1=0, sc_failed=0, lrsc_dma_stall=0, dma_reserved=0;
+  };
+  std::vector<MorrisonReadyProfile> morrisonReadyProfile_;
   // Reverse only, indexed by SMT, 8KiB payload word, advance/stall.
   std::array<std::array<std::array<uint64_t, 2>, 2048>, 2> brunelExecutionPcs_{};
   // cycle low/high, step, PU, count/head/tail, masks, exec PC/flags, fetch PCs.
@@ -334,6 +342,7 @@ class SoftSystemBackend : public SystemBackend {
   std::vector<BrunelMemoryEvent> brunelMemoryEvents_;
   std::vector<std::array<uint32_t,4>> brunelBulkBanks_; // state0/1, issuing-job ticket0/1
   void observeBrunelMemory(uint64_t cycle);
+  void observeMorrisonPhase(uint64_t cycle);
   void observeMorrisonBoundary(uint64_t cycle, const char *directory,
                                 uint32_t completed);
   void observeBrunelProfile(uint64_t cycle, const char *directory,

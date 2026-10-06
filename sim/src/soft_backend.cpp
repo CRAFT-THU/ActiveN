@@ -29,9 +29,12 @@
 #include "soft_components.h"
 #include "soft_mem.h"
 #include "soft_verilated/soft_rtl___024root.h"
+#include "morrison_phase_probe.h"
 #include "../payloads/sys/mnist_sparse_layout.inc"
 
 using namespace std;
+
+#include "morrison_cpu_probe.inc"
 
 // Wall-clock accumulator (ns) for time spent inside soft_rtl Verilator
 // eval() calls, summed across all PUs. Thread-local because Verilated
@@ -736,7 +739,7 @@ void SoftSystemBackend::peek(uint64_t cycle, std::vector<MemBusOut *> out) {
     if (recognized && completed != brunel_observed_steps_) {
       if (completed != brunel_observed_steps_ + 1)
         throw runtime_error("Brunel observer missed step");
-      if (compact && word(1, MR_PARAMETERS+16) == MB_ABI_VERSION)
+      if (compact && word(1, MR_PARAMETERS+16) >= 2)
         brunelBoundaryPending_ = completed;
       std::ostringstream name;
       name << directory << "/step-" << std::setfill('0') << std::setw(4) << completed << ".bin";
@@ -821,8 +824,20 @@ void SoftSystemBackend::observeMorrisonBoundary(uint64_t cycle, const char *dire
     return dst >= 0x8001 && (tag & 255) == 2;
   };
   size_t coreStores = 0, networkStores = 0, memoryStores = 0;
+  size_t updater8Events = 0, updater15Events = 0;
   for (unsigned pu = 1; pu <= cfg.numPU; ++pu) {
     const auto *root = cores[pu]->rootp;
+    if (word(pu,MR_PARAMETERS+16)==3) {
+      const auto queued = [](unsigned enq, unsigned deq, bool full) {
+        return full ? 16u : ((enq-deq)&15u);
+      };
+      updater8Events += queued(root->Core__DOT__exec__DOT__biu__DOT__evq_8__DOT__enq_ptr_value,
+          root->Core__DOT__exec__DOT__biu__DOT__evq_8__DOT__deq_ptr_value,
+          root->Core__DOT__exec__DOT__biu__DOT__evq_8__DOT__full);
+      updater15Events += queued(root->Core__DOT__exec__DOT__biu__DOT__evq_15__DOT__enq_ptr_value,
+          root->Core__DOT__exec__DOT__biu__DOT__evq_15__DOT__deq_ptr_value,
+          root->Core__DOT__exec__DOT__biu__DOT__evq_15__DOT__full);
+    }
     // Both configured workload cores have 32 BIU send slots. Checking
     // just ext_out would miss a store behind hardware I-cache traffic.
 #define CHECK_POSTED_SLOT(N) \
@@ -848,12 +863,14 @@ void SoftSystemBackend::observeMorrisonBoundary(uint64_t cycle, const char *dire
   for (const auto &dram : drams) memoryStores += dram.postedStoreCount();
   std::ofstream boundary(std::filesystem::path(directory) / "morrison-boundary.csv",
                          completed == 1 ? std::ios::out : std::ios::app);
-  if (completed == 1) boundary << "step,cycle,core_stores,network_stores,mc_stores\n";
+  if (completed == 1) boundary << "step,cycle,core_stores,network_stores,mc_stores,updater8_events,updater15_events\n";
   boundary << completed << ',' << cycle << ',' << coreStores << ','
-           << networkStores << ',' << memoryStores << '\n';
+           << networkStores << ',' << memoryStores << ',' << updater8Events << ',' << updater15Events << '\n';
   if (!boundary) throw runtime_error("cannot write Morrison boundary observation");
   if (coreStores || networkStores || memoryStores)
     throw runtime_error("Morrison completed with posted stores in flight");
+  if (updater8Events || updater15Events)
+    throw runtime_error("Morrison completed with updater continuations queued");
 }
 
 // Sample pre-edge state every 256 target cycles. PC histograms cover the timed
@@ -927,7 +944,7 @@ void SoftSystemBackend::observeBrunelProfile(uint64_t cycle,
         p = {};
       }
     if (!mc) throw runtime_error("cannot write Brunel MC profile");
-    if (detailedMshr) {
+    if (detailedMshr && word(1, MR_PARAMETERS+16) < 3) {
       std::ofstream pools(std::filesystem::path(directory) / "mshr-pool-profile.csv",
                           completed == 1 ? std::ios::out : std::ios::app);
       if (completed == 1) {
@@ -992,6 +1009,7 @@ void SoftSystemBackend::observeBrunelProfile(uint64_t cycle,
         }
       if (!pcs) throw runtime_error("cannot write reverse execution PCs");
 
+      if (word(1, MR_PARAMETERS+16) < 3) {
       std::ofstream joint(std::filesystem::path(directory) / "reverse-execution-samples.bin",
                            std::ios::binary | (completed == 1 ? std::ios::out : std::ios::app));
       static_assert(std::endian::native == std::endian::little);
@@ -1006,6 +1024,22 @@ void SoftSystemBackend::observeBrunelProfile(uint64_t cycle,
                     brunelExecutionSamples_.size() * sizeof(brunelExecutionSamples_[0]));
       if (!joint) throw runtime_error("cannot write reverse execution samples");
       brunelExecutionSamples_.clear();
+      }
+      if (!morrisonReadyProfile_.empty()) {
+        std::ofstream ready(std::filesystem::path(directory) / "ready-queue-profile.csv",
+                            completed == 1 ? std::ios::out : std::ios::app);
+        if (completed == 1) ready << "step,pu,cycles,credit_sum,ready_sum,occupied_sum,max_credit,max_ready,max_occupied,max_tail,pending,next_busy,credit_full,lr,sc0,sc1,sc_failed,lrsc_dma_stall,dma_reserved\n";
+        for (unsigned pu=1;pu<=cfg.numPU;++pu) {
+          auto &r=morrisonReadyProfile_[pu];
+          ready << completed << ',' << pu << ',' << r.cycles << ',' << r.credit_sum << ','
+                << r.ready_sum << ',' << r.occupied_sum << ',' << r.max_credit << ',' << r.max_ready << ','
+                << r.max_occupied << ',' << r.max_tail << ',' << r.pending << ',' << r.next_busy << ','
+                << r.credit_full << ',' << r.lr << ',' << r.sc0 << ',' << r.sc1 << ',' << r.sc_failed << ','
+                << r.lrsc_dma_stall << ',' << r.dma_reserved << '\n';
+          r={};
+        }
+        if (!ready) throw runtime_error("cannot write Morrison ready profile");
+      }
     }
     std::ofstream memory(std::filesystem::path(directory) / "mshr-memory.csv",
                          completed == 1 ? std::ios::out : std::ios::app);
@@ -1072,17 +1106,20 @@ void SoftSystemBackend::observeBrunelProfile(uint64_t cycle,
     const bool executing = root->Core__DOT__exec__DOT__valid;
     p.executing += executing;
     p.stalled += executing && !root->Core__DOT__exec__DOT__s0step;
-    p.outstanding += word(pu, offsetof(BrHeader, issued)) - word(pu, offsetof(BrHeader, consumed));
+    const bool readyRuntime = word(pu,0) == MR_MAGIC && word(pu,MR_PARAMETERS+16) == 3;
+    const auto outstanding = readyRuntime ? word(pu,MB_READY_CONTROL+R_CREDIT) :
+        word(pu,offsetof(BrHeader,issued))-word(pu,offsetof(BrHeader,consumed));
+    p.outstanding += outstanding;
     const auto occupancy = word(pu, offsetof(BrHeader,mshr_count));
     p.mshr_occupancy += occupancy;
-    p.mshr_full += occupancy >= BR_MSHRS;
-    p.credit_full += word(pu, offsetof(BrHeader,issued)) - word(pu, offsetof(BrHeader,consumed)) >= BR_CREDITS;
+    p.mshr_full += occupancy >= (readyRuntime ? MB_MSHRS : BR_MSHRS);
+    p.credit_full += outstanding >= (readyRuntime ? MB_READ_CREDITS : BR_CREDITS);
     p.egress += root->Core__DOT__exec__DOT__biu__DOT__sendQueue__DOT__cnt;
     const auto &buf = routers[pu].buf;
     p.injection_blocked += buf.core_inject_presenting && !buf.core_inject_accepting;
     p.reverse_full += root->Core__DOT__exec__DOT__biu__DOT__evq_4__DOT__full;
-    const bool bulk = word(pu, 0) == MR_MAGIC && word(pu, MR_PARAMETERS+16) == MB_ABI_VERSION;
-    if (detailedMshr && bulk && phase == 3) {
+    const bool bulk = word(pu, 0) == MR_MAGIC && word(pu, MR_PARAMETERS+16) >= 2;
+    if (detailedMshr && bulk && word(pu, MR_PARAMETERS+16) == 2 && phase == 3) {
       auto &probe = brunelMshrProfile_[pu];
       ++probe.samples;
       if (occupancy >= BR_MSHRS) {
@@ -1142,7 +1179,7 @@ void SoftSystemBackend::observeBrunelMemory(uint64_t cycle) {
     return rootSpm[offset / MEM_BUS_WIDTH_B][(offset % MEM_BUS_WIDTH_B) / 4];
   };
   const bool reverseExecution = executionProfile && rootWord(0) == MR_MAGIC &&
-      rootWord(MR_PARAMETERS + 16) == MB_ABI_VERSION &&
+      rootWord(MR_PARAMETERS + 16) >= 2 &&
       rootWord(offsetof(BrHeader, phase)) == 3 &&
       rootWord(offsetof(BrHeader, completed)) < rootWord(offsetof(BrHeader, steps));
   const uint32_t executionStep = reverseExecution ? rootWord(offsetof(BrHeader, completed)) + 1 : 0;
@@ -1158,7 +1195,7 @@ void SoftSystemBackend::observeBrunelMemory(uint64_t cycle) {
       return spm[offset / MEM_BUS_WIDTH_B][(offset % MEM_BUS_WIDTH_B) / 4];
     };
     const bool compact = word(0) == MR_MAGIC;
-    const bool bulk = compact && word(MR_PARAMETERS+16) == MB_ABI_VERSION;
+    const bool bulk = compact && word(MR_PARAMETERS+16) >= 2;
     if ((!compact && word(0) != BR_MAGIC) || brunelPuProfile_.empty()) continue;
     if (reverseExecution) {
       if (!bulk || brunelExecutionProfile_.size() != cfg.numPU + 1)
@@ -1186,7 +1223,7 @@ void SoftSystemBackend::observeBrunelMemory(uint64_t cycle) {
           p.delayed += root.Core__DOT__exec__DOT__delayed;
         } else (thread ? p.stalled1 : p.stalled0)++;
       }
-      if (!(cycle & 255)) {
+      if (!(cycle & 255) && word(MR_PARAMETERS+16) == 2) {
         const uint32_t count = word(offsetof(BrHeader, mshr_count));
         const uint32_t head = word(offsetof(BrHeader, mshr_head));
         const uint32_t tail = word(offsetof(BrHeader, mshr_tail));
@@ -1213,6 +1250,46 @@ void SoftSystemBackend::observeBrunelMemory(uint64_t cycle) {
       }
     }
     const auto phase = word(offsetof(BrHeader, phase));
+    if (reverseExecution && word(MR_PARAMETERS+16) == 3 &&
+        word(MB_CONTROL+B_REVERSE_STARTED)) {
+      if (morrisonReadyProfile_.empty()) morrisonReadyProfile_.resize(cfg.numPU+1);
+      auto &r=morrisonReadyProfile_[pu];
+      const auto credits=word(MB_READY_CONTROL+R_CREDIT);
+      const uint32_t tail=word(MB_READY_CONTROL+R_TAIL);
+      const uint32_t ready=tail-word(MB_READY_CONTROL+R_HEAD);
+      const auto occupied=word(offsetof(BrHeader,mshr_count));
+      if (credits>MB_READ_CREDITS || ready>MB_MSHRS)
+        throw runtime_error("Morrison credit/ready bound exceeded");
+      ++r.cycles; r.credit_sum+=credits; r.ready_sum+=ready; r.occupied_sum+=occupied;
+      r.max_credit=std::max(r.max_credit,uint64_t(credits));
+      r.max_ready=std::max(r.max_ready,uint64_t(ready));
+      r.max_occupied=std::max(r.max_occupied,uint64_t(occupied));
+      r.max_tail=std::max(r.max_tail,uint64_t(tail));
+      const auto pending=word(MB_READY_CONTROL+R_PENDING);
+      r.pending+=pending!=0; r.credit_full+=credits==MB_READ_CREDITS;
+      const auto cursor=word(MB_READY_CONTROL+R_ALLOC);
+      if (cursor>=MB_MSHRS) throw runtime_error("Morrison allocation cursor exceeded pool");
+      const auto slot=(cursor<32 ? MB_SHARED0 : MB_SHARED1)+(cursor&31)*sizeof(BrMshr);
+      r.next_busy+=pending && word(slot+offsetof(BrMshr,state));
+      const bool valid=root.Core__DOT__exec__DOT__valid;
+      const bool advanced=valid && root.Core__DOT__exec__DOT__s0step;
+      const bool queueAtomic=valid && root.Core__DOT__exec__DOT__uop_isMem &&
+          root.Core__DOT__exec__DOT____Vcellinp__lsu__req_bits_lrsc &&
+          root.Core__DOT__exec__DOT____Vcellinp__lsu__req_bits_addr==BR_BASE+MB_READY_CONTROL+R_HEAD;
+      const bool sc=root.Core__DOT__exec__DOT____Vcellinp__lsu__req_bits_write;
+      const bool dma=root.Core__DOT__exec__DOT__lsu__DOT__respMcwb;
+      r.lr+=queueAtomic && advanced && !sc;
+      if (queueAtomic && advanced && sc) {
+        (root.Core__DOT__exec__DOT__uop_smsel==1 ? r.sc0 : r.sc1)++;
+        r.sc_failed+=!root.Core__DOT__exec__DOT__lsu__DOT__reserved;
+      }
+      r.lrsc_dma_stall+=queueAtomic && dma && !advanced;
+      r.dma_reserved+=dma &&
+          ((root.Core__DOT__exec__DOT__lsu__DOT__spmReserved_0 &&
+            root.Core__DOT__exec__DOT__lsu__DOT__spmReservedAddr_0==MB_READY_CONTROL+R_HEAD) ||
+           (root.Core__DOT__exec__DOT__lsu__DOT__spmReserved_1 &&
+            root.Core__DOT__exec__DOT__lsu__DOT__spmReservedAddr_1==MB_READY_CONTROL+R_HEAD));
+    }
     if (bulk && phase == 2) {
       auto &banks = brunelBulkBanks_[pu];
       for (unsigned bank=0;bank<2;++bank) {
@@ -1271,14 +1348,20 @@ void SoftSystemBackend::observeBrunelMemory(uint64_t cycle) {
       if (core_mem_accept[pu].unicast && c.mem_unicast_bits_id == 0x8001)
         brunelMemoryEvents_.push_back({cycle, pu, 3, c.mem_unicast_bits_ident, 0});
     }
+    const auto descriptorToken = [&](uint32_t token) {
+      if (bulk && word(MR_PARAMETERS+16)==3)
+        return !(token&63) && ((token>=MB_SHARED0 && token<MB_SHARED0+MB_SHARED_BYTES) ||
+                              (token>=MB_SHARED1 && token<MB_SHARED1+MB_SHARED_BYTES));
+      return token>=BR_MSHR && token<BR_READ;
+    };
     if (routers[pu].buf.core_inject_accepting && c.ext_out_valid &&
         (c.ext_out_bits_tag & 255) == 0 &&
         (c.ext_out_bits_data_1 & 65535) == 0x8002 &&
-        c.ext_out_bits_data_3 >= BR_MSHR && c.ext_out_bits_data_3 < BR_READ) {
+        descriptorToken(c.ext_out_bits_data_3)) {
       brunelMemoryEvents_.push_back({cycle, pu, 0, c.ext_out_bits_data_3, c.ext_out_bits_data_0});
     }
     if (core_mem_accept[pu].unicast && c.mem_unicast_bits_id == 0x8002 &&
-        c.mem_unicast_bits_extra1 >= BR_MSHR && c.mem_unicast_bits_extra1 < BR_READ) {
+        descriptorToken(c.mem_unicast_bits_extra1)) {
       brunelMemoryEvents_.push_back({cycle, pu, 1, c.mem_unicast_bits_extra1, 0});
     }
   }
@@ -1512,6 +1595,7 @@ void SoftSystemBackend::step(uint64_t cycle) {
   const uint64_t statsStart = profile ? workProfileNowNs() : 0;
   accumulateStats(cycle);
   observeBrunelMemory(cycle);
+  observeMorrisonPhase(cycle);
   if (profile)
     workProfileRecordUnit(cycle, WorkProfilePhase::StepStart,
                           WorkProfileUnit::Stats, 0,
@@ -2738,6 +2822,8 @@ void SoftSystemBackend::printWorkProfile() const {
 
 bool SoftSystemBackend::printStats(uint64_t cycles, bool final_print) {
   if (final_print) {
+    if (const char *directory = std::getenv("MORRISON_WRITE_PROBE"))
+      for (const auto &dram : drams) dram.dumpWriteProbe(directory);
     if (nocProfileActive_) timerStatsStop(cycles);
     double v_ms = verilator_ns_ / 1e6;
     double u_ms = uncore_ns_ / 1e6;

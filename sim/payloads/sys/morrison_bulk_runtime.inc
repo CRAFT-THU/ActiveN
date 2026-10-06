@@ -1,5 +1,5 @@
 .globl mb_memory_idle,mb_copy_ready,mb_dispatch,mb_job,mb_produce,mb_check,mb_emit,br_control,br_report
-/* ABI2. SMT0 s0-s3 own the issuing range. SMT1 s0-s7 own emission.
+/* ABI3. SMT0 s0-s3 own the issuing range. SMT1 s0-s11 own emission.
  * All other forward handlers preserve saved registers. State words B_* are
  * relative to 0x20002000. Local continuations have arity zero. */
 .equ MB_BASE, BR_BASE+MB_CONTROL
@@ -87,7 +87,7 @@ mb_dispatch:
  lw t1,B_STATE(t3)
  bnez t1,.Lboot_bad
 1: sub t2,s1,s0
- li t1,1024
+ li t1,MB_COPY_BYTES
  bleu t2,t1,2f
  mv t2,t1
 2: sw s0,B_ADDRESS(t3)
@@ -110,11 +110,11 @@ mb_dispatch:
  or t1,t1,t4
  sw t1,B_RETURN(t3)
 #endif
- sub t1,t3,t0
- addi t1,t1,-B_BANK0
- slli t1,t1,5
- li a4,BR_BASE+PING
- add a4,a4,t1
+ li a4,BR_BASE+MB_SHARED0
+ addi t1,t0,B_BANK0
+ beq t3,t1,4f
+ li a4,BR_BASE+MB_SHARED1
+4:
  sw a4,B_LANDING(t3)
  li t1,B_FILLING
  sw t1,B_STATE(t3)
@@ -166,8 +166,12 @@ mb_copy_ready:
 #if BR_BULK_TREE
  lw s9,B_RETURN(s5)        # capture before the bank can be recycled
 #endif
+ add s11,s0,s2
  bnez s6,1f
- srli s2,s2,1
+ li t0,1024
+ bleu s2,t0,2f
+ mv s2,t0
+2: srli s2,s2,1
 1: add s1,s0,s2
  csrsi 0x719,8
  YIELDI 15
@@ -177,7 +181,7 @@ mb_emit:
  li a6,4
  bnez s6,.Lmb_emit_static
 .Lmb_emit_plastic:
- bgeu s0,s1,.Lmb_emitted
+ bgeu s0,s1,.Lmb_next_chunk
  add t0,s0,s2
  lw t0,0(t0)
  li t1,-1
@@ -226,6 +230,17 @@ mb_emit:
  bnez a6,.Lmb_emit_static
 .Lmb_emit_continue:
  bltu s0,s1,3f
+ bnez s6,.Lmb_emitted
+.Lmb_next_chunk:
+ add s0,s0,s2              # skip this chunk's destination half
+ bgeu s0,s11,.Lmb_emitted
+ sub s2,s11,s0
+ li t0,1024
+ bleu s2,t0,5f
+ mv s2,t0
+5: srli s2,s2,1
+ add s1,s0,s2
+ j 3f
 .Lmb_emitted:
  sw zero,B_STATE(s5)
  li t0,MB_BASE
@@ -515,12 +530,18 @@ br_control_leaf:
  snez a1,a1
  j .Lmb_control_report
 .Lmb_reverse_query:
- lw a1,H_MSHR_COUNT(gp)
+ li t0,R_BASE
+ li t1,1
+ sw t1,R_CLOSING(t0)
+ csrsi 0x718,8
+ csrsi 0x71f,16
+ lw a1,R_PENDING(t0)
+ lw t0,H_MSHR_COUNT(gp)
+ or a1,a1,t0
  lw t0,H_MSHR_SCHEDULED(gp)
  or a1,a1,t0
- lw t0,H_ISSUED(gp)
- lw t1,H_CONSUMED(gp)
- sub t0,t0,t1
+ li t0,R_BASE
+ lw t0,R_CREDIT(t0)
  or a1,a1,t0
 #if BR_BULK_TREE
  lw t0,B_RX_PENDING(t4)
@@ -532,6 +553,9 @@ br_control_leaf:
  j br_idle
 .Lmb_integrate_start:
  sw a0,H_PHASE(gp)
+ # Both chains have retired; restore callback before saved registers change.
+ la t0,br_completion
+ csrw 0x700,t0
  sw zero,H_JOIN_COUNT(gp)
  sw zero,H_RECEIVED(gp)
  sw zero,H_REVERSE_RECEIVED(gp)
@@ -572,6 +596,18 @@ br_control_leaf:
  j br_idle
 .Lmb_forward_start:
  sw a0,H_PHASE(gp)
+ la t0,SPIKE_ENTRY
+ csrw 0x705,t0
+ li t0,0x00010003
+ csrw 0x725,t0
+ la t0,mb_emit
+ csrw 0x70f,t0
+#if BR_BULK_TREE
+ li t0,0x0006000b
+#else
+ li t0,0x0005000a
+#endif
+ csrw 0x72f,t0
  sw zero,H_SENT(gp)
 #if BR_BULK_TREE
  li s8,0
@@ -647,12 +683,54 @@ br_control_leaf:
  csrci 0x71c,8
  csrci 0x71f,16
  csrci 0x715,24
- la t0,br_mshr_service
+ # Forward owns both banks until global closure. Clear only descriptor flags.
+ li t0,BR_BASE+MB_SHARED0+44
+ li t1,32
+1: sw zero,0(t0)
+ addi t0,t0,64
+ addi t1,t1,-1
+ bnez t1,1b
+ li t0,BR_BASE+MB_SHARED1+44
+ li t1,32
+2: sw zero,0(t0)
+ addi t0,t0,64
+ addi t1,t1,-1
+ bnez t1,2b
+ li t0,R_BASE
+ sw zero,R_HEAD(t0)
+ sw zero,R_TAIL(t0)
+ sw zero,R_ALLOC(t0)
+ sw zero,R_PENDING(t0)
+ sw zero,R_DIR_STAGE(t0)
+ sw zero,R_CLOSING(t0)
+ li t1,3
+ sw t1,H_MSHR_SCHEDULED(gp)
+ li s0,0
+ li s1,BR_BASE+MB_READY_RING
+ mv s2,t0
+ la t1,mr_completion
+ csrw 0x700,t1
+ li t1,1
+ sw t1,R_DIR_ACTIVE(t0)
+ li s3,0x4c2bac89
+ li s4,0xcccccccd
+ li s10,0x3f99ca19
+ la t0,mr_issue
+ csrw 0x705,t0
+ li t0,0x00010007
+ csrw 0x725,t0
+ li t0,8
+ csrw 0x715,t0
+ la t0,mr_update
  csrw 0x708,t0
- li t0,0x00020003
+ csrw 0x70f,t0
+ li t0,0x00030006
  csrw 0x728,t0
+ csrw 0x72f,t0
  li t0,8
  csrw 0x718,t0
+ li t0,16
+ csrw 0x71f,t0
  la t0,mb_reverse_work
  csrw 0x709,t0
  li t0,0x0018001f
@@ -667,9 +745,13 @@ br_control_leaf:
 .Lmb_finish_start:
  sw a0,H_PHASE(gp)
  csrci 0x714,8
+ csrci 0x715,8
+ csrci 0x718,8
+ csrci 0x71f,16
  sw zero,H_WORK_MC(gp)
  la t0,mb_fence_routes
  csrw 0x709,t0
+ csrsi 0x719,8
  YIELDI 9
  j br_idle
 .Lmb_idle_start:
@@ -854,6 +936,7 @@ br_report_leaf:
 #endif
 
 mb_reverse_work:
+ csrci 0x719,8
  li t0,MB_BASE
  lw t1,B_REVERSE_STARTED(t0)
  bnez t1,1f
@@ -862,9 +945,14 @@ mb_reverse_work:
  li s10,0x3f99ca19
  li t1,1
  sw t1,B_REVERSE_STARTED(t0)
+ SENDI zero,8
+ SENDI zero,15
  csrsi 0x714,8
-1: lw t0,H_WORK_MC(gp)
- bnez t0,.Lmb_reverse_directory_resume
+1: li t0,R_BASE
+ lw t1,R_DIR_STAGE(t0)
+ li t2,1
+ beq t1,t2,.Lmb_reverse_load
+ bnez t1,.Lmb_reverse_directory_resume
  lw s1,H_WORK_NEURON(gp)
  lw t0,H_FIRE_COUNT(gp)
  bgeu s1,t0,.Lmb_reverse_report
@@ -885,7 +973,14 @@ mb_reverse_work:
  add s7,t0,t1
  li s6,0
  srli s5,t2,5
+ li t0,R_BASE
+ li t1,1
+ sw t1,R_DIR_STAGE(t0)
 .Lmb_reverse_load:
+ li t0,R_BASE
+ lw t0,R_CREDIT(t0)
+ li t1,MB_READ_CREDITS
+ bgeu t0,t1,.Lmb_reverse_park
  slli a0,s6,5
  add a0,a0,s7
  mv a1,s6
@@ -895,14 +990,20 @@ mb_reverse_work:
  li s6,0
  li s7,BR_BASE+READ
  lw s9,H_SENT(gp)
+ li t0,R_BASE
+ li t1,2
+ sw t1,R_DIR_STAGE(t0)
 .Lmb_reverse_directory_resume:
  li t0,BR_BASE+MR_PARAMETERS
  lw t0,8(t0)
  bgeu s6,t0,.Lmb_reverse_directory_done
  andi t0,s6,3
  bnez t0,2f
- srli a0,s6,2
- jal ra,br_load_wait
+ srli t0,s6,2
+ slli t0,t0,2
+ add t0,gp,t0
+ lw t0,H_READY0(t0)
+ beqz t0,.Lmb_reverse_park
 2: lw a0,0(s7)
  lw s5,4(s7)
  beqz s5,3f
@@ -919,7 +1020,8 @@ mb_reverse_work:
  add s9,s9,s5
 3: addi s6,s6,1
  addi s7,s7,8
- sw s6,H_WORK_MC(gp)
+ csrsi 0x719,8
+.Lmb_reverse_park:
  YIELDI 9
  j br_idle
 .Lmb_reverse_directory_done:
@@ -927,10 +1029,14 @@ mb_reverse_work:
 .Lmb_reverse_next:
  addi s1,s1,1
  sw s1,H_WORK_NEURON(gp)
- sw zero,H_WORK_MC(gp)
+ li t0,R_BASE
+ sw zero,R_DIR_STAGE(t0)
+ csrsi 0x719,8
  YIELDI 9
  j br_idle
 .Lmb_reverse_report:
+ li t0,R_BASE
+ sw zero,R_DIR_ACTIVE(t0)
  li a0,3
  lw a1,H_SENT(gp)
  YIELDI 7

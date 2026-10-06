@@ -153,6 +153,9 @@ public:
   virtual void timerStatsStart(uint64_t cycle) {}
   virtual void timerStatsStop(uint64_t cycle) {}
 
+  // Optional passive workload phase query: {completed + 1, phase}, or zeros.
+  virtual std::pair<uint32_t, uint32_t> morrisonProbePhase() const { return {}; }
+
   // Print stat into stderr.
   // The backend should allocate a context object to store relevant information
   // needed for incremental stats (the last counter values, the last cycle, etc.)

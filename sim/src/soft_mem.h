@@ -2,6 +2,7 @@
 
 #include "system.h"
 #include "soft_components.h"
+#include "morrison_phase_probe.h"
 #include <cstddef>
 #include <limits>
 #include <sys/cdefs.h>
@@ -228,6 +229,25 @@ protected:
   DynamicBitMask fulfilled;
   FlitArb reqArb;
   FixedLenQueue<uint8_t> issueQueue;
+  // Passive, lossless request log. Only this MemIf's owner thread appends;
+  // the main thread publishes it after workers are parked at shutdown.
+  std::vector<std::array<uint32_t, 12>> writeProbeEvents;
+  static bool writeProbeEnabled() {
+    static const bool enabled = std::getenv("MORRISON_WRITE_PROBE") != nullptr;
+    return enabled;
+  }
+  void recordWriteProbe(uint32_t kind, uint8_t slot, const MSHR &req) {
+    if (!writeProbeEnabled() || idx == 0) return;
+    if (!morrison_probe::enabled())
+      throw std::runtime_error("MORRISON_WRITE_PROBE requires MORRISON_PHASE_PROBE");
+    writeProbeEvents.push_back({
+      uint32_t(morrison_probe::cycle), uint32_t(morrison_probe::cycle >> 32),
+      morrison_probe::step, morrison_probe::phase, uint32_t(idx - 1), kind,
+      slot, req.addr, req.size,
+      uint32_t(req.write) | (uint32_t(req.isNoReceipt()) << 1) |
+          (uint32_t(req.isBroadcast()) << 2),
+      req.carried[1], uint32_t(req.src) | (uint32_t(req.id) << 16)});
+  }
   FlitArb unicastArb;
   FlitArb broadcastArb;
   std::optional<IdleNotifier> idleNotifier;
@@ -343,6 +363,21 @@ public:
     return issueQueue.size();
   }
 
+  void dumpWriteProbe(const char *directory) const {
+    if (!writeProbeEnabled() || idx == 0) return;
+    static_assert(std::endian::native == std::endian::little);
+    std::ofstream out(std::filesystem::path(directory) /
+                      ("write-probe-mc" + std::to_string(idx - 1) + ".bin"),
+                      std::ios::binary);
+    const std::array<uint32_t, 8> header{
+        0x57524831, 1, 12, uint32_t(MEM_BUS_WIDTH_B), uint32_t(idx - 1),
+        uint32_t(inflight), 0, 0};
+    out.write(reinterpret_cast<const char *>(header.data()), sizeof(header));
+    out.write(reinterpret_cast<const char *>(writeProbeEvents.data()),
+              writeProbeEvents.size() * sizeof(writeProbeEvents[0]));
+    if (!out) throw std::runtime_error("Cannot publish MemIf write probe");
+  }
+
   size_t mshrIssuedUnfulfilledCount() const noexcept {
     return mshrInflightCount() - mshrUnissuedCount() - mshrFulfilledCount();
   }
@@ -380,6 +415,7 @@ public:
     allocated.set(slot);
     fulfilled.reset(slot);
     mshrs[slot] = req;
+    recordWriteProbe(0, slot, req);
   }
 
   void mshrDeallocCommit(uint8_t slot) noexcept __attribute__((always_inline)) {
@@ -410,6 +446,7 @@ public:
       if (mshrReqSlot() != slot)
         throw std::logic_error("mshrReqCommit: slot is not the issue queue head");
     }
+    recordWriteProbe(1, slot, mshrs[slot]);
     issueQueue.pop();
   }
 
@@ -591,6 +628,11 @@ class DRAMIf : public MemIf {
 
  public:
   struct CycleEvents {
+    bool bulkHeadPresent = false;
+    bool allocationFull = false;
+    bool bulkScalarPriority = false;
+    bool bulkBroadcastLimit = false;
+    bool bulkAllocated = false;
     bool externalRequestPresented = false;
     bool externalRequestAccepted = false;
     bool externalRequestWrite = false;
@@ -776,6 +818,11 @@ public:
       bcstInflight == DRAM_BROADCAST_BOUND;
     const bool bulkAlloc = allocSlot && bulkHead && !acceptedScalar && !bcstBlocked;
     const bool bulkDone = bulkAlloc && bulkCount + 1 == bulkHead->count;
+    lastCycleEvents.bulkHeadPresent = bool(bulkHead);
+    lastCycleEvents.allocationFull = !allocSlot;
+    lastCycleEvents.bulkScalarPriority = bulkHead && acceptedScalar;
+    lastCycleEvents.bulkBroadcastLimit = bool(bulkHead) && bcstBlocked;
+    lastCycleEvents.bulkAllocated = bulkAlloc;
 
     std::optional<BcastLine> centralLine;
     if (auto head = bcstEgressQueue.front()) centralLine = head->get();
