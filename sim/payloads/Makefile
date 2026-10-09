@@ -252,6 +252,14 @@ sys/morrison_bulk_tree.bin: $(BRUNEL_SOURCES) sys/morrison_bulk_layout.h sys/mor
 	${PREFIX}gcc $(BRUNEL_BUILD_FLAGS) -DBR_RULE=1 -DBR_MORRISON=1 -DBR_PROXY=1 -DBR_PROXY_SIZE=4 -DBR_PROXY_TRACES=0 -DBR_BULK=1 -DBR_BULK_TREE=1 $(BRUNEL_ASM_FLAGS) -o $(@:.bin=.elf) sys/brunel.S sys/brunel_runtime.S
 	${PREFIX}objcopy -j .text -j .data -O binary $(@:.bin=.elf) $@
 
+sys/morrison_bulk_distant.bin: $(BRUNEL_SOURCES) sys/morrison_bulk_layout.h sys/morrison_bulk_runtime.inc sys/morrison_tree_runtime.inc sys/morrison_ready_runtime.inc
+	${PREFIX}gcc $(BRUNEL_BUILD_FLAGS) -DBR_RULE=1 -DBR_MORRISON=1 -DBR_PROXY=1 -DBR_PROXY_SIZE=4 -DBR_PROXY_TRACES=0 -DBR_BULK=1 -DBR_BULK_TREE=1 -DBR_BULK_DISTANT=1 $(BRUNEL_ASM_FLAGS) -o $(@:.bin=.elf) sys/brunel.S sys/brunel_runtime.S
+	${PREFIX}objcopy -j .text -j .data -O binary $(@:.bin=.elf) $@
+
+sys/morrison_bulk_uncounted.bin sys/morrison_bulk_distant_uncounted.bin: $(BRUNEL_SOURCES) sys/morrison_bulk_layout.h sys/morrison_bulk_runtime.inc sys/morrison_tree_runtime.inc sys/morrison_ready_runtime.inc
+	${PREFIX}gcc $(BRUNEL_BUILD_FLAGS) -DBR_RULE=1 -DBR_MORRISON=1 -DBR_PROXY=1 -DBR_PROXY_SIZE=4 -DBR_PROXY_TRACES=0 -DBR_BULK=1 -DBR_BULK_TREE=1 -DBR_BULK_UNCOUNTED=1 -DBR_BULK_DISTANT=$(if $(findstring distant,$@),1,0) $(BRUNEL_ASM_FLAGS) -o $(@:.bin=.elf) sys/brunel.S sys/brunel_runtime.S
+	${PREFIX}objcopy -j .text -j .data -O binary $(@:.bin=.elf) $@
+
 # Full Morrison uses a distinct, versioned compact image ABI. Both variants keep
 # learning traces at neuron homes; the MC count is read from the image.
 define MORRISON_VARIANT

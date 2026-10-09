@@ -1,5 +1,6 @@
 /* Reverse-only descriptor ownership. Handler4 accepts one job; handler5
- * resumes its issuer on SMT0. Handler0 is the sole ready-queue producer.
+ * (or12 in the uncounted variant) resumes its issuer on SMT0.
+ * Handler0 is the sole ready-queue producer.
  * Handlers8/15 run the same updater on SMT0/1. H_MSHR_SCHEDULED has one
  * live-chain bit per updater (1/2), retained across every yield. Each chain
  * has exactly one active/queued token. Only its final empty retirement clears
@@ -42,7 +43,7 @@ mr_completion:
  addi t0,s2,R_CREDIT
  li t1,-1
  amoadd.w zero,t1,(t0)
- csrsi 0x715,8
+ csrsi (0x710+MB_ISSUER_ID),8
  csrsi 0x718,8
  csrsi 0x71f,16
  # This callback is installed only in reverse and marker phases. An enable
@@ -66,7 +67,7 @@ mr_accept:
  j mr_issue
 
 mr_issue:
- csrci 0x715,8
+ csrci (0x710+MB_ISSUER_ID),8
  li t3,R_BASE
  lw t0,R_PENDING(t3)
  beqz t0,9f
@@ -108,7 +109,7 @@ mr_issue:
  csrsi 0x714,8
 9: j br_idle
 .Lmr_issue_park:
- YIELDI 5
+ YIELDI MB_ISSUER_ID
  j br_idle
 
 mr_update:
@@ -146,7 +147,7 @@ mr_update:
  lw t0,52(a5)
  SENDI t0,2
  sw zero,44(a5)          # store captured; no descriptor access follows
- csrsi 0x715,8
+ csrsi (0x710+MB_ISSUER_ID),8
  addi t0,gp,H_MSHR_COUNT
  li t1,-1
  amoadd.w zero,t1,(t0)

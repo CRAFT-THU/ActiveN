@@ -15,6 +15,8 @@ inline const char *directory() { return std::getenv("MORRISON_PHASE_PROBE"); }
 inline bool enabled() { static const bool v = directory() != nullptr; return v; }
 inline uint64_t cycle = 0;
 inline uint32_t step = 0, phase = 0, mc = 0;
+// Exactly the peripheral timer's counted cycles: start+1 through stop.
+inline bool timerActive = false;
 inline bool inPhase() { return step && (phase == 2 || phase == 3); }
 
 // Long-form counters keep overlapping conditions explicit. All denominators
@@ -26,6 +28,9 @@ struct Counters {
   explicit Counters(std::string n) : name(std::move(n)) {}
   void add(uint32_t s, uint32_t p, uint32_t id, const std::string &k, uint64_t n=1) {
     if (n) values[{s,p,id,k}] += n;
+  }
+  void maximum(uint32_t s, uint32_t p, uint32_t id, const std::string &k, uint64_t n) {
+    auto &v=values[{s,p,id,k}]; if(n>v)v=n;
   }
   void flush() const {
     if (!enabled()) return;

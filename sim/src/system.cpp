@@ -47,6 +47,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <limits>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -159,11 +160,28 @@ static vector<McImage> mc_images;
 static void loadImages(const vector<string> &paths, const vector<uint64_t> &mc_sizes) {
   mc_images.resize(paths.size());
   for (size_t i = 0; i < paths.size(); ++i) {
+    const bool streamed = std::filesystem::is_fifo(paths[i]);
     ifstream fin(paths[i], ios::binary);
     if (!fin) throw runtime_error("Cannot open " + paths[i]);
-    fin.seekg(0, ios::end);
-    size_t fsize = fin.tellg();
-    fin.seekg(0);
+    uint64_t fsize = 0;
+    if (streamed) {
+      // A FIFO carries one framed image: ASCII ACTIMG1\0, then uint64 LE bytes.
+      std::array<unsigned char,16> header{};
+      fin.read(reinterpret_cast<char*>(header.data()),header.size());
+      if (!fin || std::memcmp(header.data(),"ACTIMG1\0",8))
+        throw runtime_error("Invalid streamed image header: " + paths[i]);
+      for (unsigned j=0;j<8;++j) fsize |= uint64_t(header[8+j])<<(8*j);
+    } else {
+      fin.seekg(0, ios::end);
+      const auto end = fin.tellg();
+      if (end < 0) throw runtime_error("Cannot size image " + paths[i]);
+      fsize = static_cast<uint64_t>(end);
+      fin.seekg(0);
+    }
+    if (fsize > std::numeric_limits<size_t>::max()-MEM_ADDR_OFFSET_MASK ||
+        fsize > uint64_t(std::numeric_limits<std::streamsize>::max()) ||
+        (i<mc_sizes.size() && fsize>mc_sizes[i]))
+      throw runtime_error("MC size is smaller than image size: " + paths[i]);
 
     // Round file size up to MEM_BUS_WIDTH_B; tail bytes are zero-padded.
     size_t dense_bytes = (fsize + MEM_ADDR_OFFSET_MASK) & ~MEM_ADDR_OFFSET_MASK;
@@ -177,11 +195,15 @@ static void loadImages(const vector<string> &paths, const vector<uint64_t> &mc_s
     mc_images[i].dense = std::make_unique<AlignedMemLine[]>(nlines);
     auto t1 = std::chrono::steady_clock::now();
     fin.read(reinterpret_cast<char *>(mc_images[i].dense.get()), fsize);
+    if (!fin || uint64_t(fin.gcount()) != fsize)
+      throw runtime_error("Incomplete image body: " + paths[i]);
+    if (streamed && fin.peek() != std::char_traits<char>::eof())
+      throw runtime_error("Trailing streamed image data: " + paths[i]);
     auto t2 = std::chrono::steady_clock::now();
     double alloc_s = std::chrono::duration<double>(t1 - t0).count();
     double read_s  = std::chrono::duration<double>(t2 - t1).count();
     cerr << "[loadImages] MC " << i << ": " << paths[i]
-         << " fsize=" << fsize << " dense_bytes=" << dense_bytes
+         << " fsize=" << fsize << " dense_bytes=" << dense_bytes << " streamed=" << streamed
          << " alloc=" << alloc_s << "s read=" << read_s << "s" << endl;
   }
 }
@@ -777,6 +799,7 @@ bool System::run(uint64_t maxCycles) {
     if (morrison_probe::enabled()) {
       const auto [step,phase]=impl_->backends.front()->morrisonProbePhase();
       morrison_probe::cycle=cycle; morrison_probe::step=step; morrison_probe::phase=phase;
+      morrison_probe::timerActive=impl_->periph.timer_enabled;
     }
     impl_->tickMemory(cycle);
     impl_->buildBusInAndServe(cycle);
@@ -862,9 +885,9 @@ bool System::run(uint64_t maxCycles) {
     for (size_t mc = 0; mc < mc_images.size(); ++mc) {
       const auto &image = mc_images[mc];
       std::ofstream dump(std::string(directory) + "/dram." + std::to_string(mc), std::ios::binary);
-      for (size_t offset = 0; offset < image.dense_size; offset += MEM_BUS_WIDTH_B)
-        dump.write(reinterpret_cast<const char *>(image.dense[offset / MEM_BUS_WIDTH_B].inner.data()),
-                   std::min(size_t(MEM_BUS_WIDTH_B), image.dense_size - offset));
+      // Host I/O only: the dense line array is contiguous and byte-identical
+      // to the previous line-at-a-time dump, including initialized padding.
+      dump.write(reinterpret_cast<const char *>(image.dense.get()),image.dense_size);
       if (!dump) throw runtime_error("cannot dump Brunel backing memory");
     }
   }
@@ -1089,6 +1112,15 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  const auto memoryExperiment=soft_mem::experimentConfig();
+  if (use_hard && soft_noc::spaceMultiplier() != 1) {
+    cerr << "Experimental router reservation requires --soft without --hard\n";
+    return 1;
+  }
+  if (use_hard && (memoryExperiment.merge || memoryExperiment.slots != 256)) {
+    cerr << "Experimental MemIf merging/capacity requires --soft without --hard\n";
+    return 1;
+  }
   System system(dramInitFiles, ramulator_cfg, program.present<uint32_t>("--init-icache"));
 
   bool enable_trace = program.get<bool>("--trace");

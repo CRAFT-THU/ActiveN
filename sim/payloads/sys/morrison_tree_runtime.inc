@@ -1,6 +1,9 @@
 /* Forward completion without repeated global queries. Saved registers belong
  * to the existing producer/emitter; all handlers here use only scratch regs. */
-.globl mb_range_done,mb_producer_closed,mb_receipt_arm,mb_receipt_delta,mb_receipt_service
+.globl mb_range_done,mb_producer_closed
+#if !BR_BULK_UNCOUNTED
+.globl mb_receipt_arm,mb_receipt_delta,mb_receipt_service
+#endif
 mb_range_done:                 # SMT1, one ordinary P0 message per range
  li t0,MB_BASE
  lw t1,B_HOME_RETURNED(t0)
@@ -33,6 +36,7 @@ mb_producer_closed:            # SMT1, separate bounded local-only queue
  YIELDI 7
 1: j br_idle
 
+#if !BR_BULK_UNCOUNTED
 /* All requesters coalesce on one bit. Caller must have one local-send quota
  * if it cannot tail-yield (controller and initial receipt service). */
 mb_receipt_wake:
@@ -139,3 +143,4 @@ mb_receipt_root_check:
  li a0,3
  j br_broadcast
 1: j br_idle
+#endif

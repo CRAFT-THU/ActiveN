@@ -20,6 +20,26 @@ namespace soft_mem {
 // DON'T CHANGE THIS, we us uint16_t as masks
 const size_t CLUSTER_SIZE = 16;
 inline constexpr size_t DRAM_MSHR_COUNT = 256;
+using MshrSlot = uint16_t;
+struct ExperimentConfig {
+  size_t slots = DRAM_MSHR_COUNT;
+  bool merge = false;
+};
+inline ExperimentConfig experimentConfig() {
+  ExperimentConfig c;
+  if (const char *v = std::getenv("SOFT_MEMIF_MSHRS")) {
+    const std::string text(v);
+    if (text != "256" && text != "384" && text != "512")
+      throw std::invalid_argument("SOFT_MEMIF_MSHRS must be 256, 384, or 512");
+    c.slots = std::stoul(text);
+  }
+  if (const char *v = std::getenv("SOFT_MEMIF_WRITE_MERGE")) {
+    const std::string text(v);
+    if (text != "0" && text != "1") throw std::invalid_argument("SOFT_MEMIF_WRITE_MERGE must be 0 or 1");
+    c.merge = text == "1";
+  }
+  return c;
+}
 inline constexpr size_t DRAM_UNICAST_RESERVE = 32;
 inline constexpr size_t DRAM_BROADCAST_BOUND =
     DRAM_MSHR_COUNT - DRAM_UNICAST_RESERVE;
@@ -80,13 +100,13 @@ class DynamicBitMask {
     return result;
   }
 
-  std::optional<uint8_t> firstZero() const noexcept {
+  std::optional<MshrSlot> firstZero() const noexcept {
     for (size_t i = 0; i < words.size(); ++i) {
       uint64_t candidates = ~words[i];
       if (i + 1 == words.size() && bitCount % 64 != 0)
         candidates &= (uint64_t{1} << (bitCount % 64)) - 1;
       if (candidates != 0)
-        return static_cast<uint8_t>(i * 64 + std::countr_zero(candidates));
+        return static_cast<MshrSlot>(i * 64 + std::countr_zero(candidates));
     }
     return std::nullopt;
   }
@@ -100,6 +120,8 @@ struct MSHR {
   std::array<uint32_t, 2> carried;
   uint8_t size;
   bool write;
+  mem_mask_t wbe = std::numeric_limits<mem_mask_t>::max();
+  uint64_t flowToken = 0; // host-only observation, never part of a response payload
 
   bool isBroadcast() const noexcept { return src == 0; }
   bool isNoReceipt() const noexcept { return src == 0xFFFF; }
@@ -131,6 +153,7 @@ struct BcastLine {
   std::array<uint32_t, MEM_BUS_WIDTH_B / 4> line;
   uint16_t tag;
   std::array<uint32_t, 2> carried;
+  uint64_t flowToken = 0;
 };
 
 struct BulkDispatcher {
@@ -140,6 +163,7 @@ struct BulkDispatcher {
   uint16_t returnTag;
   std::array<uint32_t, 2> returnCarried;
   bool broadcast;
+  uint64_t flowToken = 0;
 
   static BulkDispatcher fromFlit(const Flit &f) {
     if constexpr (ASSERTIONS_ENABLED) {
@@ -168,6 +192,7 @@ struct BulkDispatcher {
       .carried = carried,
       .size = MEM_BUS_WIDTH_SIZE,
       .write = false,
+      .flowToken = flowToken,
     };
   }
 };
@@ -228,28 +253,85 @@ protected:
   DynamicBitMask allocated;
   DynamicBitMask fulfilled;
   FlitArb reqArb;
-  FixedLenQueue<uint8_t> issueQueue;
+  FixedLenQueue<MshrSlot> issueQueue;
+  bool mergeWrites = false;
+  std::unordered_map<uint32_t, MshrSlot> lastUnissued;
+  DynamicBitMask externalIds{256};
+  std::array<std::optional<MshrSlot>, 256> externalSlots{};
+  bool externalAccepting = false;
+  size_t peakExternalIds = 0;
+  static uint32_t lineOf(uint32_t addr) { return addr & MEM_ADDR_ALIGN_MASK; }
+  mem_mask_t effectiveMask(const MSHR &r) const {
+    const size_t bytes = size_t{1} << r.size;
+    if (bytes > MEM_BUS_WIDTH_B || r.addr % bytes)
+      throw std::logic_error("invalid merge store size/alignment");
+    const auto mask = bytes == MEM_BUS_WIDTH_B ? ~mem_mask_t{0} : (mem_mask_t{1} << bytes) - 1;
+    return (mask << (r.addr & MEM_ADDR_OFFSET_MASK)) & r.wbe;
+  }
+  std::optional<uint8_t> externalTag(MshrSlot slot) const {
+    if (inflight <= 256) return static_cast<uint8_t>(slot);
+    const auto tag = externalIds.firstZero();
+    return tag ? std::optional<uint8_t>(static_cast<uint8_t>(*tag)) : std::nullopt;
+  }
+  std::optional<MshrSlot> presentedSlot() const {
+    const auto slot = mshrReqSlot();
+    return slot && externalTag(*slot) ? slot : std::nullopt;
+  }
+  std::optional<MshrSlot> mergeCandidate(const MSHR &r) const {
+    if (!mergeWrites || !r.write || !r.isNoReceipt()) return std::nullopt;
+    const auto it = lastUnissued.find(lineOf(r.addr));
+    if (it == lastUnissued.end()) return std::nullopt;
+    const auto slot = it->second;
+    // The frontend has already observed the old head. Never change a request
+    // which will be accepted on this edge; no request is presented if IDs ran out.
+    if (externalAccepting && presentedSlot() == slot) return std::nullopt;
+    const auto &old = mshrs[slot];
+    if (!allocated.test(slot) || !old.write || !old.isNoReceipt()) return std::nullopt;
+    return slot;
+  }
+  void mergeCommit(MshrSlot slot, const MSHR &r, bool full) {
+    const auto it = lastUnissued.find(lineOf(r.addr));
+    if (it == lastUnissued.end() || it->second != slot || !allocated.test(slot) ||
+        !mshrs[slot].write || !mshrs[slot].isNoReceipt())
+      throw std::logic_error("merge target changed during commit");
+    auto &old = mshrs[slot];
+    const auto incoming = effectiveMask(r);
+    const auto combined = effectiveMask(old) | incoming;
+    for (size_t byte=0;byte<MEM_BUS_WIDTH_B;++byte)
+      if ((incoming >> byte) & 1) old.rwdata[byte] = r.rwdata[byte];
+    old.addr = lineOf(old.addr); old.size = MEM_BUS_WIDTH_SIZE; old.wbe = combined;
+    recordWriteProbe(2, slot, r, &old, full ? 1u : 0u);
+  }
   // Passive, lossless request log. Only this MemIf's owner thread appends;
   // the main thread publishes it after workers are parked at shutdown.
-  std::vector<std::array<uint32_t, 12>> writeProbeEvents;
+  static constexpr size_t writeProbeWords = 16 + MEM_BUS_WIDTH_B / 4;
+  std::vector<std::array<uint32_t, writeProbeWords>> writeProbeEvents;
+  std::vector<std::array<uint32_t,16>> flowMemEvents;
+  uint64_t flowSerial=0;
   static bool writeProbeEnabled() {
     static const bool enabled = std::getenv("MORRISON_WRITE_PROBE") != nullptr;
     return enabled;
   }
-  void recordWriteProbe(uint32_t kind, uint8_t slot, const MSHR &req) {
+  void recordWriteProbe(uint32_t kind, MshrSlot slot, const MSHR &r,
+                        const MSHR *combined=nullptr, uint32_t aux=0,
+                        uint32_t external=UINT32_MAX) {
     if (!writeProbeEnabled() || idx == 0) return;
-    if (!morrison_probe::enabled())
-      throw std::runtime_error("MORRISON_WRITE_PROBE requires MORRISON_PHASE_PROBE");
-    writeProbeEvents.push_back({
-      uint32_t(morrison_probe::cycle), uint32_t(morrison_probe::cycle >> 32),
-      morrison_probe::step, morrison_probe::phase, uint32_t(idx - 1), kind,
-      slot, req.addr, req.size,
-      uint32_t(req.write) | (uint32_t(req.isNoReceipt()) << 1) |
-          (uint32_t(req.isBroadcast()) << 2),
-      req.carried[1], uint32_t(req.src) | (uint32_t(req.id) << 16)});
+    if (!morrison_probe::enabled()) throw std::runtime_error("write probe requires phase probe");
+    const auto &data = combined ? *combined : r;
+    std::array<uint32_t, writeProbeWords> event{};
+    event[0]=morrison_probe::cycle; event[1]=morrison_probe::cycle>>32;
+    event[2]=morrison_probe::step; event[3]=morrison_probe::phase;
+    event[4]=idx-1; event[5]=kind; event[6]=slot; event[7]=r.addr; event[8]=r.size;
+    event[9]=uint32_t(r.write)|(uint32_t(r.isNoReceipt())<<1)|(uint32_t(r.isBroadcast())<<2);
+    event[10]=r.carried[1];event[11]=uint32_t(r.src)|(uint32_t(r.id)<<16);
+    event[12]=uint32_t(data.wbe); event[13]=uint32_t(uint64_t(data.wbe)>>32);
+    event[14]=external;event[15]=aux;
+    const auto words=std::bit_cast<std::array<uint32_t,MEM_BUS_WIDTH_B/4>>(data.rwdata);
+    std::copy(words.begin(),words.end(),event.begin()+16);
+    writeProbeEvents.push_back(event);
   }
-  FlitArb unicastArb;
-  FlitArb broadcastArb;
+  IndexedFlitArb<MshrSlot> unicastArb;
+  IndexedFlitArb<MshrSlot> broadcastArb;
   std::optional<IdleNotifier> idleNotifier;
   std::optional<IdleReturn> idleReturn;
   uint16_t idleCycles = 0;
@@ -329,12 +411,14 @@ public:
   MemIf(
     size_t idx,
     size_t inflight,
-    size_t numReq
+    size_t numReq,
+    bool merge = false
   ) : idx(idx), inflight(inflight), mshrs(inflight), allocated(inflight),
       fulfilled(inflight), reqArb(numReq), issueQueue(inflight),
       unicastArb(inflight), broadcastArb(inflight) {
-    if (inflight < 2 || inflight > 256)
-      throw std::invalid_argument("inflight must be between 2 and 256");
+    mergeWrites = merge;
+    if (inflight < 2 || inflight > 512)
+      throw std::invalid_argument("inflight must be between 2 and 512");
   }
 
   void resetIdle() noexcept {
@@ -346,6 +430,12 @@ public:
   /*
     * Shared MSHR state machine and generator
     */
+
+  size_t mshrCapacity() const { return inflight; }
+  size_t externalIdCount() const { return inflight > 256 ? externalIds.count() : mshrIssuedUnfulfilledCount(); }
+  size_t externalIdPeak() const { return peakExternalIds; }
+  bool externalTagBlocked() const { return mshrReqSlot().has_value() && !presentedSlot(); }
+  void prepareExternal(bool accepting) { externalAccepting = accepting; }
 
   size_t mshrInflightCount() const noexcept __attribute__((always_inline)) {
     return allocated.count();
@@ -363,6 +453,12 @@ public:
     return issueQueue.size();
   }
 
+  void dumpFlowProbe(const char *directory) const {
+    if (idx==0) return;
+    std::ofstream out(std::filesystem::path(directory)/("flow-mem-mc"+std::to_string(idx-1)+".bin"),std::ios::binary);
+    if (!flowMemEvents.empty()) out.write(reinterpret_cast<const char*>(flowMemEvents.data()),flowMemEvents.size()*sizeof(flowMemEvents[0]));
+    if (!out) throw std::runtime_error("Cannot publish scatter-flow probe");
+  }
   void dumpWriteProbe(const char *directory) const {
     if (!writeProbeEnabled() || idx == 0) return;
     static_assert(std::endian::native == std::endian::little);
@@ -370,7 +466,7 @@ public:
                       ("write-probe-mc" + std::to_string(idx - 1) + ".bin"),
                       std::ios::binary);
     const std::array<uint32_t, 8> header{
-        0x57524831, 1, 12, uint32_t(MEM_BUS_WIDTH_B), uint32_t(idx - 1),
+        0x57524831, 2, uint32_t(writeProbeWords), uint32_t(MEM_BUS_WIDTH_B), uint32_t(idx - 1),
         uint32_t(inflight), 0, 0};
     out.write(reinterpret_cast<const char *>(header.data()), sizeof(header));
     out.write(reinterpret_cast<const char *>(writeProbeEvents.data()),
@@ -395,11 +491,11 @@ public:
     return counts;
   }
 
-  std::optional<uint8_t> mshrAllocSlot() const noexcept __attribute__((always_inline)) {
+  std::optional<MshrSlot> mshrAllocSlot() const noexcept __attribute__((always_inline)) {
     return allocated.firstZero();
   }
 
-  void mshrAllocCommit(uint8_t slot, MSHR req) noexcept __attribute__((always_inline)) {
+  void mshrAllocCommit(MshrSlot slot, MSHR req) noexcept __attribute__((always_inline)) {
     if constexpr (ASSERTIONS_ENABLED) {
       if (allocated.test(slot))
         throw std::logic_error("mshrAllocCommit: slot already allocated");
@@ -415,59 +511,68 @@ public:
     allocated.set(slot);
     fulfilled.reset(slot);
     mshrs[slot] = req;
+    if (mergeWrites) lastUnissued[lineOf(req.addr)] = slot;
     recordWriteProbe(0, slot, req);
   }
 
-  void mshrDeallocCommit(uint8_t slot) noexcept __attribute__((always_inline)) {
+  void mshrDeallocCommit(MshrSlot slot) noexcept __attribute__((always_inline)) {
     allocated.reset(slot);
     fulfilled.reset(slot);
   }
 
-  std::optional<uint8_t> mshrReqSlot() const noexcept __attribute__((always_inline)) {
+  std::optional<MshrSlot> mshrReqSlot() const noexcept __attribute__((always_inline)) {
     if (auto head = issueQueue.front()) return head->get();
     return std::nullopt;
   }
 
-  GlobalMemReq mshrReq(uint8_t slot) const noexcept __attribute__((always_inline)) {
+  GlobalMemReq mshrReq(MshrSlot slot) const noexcept __attribute__((always_inline)) {
     return {
-      .id = slot,
+      .id = externalTag(slot).value(),
       .size = mshrs[slot].size,
       .addr = mshrs[slot].addr,
       .wdata = mshrs[slot].rwdata,
-      .wbe = std::numeric_limits<mem_mask_t>::max(), // Always full write
+      .wbe = mshrs[slot].wbe,
       .write = mshrs[slot].write,
     };
   }
 
-  void mshrReqCommit(uint8_t slot) __attribute__((always_inline)) {
+  void mshrReqCommit(MshrSlot slot) __attribute__((always_inline)) {
     if constexpr (ASSERTIONS_ENABLED) {
       if (!allocated.test(slot))
         throw std::logic_error("mshrReqCommit: slot not allocated");
       if (mshrReqSlot() != slot)
         throw std::logic_error("mshrReqCommit: slot is not the issue queue head");
     }
-    recordWriteProbe(1, slot, mshrs[slot]);
+    const auto tag = externalTag(slot);
+    if (!tag) throw std::logic_error("issuing without an external request ID");
+    if (inflight > 256) {
+      if (externalSlots[*tag]) throw std::logic_error("external ID reused before response");
+      externalSlots[*tag]=slot; externalIds.set(*tag);
+      peakExternalIds=std::max(peakExternalIds,externalIds.count());
+    }
+    recordWriteProbe(1, slot, mshrs[slot], nullptr, 0, *tag);
+    if (mergeWrites) {
+      auto it=lastUnissued.find(lineOf(mshrs[slot].addr));
+      if (it!=lastUnissued.end() && it->second==slot) lastUnissued.erase(it);
+    }
     issueQueue.pop();
   }
 
-  void mshrRespAccept(const GlobalMemResp &resp)
-      __attribute__((always_inline)) {
-    if constexpr (ASSERTIONS_ENABLED) {
-      if (resp.id >= inflight) throw std::logic_error("mshrRespAccept: invalid id");
+  void mshrRespAccept(const GlobalMemResp &resp) {
+    MshrSlot slot=resp.id;
+    if (inflight > 256) {
+      if (!externalSlots[resp.id]) throw std::logic_error("response has no external ID mapping");
+      slot=*externalSlots[resp.id];externalSlots[resp.id].reset();externalIds.reset(resp.id);
     }
-    if constexpr (ASSERTIONS_ENABLED) {
-      if (!allocated.test(resp.id))
-        throw std::logic_error("mshrRespAccept: slot not allocated");
-      if (fulfilled.test(resp.id))
-        throw std::logic_error("mshrRespAccept: duplicate response");
-    }
-    const bool noReceipt = mshrs[resp.id].isNoReceipt();
-    mshrs[resp.id].rwdata = resp.data;
-    fulfilled.set(resp.id);
-    if (noReceipt) mshrDeallocCommit(resp.id);
+    if (slot>=inflight || !allocated.test(slot) || fulfilled.test(slot))
+      throw std::logic_error("invalid or duplicate MSHR response");
+    const bool noReceipt=mshrs[slot].isNoReceipt();
+    mshrs[slot].rwdata=resp.data;fulfilled.set(slot);
+    recordWriteProbe(3,slot,mshrs[slot],nullptr,0,resp.id);
+    if (noReceipt) mshrDeallocCommit(slot);
   }
 
-  std::optional<uint8_t> mshrReturnSlot(bool broadcast) const noexcept
+  std::optional<MshrSlot> mshrReturnSlot(bool broadcast) const noexcept
       __attribute__((always_inline)) {
     const auto &arb = broadcast ? broadcastArb : unicastArb;
     return arb.peek([&](size_t i) -> std::optional<uint8_t> {
@@ -477,7 +582,7 @@ public:
     });
   }
 
-  RingResp mshrUnicast(uint8_t slot) const __attribute__((always_inline)) {
+  RingResp mshrUnicast(MshrSlot slot) const __attribute__((always_inline)) {
     return RingResp {
       .tag = mshrs[slot].id,
       .dst = mshrs[slot].src,
@@ -488,15 +593,16 @@ public:
     };
   }
 
-  BcastLine mshrBroadcast(uint8_t slot) const __attribute__((always_inline)) {
+  BcastLine mshrBroadcast(MshrSlot slot) const __attribute__((always_inline)) {
     return BcastLine {
       .line = std::bit_cast<std::array<uint32_t, MEM_BUS_WIDTH_B / 4>>(mshrs[slot].rwdata),
       .tag = mshrs[slot].id,
       .carried = mshrs[slot].carried,
+      .flowToken = mshrs[slot].flowToken,
     };
   }
 
-  void mshrReturnCommit(uint8_t slot, bool broadcast) __attribute__((always_inline)) {
+  void mshrReturnCommit(MshrSlot slot, bool broadcast) __attribute__((always_inline)) {
     (broadcast ? broadcastArb : unicastArb).commit(slot);
     mshrDeallocCommit(slot);
   }
@@ -534,6 +640,17 @@ public:
 protected:
   virtual bool nocCanAccept(const Flit &f) const = 0;
 public:
+  // Observation only: the request arbiter's choice before capacity gating.
+  // Keep admission and arbitration state changes in their existing paths.
+  template<typename FI>
+  std::optional<uint8_t> nocSelectedPort(FI flits) const
+  requires(std::is_invocable_r_v<const Flit*, FI, size_t>) {
+    return reqArb.peek([&flits](size_t port) -> std::optional<uint8_t> {
+      const Flit *flit = flits(port);
+      return flit ? std::optional<uint8_t>(flit->prio()) : std::nullopt;
+    });
+  }
+
   template<typename FI>
   [[gnu::always_inline]] std::optional<uint8_t> nocAcceptMultiple(FI flits) const
   requires(std::is_invocable_r_v<const Flit*, FI, size_t>) {
@@ -633,6 +750,9 @@ class DRAMIf : public MemIf {
     bool bulkScalarPriority = false;
     bool bulkBroadcastLimit = false;
     bool bulkAllocated = false;
+    bool incomingRead = false, incomingWrite = false;
+    bool mergedWrite = false, mergedWhileFull = false;
+    bool idBlocked = false;
     bool externalRequestPresented = false;
     bool externalRequestAccepted = false;
     bool externalRequestWrite = false;
@@ -678,6 +798,9 @@ public:
     std::optional<BcastLine> bcast;
   };
 
+  // Const snapshot of the same fulfilled-response selection used by step().
+  bool selectedRemoteUnicast() const { return unicastRespPeek(nullptr).mshrRemote; }
+
   struct PUAccept {
     bool unicast;
     bool broadcast;
@@ -699,7 +822,7 @@ public:
   bool broadcastAllocationBlocked() const noexcept {
     auto head = bulkQueue.front();
     return head && head->get().broadcast &&
-           bcstInflight == DRAM_BROADCAST_BOUND;
+           bcstInflight == inflight - DRAM_UNICAST_RESERVE;
   }
 
 protected:
@@ -707,14 +830,14 @@ protected:
     if (isIdleRequest(f)) return idleCanAccept(f);
     if (isBulkRequest(f))
       return static_cast<uint16_t>(f.data[1] >> 16) == 0 || !bulkQueue.full();
-    if (isScalarRequest(f)) return mshrAllocSlot().has_value();
+    if (isScalarRequest(f)) return mergeCandidate(MSHR::fromScalarFlit(f)).has_value() || mshrAllocSlot().has_value();
     return false;
   }
 
 public:
   DRAMIf(size_t memif_idx, size_t numReq, size_t bcstQueueCap,
-         size_t puStart, size_t puEnd)
-    : MemIf(memif_idx, DRAM_MSHR_COUNT, numReq),
+         size_t puStart, size_t puEnd, ExperimentConfig experiment = {})
+    : MemIf(memif_idx, experiment.slots, numReq, experiment.merge),
       puStart(puStart),
       puEnd(puEnd),
       bcstQueueCap(bcstQueueCap),
@@ -777,7 +900,7 @@ public:
   };
 
   virtual std::optional<GlobalMemReq> peekMem() const override __attribute__((always_inline)) {
-    if (auto slot = MemIf::mshrReqSlot()) return MemIf::mshrReq(*slot);
+    if (auto slot = presentedSlot()) return MemIf::mshrReq(*slot);
     return std::nullopt;
   }
 
@@ -804,18 +927,25 @@ public:
              acceptedFlit, nocOutAccepted);
 
     const auto allocSlot = mshrAllocSlot();
-    const auto issueSlot = mshrReqSlot();
+    const auto issueSlot = presentedSlot();
     const auto unicastSlot = mshrReturnSlot(false);
     const auto broadcastSlot = mshrReturnSlot(true);
 
     const bool acceptedScalar = acceptedFlit && isScalarRequest(*acceptedFlit);
+    const auto incoming = acceptedScalar ? std::optional<MSHR>(MSHR::fromScalarFlit(*acceptedFlit)) : std::nullopt;
+    const auto mergeSlot = incoming ? mergeCandidate(*incoming) : std::nullopt;
+    lastCycleEvents.incomingRead = incoming && !incoming->write;
+    lastCycleEvents.incomingWrite = incoming && incoming->write;
+    lastCycleEvents.mergedWrite = mergeSlot.has_value();
+    lastCycleEvents.mergedWhileFull = mergeSlot && !allocSlot;
+    lastCycleEvents.idBlocked = externalTagBlocked();
     const bool acceptedBulk = acceptedFlit && isBulkRequest(*acceptedFlit) &&
       static_cast<uint16_t>(acceptedFlit->data[1] >> 16) != 0;
 
     std::optional<BulkDispatcher> bulkHead;
     if (auto head = bulkQueue.front()) bulkHead = head->get();
     const bool bcstBlocked = bulkHead && bulkHead->broadcast &&
-      bcstInflight == DRAM_BROADCAST_BOUND;
+      bcstInflight == inflight - DRAM_UNICAST_RESERVE;
     const bool bulkAlloc = allocSlot && bulkHead && !acceptedScalar && !bcstBlocked;
     const bool bulkDone = bulkAlloc && bulkCount + 1 == bulkHead->count;
     lastCycleEvents.bulkHeadPresent = bool(bulkHead);
@@ -941,9 +1071,10 @@ public:
 
     if (acceptedScalar) {
       if constexpr (ASSERTIONS_ENABLED) {
-        if (!allocSlot) throw std::logic_error("Received scalar request without a free MSHR");
+        if (!allocSlot && !mergeSlot) throw std::logic_error("Received scalar request without a slot or merge");
       }
-      MemIf::mshrAllocCommit(*allocSlot, MSHR::fromScalarFlit(*acceptedFlit));
+      if (mergeSlot) mergeCommit(*mergeSlot, *incoming, !allocSlot);
+      else MemIf::mshrAllocCommit(*allocSlot, *incoming);
     } else if (bulkAlloc) {
       MemIf::mshrAllocCommit(*allocSlot, bulkHead->dispatch(bulkCount));
     }
@@ -961,7 +1092,15 @@ public:
     }
 
     if (acceptedBulk) {
-      const bool pushed = bulkQueue.push(BulkDispatcher::fromFlit(*acceptedFlit));
+      auto dispatcher=BulkDispatcher::fromFlit(*acceptedFlit);
+      if (std::getenv("MORRISON_FLOW_PROFILE") && dispatcher.broadcast && (dispatcher.returnTag&15)==5) {
+        dispatcher.flowToken=(uint64_t(idx)<<56)|++flowSerial;
+        const auto &f=*acceptedFlit;
+        flowMemEvents.push_back({uint32_t(morrison_probe::cycle),uint32_t(morrison_probe::cycle>>32),
+          morrison_probe::step,morrison_probe::phase,uint32_t(idx-1),0,f.src,f.dst,f.tag,
+          f.data[0],f.data[1],f.data[2],f.data[3],uint32_t(dispatcher.flowToken),uint32_t(dispatcher.flowToken>>32),0});
+      }
+      const bool pushed = bulkQueue.push(dispatcher);
       if constexpr (ASSERTIONS_ENABLED) {
         if (!pushed) throw std::logic_error("Bulk queue unexpectedly full");
       }
@@ -970,7 +1109,7 @@ public:
     const bool broadcastAlloc = bulkAlloc && bulkHead->broadcast;
     if (broadcastAlloc && !broadcastEject) {
       if constexpr (ASSERTIONS_ENABLED) {
-        if (bcstInflight >= DRAM_BROADCAST_BOUND)
+        if (bcstInflight >= inflight - DRAM_UNICAST_RESERVE)
           throw std::logic_error("Broadcast MSHR counter overflow");
       }
       ++bcstInflight;

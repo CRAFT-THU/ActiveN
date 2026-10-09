@@ -232,8 +232,9 @@ class SoftSystemBackend : public SystemBackend {
     LinkDecisionBuffer buf;
     Router<RouteFn, ROUTER_Q_DEPTH> rt;
 
-    WrappedRouter(LinkStatus l, RouteFn tbl, size_t num_in, size_t num_out)
-      : links(std::move(l)), buf{}, rt(std::move(tbl), num_in, num_out) {}
+    WrappedRouter(LinkStatus l, RouteFn tbl, size_t num_in, size_t num_out,
+                  unsigned spaceMultiplier)
+      : links(std::move(l)), buf{}, rt(std::move(tbl), num_in, num_out, spaceMultiplier) {}
   };
 
   static_assert(alignof(WrappedRouter) >= DESTRUCTIVE_INTERFERENCE_SIZE);
@@ -288,6 +289,9 @@ class SoftSystemBackend : public SystemBackend {
   uint32_t sparse_observed_steps_ = 0;
   uint32_t brunel_observed_steps_ = 0;
   uint32_t brunelBoundaryPending_ = 0;
+  // Optional host-only spike completion observation; never gates the model.
+  uint32_t morrisonUncountedSpikePc_ = 0;
+  std::vector<uint64_t> morrisonUncountedReceipts_;
   // Optional observation only: sampled target cycles, never host wall time.
   struct BrunelPuProfile {
     uint64_t samples = 0, active0 = 0, active1 = 0;
@@ -343,6 +347,10 @@ class SoftSystemBackend : public SystemBackend {
   std::vector<std::array<uint32_t,4>> brunelBulkBanks_; // state0/1, issuing-job ticket0/1
   void observeBrunelMemory(uint64_t cycle);
   void observeMorrisonPhase(uint64_t cycle);
+  void observeMorrisonFlow(uint64_t cycle);
+  void observeMorrisonInlet(uint64_t cycle);
+  void observeMorrisonSpatial(uint64_t cycle);
+  void observeMorrisonRing(uint64_t cycle);
   void observeMorrisonBoundary(uint64_t cycle, const char *directory,
                                 uint32_t completed);
   void observeBrunelProfile(uint64_t cycle, const char *directory,
@@ -374,7 +382,7 @@ class SoftSystemBackend : public SystemBackend {
     uint64_t max_occupancy = 0;
   };
 
-  static constexpr size_t MSHR_HIST_SIZE = soft_mem::DRAM_MSHR_COUNT + 1;
+  static constexpr size_t MSHR_HIST_SIZE = 513;
   struct NocMemifProfile {
     std::array<uint64_t, MSHR_HIST_SIZE> allocated{};
     std::array<uint64_t, MSHR_HIST_SIZE> unissued{};

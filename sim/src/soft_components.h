@@ -1,4 +1,7 @@
 #pragma once
+#include <limits>
+#include <cstdlib>
+#include <cstring>
 
 #include <bit>
 #include <concepts>
@@ -14,6 +17,20 @@
 #include <stdexcept>
 #include "system.h"
 #include "util.h"
+
+namespace soft_noc {
+// Admission-only experiment. Read before router construction, including the
+// routers built in SoftSystemBackend's member initializer list.
+inline unsigned spaceMultiplier() {
+  static const unsigned value = [] {
+    const char *s = std::getenv("SOFT_NOC_SPACE_MULTIPLIER");
+    if (!s || std::strcmp(s, "1") == 0) return 1u;
+    if (std::strcmp(s, "2") == 0) return 2u;
+    throw std::invalid_argument("SOFT_NOC_SPACE_MULTIPLIER must be 1 or 2");
+  }();
+  return value;
+}
+}
 
 // Fixed-length 1-based vector.
 //
@@ -117,27 +134,28 @@ struct Flit {
 template <typename F>
 concept FlitArbInputs = std::is_invocable_r_v<std::optional<uint8_t>, F, size_t>;
 
-class FlitArb {
+template <typename Index = uint8_t>
+class IndexedFlitArb {
   size_t _num_inputs;
-  uint8_t _next_grant;
+  Index _next_grant;
 
   static inline bool prio_greater(std::optional<uint8_t> a, std::optional<uint8_t> b) {
     return a.has_value() && (!b.has_value() || a.value() < b.value());
   }
 
 public:
-  FlitArb(size_t num_inputs) : _num_inputs(num_inputs),
-      _next_grant(static_cast<uint8_t>(num_inputs > 1 ? 1 : 0)) {
-    assert(num_inputs >= 1 && num_inputs <= 256); // num_inputs == 256 = auto wrapped-around by uint8_t
+  IndexedFlitArb(size_t num_inputs) : _num_inputs(num_inputs),
+      _next_grant(static_cast<Index>(num_inputs > 1 ? 1 : 0)) {
+    assert(num_inputs >= 1 && num_inputs <= size_t(std::numeric_limits<Index>::max()) + 1);
   }
 
   // Returns index
   template <FlitArbInputs Inputs>
-  [[gnu::always_inline]] inline std::optional<uint8_t> peek(Inputs inputs) const {
+  [[gnu::always_inline]] inline std::optional<Index> peek(Inputs inputs) const {
     // Look for first valid since nextGrant
-    uint8_t i = _next_grant;
+    Index i = _next_grant;
     std::optional<uint8_t> selected = std::nullopt;
-    uint8_t idx;
+    Index idx = 0;
 
     do {
       auto input = inputs(i);
@@ -158,11 +176,13 @@ public:
     }
   }
 
-  inline void commit(uint8_t selected) {
+  inline void commit(Index selected) {
     _next_grant = selected + 1;
     if (_next_grant == _num_inputs) _next_grant = 0;
   }
 };
+
+using FlitArb = IndexedFlitArb<uint8_t>;
 
 template<typename T>
 concept WithPrio = requires(T t) {
@@ -212,11 +232,11 @@ public:
     return (occupied & (1ull << idx)) != 0;
   }
 
-  bool canEnq(uint8_t prio) const {
+  bool canEnq(uint8_t prio, unsigned spaceMultiplier = 1) const {
     size_t cnt = std::popcount(occupied);
     size_t space = N_DEPTH - cnt;
 
-    return space > prio;
+    return space > spaceMultiplier * prio;
   }
 
   std::optional<size_t> firstFreeSlot() const {
@@ -261,6 +281,7 @@ template <typename RT, std::size_t Q_DEPTH>
 class Router : std::is_invocable_r<size_t, RT, size_t> {
   RT _tbl;
   size_t _num_inputs, _num_outputs;
+  unsigned _space_multiplier = 1;
   std::vector<FlitQueue<Flit, Q_DEPTH>> _input_queues;
   std::vector<FlitArb> _output_arbs;
   // Scratch for Router::step (pre-allocated to _num_inputs).
@@ -298,7 +319,11 @@ public:
 
   Router() : _num_inputs(0), _num_outputs(0) {}
 
-  Router(RT tbl, size_t num_inputs, size_t num_outputs) : _tbl(tbl), _num_inputs(num_inputs), _num_outputs(num_outputs) {
+  Router(RT tbl, size_t num_inputs, size_t num_outputs, unsigned spaceMultiplier = 1)
+      : _tbl(tbl), _num_inputs(num_inputs), _num_outputs(num_outputs),
+        _space_multiplier(spaceMultiplier) {
+    if (spaceMultiplier != 1 && spaceMultiplier != 2)
+      throw std::invalid_argument("router space multiplier must be 1 or 2");
     _input_queues.resize(num_inputs);
     _input_deqs_scratch.assign(num_inputs, std::nullopt);
     _input_enqs.assign(num_inputs, std::nullopt);
@@ -329,7 +354,7 @@ public:
     if (!prio.has_value()) return false;
 
     const auto &q = _input_queues[i_port];
-    if (!q.canEnq(*prio)) return false;
+    if (!q.canEnq(*prio, _space_multiplier)) return false;
     reservation = q.firstFreeSlot();
     return true;
   }
@@ -375,6 +400,16 @@ public:
   size_t inputQueueSize(size_t input) const {
     return _input_queues.at(input).size();
   }
+
+  // Passive queue inspection; slot order is the tie-break order of peekIdx.
+  template <typename Visitor>
+  void visitInputQueue(size_t input, Visitor visitor) const {
+    const auto &queue = _input_queues.at(input);
+    for (size_t slot = 0; slot < Q_DEPTH; ++slot)
+      if (queue.occupiedAt(slot)) visitor(slot, *queue[slot]);
+  }
+
+  size_t outputFor(uint16_t destination) const { return _tbl(destination); }
 
   // Inspect every resident flit, including those hidden behind arbitration.
   template <typename Predicate>

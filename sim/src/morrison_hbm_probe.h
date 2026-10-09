@@ -87,7 +87,8 @@ class MorrisonHBMProbe final : public HBMControllerBase {
     return mode;
   }
   void add(const std::string &key,uint64_t n=1) {
-    counts.add(morrison_probe::step,morrison_probe::phase,identity,key,n);
+    if(morrison_probe::inPhase()) counts.add(morrison_probe::step,morrison_probe::phase,identity,key,n);
+    if(morrison_probe::timerActive) counts.add(0,100,identity,key,n);
   }
   void observeSlot(SlotType slot) {
     const std::string prefix=slot==SlotType::ColumnBus ? "column_" : "row_";
@@ -127,6 +128,13 @@ class MorrisonHBMProbe final : public HBMControllerBase {
     if (selected.candidates) add(prefix+"unused_common_"+std::to_string(selected.common));
   }
  public:
+  bool send(Request &req) override {
+    const auto writes=s_num_write_reqs_coalesced,reads=s_num_read_reqs_forwarded;
+    const bool result=ControllerBase::send(req);
+    add("native_write_coalesced",s_num_write_reqs_coalesced-writes);
+    add("native_read_forwarded",s_num_read_reqs_forwarded-reads);
+    return result;
+  }
   void finalize() override {
     ControllerBase::finalize();
     // System intentionally uses std::exit with parked backend workers, so
@@ -137,7 +145,7 @@ class MorrisonHBMProbe final : public HBMControllerBase {
   void tick() override {
     if (!identified) { identity=morrison_probe::mc; counts.name="hbm-probe-mc"+std::to_string(identity)+".csv"; identified=true; }
     hbm_tick_prologue();
-    if (!morrison_probe::inPhase()) {
+    if (!morrison_probe::inPhase() && !morrison_probe::timerActive) {
       try_issue_slot(SlotType::ColumnBus); try_issue_slot(SlotType::RowBus);
     } else {
       const auto hits=s_row_hits,misses=s_row_misses,conflicts=s_row_conflicts;

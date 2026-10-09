@@ -345,8 +345,16 @@ mb_produce:
  lw t2,B_HOME_WIDTH(t3)
  addi t2,t2,-1
  and t1,t1,t2
+#if BR_BULK_DISTANT
+ lw t2,B_GROUP_SHIFT(t3)
+ sll t1,t1,t2
+#endif
  lw t2,B_GROUP_BASE(t3)
  add t1,t1,t2
+#if BR_BULK_DISTANT
+ lw t2,0(t3)             # optional fixture XOR applies to complete worker ID
+ xor t1,t1,t2
+#endif
  addi t1,t1,1
  SENDI t1,-1012           # P3 range handler12, including actual self PU ID
  sw a1,B_HOME_CUR(t3)
@@ -425,6 +433,7 @@ mb_home_span:
  mv t1,t4
 1: sw t1,B_HOME_WIDTH(t3)
  addi t4,t1,-1
+#if !BR_BULK_DISTANT
  lw a4,H_PU(gp)
  addi a4,a4,-1
  and a5,a4,t4
@@ -434,12 +443,33 @@ mb_home_span:
  lw a4,0(t3)              # functional cross-MC override, normally zero
  xor a5,a5,a4
  sw a5,B_GROUP_BASE(t3)
+#endif
  li a4,0
 2: srli t1,t1,1
  beqz t1,3f
  addi a4,a4,1
  j 2b
 3: sw a4,B_GROUP_LOG(t3)
+#if BR_BULK_DISTANT
+ lw a5,H_NUM_PU(gp)
+ srl a5,a5,a4            # stride = number of PUs / number of workers
+ addi t1,a5,-1
+ lw t5,H_PU(gp)
+ addi t5,t5,-1
+ and t1,t5,t1
+ sw t1,B_GROUP_BASE(t3)
+ li t1,0
+6: srli a5,a5,1
+ beqz a5,7f
+ addi t1,t1,1
+ j 6b
+7: sw t1,B_GROUP_SHIFT(t3)
+ srl t5,t5,t1
+ lw t1,B_HOME_KIND(t3)
+ beqz t1,8f
+ li t5,0                # static directory quarter j goes to worker quarter j
+8: sw t5,B_GROUP_RANK(t3)
+#endif
  li t1,BR_BASE+MB_DISPATCH_POLICY
  lw t1,0(t1)
  beqz t1,4f
@@ -498,7 +528,9 @@ br_control_leaf:
  beq a0,t0,.Lmb_finalize_start
  j .Lboot_bad
 .Lmb_receipt_forward:
-#if BR_BULK_TREE
+#if BR_BULK_UNCOUNTED
+ j .Lboot_bad             # no forward receiver query exists in this variant
+#elif BR_BULK_TREE
  j mb_receipt_arm
 #else
  lw a1,H_RECEIVED(gp)
@@ -543,7 +575,7 @@ br_control_leaf:
  li t0,R_BASE
  lw t0,R_CREDIT(t0)
  or a1,a1,t0
-#if BR_BULK_TREE
+#if BR_BULK_TREE && !BR_BULK_UNCOUNTED
  lw t0,B_RX_PENDING(t4)
  or a1,a1,t0
 #endif
@@ -557,7 +589,11 @@ br_control_leaf:
  la t0,br_completion
  csrw 0x700,t0
  sw zero,H_JOIN_COUNT(gp)
+#if BR_BULK_UNCOUNTED
+ csrci 0x715,24           # receiver is re-enabled after integration
+#else
  sw zero,H_RECEIVED(gp)
+#endif
  sw zero,H_REVERSE_RECEIVED(gp)
  sw zero,H_EXPECTED_FORWARD(gp)
  sw zero,H_EXPECTED_REVERSE(gp)
@@ -570,6 +606,7 @@ br_control_leaf:
  sw zero,B_HOME_CLOSED(t4)
  sw zero,B_HOME_RETURNED(t4)
  sw zero,B_HOME_SENT(t4)
+#if !BR_BULK_UNCOUNTED
  sw zero,B_RX_INITIAL(t4)
  sw zero,B_RX_LAST(t4)
  sw zero,B_RX_CHILD_DELTA(t4)
@@ -578,6 +615,7 @@ br_control_leaf:
  sw zero,B_RX_BASE_READY(t4)
  sw zero,B_RX_DONE(t4)
  # RX_PENDING was drained during reverse; never discard a queued wake.
+#endif
 #endif
  # The check flag persists until its already-queued event retires.
  lw t1,H_FIRE_COUNT(gp)
@@ -663,6 +701,12 @@ br_control_leaf:
  li t0,8
  csrw 0x719,t0
  csrci 0x714,8
+#if BR_BULK_UNCOUNTED
+ la t0,mb_job
+ csrw 0x70c,t0           # reverse used this slot for its issuer continuation
+ li t0,0x00010012
+ csrw 0x72c,t0
+#endif
  li t0,28
  csrw 0x715,t0
  li t0,12
@@ -677,12 +721,17 @@ br_control_leaf:
  sw a0,H_PHASE(gp)
 #if BR_BULK_TREE
  csrw 0x713,zero
+#if BR_BULK_UNCOUNTED
+ csrw 0x71d,zero         # no receiver service; producer13 has closed
+#endif
  # Service13 stays enabled on SMT0 to consume residual zero-delta wakes.
 #endif
  csrw 0x732,gp
  csrci 0x71c,8
  csrci 0x71f,16
+#if !BR_BULK_UNCOUNTED
  csrci 0x715,24
+#endif
  # Forward owns both banks until global closure. Clear only descriptor flags.
  li t0,BR_BASE+MB_SHARED0+44
  li t1,32
@@ -716,11 +765,11 @@ br_control_leaf:
  li s4,0xcccccccd
  li s10,0x3f99ca19
  la t0,mr_issue
- csrw 0x705,t0
+ csrw (0x700+MB_ISSUER_ID),t0
  li t0,0x00010007
- csrw 0x725,t0
+ csrw (0x720+MB_ISSUER_ID),t0
  li t0,8
- csrw 0x715,t0
+ csrw (0x710+MB_ISSUER_ID),t0
  la t0,mr_update
  csrw 0x708,t0
  csrw 0x70f,t0
@@ -745,7 +794,7 @@ br_control_leaf:
 .Lmb_finish_start:
  sw a0,H_PHASE(gp)
  csrci 0x714,8
- csrci 0x715,8
+ csrci (0x710+MB_ISSUER_ID),8
  csrci 0x718,8
  csrci 0x71f,16
  sw zero,H_WORK_MC(gp)
@@ -873,7 +922,11 @@ br_report_leaf:
 .Lmb_producers_closed:
 #if BR_BULK_TREE
  sw t1,H_EXPECTED_FORWARD(gp)
+#if BR_BULK_UNCOUNTED
+ li a0,3                 # all plastic delivery reads have completed
+#else
  li a0,4
+#endif
  j br_broadcast
 #else
  li t0,MB_BASE
@@ -897,7 +950,9 @@ br_report_leaf:
  li a0,4
  j br_broadcast
 .Lmb_delivered_forward:
-#if BR_BULK_TREE
+#if BR_BULK_UNCOUNTED
+ j .Lboot_bad
+#elif BR_BULK_TREE
  li t0,MB_BASE
  sw t1,B_RX_BASE(t0)
  li t1,1

@@ -1,5 +1,9 @@
 // Included only by soft_backend.cpp, after the native generated root type.
 namespace {
+const char *morrisonSpatialDirectory() {
+  static const char *directory = std::getenv("MORRISON_NOC_SPATIAL_PROBE");
+  return directory;
+}
 struct MorrisonCpuProbe {
   struct State {
     uint32_t phase=0,step=0,valid=0,advance=0,decode=0,wfi=0,busy=0,idle=0,eidle=0,branch=0,wake=0,delayed=0,kind=0;
@@ -15,11 +19,19 @@ struct MorrisonCpuProbe {
   std::pair<unsigned,unsigned> lastKey{};
   std::vector<Totals> *current=nullptr;
   std::ofstream samples;
+  std::ofstream spatialSamples;
   morrison_probe::Counters memory{"memif-probe.csv"};
   unsigned previousStep=0,previousPhase=0;
+  bool previousTimer=false;
   MorrisonCpuProbe() {
     samples.open(std::filesystem::path(morrison_probe::directory())/"cpu-joint.bin",std::ios::binary);
     if (!samples) throw std::runtime_error("Cannot open Morrison CPU probe");
+    if (const char *directory = morrisonSpatialDirectory()) {
+      spatialSamples.open(std::filesystem::path(directory)/"cpu-spatial.bin", std::ios::binary);
+      const std::array<uint32_t,8> header{0x4d534350,1,48,251,SYSTEM_PIPE_CNT,MEM_BUS_WIDTH_B,0,0};
+      spatialSamples.write(reinterpret_cast<const char*>(header.data()), sizeof(header));
+      if (!spatialSamples) throw std::runtime_error("Cannot open simultaneous CPU samples");
+    }
   }
   ~MorrisonCpuProbe() {
     morrison_probe::Counters out{"cpu-probe.csv"};
@@ -53,15 +65,27 @@ void SoftSystemBackend::observeMorrisonPhase(uint64_t cycle) {
     const auto &d=drams[id];
     // Current occupancy is pre-edge; event booleans are from the preceding
     // committed edge, tagged with its saved phase rather than today's header.
-    if (measuring) {
-      auto add=[&](const char *k,uint64_t n=1){p.memory.add(step,phase,id,k,n);};
+    if (measuring || morrison_probe::timerActive) {
+      auto add=[&](const char *k,uint64_t n=1){
+        if(measuring)p.memory.add(step,phase,id,k,n);
+        if(morrison_probe::timerActive)p.memory.add(0,100,id,k,n);
+      };
+      if(measuring)p.memory.maximum(step,phase,id,"external_id_max",d.externalIdCount());
+      if(morrison_probe::timerActive)p.memory.maximum(0,100,id,"external_id_max",d.externalIdCount());
+      add("capacity_sum",d.mshrCapacity()); add("external_id_sum",d.externalIdCount());
       add("cycles"); add("allocated_sum",d.mshrInflightCount()); add("unissued_sum",d.mshrUnissuedCount());
-      add("fulfilled_sum",d.mshrFulfilledCount()); add("full",d.mshrInflightCount()==256);
+      add("fulfilled_sum",d.mshrFulfilledCount()); add("full",d.mshrInflightCount()==d.mshrCapacity());
       add("bulk_queue_sum",d.bulkQueueOccupancy());
     }
-    if (p.previousStep && (p.previousPhase==2 || p.previousPhase==3)) {
+    const bool previousMeasuring=p.previousStep && (p.previousPhase==2 || p.previousPhase==3);
+    if (previousMeasuring || p.previousTimer) {
       const auto &e=d.cycleEvents();
-      auto add=[&](const char *k,uint64_t n=1){p.memory.add(p.previousStep,p.previousPhase,id,k,n);};
+      auto add=[&](const char *k,uint64_t n=1){
+        if(previousMeasuring)p.memory.add(p.previousStep,p.previousPhase,id,k,n);
+        if(p.previousTimer)p.memory.add(0,100,id,k,n);
+      };
+      add("incoming_reads",e.incomingRead); add("incoming_writes",e.incomingWrite);
+      add("merges",e.mergedWrite); add("merges_when_full",e.mergedWhileFull); add("external_id_blocked",e.idBlocked);
       add("event_cycles"); add("bulk_head",e.bulkHeadPresent); add("allocation_full",e.allocationFull);
       add("bulk_full",e.bulkHeadPresent && e.allocationFull); add("bulk_scalar",e.bulkScalarPriority);
       add("bulk_bcst_limit",e.bulkBroadcastLimit); add("bulk_allocated",e.bulkAllocated);
@@ -71,7 +95,7 @@ void SoftSystemBackend::observeMorrisonPhase(uint64_t cycle) {
       add("refused_writes",e.externalRequestPresented && !e.externalRequestAccepted && e.externalRequestWrite);
     }
   }
-  p.previousStep=step;p.previousPhase=phase;
+  p.previousStep=step;p.previousPhase=phase;p.previousTimer=morrison_probe::timerActive;
   for (unsigned pu=1;pu<=cfg.numPU;++pu) {
     const auto &r=*cores[pu]->rootp;
     auto &prev=p.previous[pu];
@@ -115,7 +139,8 @@ void SoftSystemBackend::observeMorrisonPhase(uint64_t cycle) {
       if (!p.samples) throw runtime_error("Morrison CPU sample write failed");
     }
     n.sampled=measuring && (cycle+pu+1)%251==0;
-    if (n.sampled) {
+    const bool spatialSample=morrisonSpatialDirectory() && step && phase==2 && cycle%251==0;
+    if (n.sampled || spatialSample) {
       const auto &s=r.Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
       const auto w=[&](unsigned o){return s[o/MEM_BUS_WIDTH_B][o%MEM_BUS_WIDTH_B/4];};
       auto &a=n.raw;
@@ -150,6 +175,12 @@ void SoftSystemBackend::observeMorrisonPhase(uint64_t cycle) {
       a[41]=w(MB_CONTROL+B_HOME_CLOSED);a[42]=w(64);a[43]=w(68);
       a[44]=w(72);a[45]=w(MB_CONTROL+B_PRODUCED);a[46]=w(MB_CONTROL+B_EXPANDED);
       a[47]=r.Core__DOT__fetch__DOT__icache__DOT__mem_req_valid_0 | (n.advance<<1);
+      // Same 48-word schema as cpu-joint, but all PUs on one cycle. Words6/7
+      // stay zero here: only cpu-joint fills those with next-cycle validity.
+      if (spatialSample) {
+        p.spatialSamples.write(reinterpret_cast<const char*>(a.data()), sizeof(a));
+        if (!p.spatialSamples) throw runtime_error("Simultaneous CPU sample write failed");
+      }
     }
     prev=n;
   }

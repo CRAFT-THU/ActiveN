@@ -883,6 +883,12 @@ br_integrate:
  SENDI t0,1026
 #endif
 9:
+#if BR_BULK_UNCOUNTED
+ /* Passive observation may watch this existing final jump. No receiver
+  * counter, wake, or completion reduction is executed by this variant. */
+ .globl mb_spike_done
+mb_spike_done:
+#else
  /* Both SMT threads may deliver spikes; preserve the barrier count atomically. */
  addi t0,gp,H_RECEIVED
  li t1,1
@@ -897,6 +903,7 @@ br_integrate:
  YIELDI 13
 8:
 .endif
+#endif
  j br_idle
 .endm
 #if BR_RULE == 1
@@ -908,7 +915,7 @@ SPIKE_ENTRY:
 SPIKE_ENTRY:
  SPIKE_BODY 0
 #endif
-#if BR_BULK_TREE
+#if BR_BULK_TREE && !BR_BULK_UNCOUNTED
 .globl mb_spike_receipt
 mb_spike_receipt:
  SPIKE_BODY 1,1

@@ -32,6 +32,18 @@ def check(directory, run):
     report = []
     late_receipts = []
     observed_rows = list(csv.DictReader((run/"morrison-activity.csv").open()))
+    uncounted = manifest.get('forward_receiver_count') == 'none-experimental'
+    passive_receipts = {}
+    if uncounted:
+        for row in csv.DictReader((run/'uncounted-receipts.csv').open()):
+            key = (int(row['step']), int(row['pu'])-1)
+            if key in passive_receipts:
+                raise ValueError('duplicate passive receipt row')
+            passive_receipts[key] = int(row['completed'])
+        expected_keys = {(step, pu) for step in range(1, manifest['warmup']+manifest['timed']+1)
+                         for pu in range(spec.pu)}
+        if passive_receipts.keys() != expected_keys:
+            raise ValueError('passive receipt coverage mismatch')
     copy_profiles = {}
     profile_path = run/'pu-profile.csv'
     if image.bulk and profile_path.exists():
@@ -60,6 +72,7 @@ def check(directory, run):
         ef[:, 4] = F(f[:, 4]*c["decay_post"])
         ef[:, 5:7] = 0.
         forward = reverse = 0
+        expected_pu_receipts = np.zeros(spec.pu, np.int64)
         for source in np.flatnonzero(fired):
             peers = source % spec.pu // image.group * image.group + np.arange(image.group)
             slot = source // spec.pu * image.group + source % image.group
@@ -70,6 +83,7 @@ def check(directory, run):
                 weights = weights_at(mc, addresses)
                 np.add.at(ef[:, 5], post, weights)
                 forward += len(post)
+                np.add.at(expected_pu_receipts, post % spec.pu, 1)
                 quiet = ~fired[post]
                 new = np.maximum(F(0.), F(weights[quiet]-F(weights[quiet]*ef[post[quiet], 4])))
                 changed[mc].update((int(a), w) for a, w in zip(addresses[quiet], new))
@@ -80,6 +94,7 @@ def check(directory, run):
                     target = ((packed>>16)-NODE_BASE-field)//NODE_BYTES*spec.pu+(packed&65535)-1
                     np.add.at(ef[:, col], target, entries[:, 1].view(F))
                     forward += int(count)
+                    np.add.at(expected_pu_receipts, target % spec.pu, 1)
         for post in np.flatnonzero(fired[:spec.ne]):
             owner = post % spec.pu
             slot = post // spec.pu * image.group + post % image.group
@@ -116,7 +131,12 @@ def check(directory, run):
                     offset = 0
                     for rank,count in enumerate(cuts):
                         if not count: continue
-                        owner = ((home//workers*workers)^override)+(home%workers+rank)%workers
+                        if manifest.get('dispatch_layout') == 'distant-locality-source-mc-v1':
+                            stride = spec.pu//workers
+                            rotation = home//stride if unit == 1024 else 0
+                            owner = (home%stride+((rotation+rank)%workers)*stride)^override
+                        else:
+                            owner = ((home//workers*workers)^override)+(home%workers+rank)%workers
                         length = min(size-offset,count*unit)
                         bank_bytes = manifest.get("forward_copy_bytes",manifest.get("forward_bank_bytes",1024))
                         commands[owner] += (length+bank_bytes-1)//bank_bytes
@@ -177,12 +197,14 @@ def check(directory, run):
                 jobs_expanded += int(control[80//4])
                 if manifest.get('forward_completion','poll')=='tree':
                     tree=spm[(0x2000+256)//4:(0x2000+300)//4]
-                    if int(tree[0])!=2 or int(tree[1])!=int(control[84//4]) or int(tree[3]):
+                    if int(tree[0])!=2 or int(tree[1])!=int(control[84//4]) or (not uncounted and int(tree[3])):
                         raise ValueError('incomplete home/receiver completion tree')
-                    if pu==0:
+                    if pu==0 and not uncounted:
                         if int(tree[7])+int(tree[8])!=expected_forward or tuple(tree[9:11])!=(1,1):
                             raise ValueError('root receiver reduction does not match deliveries')
                         late_receipts.append(int(tree[8]))
+                    if pu == 0 and int(spm[26]) != expected_forward:
+                        raise ValueError('sender reduction does not match expected deliveries')
                 width = manifest['dispatch_width']
                 balanced = manifest.get('dispatch_policy', 'legacy') == 'balanced'
                 expected_jobs = 0
@@ -208,7 +230,15 @@ def check(directory, run):
                 expected_jobs = np.flatnonzero(valid & fired[np.minimum(ids, spec.n-1)])+1
                 if not np.array_equal(np.sort(jobs), expected_jobs) or config[11] != image.group or config[12] != len(jobs):
                     raise ValueError("proxy notification/compact job mismatch")
-            forward += int(spm[16])
+            if uncounted:
+                if spm[16] != image.spms[pu][16]:
+                    raise ValueError('unused receiver count was modified')
+                delivered = passive_receipts[step,pu]
+                if delivered != expected_pu_receipts[pu]:
+                    raise ValueError(f'step{step} PU{pu+1}: passive delivery total mismatch')
+                forward += delivered
+            else:
+                forward += int(spm[16])
             reverse += int(spm[17])
         if image.bulk and jobs_produced != jobs_expanded:
             raise ValueError("global range accounting mismatch")
@@ -296,6 +326,7 @@ def check(directory, run):
                 proxy_job_lists_checked=not image.bulk,
                 range_accounting_checked=image.bulk,
                 forward_tree_checked=manifest.get('forward_completion','poll')=='tree',
+                passive_per_pu_deliveries_checked=uncounted,
                 late_forward_deliveries=late_receipts)
 
 

@@ -7,6 +7,15 @@
 #ifndef BR_BULK_TREE
 #define BR_BULK_TREE 0
 #endif
+#ifndef BR_BULK_DISTANT
+#define BR_BULK_DISTANT 0
+#endif
+#ifndef BR_BULK_UNCOUNTED
+#define BR_BULK_UNCOUNTED 0
+#endif
+#if BR_BULK_UNCOUNTED && (!BR_BULK || !BR_BULK_TREE)
+#error Uncounted overlap requires the bulk completion tree
+#endif
 #if BR_BULK
 #include "morrison_bulk_layout.h"
 #define BR_CONTROL_ID 6

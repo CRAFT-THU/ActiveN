@@ -9,6 +9,11 @@
 #define MB_COPY_BYTES 1024
 #define MB_MSHRS 64
 #define MB_READ_CREDITS 16
+#if BR_BULK_UNCOUNTED
+#define MB_ISSUER_ID 12
+#else
+#define MB_ISSUER_ID 5
+#endif
 #define MB_READY_CONTROL 0x2140
 #define R_HEAD 0
 #define R_TAIL 32
@@ -50,6 +55,7 @@
 #define B_DIR_STRIDE 128
 #define B_STATIC_BASE 132
 #define B_REVERSE_BASE 136
+#define B_GROUP_SHIFT 140
 #define B_COMPLETE_PENDING 164
 #define B_REVERSE_STARTED 168
 #define B_GROUP_BASE 172

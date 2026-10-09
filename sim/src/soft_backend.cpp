@@ -35,6 +35,10 @@
 using namespace std;
 
 #include "morrison_cpu_probe.inc"
+#include "morrison_flow_probe.inc"
+#include "morrison_inlet_probe.inc"
+#include "morrison_spatial_probe.inc"
+#include "morrison_ring_probe.inc"
 
 // Wall-clock accumulator (ns) for time spent inside soft_rtl Verilator
 // eval() calls, summed across all PUs. Thread-local because Verilated
@@ -440,7 +444,8 @@ SoftSystemBackend::WrappedRouter SoftSystemBackend::buildRouter(uint16_t pu) con
       links.memif ? std::optional<size_t>(nf + 1) : std::nullopt;
   links.num_forwards = static_cast<uint8_t>(nf);
   auto tbl = topo.routingTableFor(pu, dir_to_link, core_eject_port, memif_port);
-  return WrappedRouter(std::move(links), std::move(tbl), num_in, num_out);
+  return WrappedRouter(std::move(links), std::move(tbl), num_in, num_out,
+                       soft_noc::spaceMultiplier());
 }
 
 soft_mem::MemIf &SoftSystemBackend::memifAt(size_t memifIdx) {
@@ -535,6 +540,18 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads)
   if ((cfg.numPU / cfg.numMC) % soft_mem::CLUSTER_SIZE != 0) throw std::invalid_argument("PU per MC must be a multiple of cluster size");
   if (numThreads < 1 || numThreads > cfg.numPU) throw std::invalid_argument("numThreads must be between 1 and numPU");
 
+  if (const char *value = std::getenv("MORRISON_UNCOUNTED_SPIKE_PC")) {
+    size_t consumed = 0;
+    const auto pc = std::stoul(value, &consumed, 0);
+    if (consumed != std::strlen(value) || pc < 0x80000010ul ||
+        pc >= 0x80002000ul || (pc & 3) || !std::getenv("SOFT_BRUNEL_DUMP"))
+      throw std::invalid_argument("invalid MORRISON_UNCOUNTED_SPIKE_PC/dump configuration");
+    morrisonUncountedSpikePc_ = pc;
+    morrisonUncountedReceipts_.resize(cfg.numPU + 1);
+    std::cerr << "[Morrison uncounted observer] spike_pc=0x" << std::hex
+              << pc << std::dec << " passive=1\n";
+  }
+
   if (workProfileEnabled) {
     workProfilePhaseSamples.reserve(1 << 18);
     workProfileUnitSamples.reserve(1 << 20);
@@ -545,11 +562,16 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads)
 
   const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
   const size_t CLUSTER_PER_MC = PU_PER_MC / soft_mem::CLUSTER_SIZE;
+  const auto memoryExperiment=soft_mem::experimentConfig();
+  std::cerr << "[Soft NoC] space_multiplier=" << soft_noc::spaceMultiplier()
+            << " router_queue_depth=" << ROUTER_Q_DEPTH << '\n';
+  std::cerr << "[Soft MemIf] slots=" << memoryExperiment.slots
+            << " merge=" << memoryExperiment.merge << " external_ids=256 unicast_reserve=32\n";
   drams.reserve(cfg.numMC);
   for (size_t m = 0; m < cfg.numMC; ++m) {
     drams.emplace_back(m + 1, CLUSTER_PER_MC, 2,
                        1 + m * PU_PER_MC,
-                       1 + (m + 1) * PU_PER_MC);
+                       1 + (m + 1) * PU_PER_MC, memoryExperiment);
   }
 
   memif_owner[0] = puOwner(1);
@@ -773,7 +795,8 @@ void SoftSystemBackend::peek(uint64_t cycle, std::vector<MemBusOut *> out) {
             if (compact) firedIds.push_back(gid);
           }
         }
-        forwardReceipts += word(pu, offsetof(BrHeader,received));
+        forwardReceipts += morrisonUncountedSpikePc_ ? morrisonUncountedReceipts_[pu]
+                                                    : word(pu, offsetof(BrHeader,received));
         reverseReceipts += word(pu, offsetof(BrHeader,reverse_received));
         resident += word(pu, offsetof(BrHeader,buffer_bytes)) / 4;
         pending += word(pu, offsetof(BrHeader,mshr_count));
@@ -795,6 +818,22 @@ void SoftSystemBackend::peek(uint64_t cycle, std::vector<MemBusOut *> out) {
         write(completed); write(firedIds.size());
         for (auto gid : firedIds) write(gid);
         if (!activity || !spikes) throw runtime_error("cannot write Morrison activity");
+      }
+      if (morrisonUncountedSpikePc_) {
+        std::ofstream receipts(std::filesystem::path(directory) / "uncounted-receipts.csv",
+                               completed == 1 ? std::ios::out : std::ios::app);
+        if (completed == 1) receipts << "step,pu,completed\n";
+        for (unsigned pu = 1; pu <= cfg.numPU; ++pu)
+          receipts << completed << ',' << pu << ',' << morrisonUncountedReceipts_[pu] << '\n';
+        receipts.close();
+        if (!receipts) throw runtime_error("cannot write uncounted receipt observation");
+        if (forwardReceipts != word(1, offsetof(BrHeader,expected_forward)))
+          throw runtime_error("uncounted timestep completed with missing/excess spike deliveries: observed=" +
+                              std::to_string(forwardReceipts) + " expected=" +
+                              std::to_string(word(1, offsetof(BrHeader,expected_forward))));
+        // peek(K) has captured edge K-1. step(K) will count edge K in the
+        // next interval. No architectural counter or barrier is changed.
+        std::fill(morrisonUncountedReceipts_.begin(), morrisonUncountedReceipts_.end(), 0);
       }
       std::cerr << (compact ? "[Morrison step] step=" : "[Brunel step] step=") << completed << " cycle=" << cycle
                 << " E=" << excitatory << " I=" << inhibitory;
@@ -1551,6 +1590,7 @@ void SoftSystemBackend::stageMemifWork(size_t threadId, bool) {
     resolveMemifTokens(memifIdx);
     auto *ringInput = ring.peekAt(memifIdx);
     auto &memif = memifAt(memifIdx);
+    memif.prepareExternal(memif_ext[memifIdx].reqAccepting);
     memif_ring_accept[memifIdx] =
         ringInput && memif.ringCanAccept(*ringInput);
     memif_eject_accept[memifIdx] = memif.nocAcceptMultiple(
@@ -1596,6 +1636,18 @@ void SoftSystemBackend::step(uint64_t cycle) {
   accumulateStats(cycle);
   observeBrunelMemory(cycle);
   observeMorrisonPhase(cycle);
+  observeMorrisonFlow(cycle);
+  observeMorrisonInlet(cycle);
+  observeMorrisonSpatial(cycle);
+  observeMorrisonRing(cycle);
+  if (morrisonUncountedSpikePc_) {
+    for (unsigned pu = 1; pu <= cfg.numPU; ++pu) {
+      const auto &r = *cores[pu]->rootp;
+      if (r.Core__DOT__exec__DOT__valid && r.Core__DOT__exec__DOT__s0step &&
+          r.Core__DOT__exec__DOT__uop_pc == morrisonUncountedSpikePc_)
+        ++morrisonUncountedReceipts_[pu];
+    }
+  }
   if (profile)
     workProfileRecordUnit(cycle, WorkProfilePhase::StepStart,
                           WorkProfileUnit::Stats, 0,
@@ -2131,9 +2183,10 @@ void SoftSystemBackend::accumulateNocProfile(uint64_t cycle) {
     const bool scFailure = scAttempt
         && !root->Core__DOT__exec__DOT__lsu__DOT__reserved;
 
-    const size_t enq = root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__enq_ptr_value;
-    const size_t deq = root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__deq_ptr_value;
-    const bool maybeFull = root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__maybe_full;
+    const bool morrison=root->Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory[0][0]==MR_MAGIC;
+    const size_t enq = morrison ? root->Core__DOT__exec__DOT__biu__DOT__evq_5__DOT__enq_ptr_value : root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__enq_ptr_value;
+    const size_t deq = morrison ? root->Core__DOT__exec__DOT__biu__DOT__evq_5__DOT__deq_ptr_value : root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__deq_ptr_value;
+    const bool maybeFull = morrison ? root->Core__DOT__exec__DOT__biu__DOT__evq_5__DOT__maybe_full : root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__maybe_full;
     const size_t spikeQueueOccupancy = enq == deq
         ? (maybeFull ? spikeQueueDepth : 0)
         : ((enq - deq) & (spikeQueueDepth - 1));
@@ -2822,6 +2875,8 @@ void SoftSystemBackend::printWorkProfile() const {
 
 bool SoftSystemBackend::printStats(uint64_t cycles, bool final_print) {
   if (final_print) {
+    if (const char *directory = std::getenv("MORRISON_FLOW_PROFILE"))
+      for (const auto &dram : drams) dram.dumpFlowProbe(directory);
     if (const char *directory = std::getenv("MORRISON_WRITE_PROBE"))
       for (const auto &dram : drams) dram.dumpWriteProbe(directory);
     if (nocProfileActive_) timerStatsStop(cycles);
