@@ -42,6 +42,10 @@ class LSU(implicit val param: CoreParameters) extends Module {
     val len = Input(UInt(32.W))
     val start = Flipped(Valid(ACOps()))
     val remaining = Output(UInt(16.W))
+
+    // Completion notification
+    val notify = Input(Bool())
+    val handler = Input(UInt(4.W))
   })
 
   // Manual async-copy completion push
@@ -109,6 +113,7 @@ class LSU(implicit val param: CoreParameters) extends Module {
     acNew -> (ac.len >> log2Ceil(param.memBusWidth / 8)),
     respAc -> (acRemaining - 1.U)
   ))
+  val acCompletion = acRemaining === 1.U && respAc
 
   val wmapped = Mux1H(Seq(
     req.bits.len.w -> req.bits.wdata,
@@ -294,6 +299,13 @@ class LSU(implicit val param: CoreParameters) extends Module {
     pushingData.handler := mem.resp.bits.extra0
     pushingData.regs(0) := mem.resp.bits.ident
     pushingData.regs(1) := mem.resp.bits.extra1
+    pushingData.regs(2) := DontCare
+    pushingData.regs(3) := DontCare
+  } .elsewhen (acCompletion && ac.notify) {
+    pushing := COMPLETION_TIMEOUT.U
+    pushingData.handler := ac.handler
+    pushingData.regs(0) := DontCare
+    pushingData.regs(1) := DontCare
     pushingData.regs(2) := DontCare
     pushingData.regs(3) := DontCare
   } .elsewhen (push.ready) {

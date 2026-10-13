@@ -99,3 +99,11 @@ The idle notifier, when registered, will transmit a **message** (not a unicast m
 For unregister requests, the response code:
 - 0: There is pending notifier and is unregistered
 - -1: There is no pending notifier
+
+## Async copy
+
+The async copy can have a notifier registered. The encoding of CSR acnotify(0x734) is:
+- acnotify[11]: enable / disable the completion handler
+- acnotify[3-0]: the handler number
+
+This has the same limitation to the manual single-line read / writes: the completion is "volatile": if the event queue is full, this message can be lost.

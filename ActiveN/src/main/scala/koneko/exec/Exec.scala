@@ -195,9 +195,13 @@ class Exec(implicit val param: CoreParameters) extends Module {
   val acGBase = RegInit(0x80000000L.U(32.W))
   val acSBase = RegInit(0x20000000L.U(32.W))
   val acLen = RegInit(0.U(32.W))
+  val acNotify = RegInit(false.B)
+  val acHandler = Reg(UInt(4.W))
   lsu.ac.gBase := acGBase
   lsu.ac.sBase := acSBase
   lsu.ac.len := acLen
+  lsu.ac.notify := acNotify
+  lsu.ac.handler := acHandler
   // Default connection
   lsu.ac.start.valid := false.B
   lsu.ac.start.bits := DontCare
@@ -393,6 +397,13 @@ class Exec(implicit val param: CoreParameters) extends Module {
       start.bits := ops
     }
   }
+  case class CSRACNotify(enabled: Bool, handler: UInt) extends CSR {
+    def read = enabled ## 0.U(7.W) ## handler
+    def write(data: UInt) = {
+      enabled := data(11)
+      handler := data(3, 0)
+    }
+  }
 
   // CSR
   val csrmapping: Seq[(Int, CSR)] = Seq(
@@ -401,6 +412,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
     0x731 -> CSRGatedUInt(acGBase, lsu.ac.remaining === 0.U),
     0x732 -> CSRGatedUInt(acSBase, lsu.ac.remaining === 0.U),
     0x733 -> CSRGatedUInt(acLen, lsu.ac.remaining === 0.U),
+    0x734 -> CSRACNotify(acNotify, acHandler),
   ) ++ (
     for (i <- 0 until 16) yield (0x700 + i) -> CSRUInt(handlers(i))
   ) ++ (
