@@ -332,6 +332,7 @@ abstract class MemIf(
 
   private val ringFwdQueue = Module(new Queue(new RingResp, 2))
   private val ringSendGated = Wire(Decoupled(new RingResp))
+  final protected val ringFwdEmpty = !ringFwdQueue.io.deq.valid
   ringSendGated.bits := ringSend.bits
   ringSendGated.valid := ringSend.valid && ringFwdQueue.io.count === 0.U
   ringSend.ready := ringSendGated.ready && ringFwdQueue.io.count === 0.U
@@ -544,7 +545,10 @@ class DRAMIf(
     broadcast(ci) <> bcstDists(ci)
   }
 
-  idleCurrently := !bulkQueue.io.deq.valid && !bcstQueue.io.deq.valid && !allocated.asUInt.orR
+  idleCurrently := !bulkQueue.io.deq.valid && !bcstQueue.io.deq.valid && !allocated.asUInt.orR && ringFwdEmpty
+
+  val idle = IO(Output(Bool()))
+  idle := idleCurrently
 }
 
 // No distributor, no scatter / bulk, can have configROM
@@ -582,5 +586,8 @@ class PeripheralIf(
 
   flit.ready := scalarAcceptFlit || idleAcceptFlit
 
-  idleCurrently := !allocated.asUInt.orR
+  val systemIdle = IO(Input(Bool()))
+
+  // Special case: for peripheral MemIf, idle means global idle
+  idleCurrently := !allocated.asUInt.orR && ringFwdEmpty && systemIdle
 }

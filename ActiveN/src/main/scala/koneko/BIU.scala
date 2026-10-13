@@ -32,6 +32,9 @@ class BIU(implicit val param: CoreParameters) extends Module {
     }))
   })
 
+  // Nothing in the queues
+  val empty = IO(Output(Bool()))
+
   // Bitmask for enabled handlers
   val enmasks = IO(Input(Vec(16, UInt(param.pipeCnt.W))))
   val accepting = IO(Input(UInt(param.pipeCnt.W)))
@@ -142,4 +145,10 @@ class BIU(implicit val param: CoreParameters) extends Module {
   // and we have wakeup being a subset of accepting
   scheduleArb.io.out.ready := true.B
   assert(!scheduleArb.io.out.valid || sched.wakeup.orR)
+
+  empty := !(
+    VecInit(evQueues.map(_.io.deq.valid)).asUInt.orR
+    || sendQueue.deq.valid
+    || bcastQueue.io.deq.valid
+  )
 }

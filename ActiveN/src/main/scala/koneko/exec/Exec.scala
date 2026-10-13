@@ -45,6 +45,9 @@ class Exec(implicit val param: CoreParameters) extends Module {
   // CSR broadcast input from MemDistributor (via Core)
   val bcast = IO(Flipped(Decoupled(new BcastLine)))
 
+  // BIU emptiness
+  val biuEmpty = IO(Output(Bool()))
+
   //////////////////////////
   // Cfg CSRS
   //////////////////////////
@@ -209,6 +212,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
   // BIU & related AM connections
   val biu = Module(new BIU)
   biu.hartid := cfg.hartid(15, 0)
+  biuEmpty := biu.empty
 
   biu.ext.in <> ext.in
   biu.ext.out <> ext.out

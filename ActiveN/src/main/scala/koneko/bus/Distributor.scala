@@ -39,6 +39,8 @@ class Distributor(
 
   val out = IO(new DistributorOutput)
 
+  val idle = IO(Output(Bool()))
+
   // Unicast
   val unicast = Common.pipeValid(in.unicast)
   out.unicast.resp.id := unicast.bits.id
@@ -70,4 +72,6 @@ class Distributor(
     0.U,
     bcstAccepted | (out.broadcast.valids & out.broadcast.readies)
   )
+
+  idle := !unicast.valid && !bcstQueue.io.deq.valid
 }

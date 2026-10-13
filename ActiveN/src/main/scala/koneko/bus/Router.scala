@@ -193,4 +193,8 @@ class Router[D <: Routable](
   for (i <- 0 until numInputs) {
     inputQueues(i).deq.ready := deqGrant(i)
   }
+
+  val idle = IO(Output(Bool()))
+  // Routing being idle means all input queues are empty
+  idle := !VecInit(inputQueues.map(_.deq.valid)).asUInt.orR
 }

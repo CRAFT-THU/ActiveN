@@ -451,7 +451,7 @@ class System(implicit val params: SystemParameters) extends Module {
   }
 
   // --- Instantiate MemDistributors (one per cluster) and connect ---
-  for (ci <- 0 until numClusters) {
+  val dists = for (ci <- 0 until numClusters) yield {
     val mcIdx = ci / clustersPerMC
     val ciLocal = ci % clustersPerMC // cluster index within the MC's zone
     val puStart = ci * 16 + 1
@@ -474,5 +474,17 @@ class System(implicit val params: SystemParameters) extends Module {
       readies(j) := cores(puId).mem.broadcast.ready
     }
     dist.out.broadcast.readies := readies.asUInt
+    dist
   }
+
+  // Collect idle signals
+  val coresIdle = VecInit(cores.values.map(_.idle).toSeq).asUInt.andR
+  val routersIdle = VecInit(puRouters.values.map(_.idle).toSeq).asUInt.andR
+  val memIfsIdle = VecInit(memIfs.values.map(_.idle).toSeq).asUInt.andR
+  val distsIdle = VecInit(dists.map(_.idle)).asUInt.andR
+  val IDLE_LATENCY = 4
+  val systemIdle = (1 to IDLE_LATENCY).foldLeft(coresIdle && routersIdle && memIfsIdle && distsIdle) { (acc, _) =>
+    RegNext(acc, false.B)
+  }
+  periphMemIf.systemIdle := systemIdle
 }

@@ -27,6 +27,9 @@ class Core(implicit val params: CoreParameters) extends Module {
     val hartid = UInt(32.W)
   }))
 
+  // Completely idle
+  @public val idle = IO(Output(Bool()))
+
   //////////////////////////
   // Cfg CSRS
   //////////////////////////
@@ -65,4 +68,8 @@ class Core(implicit val params: CoreParameters) extends Module {
   fetch.decoded <> exec.dec
   fetch.nidlings := exec.nidlings
   fetch.ctrl.br <> exec.brs
+
+  // Completely idle: both core idle, BIU empty, msg queue empty
+  // Depends on retiming for timing constraints
+  idle := ext.idlings.andR && !msgQueue.deq.valid && exec.biuEmpty
 }

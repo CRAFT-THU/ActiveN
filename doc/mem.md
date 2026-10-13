@@ -100,6 +100,8 @@ For unregister requests, the response code:
 - 0: There is pending notifier and is unregistered
 - -1: There is no pending notifier
 
+**System-wide idle notification**: The peripheral interface's idle notifier operates based on system-wide idleness: you can use that to assert that the entire system is idle. Expect spurious idle signals, so use a counter value >= 0xFF.
+
 ## Async copy
 
 The async copy can have a notifier registered. The encoding of CSR acnotify(0x734) is:
