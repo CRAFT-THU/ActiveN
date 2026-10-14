@@ -13,6 +13,39 @@
 #ifndef BR_BULK_UNCOUNTED
 #define BR_BULK_UNCOUNTED 0
 #endif
+#ifndef BR_BULK_WORKER
+#define BR_BULK_WORKER 0
+#endif
+#ifndef BR_BULK_RELAY
+#define BR_BULK_RELAY 0
+#endif
+#ifndef BR_BULK_SCHEDULED
+#define BR_BULK_SCHEDULED 0
+#endif
+#ifndef BR_BULK_RELAY_SMT1
+#define BR_BULK_RELAY_SMT1 0
+#endif
+#ifndef BR_BULK_RELAY_ORDERED
+#define BR_BULK_RELAY_ORDERED 0
+#endif
+#ifndef BR_BULK_UPDATE_FIRST
+#define BR_BULK_UPDATE_FIRST 0
+#endif
+#if BR_BULK_UPDATE_FIRST && (!BR_BULK_RELAY_ORDERED || !BR_BULK_SCHEDULED)
+#error Update-first scheduling requires the ordered shared-updater variant
+#endif
+#if (BR_BULK_RELAY_SMT1 || BR_BULK_RELAY_ORDERED) && !BR_BULK_SCHEDULED
+#error Relay scheduling controls require shared updater scheduling
+#endif
+#if BR_BULK_SCHEDULED && !BR_BULK_RELAY
+#error Shared updater scheduling requires bulk worker relay
+#endif
+#if BR_BULK_RELAY && !BR_BULK_WORKER
+#error Bulk relay requires worker-local weight placement
+#endif
+#if BR_BULK_WORKER && (!BR_BULK_DISTANT || !BR_BULK_UNCOUNTED)
+#error Worker placement requires distant uncounted bulk dispatch
+#endif
 #if BR_BULK_UNCOUNTED && (!BR_BULK || !BR_BULK_TREE)
 #error Uncounted overlap requires the bulk completion tree
 #endif

@@ -56,7 +56,7 @@ mb_check:
 2: j br_idle
 
 mb_job:
- csrci 0x71c,8
+ csrci (0x710+MB_JOB_ID),8
  mv s0,a0
  mv s1,a1
  mv s2,a2
@@ -140,7 +140,7 @@ mb_dispatch:
  lw t1,B_EXPANDED(t0)
  addi t1,t1,1
  sw t1,B_EXPANDED(t0)
- csrsi 0x71c,8
+ csrsi (0x710+MB_JOB_ID),8
  j br_idle
 3: YIELDI 9
  j br_idle
@@ -282,6 +282,17 @@ mb_produce:
  sw zero,B_HOME_AUX(t3)
  lw t2,H_EXCITATORY_END(gp)
  bgeu t0,t2,.Lmb_prepare_static
+#if BR_BULK_WORKER
+ li t2,BR_BASE+MR_PARAMETERS
+ lw t5,40(t2)
+ lw t2,20(t2)
+ mul t2,t1,t2
+ slli t2,t2,3
+ add t5,t5,t2
+ sw t5,B_HOME_DIRECTORY(t3)
+ li t5,-1
+ sw t5,B_HOME_DIRECTORY_LINE(t3)
+#endif
  slli t0,t1,2
  li t2,BR_BASE+MB_ROW_POINTERS
  add t0,t0,t2
@@ -314,6 +325,28 @@ mb_produce:
 .Lmb_span:
  jal ra,mb_home_span
 .Lmb_send_job:
+#if BR_BULK_WORKER
+ lw t0,B_HOME_KIND(t3)
+ bnez t0,.Lmb_directory_ready
+ lw t0,B_HOME_RANK(t3)
+ srli t0,t0,2
+ lw t1,B_HOME_DIRECTORY_LINE(t3)
+ beq t0,t1,.Lmb_directory_ready
+ sw t0,B_HOME_DIRECTORY_LINE(t3)
+ slli a0,t0,5
+ lw t1,B_HOME_DIRECTORY(t3)
+ add a0,a0,t1
+ csrci 0x71d,8           # clear before issue; callback may return early
+ sw zero,B_HOME_DIRECTORY_RECEIVED(t3)
+ li a1,0x10800          # one scatter line, P2 response to handler0
+ li a2,0
+ li a3,0
+ lw t0,H_MC_DEST(gp)
+ SENDI t0,-2032         # P2 scatter; four pointer events, no SPM DMA
+ YIELDI 13
+ j br_idle
+.Lmb_directory_ready:
+#endif
  lw a0,B_HOME_CUR(t3)
  lw a1,B_HOME_SPAN(t3)
  lw t0,B_HOME_RANK(t3)
@@ -356,8 +389,33 @@ mb_produce:
  xor t1,t1,t2
 #endif
  addi t1,t1,1
- SENDI t1,-1012           # P3 range handler12, including actual self PU ID
+#if BR_BULK_WORKER
+ mv a5,a1               # keep the logical cursor across address translation
+ lw t0,B_HOME_KIND(t3)
+ bnez t0,.Lmb_worker_address_ready
+ sub a1,a1,a0
+ lw t0,B_HOME_RANK(t3)
+ andi t0,t0,3
+ slli t0,t0,2
+ li t2,BR_BASE+READ
+ add t2,t2,t0
+ lw a0,0(t2)
+ add a1,a1,a0
+ addi t0,t1,-1
+ srli t0,t0,5           # both supported systems have 32 PUs per MC
+ li t2,0x8001
+ add t0,t0,t2
+ li t2,0xffff0000
+ and a3,a3,t2
+ or a3,a3,t0
+.Lmb_worker_address_ready:
+#endif
+ SENDI t1,(-1024+MB_JOB_ID) # P3 range, including actual self PU ID
+#if BR_BULK_WORKER
+ sw a5,B_HOME_CUR(t3)
+#else
  sw a1,B_HOME_CUR(t3)
+#endif
  lw t0,B_PRODUCED(t3)
  addi t0,t0,1
  sw t0,B_PRODUCED(t3)
@@ -369,7 +427,11 @@ mb_produce:
  addi t0,t0,1
  sw t0,B_HOME_RANK(t3)
  lw t0,B_HOME_END(t3)
+#if BR_BULK_WORKER
+ bne a5,t0,.Lmb_producer_yield
+#else
  bne a1,t0,.Lmb_producer_yield
+#endif
  lw t0,B_HOME_STAGE(t3)
  li t1,2
  beq t0,t1,2f
@@ -563,15 +625,19 @@ br_control_leaf:
  j .Lmb_control_report
 .Lmb_reverse_query:
  li t0,R_BASE
+#if !BR_BULK_SCHEDULED
  li t1,1
  sw t1,R_CLOSING(t0)
  csrsi 0x718,8
  csrsi 0x71f,16
+#endif
  lw a1,R_PENDING(t0)
  lw t0,H_MSHR_COUNT(gp)
  or a1,a1,t0
+#if !BR_BULK_SCHEDULED
  lw t0,H_MSHR_SCHEDULED(gp)
  or a1,a1,t0
+#endif
  li t0,R_BASE
  lw t0,R_CREDIT(t0)
  or a1,a1,t0
@@ -585,7 +651,22 @@ br_control_leaf:
  j br_idle
 .Lmb_integrate_start:
  sw a0,H_PHASE(gp)
- # Both chains have retired; restore callback before saved registers change.
+#if BR_BULK_SCHEDULED
+ # Marker callbacks can re-enable the now-empty updater queue. Mask it before
+ # joining integration: an early next-step job must wait for mb_job binding.
+ csrci (0x710+MB_UPDATER0_ID),24
+#endif
+#if BR_BULK_RELAY
+ # Global reverse acceptance and pool drain retired every relay token.
+ csrw (0x710+MB_INTEGRATE_ID),zero
+ la t0,br_integrate
+ csrw (0x700+MB_INTEGRATE_ID),t0
+ li t0,0x00010002
+ csrw (0x720+MB_INTEGRATE_ID),t0
+ li t0,24
+ csrw (0x710+MB_INTEGRATE_ID),t0
+#endif
+ # Updater tokens are gone; restore callback before saved registers change.
  la t0,br_completion
  csrw 0x700,t0
  sw zero,H_JOIN_COUNT(gp)
@@ -629,11 +710,14 @@ br_control_leaf:
 2: sw zero,H_FIRE_COUNT(gp)
  addi t0,gp,256
  sw t0,H_WORK_NEURON(gp)
- SENDI zero,11
- YIELDI 11
+ SENDI zero,MB_INTEGRATE_ID
+ YIELDI MB_INTEGRATE_ID
  j br_idle
 .Lmb_forward_start:
  sw a0,H_PHASE(gp)
+#if BR_BULK_RELAY
+ csrci (0x710+MB_INTEGRATE_ID),24         # integration joined; early reverse relays may queue
+#endif
  la t0,SPIKE_ENTRY
  csrw 0x705,t0
  li t0,0x00010003
@@ -700,17 +784,21 @@ br_control_leaf:
  csrw 0x729,t0
  li t0,8
  csrw 0x719,t0
+#if BR_BULK_RELAY
+ csrci 0x714,24
+#else
  csrci 0x714,8
+#endif
 #if BR_BULK_UNCOUNTED
  la t0,mb_job
- csrw 0x70c,t0           # reverse used this slot for its issuer continuation
+ csrw (0x700+MB_JOB_ID),t0           # reverse issuer or updater reused this slot
  li t0,0x00010012
- csrw 0x72c,t0
+ csrw (0x720+MB_JOB_ID),t0
 #endif
  li t0,28
  csrw 0x715,t0
  li t0,12
- csrw 0x71c,t0
+ csrw (0x710+MB_JOB_ID),t0
  li t0,16
  csrw 0x71f,t0
  li t0,8
@@ -719,6 +807,24 @@ br_control_leaf:
  j br_idle
 .Lmb_reverse_start:
  sw a0,H_PHASE(gp)
+#if BR_BULK_RELAY
+ # Install disabled: mb_reverse_work first initializes SMT0 FP constants.
+ csrw (0x710+MB_INTEGRATE_ID),zero
+#if BR_BULK_RELAY_ORDERED
+ la t0,br_reverse
+#else
+ la t0,mr_proxy_accept
+#endif
+ csrw (0x700+MB_INTEGRATE_ID),t0
+#if BR_BULK_RELAY_ORDERED
+ li t0,0x00010008
+#else
+ li t0,0x00010007
+#endif
+ csrw (0x720+MB_INTEGRATE_ID),t0
+ li t0,4
+ csrw (0x710+MB_INTEGRATE_ID),t0
+#endif
 #if BR_BULK_TREE
  csrw 0x713,zero
 #if BR_BULK_UNCOUNTED
@@ -727,7 +833,7 @@ br_control_leaf:
  # Service13 stays enabled on SMT0 to consume residual zero-delta wakes.
 #endif
  csrw 0x732,gp
- csrci 0x71c,8
+ csrci (0x710+MB_JOB_ID),8
  csrci 0x71f,16
 #if !BR_BULK_UNCOUNTED
  csrci 0x715,24
@@ -751,9 +857,11 @@ br_control_leaf:
  sw zero,R_ALLOC(t0)
  sw zero,R_PENDING(t0)
  sw zero,R_DIR_STAGE(t0)
+#if !BR_BULK_SCHEDULED
  sw zero,R_CLOSING(t0)
  li t1,3
  sw t1,H_MSHR_SCHEDULED(gp)
+#endif
  li s0,0
  li s1,BR_BASE+MB_READY_RING
  mv s2,t0
@@ -771,15 +879,22 @@ br_control_leaf:
  li t0,8
  csrw (0x710+MB_ISSUER_ID),t0
  la t0,mr_update
- csrw 0x708,t0
- csrw 0x70f,t0
+ csrw (0x700+MB_UPDATER0_ID),t0
+#if !BR_BULK_SCHEDULED
+ csrw (0x700+MB_UPDATER1_ID),t0
+#endif
  li t0,0x00030006
- csrw 0x728,t0
- csrw 0x72f,t0
+ csrw (0x720+MB_UPDATER0_ID),t0
+#if BR_BULK_SCHEDULED
+ li t0,24
+ csrw (0x710+MB_UPDATER0_ID),t0
+#else
+ csrw (0x720+MB_UPDATER1_ID),t0
  li t0,8
- csrw 0x718,t0
+ csrw (0x710+MB_UPDATER0_ID),t0
  li t0,16
- csrw 0x71f,t0
+ csrw (0x710+MB_UPDATER1_ID),t0
+#endif
  la t0,mb_reverse_work
  csrw 0x709,t0
  li t0,0x0018001f
@@ -793,10 +908,48 @@ br_control_leaf:
  j br_idle
 .Lmb_finish_start:
  sw a0,H_PHASE(gp)
+#if BR_BULK_RELAY
+ csrci 0x714,24
+ csrci (0x710+MB_INTEGRATE_ID),24
+#else
  csrci 0x714,8
+#endif
  csrci (0x710+MB_ISSUER_ID),8
+#if BR_BULK_SCHEDULED
+ # Work counts exclude the final updater scheduling tail on the other SMT.
+ # Bind future tokens to a consumer, then cross to SMT0 to fence that tail.
+ csrci (0x710+MB_UPDATER0_ID),24
+ la t0,br_idle
+ csrw (0x700+MB_UPDATER0_ID),t0
+ csrw (0x720+MB_UPDATER0_ID),zero
+ li t0,24
+ csrw (0x710+MB_UPDATER0_ID),t0
+ la t0,mb_update_tail_drained
+ csrw 0x70d,t0
+ csrw 0x72d,zero
+ li t0,8
+ csrw 0x71d,t0
+ la t0,mb_update_tokens_drained
+ csrw 0x70f,t0
+ csrw 0x72f,zero
+ li t0,16
+ csrw 0x71f,t0
+ YIELDI 13
+ j br_idle
+
+mb_update_tail_drained:    # SMT0; no old real updater can enqueue after this
+ csrsi (0x710+MB_UPDATER0_ID),24           # repair a possible late mask clear by that updater
+ YIELDI 15
+ j br_idle
+
+mb_update_tokens_drained: # SMT1; zero-margin updater queue had priority
+ csrci (0x710+MB_UPDATER0_ID),24
+ csrci 0x71d,8
+ csrci 0x71f,16
+#else
  csrci 0x718,8
  csrci 0x71f,16
+#endif
  sw zero,H_WORK_MC(gp)
  la t0,mb_fence_routes
  csrw 0x709,t0
@@ -1000,9 +1153,18 @@ mb_reverse_work:
  li s10,0x3f99ca19
  li t1,1
  sw t1,B_REVERSE_STARTED(t0)
- SENDI zero,8
- SENDI zero,15
+ SENDI zero,MB_UPDATER0_ID
+ SENDI zero,MB_UPDATER1_ID
+#if BR_BULK_RELAY
+ csrsi (0x710+MB_ACCEPT_ID),8
+#if BR_BULK_SCHEDULED && !BR_BULK_RELAY_SMT1
+ csrsi (0x710+MB_RELAY_ID),24 # trace reads/no-op accounting are safe on both
+#else
+ csrsi (0x710+MB_RELAY_ID),16
+#endif
+#else
  csrsi 0x714,8
+#endif
 1: li t0,R_BASE
  lw t1,R_DIR_STAGE(t0)
  li t2,1
@@ -1067,7 +1229,7 @@ mb_reverse_work:
  addi a1,s5,3
  srli a1,a1,2
  slli a1,a1,16
- li t0,0xc04
+ li t0,(0xc00+MB_RELAY_ID)
  or a1,a1,t0
  li t0,0x8001
  add t0,t0,s6

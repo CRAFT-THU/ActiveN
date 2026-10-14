@@ -1,3 +1,44 @@
+<a id="selected-configuration"></a>
+
+As of **2026-10-14**, this Morrison optimization round is complete. Retain **SMT1-only reverse relay** as the best measured configuration from this round. This is the ABI4 distant G32 variant with individual synapses randomly assigned to workers and stored in their worker MCs (placement seed `0x20261011`). “SMT1-only” applies to reverse relay handler 4; shared updater handler 12 remains enabled on both SMT threads. Proxy acceptance uses handler 11 and the read issuer uses handler 8. The selected payload is `sys/morrison_bulk_worker_scheduled_smt1.bin`.
+
+The selected implementation retains 1 KiB bulk reads, two 2 KiB forward banks reused as 64 reverse software descriptors, a ready queue with 16 read credits, posted weight stores, and the experimental forward transition without receiver counting. The recorded performance includes the timestep marker/MC-idle drain. The recorded MemIf write merging is a soft-model experiment tied to the retained simulator and payload.
+
+Both checkpoint comparisons used the full network and 512 PUs, sixteen 1 GiB MCs (two 8 GiB HBM2 stacks), 32-byte transactions, two SMT pipes, 1 GHz, Ramulator HBM2, soft backend with eight host threads, 256 MemIf slots, NoC reservation multiplier 1, 8 KiB instruction-cache preload and external drive. Each used the approved **0 warmup + 100 measured timesteps** pilot window, or 10 ms biological time. These pilots do not replace the standard benchmark windows below. The primary metric is the complete peripheral timer divided by 100, including all measured synchronization and drain overhead.
+
+| Starting checkpoint | Policy | Timer cycles / 100 steps | Cycles/timestep |
+| --- | --- | ---: | ---: |
+| Settled, absolute tick 12,000,000 | **SMT1-only relay** | 17,123,741 | **171,237.41** |
+| Settled, absolute tick 12,000,000 | Updater11 / relay12 | 17,280,278 | 172,802.78 |
+| Diagnostic step 750,000, absolute tick 12,750,060 | **SMT1-only relay** | 14,895,085 | **148,950.85** |
+| Diagnostic step 750,000, absolute tick 12,750,060 | Updater11 / relay12 | 14,989,157 | 149,891.57 |
+
+Updater11/relay12 costs **0.9142%** more cycles in the first pair and **0.6316%** more in the second. The preference repeats across these two starting states, although the advantage is small. Compare policies within each checkpoint; different activity across checkpoints is not an implementation speedup or evidence of a universal optimum.
+
+For the step-750,000 comparison, the phase breakdown is:
+
+| Policy | Integration | Forward | Reverse | Finish/drain | Other timer overhead |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| SMT1-only relay | 12,732.61 | 41,766.12 | 84,968.58 | 9,460.46 | 23.08 |
+| Updater11 / relay12 | 12,732.89 | 41,604.25 | 86,064.47 | 9,466.88 | 23.08 |
+
+All entries are cycles/timestep. Updater11/relay12 adds 1,095.89 reverse cycles and saves 161.87 forward cycles, for a net cost of 940.72 cycles/timestep.
+
+The matched activity and final weight statistics for each 100-step window are:
+
+| Starting checkpoint | E / I spikes | E / I rate (Hz) | LTD / LTP opportunities | Final weight mean / stddev (pA) |
+| --- | ---: | ---: | ---: | ---: |
+| Absolute tick 12,000,000 | 2,276 / 778 | 2.528889 / 3.457778 | 20,482,463 / 20,484,000 | 44.497198122 / 3.960250737 |
+| Diagnostic step 750,000 | 1,927 / 696 | 2.141111 / 3.093333 | 17,334,233 / 17,343,000 | 44.482373707 / 3.984935992 |
+
+In the second pair, the initial physical state and graph match apart from policy code. Both produce identical spike sets in every timestep, 29,498,313 forward deliveries and 17,343,000 reverse visits; all **810 million final weights match bit for bit**. Neuron states have small floating-point differences. Each run passes its own integration/trace/RNG and per-PU delivery/copy/cleanup checks; the full-network checker does not independently sum every pending input or establish a tolerance between the two trajectories. The [reviewed comparison](../copilot/tmp/morrison-checkpoint-750000-20261013/results-report.md) records the numerical differences and validation limits.
+
+The step-750,000 updater11/relay12 capture was interrupted during final archival. Its completed rerun used bounded host archive buffers and a 26 GiB process-group limit, reproducing the original timer, all 400 phase markers and all 100 SPM snapshots exactly. The interrupted capture is retained as incomplete evidence; only the completed rerun supplies the final comparison.
+
+The [selected run recipe](../copilot/tmp/morrison-checkpoint-750000-20261013/relay_smt1/layout-recipe.json) pins the ABI4 layout, handler policy and payload SHA-256 `c0df21626f61674a82d0b6bb5aa4f5a012056535652a4cc237b699e0c95c15b4`. [Checkpoint selection](../copilot/tmp/morrison-checkpoint-750000-20261013/selection.json), [complete metrics](../copilot/tmp/morrison-checkpoint-750000-20261013/results-updater11_relay12_recovered2.json), [pair validation](../copilot/tmp/morrison-checkpoint-750000-20261013/comparison.json) and the [independent results review](../copilot/tmp/morrison-checkpoint-750000-20261013/results-review.md) retain source identities and raw-evidence paths. The [earlier checkpoint review](../copilot/tmp/morrison-update-before-relay-20261013/results-review.md) covers the first pair. No further Morrison optimization work is scheduled for this round.
+
+The remaining layout details and commands describe the original ABI1 baseline and its historical results. The [bulk variant document](morrison-bulk.md) records the earlier bulk implementation.
+
 The [bulk coroutine variant](morrison-bulk.md) adds whole-row range delegation and prefetch across jobs. The G1/G4 layout below remains the ABI1 baseline. Its home-update stores are posted, but its finish path waits only for read completions and software slots; it does not implement an explicit NoC/MemIf drain. ABI2 now supplies that timestep boundary with route markers followed by MC idle notifications. Historic passing runs do not by themselves prove the missing ABI1 ordering guarantee.
 
 The full Morrison port targets the model in `../stdp-experiments/workloads/morrison.py`: 90,000 excitatory and 22,500 inhibitory neurons, fixed incoming degrees of 9,000 E and 2,250 I, and 0.1 ms timesteps. Connectivity is sampled with replacement without recurrent autapses. Of the 1,265,625,000 recurrent synapses, 810,000,000 E→E synapses are plastic. External Poisson input is generated locally and has no stored adjacency matrix.

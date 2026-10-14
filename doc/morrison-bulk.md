@@ -1,3 +1,5 @@
+The retained best result is the [ABI4 distant G32 configuration with SMT1-only reverse relay](morrison.md#selected-configuration). The current optimization round is complete; the description below records the earlier bulk implementation.
+
 The bulk Morrison variant uses the same neuron equations, checkpoint state and learning order described in [Morrison](morrison.md). Build `sys/morrison_bulk.bin` for ABI2 with the original polling completion, or `sys/morrison_bulk_tree.bin` for ABI2 with forward completion through a reduction tree. `morrison_g1.bin` and `morrison_g4.bin` remain ABI1 baselines.
 
 Plastic rows are consecutive within each home PU's MC section. Full chunks contain 128 FP32 weights followed by 128 packed destinations. Each row ends with an invalid-destination sentinel; the two tail halves are separately rounded to 32 bytes. A row with n real synapses occupies `64 * ceil((n + 1) / 8)` bytes, including its sentinel. Delegation splits at chunk boundaries relative to that row, so every worker receives complete weight/destination pairs.

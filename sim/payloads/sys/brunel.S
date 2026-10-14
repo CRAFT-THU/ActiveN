@@ -29,15 +29,26 @@ _start:
   INSTALL 2,mb_range_done,17,0
   INSTALL 3,mb_producer_closed,16,0
 #endif
+#if BR_BULK_RELAY
+#if BR_BULK_RELAY_ORDERED
+  # The relay slot remains the integrator until its reverse-phase rebind.
+  INSTALL 4,mr_proxy_accept,4,0x00010007
+#else
+  # One P2 relay must leave the seven slots needed by its downstream
+  # accept/read issuer; equal margins can strand both behind queued relays.
+  INSTALL 4,br_reverse,4,0x00010008
+#endif
+#else
   INSTALL 4,br_reverse,4,0x000a0011
+#endif
   INSTALL 5,SPIKE_ENTRY,28,0x00010003
   INSTALL 6,br_control,20,0x00040006
   INSTALL 7,br_report,20,0x00020004
   INSTALL 8,mb_copy_ready,1,0x00010001
   INSTALL 9,mb_dispatch,0,0x00030012
   INSTALL 10,idle,16,0
-  INSTALL 11,br_integrate,24,0x00010002
-  INSTALL 12,mb_job,4,0x00010012
+  INSTALL MB_INTEGRATE_ID,br_integrate,24,0x00010002
+  INSTALL MB_JOB_ID,mb_job,4,0x00010012
   INSTALL 13,mb_produce,0,0x00030018
   INSTALL 14,mb_check,8,0x00010001
 #if BR_BULK_TREE

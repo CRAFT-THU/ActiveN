@@ -863,17 +863,42 @@ void SoftSystemBackend::observeMorrisonBoundary(uint64_t cycle, const char *dire
     return dst >= 0x8001 && (tag & 255) == 2;
   };
   size_t coreStores = 0, networkStores = 0, memoryStores = 0;
-  size_t updater8Events = 0, updater15Events = 0;
+  static const bool sharedUpdater = [] {
+    const char *value = std::getenv("MORRISON_SHARED_UPDATER");
+    return value && std::strcmp(value, "0") != 0;
+  }();
+  static const unsigned sharedUpdaterId = [] {
+    const char *value = std::getenv("MORRISON_SHARED_UPDATER_ID");
+    if (!value || std::strcmp(value, "12") == 0) return 12u;
+    if (std::strcmp(value, "11") == 0) return 11u;
+    throw runtime_error("MORRISON_SHARED_UPDATER_ID must be 11 or 12");
+  }();
+  size_t updaterEvents = 0, secondUpdaterEvents = 0, cleanupEvents = 0;
   for (unsigned pu = 1; pu <= cfg.numPU; ++pu) {
     const auto *root = cores[pu]->rootp;
-    if (word(pu,MR_PARAMETERS+16)==3) {
+    if (word(pu,MR_PARAMETERS+16)==3 || word(pu,MR_PARAMETERS+16)==4) {
       const auto queued = [](unsigned enq, unsigned deq, bool full) {
         return full ? 16u : ((enq-deq)&15u);
       };
-      updater8Events += queued(root->Core__DOT__exec__DOT__biu__DOT__evq_8__DOT__enq_ptr_value,
-          root->Core__DOT__exec__DOT__biu__DOT__evq_8__DOT__deq_ptr_value,
-          root->Core__DOT__exec__DOT__biu__DOT__evq_8__DOT__full);
-      updater15Events += queued(root->Core__DOT__exec__DOT__biu__DOT__evq_15__DOT__enq_ptr_value,
+      if (sharedUpdater) {
+        if (sharedUpdaterId == 11) {
+          updaterEvents += queued(root->Core__DOT__exec__DOT__biu__DOT__evq_11__DOT__enq_ptr_value,
+              root->Core__DOT__exec__DOT__biu__DOT__evq_11__DOT__deq_ptr_value,
+              root->Core__DOT__exec__DOT__biu__DOT__evq_11__DOT__full);
+        } else {
+          updaterEvents += queued(root->Core__DOT__exec__DOT__biu__DOT__evq_12__DOT__enq_ptr_value,
+              root->Core__DOT__exec__DOT__biu__DOT__evq_12__DOT__deq_ptr_value,
+              root->Core__DOT__exec__DOT__biu__DOT__evq_12__DOT__full);
+        }
+        cleanupEvents += queued(root->Core__DOT__exec__DOT__biu__DOT__evq_13__DOT__enq_ptr_value,
+            root->Core__DOT__exec__DOT__biu__DOT__evq_13__DOT__deq_ptr_value,
+            root->Core__DOT__exec__DOT__biu__DOT__evq_13__DOT__full);
+      } else {
+        updaterEvents += queued(root->Core__DOT__exec__DOT__biu__DOT__evq_8__DOT__enq_ptr_value,
+            root->Core__DOT__exec__DOT__biu__DOT__evq_8__DOT__deq_ptr_value,
+            root->Core__DOT__exec__DOT__biu__DOT__evq_8__DOT__full);
+      }
+      secondUpdaterEvents += queued(root->Core__DOT__exec__DOT__biu__DOT__evq_15__DOT__enq_ptr_value,
           root->Core__DOT__exec__DOT__biu__DOT__evq_15__DOT__deq_ptr_value,
           root->Core__DOT__exec__DOT__biu__DOT__evq_15__DOT__full);
     }
@@ -902,13 +927,20 @@ void SoftSystemBackend::observeMorrisonBoundary(uint64_t cycle, const char *dire
   for (const auto &dram : drams) memoryStores += dram.postedStoreCount();
   std::ofstream boundary(std::filesystem::path(directory) / "morrison-boundary.csv",
                          completed == 1 ? std::ios::out : std::ios::app);
-  if (completed == 1) boundary << "step,cycle,core_stores,network_stores,mc_stores,updater8_events,updater15_events\n";
+  if (completed == 1) {
+    boundary << "step,cycle,core_stores,network_stores,mc_stores,";
+    boundary << (sharedUpdater ? "updater" + std::to_string(sharedUpdaterId) +
+                                   "_events,cleanup15_events,cleanup13_events\n"
+                              : "updater8_events,updater15_events\n");
+  }
   boundary << completed << ',' << cycle << ',' << coreStores << ','
-           << networkStores << ',' << memoryStores << ',' << updater8Events << ',' << updater15Events << '\n';
+           << networkStores << ',' << memoryStores << ',' << updaterEvents << ',' << secondUpdaterEvents;
+  if (sharedUpdater) boundary << ',' << cleanupEvents;
+  boundary << '\n';
   if (!boundary) throw runtime_error("cannot write Morrison boundary observation");
   if (coreStores || networkStores || memoryStores)
     throw runtime_error("Morrison completed with posted stores in flight");
-  if (updater8Events || updater15Events)
+  if (updaterEvents || secondUpdaterEvents || cleanupEvents)
     throw runtime_error("Morrison completed with updater continuations queued");
 }
 
@@ -1145,7 +1177,8 @@ void SoftSystemBackend::observeBrunelProfile(uint64_t cycle,
     const bool executing = root->Core__DOT__exec__DOT__valid;
     p.executing += executing;
     p.stalled += executing && !root->Core__DOT__exec__DOT__s0step;
-    const bool readyRuntime = word(pu,0) == MR_MAGIC && word(pu,MR_PARAMETERS+16) == 3;
+    const bool readyRuntime = word(pu,0) == MR_MAGIC &&
+        (word(pu,MR_PARAMETERS+16) == 3 || word(pu,MR_PARAMETERS+16) == 4);
     const auto outstanding = readyRuntime ? word(pu,MB_READY_CONTROL+R_CREDIT) :
         word(pu,offsetof(BrHeader,issued))-word(pu,offsetof(BrHeader,consumed));
     p.outstanding += outstanding;
@@ -1289,7 +1322,7 @@ void SoftSystemBackend::observeBrunelMemory(uint64_t cycle) {
       }
     }
     const auto phase = word(offsetof(BrHeader, phase));
-    if (reverseExecution && word(MR_PARAMETERS+16) == 3 &&
+    if (reverseExecution && (word(MR_PARAMETERS+16) == 3 || word(MR_PARAMETERS+16) == 4) &&
         word(MB_CONTROL+B_REVERSE_STARTED)) {
       if (morrisonReadyProfile_.empty()) morrisonReadyProfile_.resize(cfg.numPU+1);
       auto &r=morrisonReadyProfile_[pu];
@@ -1388,7 +1421,7 @@ void SoftSystemBackend::observeBrunelMemory(uint64_t cycle) {
         brunelMemoryEvents_.push_back({cycle, pu, 3, c.mem_unicast_bits_ident, 0});
     }
     const auto descriptorToken = [&](uint32_t token) {
-      if (bulk && word(MR_PARAMETERS+16)==3)
+      if (bulk && (word(MR_PARAMETERS+16)==3 || word(MR_PARAMETERS+16)==4))
         return !(token&63) && ((token>=MB_SHARED0 && token<MB_SHARED0+MB_SHARED_BYTES) ||
                               (token>=MB_SHARED1 && token<MB_SHARED1+MB_SHARED_BYTES));
       return token>=BR_MSHR && token<BR_READ;

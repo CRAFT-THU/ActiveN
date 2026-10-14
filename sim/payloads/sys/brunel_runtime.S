@@ -261,6 +261,24 @@
 .globl br_completion
 br_completion:
 #if BR_BULK
+#if BR_BULK_WORKER
+ lw t0,H_PHASE(gp)
+ li t1,2
+ bne t0,t1,.Lworker_manual_completion
+ # Directory scatter carries an SPM byte offset and a relocated row base.
+ # Unlike ID2 DMA, this path is independent of the live bulk AC base CSR.
+ add t0,gp,a0
+ sw a1,0(t0)
+ li t0,BR_BASE+MB_CONTROL+B_HOME_DIRECTORY_RECEIVED
+ lw t1,0(t0)
+ addi t1,t1,1
+ sw t1,0(t0)
+ li t2,4
+ bne t1,t2,br_idle
+ csrsi 0x71d,8
+ j br_idle
+.Lworker_manual_completion:
+#endif
  # Ordinary boot/directory completion; reverse installs the cached producer.
  slli t0,a0,16
  bltz t0,1f
@@ -343,6 +361,15 @@ br_mshr_line_start:
   * Completion uses the dedicated, bounded queue on SMT1 as before. */
  SENDI t0,1024
 #else
+#if BR_BULK_RELAY
+ # Only descriptor reads need P1. Directory/boot/route-marker tokens 0..3
+ # retain P2, and every route still uses the caller's explicit a7 MC.
+ li t1,3
+ bleu a3,t1,1f
+ SENDI t0,1024
+ ret
+1:
+#endif
  SENDI t0,-2048
 #endif
  ret
@@ -601,7 +628,22 @@ br_reverse:
  li a2,0
 .Lreverse_allocate:
 #if BR_BULK
+#if BR_BULK_RELAY
+ # Any group member in the weight MC can update this address locally.
+ # Keep address/LTD in a1/a2; a0 is unused by the proxy accept handler.
+ mv a3,t2
+ andi t0,a0,15
+ slli t0,t0,5
+ lw t1,H_PU(gp)
+ addi t1,t1,-1
+ andi t1,t1,31
+ add t0,t0,t1
+ addi t0,t0,1
+ SENDI t0,(-2048+MB_ACCEPT_ID) # P2 reception -> P1 read -> P0 store
+ j br_idle
+#else
  j mr_accept
+#endif
 #else
 #if BR_RELAY_UPDATES
  /* One targeted packet per useful update; the address already identifies
@@ -635,8 +677,8 @@ br_reverse:
 #endif
 8:
 .Lreverse_received:
-#if BR_RELAY_UPDATES
- /* SMT1 counts home no-ops; SMT0 counts accepted proxy updates. */
+#if BR_RELAY_UPDATES || BR_BULK_RELAY
+ /* Home no-ops and accepted proxy updates may count on different SMTs. */
  addi t0,gp,H_REVERSE_RECEIVED
  li t1,1
  amoadd.w zero,t1,(t0)

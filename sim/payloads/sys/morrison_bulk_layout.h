@@ -1,18 +1,51 @@
-/* ABI 3: whole CSR rows, two 2 KiB forward/reverse banks and a ready queue.
+/* ABI 3/4: CSR row bounds, two 2 KiB forward/reverse banks and a ready queue.
  * MB_* offsets are relative to scratchpad; B_* to scratchpad + 0x2000. */
 #ifndef MORRISON_BULK_LAYOUT_H
 #define MORRISON_BULK_LAYOUT_H
+#if BR_BULK_WORKER
+#define MB_ABI_VERSION 4
+#else
 #define MB_ABI_VERSION 3
+#endif
 #define MB_SHARED0 0x2500
 #define MB_SHARED1 0x3700
 #define MB_SHARED_BYTES 2048
 #define MB_COPY_BYTES 1024
 #define MB_MSHRS 64
 #define MB_READ_CREDITS 16
+#if BR_BULK_UPDATE_FIRST
+/* Keep the whole phase alias together: integration/relay and job/updater.
+ * This leaves early next-phase traffic queued behind a disabled handler. */
+#define MB_INTEGRATE_ID 12
+#define MB_JOB_ID 11
+#define MB_RELAY_ID 12
+#define MB_ACCEPT_ID 4
+#else
+#define MB_INTEGRATE_ID 11
+#define MB_JOB_ID 12
+#if BR_BULK_RELAY_ORDERED
+#define MB_RELAY_ID 11
+#define MB_ACCEPT_ID 4
+#elif BR_BULK_RELAY
+#define MB_RELAY_ID 4
+#define MB_ACCEPT_ID 11
+#else
+#define MB_RELAY_ID 4
+#define MB_ACCEPT_ID 4
+#endif
+#endif
+#if BR_BULK_SCHEDULED
+#define MB_ISSUER_ID 8
+#define MB_UPDATER0_ID MB_JOB_ID
+#define MB_UPDATER1_ID MB_JOB_ID
+#else
+#define MB_UPDATER0_ID 8
+#define MB_UPDATER1_ID 15
 #if BR_BULK_UNCOUNTED
 #define MB_ISSUER_ID 12
 #else
 #define MB_ISSUER_ID 5
+#endif
 #endif
 #define MB_READY_CONTROL 0x2140
 #define R_HEAD 0
@@ -86,6 +119,9 @@
 #define B_RX_LATE 288
 #define B_RX_BASE_READY 292
 #define B_RX_DONE 296
+#define B_HOME_DIRECTORY 300
+#define B_HOME_DIRECTORY_LINE 304
+#define B_HOME_DIRECTORY_RECEIVED 308
 #define B_FREE 0
 #define B_FILLING 1
 #define B_READY 2

@@ -48,7 +48,8 @@ struct MorrisonCpuProbe {
 std::pair<uint32_t,uint32_t> SoftSystemBackend::morrisonProbePhase() const {
   const auto &s=cores[1]->rootp->Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
   const auto w=[&](unsigned o){return s[o/MEM_BUS_WIDTH_B][o%MEM_BUS_WIDTH_B/4];};
-  if (w(0)!=MR_MAGIC || w(MR_PARAMETERS+16)!=3 || w(24)>=w(36)) return {};
+  const auto abi=w(MR_PARAMETERS+16);
+  if (w(0)!=MR_MAGIC || (abi!=3 && abi!=4) || w(24)>=w(36)) return {};
   return {w(24)+1,w(28)};
 }
 

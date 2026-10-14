@@ -260,6 +260,12 @@ sys/morrison_bulk_uncounted.bin sys/morrison_bulk_distant_uncounted.bin: $(BRUNE
 	${PREFIX}gcc $(BRUNEL_BUILD_FLAGS) -DBR_RULE=1 -DBR_MORRISON=1 -DBR_PROXY=1 -DBR_PROXY_SIZE=4 -DBR_PROXY_TRACES=0 -DBR_BULK=1 -DBR_BULK_TREE=1 -DBR_BULK_UNCOUNTED=1 -DBR_BULK_DISTANT=$(if $(findstring distant,$@),1,0) $(BRUNEL_ASM_FLAGS) -o $(@:.bin=.elf) sys/brunel.S sys/brunel_runtime.S
 	${PREFIX}objcopy -j .text -j .data -O binary $(@:.bin=.elf) $@
 
+# Relocated plastic ranges; home reverse updates use their encoded remote MC.
+# The relay variant also moves reverse execution into the weight MC.
+sys/morrison_bulk_worker.bin sys/morrison_bulk_worker_relay.bin sys/morrison_bulk_worker_scheduled.bin sys/morrison_bulk_worker_scheduled_smt1.bin sys/morrison_bulk_worker_scheduled_ordered.bin sys/morrison_bulk_worker_scheduled_ordered_update_first.bin: $(BRUNEL_SOURCES) sys/morrison_bulk_layout.h sys/morrison_bulk_runtime.inc sys/morrison_tree_runtime.inc sys/morrison_ready_runtime.inc
+	${PREFIX}gcc $(BRUNEL_BUILD_FLAGS) -DBR_RULE=1 -DBR_MORRISON=1 -DBR_PROXY=1 -DBR_PROXY_SIZE=4 -DBR_PROXY_TRACES=0 -DBR_BULK=1 -DBR_BULK_TREE=1 -DBR_BULK_UNCOUNTED=1 -DBR_BULK_DISTANT=1 -DBR_BULK_WORKER=1 -DBR_BULK_RELAY=$(if $(filter %relay.bin %scheduled.bin %scheduled_smt1.bin %scheduled_ordered.bin %scheduled_ordered_update_first.bin,$@),1,0) -DBR_BULK_SCHEDULED=$(if $(findstring scheduled,$@),1,0) -DBR_BULK_RELAY_SMT1=$(if $(findstring scheduled_smt1,$@),1,0) -DBR_BULK_RELAY_ORDERED=$(if $(findstring scheduled_ordered,$@),1,0) -DBR_BULK_UPDATE_FIRST=$(if $(findstring update_first,$@),1,0) $(BRUNEL_ASM_FLAGS) -o $(@:.bin=.elf) sys/brunel.S sys/brunel_runtime.S
+	${PREFIX}objcopy -j .text -j .data -O binary $(@:.bin=.elf) $@
+
 # Full Morrison uses a distinct, versioned compact image ABI. Both variants keep
 # learning traces at neuron homes; the MC count is read from the image.
 define MORRISON_VARIANT

@@ -1,11 +1,16 @@
-/* Reverse-only descriptor ownership. Handler4 accepts one job; handler5
- * (or12 in the uncounted variant) resumes its issuer on SMT0.
+/* Reverse-only descriptor ownership. Handler4 accepts home updates, or
+ * handler11 accepts relayed updates; handler5
+ * (or12 in the uncounted variant, or8 with shared scheduling) resumes its
+ * issuer on SMT0.
  * Handler0 is the sole ready-queue producer.
  * Handlers8/15 run the same updater on SMT0/1. H_MSHR_SCHEDULED has one
  * live-chain bit per updater (1/2), retained across every yield. Each chain
  * has exactly one active/queued token. Only its final empty retirement clears
  * its bit. The issuer retains its job token while parked. Clear the own mask
  * before inspecting work, so publication racing with sleep cannot lose a wake.
+ * Shared scheduling instead uses two anonymous tokens in MB_UPDATER0_ID, enabled
+ * on both SMTs. Empty tokens park until completion wakes them; phase cleanup
+ * consumes them through a WFI stub, without live-chain bookkeeping.
  * Updaters preserve saved registers. The SMT1 producer owns s0-s2; the
  * separate SMT0 register bank retains the directory continuation. */
 .equ R_BASE, BR_BASE+MB_READY_CONTROL
@@ -44,23 +49,38 @@ mr_completion:
  li t1,-1
  amoadd.w zero,t1,(t0)
  csrsi (0x710+MB_ISSUER_ID),8
- csrsi 0x718,8
- csrsi 0x71f,16
+#if BR_BULK_SCHEDULED
+ csrsi (0x710+MB_UPDATER0_ID),24
+#else
+ csrsi (0x710+MB_UPDATER0_ID),8
+ csrsi (0x710+MB_UPDATER1_ID),16
+#endif
  # This callback is installed only in reverse and marker phases. An enable
  # after directory closure cannot create a new continuation token.
  csrsi 0x719,8
  j br_idle
 
-/* a0 packs the home MC; a1=weight address, a2=LTD, t2=LTP. */
+/* Home execution: a0 packs the weight MC; a1=address, a2=LTD, t2=LTP. */
+#if BR_BULK_RELAY
+#if BR_BULK_RELAY_ORDERED
+.globl mr_proxy_accept
+#endif
+mr_proxy_accept:          # a1=weight address, a2=LTD, a3=LTP
+#endif
 mr_accept:
- csrci 0x714,8
+ csrci (0x710+MB_ACCEPT_ID),8
  li t0,R_BASE
  sw a1,R_ADDRESS(t0)
  sw a2,R_LTD(t0)
+#if BR_BULK_RELAY
+ sw a3,R_LTP(t0)
+ lw t1,H_MC_DEST(gp)
+#else
  sw t2,R_LTP(t0)
  andi t1,a0,15
  li t2,0x8001
  add t1,t1,t2
+#endif
  sw t1,R_MC(t0)
  li t1,1
  sw t1,R_PENDING(t0)
@@ -105,8 +125,14 @@ mr_issue:
  jal ra,br_mshr_line_start # prechecked credit, sole SMT0 request issuer
  li t0,R_BASE
  sw zero,R_PENDING(t0)
+#if BR_BULK_RELAY
+ addi t1,gp,H_REVERSE_RECEIVED
+ li t2,1
+ amoadd.w zero,t2,(t1)
+#else
  INC H_REVERSE_RECEIVED,t1
- csrsi 0x714,8
+#endif
+ csrsi (0x710+MB_ACCEPT_ID),8
 9: j br_idle
 .Lmr_issue_park:
  YIELDI MB_ISSUER_ID
@@ -114,9 +140,9 @@ mr_issue:
 
 mr_update:
  bnez tp,1f
- csrci 0x718,8
+ csrci (0x710+MB_UPDATER0_ID),8
  j 2f
-1: csrci 0x71f,16
+1: csrci (0x710+MB_UPDATER1_ID),16
 2:
  li a4,R_BASE
 .Lmr_update_claim:
@@ -151,15 +177,16 @@ mr_update:
  addi t0,gp,H_MSHR_COUNT
  li t1,-1
  amoadd.w zero,t1,(t0)
- # The live-chain bit covers this scheduling tail through the next yield.
+ # Keep exactly one successor token, including while it is parked.
  bnez tp,4f
- csrsi 0x718,8
- YIELDI 8
+ csrsi (0x710+MB_UPDATER0_ID),8
+ YIELDI MB_UPDATER0_ID
  j br_idle
-4: csrsi 0x71f,16
- YIELDI 15
+4: csrsi (0x710+MB_UPDATER1_ID),16
+ YIELDI MB_UPDATER1_ID
  j br_idle
 .Lmr_update_empty:
+#if !BR_BULK_SCHEDULED
  lw t0,R_CLOSING(a4)
  beqz t0,.Lmr_update_park
  lw t0,R_CREDIT(a4)
@@ -175,9 +202,10 @@ mr_update:
  addi t0,gp,H_MSHR_SCHEDULED
  amoand.w zero,t1,(t0)
  j br_idle
+#endif
 .Lmr_update_park:
  bnez tp,5f
- YIELDI 8
+ YIELDI MB_UPDATER0_ID
  j br_idle
-5: YIELDI 15
+5: YIELDI MB_UPDATER1_ID
  j br_idle

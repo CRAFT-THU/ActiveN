@@ -33,6 +33,20 @@ def check(directory, run):
     late_receipts = []
     observed_rows = list(csv.DictReader((run/"morrison-activity.csv").open()))
     uncounted = manifest.get('forward_receiver_count') == 'none-experimental'
+    shared_updater = manifest.get('reverse_schedule') == 'shared-updater-tokens-v1'
+    if shared_updater:
+        updater_id = manifest.get('shared_updater_id', 12)
+        if updater_id not in (11, 12):
+            raise ValueError('unsupported shared updater handler ID')
+        boundary = list(csv.DictReader((run/'morrison-boundary.csv').open()))
+        fields = {'core_stores', 'network_stores', 'mc_stores',
+                  f'updater{updater_id}_events', 'cleanup13_events', 'cleanup15_events'}
+        expected_steps = list(range(1, manifest['warmup']+manifest['timed']+1))
+        if [int(row['step']) for row in boundary] != expected_steps:
+            raise ValueError('shared updater boundary coverage mismatch')
+        if any(set(row) != fields | {'step', 'cycle'} or
+               any(int(row[field]) for field in fields) for row in boundary):
+            raise ValueError('shared updater tokens or stores remain at completion')
     passive_receipts = {}
     if uncounted:
         for row in csv.DictReader((run/'uncounted-receipts.csv').open()):
@@ -131,7 +145,10 @@ def check(directory, run):
                     offset = 0
                     for rank,count in enumerate(cuts):
                         if not count: continue
-                        if manifest.get('dispatch_layout') == 'distant-locality-source-mc-v1':
+                        if manifest.get('dispatch_layout') in (
+                                'distant-locality-source-mc-v1',
+                                'distant-locality-worker-mc-v1',
+                                'distant-random-worker-mc-v1'):
                             stride = spec.pu//workers
                             rotation = home//stride if unit == 1024 else 0
                             owner = (home%stride+((rotation+rank)%workers)*stride)^override
@@ -178,6 +195,8 @@ def check(directory, run):
                     raise ValueError('live ready queue/credit/job/directory at completion')
                 if manifest.get('reverse_schedule') == 'ready-queue-chains-v1' and spm[0x21c0//4] != 1:
                     raise ValueError('updater chains were not closed')
+                if shared_updater and spm[0x21c0//4] != 0:
+                    raise ValueError('shared updater used obsolete closing bookkeeping')
             else:
                 pool = spm[0x2900//4:0x2d00//4].reshape(16, 16)
             if np.any(pool[:, 11]):
@@ -327,6 +346,7 @@ def check(directory, run):
                 range_accounting_checked=image.bulk,
                 forward_tree_checked=manifest.get('forward_completion','poll')=='tree',
                 passive_per_pu_deliveries_checked=uncounted,
+                shared_updater_token_drain_checked=shared_updater,
                 late_forward_deliveries=late_receipts)
 
 
