@@ -1,6 +1,34 @@
-The retained best result is the [ABI4 distant G32 configuration with SMT1-only reverse relay](morrison.md#selected-configuration). The current optimization round is complete; the description below records the earlier bulk implementation.
+# Morrison bulk variants
 
-The bulk Morrison variant uses the same neuron equations, checkpoint state and learning order described in [Morrison](morrison.md). Build `sys/morrison_bulk.bin` for ABI2 with the original polling completion, or `sys/morrison_bulk_tree.bin` for ABI2 with forward completion through a reduction tree. `morrison_g1.bin` and `morrison_g4.bin` remain ABI1 baselines.
+The selected implementation is [ABI4 distant G32 with SMT1-only reverse
+relay](morrison.md#selected-configuration). Current target names and image ABI
+are determined by `morrison_bulk_layout.h`, the Makefile and the generator:
+
+| Target family | Current image ABI | Image/layout implementation |
+| --- | ---: | --- |
+| `morrison_g1.bin`, `morrison_g4.bin` | 1 | `datagen/morrison.py`; original baseline |
+| `morrison_bulk.bin`, `morrison_bulk_tree.bin` and non-worker bulk variants | 3 | `datagen/morrison_bulk.py` canonical base, with recorded layout/policy for distant variants; ready queue, 64 descriptors, 16 credits |
+| `morrison_bulk_worker*.bin` | 4 | `datagen/morrison_worker.py`; worker-MC placement and optional relay/scheduling |
+
+The selected ABI4 target shares the same assembly entry/runtime and selects
+its behavior through compile-time flags. Its 1 KiB copies use two shared 2 KiB
+banks at `0x2500` and `0x3700`; reverse descriptors reuse those banks. The
+`WorkerLayout` library consumes a canonical ABI3 image and the recorded
+launcher adds the selected placement/checkpoint policy. See
+[the current selection](morrison.md#selected-source-and-integration-status)
+for the source and reproduction dependencies.
+
+The older target names now compile the current ABI3 runtime; rebuilding them
+does not recreate an archived ABI2 binary. Boot checks the image ABI. Preserve
+frozen payload/source/image identities when referring to an earlier result.
+
+## Historical ABI2 design
+
+The layout and scheduling description below records the earlier ABI2 bulk and
+tree implementation, including its old bank addresses and twelve-read window.
+It is retained for the archive migration. Current ABI3/ABI4 bank/credit values
+are listed above, and the selected ABI4 forward transition omits receiver
+counting. These historical details are not the current selected layout.
 
 Plastic rows are consecutive within each home PU's MC section. Full chunks contain 128 FP32 weights followed by 128 packed destinations. Each row ends with an invalid-destination sentinel; the two tail halves are separately rounded to 32 bytes. A row with n real synapses occupies `64 * ceil((n + 1) / 8)` bytes, including its sentinel. Delegation splits at chunk boundaries relative to that row, so every worker receives complete weight/destination pairs.
 
@@ -28,7 +56,11 @@ The range emitter reserves quota6/margin11, compared with quota5/margin10 in the
 
 After forward completion and reverse read/slot retirement, finish phase6 drains posted stores before trace increments or the next timestep. Every PU sends one P2 asynchronous read marker to every MC, in batches of at most four using the existing READ lines. Each marker follows the same route as that PU's earlier P0 stores to its destination, so strict priority prevents it from overtaking those stores. Global marker completion establishes that all stores reached their controllers. Only then does one leader per MC register the existing idle notification. All successful idle replies must arrive before step finalization. A controller-idle check by itself cannot rule out stores delayed in the network. The full target adds 8,192 marker reads and 16 idle exchanges per timestep; all this work remains inside the measured finish phase and timer. This uses no new RTL or per-weight completion protocol.
 
-Generate ABI2 images from an existing validated image directory's canonical graph and initial state, without generating another checkpoint:
+## Current ABI3 generator example
+
+The current generator emits ABI3, not the historical ABI2 layout above. This
+example uses an existing validated canonical graph and state; it does not
+select the ABI4 worker-MC layout or reproduce its retained pilot:
 
 ```sh
 nix develop --command bash -c 'cd /root/workspace/ActiveN/sim/payloads && make sys/morrison_bulk_tree.bin'
@@ -36,10 +68,20 @@ nix develop --command bash -c 'cd /root/workspace/ActiveN && python3 -B datagen/
 nix develop --command bash -c 'cd /root/workspace/ActiveN && python3 -B datagen/morrison_validate.py <new-images>'
 ```
 
-Use the full target and HBM2 invocation in the main Morrison document. Benchmark defaults remain 60 warmup plus 1,000 measured timesteps; shorter diagnostics require the separately approved window. Keep the original graph/checkpoint and input images read-only, and reserve enough storage for generation workspace and final dumps.
+The existing quick benchmark contract is 60 warmup plus 1,000 measured steps
+on the full target with explicit HBM2 timing. The selected 0+100 results are
+historical exceptions, not a new default. Use exact recorded commands and
+starting state when interpreting old measurements. New reproduction settings
+will be agreed separately. Keep original inputs and the dependencies listed
+in [the workload overview](workloads.md) through the archive migration.
+
+## Observation and functional fixtures
+
+The following observers and fixtures cover bulk variants; consult the selected
+ABI and its checker rather than assuming the historical ABI2 counters apply.
 
 With `SOFT_BRUNEL_DUMP` set, `SOFT_BRUNEL_PROFILE=1` retains passive PC, PU and MC profiles. `SOFT_BRUNEL_PROFILE_EVENTS=0` suppresses the large individual memory-event CSV records while retaining aggregate profiles and bulk-command/overlap counts. Sample columns remain samples. Bulk command columns count requests accepted by the PU's source router; bulk line columns sum the requested 32-byte lines. The cross-job overlap counter detects a new job's bulk request being injected while the preceding job's bank is still emitting. These observations do not change the payload's instruction stream.
 
 Functional fixtures support `--bulk --timed 100`, runtime dispatch widths, `--dispatch-policy balanced`, `--forward-completion tree` and `--cross-mc-jobs`. The `chunks` case exercises row/chunk boundaries; `--stagger-fire` makes it active across successive steps, and `--static-burst` adds a large static delivery burst for receiver-closing tests. These controls are functional tests, not target-performance measurements. `morrison_check.py` checks complete per-step neuron snapshots and learning, plus home completion and initial/late delivery accounting for tree images. `morrison_learning_check.py` can replay learning and delivery counts from a completed run's observed spikes; it explicitly does not certify the membrane trajectory when snapshots are omitted.
 
-With `SOFT_BRUNEL_DUMP` enabled, the ABI2 observer checks each completed timestep for posted stores in all PU send slots, all router input queues and allocated MC slots. It records `morrison-boundary.csv` and rejects a nonempty boundary or incomplete marker/idle control state. This passive check allows unrelated control and instruction-fetch traffic; it does not insert a simulator drain.
+With `SOFT_BRUNEL_DUMP` enabled, the bulk observer checks each completed timestep for posted stores in all PU send slots, all router input queues and allocated MC slots. It records `morrison-boundary.csv` and rejects a nonempty boundary or incomplete marker/idle control state. This passive check allows unrelated control and instruction-fetch traffic; it does not insert a simulator drain.

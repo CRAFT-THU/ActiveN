@@ -6,8 +6,39 @@ cache. The model contains 784 Poisson inputs, 400 excitatory neurons, and 400
 inhibitory neurons and advances in 0.5 ms steps.
 
 The dense build uses compact input-to-excitatory rows. The separate
-[`mnist_sparse` build](mnist_sparse_train.md) adds sparse forward CSR and three
+[`mnist_sparse` build](mnist_sparse_train.md) adds sparse forward CSR and four
 reverse-delivery paths while sharing the dense FP32 neuron kernel.
+
+## Current selection and retained results (2026-10-14)
+
+The selected dense implementation is the shared one-/two-/three-trace assembly
+in `sim/payloads/sys/mnist_train.S`, with tree recurrence, unbundled trace
+messages, the bit-seeded fifth-root helper and `full-8` partitioning. Build with
+`MNIST_HORIZONTAL_GROUP_COUNT=8` explicitly: the generic Makefile default is
+four groups. The selected placement is 288 input PUs and 224 neuron PUs.
+
+| Trace rule | Raw timer cycles / measured steps | Cycles/timestep |
+| --- | ---: | ---: |
+| One | 3,102,966 / 1,200 | 2,585.8050 |
+| Two | 5,495,399 / 1,200 | 4,579.4992 |
+| Three | 3,817,586 / 1,200 | 3,181.3217 |
+
+These are the [completed consolidated results](#completed-full-corpus-results):
+100 snapshots per rule, each with four warmup and twelve timed 0.5-ms steps,
+including 70 presentation and 30 rest snapshots. They used flat memory, eight
+host threads and no I-cache preload. The metric sums the twelve peripheral
+timer intervals; untimed gaps between them are excluded. The corpora differ
+between rules, so the table is not an equal-work comparison across rules.
+
+The evidence is retained in `copilot/tmp/mnist-dense-consolidated-20260909/`;
+[the workload overview](workloads.md) lists the external snapshot/build
+dependencies needed to preserve it. These September results predate the
+write-merge experiment and the new completion/idle interfaces. They are not
+HBM2 measurements or a rerun of the latest RTL. The forthcoming reproduction
+protocol is separate from this historical snapshot protocol.
+
+Dated experiment sections below retain their original contexts; the selection
+and table above supersede earlier configuration recommendations.
 
 ## Placement
 
@@ -647,7 +678,15 @@ control stays at zero. With tree recurrence, frame data is the only runtime
 DRAM input; the remaining hot-frame cost is local neuron/STDP computation plus
 active-message dispatch rather than sustained DRAM traffic.
 
-## Build and run
+<a id="build-and-run"></a>
+
+## Build and image-generation example
+
+The commands below select the current eight-way assembly and generate a fresh
+image. They do not reproduce the retained snapshot means without the original
+runtime snapshots, frozen payloads and simulator. Execute both commands through
+the repository's Nix development shell. The 4+12 window is the historical
+snapshot protocol, not a new HBM2 benchmark prescription.
 
 ```sh
 nix develop --command bash -c \
@@ -658,7 +697,7 @@ nix develop --command bash -c \
      MNIST_INPUT_DECAY_MODE=1 MNIST_FUSE_NEURON_UPDATE=1 \
      MNIST_PIPELINE_INPUT_PREPARE=1 MNIST_HORIZONTAL_GROUP_COUNT=8"
 
-PYTHONDONTWRITEBYTECODE=1 python3 datagen/mnist_train.py \
+nix develop --command bash -c 'PYTHONDONTWRITEBYTECODE=1 python3 datagen/mnist_train.py \
   --rule three-trace --recurrent-mode tree \
   --input-pus 288 --neuron-pus 224 \
   --placement-policy near --neuron-zone-policy network-balanced \
@@ -666,7 +705,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 datagen/mnist_train.py \
   --horizontal-partition full-8 --horizontal-replica-stride 3 \
   --feedforward-destination-stride 167 --trace-destination-stride 83 \
   --warmup-steps 4 --timed-steps 12 \
-  --output copilot/tmp/mnist-train
+  --output copilot/tmp/mnist-train'
 ```
 
 Use `--frame` and `--frame-index` for an IDX MNIST image. The manifest
@@ -711,6 +750,11 @@ still contain only weights and theta; traces are needed in runtime snapshots,
 not in those checkpoints. `--initial-weights` starts at accepted sample zero,
 and training saves checkpoints every 10,000 accepted samples
 and at its endpoint. A fresh run does not require a previously trained checkpoint.
+
+The following is a historical corpus/replay example. Select the intended
+frozen simulator and explicit placement settings for an archived comparison;
+the generic driver defaults alone do not select the consolidated full-eight
+configuration. Run these commands in the configured Nix/GeNN environment.
 
 ```sh
 python3 datagen/mnist_genn_snapshots.py \

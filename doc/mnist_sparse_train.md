@@ -23,6 +23,46 @@ The implementation and experiment files are:
 - `copilot/tmp/mnist-fanin-no-bound-check-20260910/`: fresh full training with
   the diagnostic normalization bound assertion disabled and automatic benchmark handoff.
 
+## Current selection and retained results (2026-10-14)
+
+The selected baseline uses compact scheduling, reverse setup extraction and
+the bit-seeded fifth-root helper. Relevant masks, MC-drain synchronization and
+active-prefix experiments remain disabled.
+`mnist_train.S` selects `mnist_sparse.inc`; the trace rule and reverse mode are
+compile-time switches. Select `MNIST_SPARSE_MODE` explicitly because its generic
+default is mode 1, not either of the selected full-corpus modes below.
+
+| Rule | Connectivity | Selected reverse mode | Cycles/timestep |
+| --- | ---: | --- | ---: |
+| One trace | 12.5% / 25% / 50% | Neuron scatter (3) | 3,965.0383 / 4,291.2033 / 4,825.7275 |
+| Two traces | 12.5% | Neuron scatter (3) | 5,253.9917 |
+| Two traces | 25% / 50% | Dense map (4) | 5,854.0317 / 6,396.2517 |
+| Three traces | 12.5% | Neuron scatter (3) | 4,910.7783 |
+| Three traces | 25% / 50% | Dense map (4) | 5,835.4467 / 6,378.1717 |
+
+The completed `copilot/tmp/mnist-sparse-baseline-full-20260913/` campaign
+contains 1,800 simulations and 900 paired checkpoints. Each rule/rate/mode has
+100 snapshots and 1,200 measured 0.5-ms timesteps: four warmup plus twelve timed
+steps per snapshot, with 70 presentation and 30 rest snapshots. All means use
+the full timer sums, including timed instruction fills and excluding untimed
+inter-interval gaps. The runs used 512 PUs/16 MCs, two SMT pipes, flat memory,
+I-cache preload and one host thread per simulator. This records the historical
+configuration; it is not the default for a new target-memory benchmark.
+
+The table selects the faster of the two modes in that complete comparison;
+it is not a bound on all modes or all individual timesteps. Mode 4 stores a
+dense reverse lookup over sparse forward synapses, not a fully connected graph.
+One-trace's small scatter advantage includes residual cache-fill differences.
+The [baseline manifest](mnist_sparse_baseline.json) pins the payloads and source;
+[the workload overview](workloads.md) lists the required evidence and snapshot
+roots. New HBM2 reproduction will use a separately agreed protocol.
+
+Dated sections below describe earlier baselines and opt-in experiments. The
+72-case relevant-mask/MC-drain pilot is complete according to its retained
+records, but it has not replaced this full-corpus baseline. Its historical
+summary still contains restart wording; no pilot speedups or drain correctness
+are re-established by the documentation update.
+
 ## Caps from realized fan-in
 
 The current sparse model uses `wmax[j] = float32(784 / fan_in[j])` for every
@@ -45,7 +85,7 @@ kernels. Its normalization guard compares each column against its own cap
 with the existing 2% tolerance. This cap change does not make column
 normalization preserve individual upper bounds.
 
-For the current full-training experiment, the exporter is launched with
+For the completed fan-in reference campaign, the exporter was launched with
 `--skip-normalization-bound-check`. This disables only the diagnostic
 post-normalization upper-bound assertion. Incoming columns still normalize to
 78; zero/non-finite column sums are still rejected, and the existing STDP
@@ -78,8 +118,10 @@ Fresh references use the original random masks and initial weights, seed
 19260817, FP32, presynaptic sparse scheduling with 32 threads per spike, and
 30,000 accepted examples. Each completed rule/rate corpus supplies 100 windows
 (70 presentation, 30 rest) to all three modes, with four warm-up and twelve
-timed steps. `copilot/tmp/mnist-fanin-no-bound-check-20260910/full-status.json` records progress;
-incomplete reference corpora are never submitted to the benchmark.
+timed steps. `copilot/tmp/mnist-fanin-no-bound-check-20260910/full-status.json`
+records all nine completed reference/benchmark cases. These are the earlier
+three-mode runs; the selected two-mode baseline at the top is the later
+setup-extracted campaign.
 
 Validation of this cap change passed 71 Python checks, nine 100-example GPU
 pilots, and GPU saturation checks for all three rules over all 39,001 synapses
@@ -479,16 +521,23 @@ audit. Its final reference state digest is
 The 25% three-trace corpus also completed and passed the same audits, with digest
 `5ed36ef4e4825841b04fbd06535bcfb19ed65c3e4d507fbcee279c6639d75d30`.
 
-## Reproduction and validation
+<a id="reproduction-and-validation"></a>
 
-Build one variant with the repository development shell:
+## Functional examples and historical replay
+
+These flat-memory examples describe a legacy mode-2 functional workload and
+snapshot replay, not the selected mode-3/mode-4 performance comparison or a new
+HBM2 benchmark recipe. Choose a simulator with the specified configuration;
+`sim/build/sim_system` is not necessarily a 512-PU workload build.
+
+Build the example variant with the repository development shell:
 
 ```sh
 nix develop --command bash -c 'cd /root/workspace/ActiveN/sim/payloads && \
   make sys/mnist_sparse.bin MNIST_RULE=three-trace MNIST_SPARSE_MODE=2'
 ```
 
-Generate its images and run the maintained 512-PU simulator:
+Generate its images and run the matching 512-PU simulator:
 
 ```sh
 nix develop --command bash -c 'cd /root/workspace/ActiveN && \
@@ -615,12 +664,11 @@ had identical cycle counts. These short windows do not establish full-corpus
 averages. The validated implementation report is
 `copilot/tmp/mnist-sparse-dense-20260912/summary.md`.
 
-The 900-case full benchmark is queued in
-`copilot/tmp/mnist-sparse-dense-full-20260912/`, reusing twelve validated pilots.
-It waits for the existing compact controller to exit successfully, then runs
-only mode 4 on the same reference windows and audits against compact-local.
-Frozen provenance, process identities, status, and automatic final reporting
-are retained in that directory; no manual batch handoff is needed.
+The retained status in `copilot/tmp/mnist-sparse-dense-full-20260912/` records
+all 900 cases complete, including twelve reused pilots. That earlier campaign
+compared mode 4 against compact-local on the same reference windows. Its frozen
+provenance, logs and comparison records remain historical evidence; the later
+setup-extracted comparison at the top is the selected baseline.
 
 ## Established sparse benchmark baseline
 
@@ -629,13 +677,19 @@ sparse MNIST experiments. Use `MNIST_SPARSE_CACHE_REVERSE=1`, compact scheduling
 the existing bounded-tail binary reverse search, and the existing per-mode
 forward packet format. Relevant masks, MC drain synchronization, and nibble
 skipping are experiments relative to this baseline, not baseline features.
-The current Makefile defaults already select this implementation.
+The current Makefile defaults already select this implementation. The generic
+`MNIST_SPARSE_BINARY_REVERSE=2` flag enables bounded-tail search in modes 1/2;
+selected modes 3/4 use carried weight locations or the dense reverse map
+instead.
 
-Every paired timing comparison must enable `--init-icache` on both sides and
-retain four warmup plus twelve timed steps, with identical checkpoints,
-connectivity, trace rules and reverse-map modes. The timing baseline uses flat
-memory; the Ramulator runs are separate protocol stress tests. Report residual
-timed I-cache fills alongside cycle results even when prefill is enabled.
+The historical paired comparisons enabled `--init-icache` on both sides and
+used four warmup plus twelve timed steps with matching checkpoints,
+connectivity and trace rules. Optimization pairs also fixed the reverse mode;
+the full mode comparison changed only that selected mode. Timing used flat
+memory, while separate Ramulator runs exercised variable-latency protocol
+stress. Retain those settings when interpreting the old results; they do not
+supersede the repository's HBM2 requirements for new workload benchmarks.
+Residual timed I-cache fills remain included even with prefill.
 
 `doc/mnist_sparse_baseline.json` records the twelve frozen payload hashes,
 simulator/configuration/source hashes, build settings, timing settings and
@@ -644,11 +698,14 @@ validation records. Its frozen executable directory is
 pairs passed independent FP32 checks and had bit-identical logical final states.
 The original pre-extraction binaries remain historical controls only.
 
-The current 72-case mask pilot already compares each candidate against these
-established baseline results. It covers per-post PU masks for local CSR/dense
-maps, per-post MC masks plus drain synchronization for both scatter modes, and
-drain-only controls that retain the old MC activity filter. Nibble skipping
-remains the next experiment after this pilot has been assessed.
+The saved mask-pilot status records 72 of 72 cases complete, and its result
+array contains 72 entries. It covers per-post PU masks for local CSR/dense maps,
+per-post MC masks plus drain synchronization for both scatter modes, and
+drain-only controls that retain the old MC activity filter. The pilot's
+`summary.md` still describes its restart; use `pilot-status.json` and
+`pilot-results.json` for the recorded completion state. Assessment/promotion of
+these experiments and nibble skipping remain open work; neither changes the
+selected baseline.
 
 ## Reverse setup pilot
 
@@ -687,7 +744,7 @@ message-count semantics are unchanged in this pilot.
 The benchmark driver accepts `--init-icache`, records it in provenance, and
 passes it to the simulator. Both pilot variants use prefill with the existing
 four warmup and twelve timed steps. The frozen baseline, optimized payloads,
-directed checks, and background pilot are under
+directed checks, and completed pilot records are under
 `copilot/tmp/mnist-sparse-setup-20260913/`. Performance conclusions must use
 that directory's paired results; earlier cold-cache results are not its
 control. This pilot does not implement per-post activity masks or nibble

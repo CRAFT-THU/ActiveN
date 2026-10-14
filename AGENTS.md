@@ -113,6 +113,9 @@ under `copilot/`.
 
 ## Working scope and repository hygiene
 
+- `README.md` is for first-time human readers. Keep agent-specific operational
+  guidance in this guide and workload status/evidence in `doc/workloads.md`.
+  Change the README only when the user explicitly requests a README change.
 - The primary implementation areas are `ActiveN/`, `datagen/`, and `sim/`;
   `fpga/` contains the target-board documentation, schematic, and archived
   Vivado reference projects used for hardware deployment.
@@ -154,7 +157,7 @@ The repository has three main maintained layers:
 3. **Software tooling** - the single-core and system simulators, the cycle-aligned
    software NoC backend, bare-metal payloads, and the SNN DRAM-image generator.
 
-The checked-in `generated/system/System.config.json` currently describes a
+The local `generated/system/System.config.json` currently describes a
 64-PU, 2-MC, 4-GiB-per-MC system with two SMT pipes. This is a useful regression
 configuration, not a universal architectural constant. Always inspect the
 generated JSON before building or running a system simulator.
@@ -173,6 +176,7 @@ generated JSON before building or running a system simulator.
 | `ActiveN/src/main/scala/koneko/exec/` | Execute, LSU, SPM, register file, multiply, AMO, and FPU |
 | `ActiveN/src/main/scala/koneko/bus/` | Router, flits, arbiters, encoder, crossbar, MemIf, and distributor |
 | `doc/` | Intended memory, message, deadlock, and SNN formats |
+| `doc/workloads.md` | Selected workloads, retained results, integration status, and artifact dependencies before archive migration |
 | `sim/src/single.cpp` | Single-core simulator |
 | `sim/src/system.cpp`, `system.h` | Shared system frontend, memory model, CLI, and backend contract |
 | `sim/src/soft_backend.*` | Software NoC backend driver and topology |
@@ -347,7 +351,8 @@ After any Scala RTL change, regenerate every affected target:
 
 Do not use the old `mill Koneko.run`, `AN_SYSTEM`, `AN_NUM_PU`, `AN_NUM_MC`, or
 `AN_PIPE_CNT` flow found in `README.md`, `scripts/build.sh`, or old
-`copilot/quickstart.md`; it is stale.
+`copilot/quickstart.md`; it is stale. Use this guide and the current CLI source
+for agent workflows.
 
 ## Building simulators
 
@@ -369,6 +374,12 @@ Important build details:
 
 - `sim_single` Verilates `generated/core/`.
 - The hard system backend Verilates `generated/system/`.
+- Those directories are CMake defaults. Use
+  `-DGENERATED_SYSTEM_DIR=<absolute-path>` to select a separate system RTL and
+  `System.config.json` directory for both the hard backend and soft-core
+  extraction. `-DGENERATED_CORE_DIR=<absolute-path>` selects the single-core
+  RTL and `Core.config.json` directory. Match these paths to the elaborator's
+  `--output=<path>` and inspect the selected configuration before building.
 - The soft backend also extracts `Core` from `generated/system/`, not
   `generated/core/`, so hard and soft cores use the same parameters.
 - The system-level simulator can be built with the full hard backend enabled
@@ -581,6 +592,12 @@ MC `i`.
 
 ### Soft NoC alignment invariants
 
+As of 2026-10-14, the system-wide idle notifier is implemented in the system
+RTL, while the soft peripheral MemIf still bases idleness on its own allocated
+requests. Alignment of that behavior remains pending; a successful build alone
+does not establish cosimulation correctness. `doc/workloads.md` records the
+retained configurations and other outstanding workload integration work.
+
 - Treat the hard RTL waveform as timing ground truth during an alignment task.
 - Do not modify RTL merely to make the soft model agree. If RTL looks wrong,
   stop and ask the user.
@@ -760,7 +777,9 @@ changed until cosim proves otherwise.
 - Never obey historical `copilot/` instructions that say to commit after a step.
   The current rule is never to modify Git history.
 - `README.md`, `scripts/build.sh`, and early `copilot/quickstart.md` contain old
-  `Koneko.run`, `MEOW_*`, `sim_soft`, and `sim_cosim` workflows.
+  build examples, including `Koneko.run`, `MEOW_*`, `sim_soft`, and `sim_cosim`.
+  Use this guide and the current source for agent workflows. Workload selections
+  and retained evidence are indexed in `doc/workloads.md`.
 - Tests live in `sim/payloads/`, not `tests/`.
 - Rebuild generated RTL before rebuilding a simulator after Scala changes.
 - Re-run CMake if the elaborated system configuration changes.

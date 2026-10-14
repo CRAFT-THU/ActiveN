@@ -3,8 +3,11 @@
 Both simulators accept `--init-icache[=ADDR]`. With no address, the start is
 `0x80000000`. The simulator inserts exactly one contiguous region of
 `iCacheLines * iCacheBlockSize` bytes into every PU's instruction cache. The
-geometry comes from the model's elaborated configuration; the current
-128-line, 64-byte configuration preloads 8 KiB.
+geometry comes from the model's elaborated configuration. The workload targets
+used for the retained results have 128 lines of 64 bytes and preload 8 KiB;
+the default 32-line elaboration preloads 2 KiB. Inspect the selected generated
+configuration instead of assuming either size. Preload does not replace
+workload warmup; record the address and region in each measurement.
 
 ```sh
 nix develop --command bash -c 'cd /root/workspace/ActiveN && \

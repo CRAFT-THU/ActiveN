@@ -1,5 +1,13 @@
 # Sparse Brunel training
 
+Current selection: **consecutive home G4** for both rules, with the retained
+full HBM2 results below. The [workload overview](workloads.md) indexes selected
+assembly, data dependencies and integration work. September benchmark results
+predate the soft-model write-merge experiment and the new idle/copy interfaces;
+no latest-RTL reproduction is claimed. Dated sections retain their original
+experiment context, and the completed HBM sections supersede older pending
+statements and flat-memory rankings.
+
 ## Benchmark contract
 
 All benchmarks enable Ramulator **HBM2 timing** using the preserved
@@ -449,17 +457,18 @@ with a 20,000-second preparation limit. Final checkpoints passed two
 successive checks of a trailing 100-second window for weight spread, mean,
 distribution and E/I firing-rate stability. Current GeNN uses integer STDP
 timestamps. The full protocol and A100/RTX 3090 timing results are in
-`../stdp-experiments/BASELINE.md`; power and new A800/H800 data remain pending.
+`../stdp-experiments/BASELINE.md`. GPU/power campaign status belongs to that
+repository; the September notes here do not establish its current status.
 Artifacts and full per-window results: `copilot/tmp/brunel-settled-20260927/`
 and the matching CRAFT-A100 directory. `completion-audit.json` records the
 remote completion markers, validation and timer totals; `final-audit-v1.json`
 checks all six reports, shared checkpoint hashes, full-window activity,
 GPU means and 100-ms blocks. Earlier sections below are historical
 configuration-selection results, not the settled-checkpoint measurements.
-The full 60+10,000-step HBM2 runs, detailed memory-stall attribution and HBM
-configuration comparison remain outstanding; quick-window memory statistics
-are reported above. Preserve the flat-memory
-artifacts as controls rather than overwriting or relabeling them.
+The full 60+10,000-step HBM2 runs and the 1,000-step HBM group comparison
+completed and are reported above. The full runs cover the selected common G4
+configuration; they do not rerank all alternatives over 10,000 steps. Preserve
+the flat-memory artifacts as controls with their original settings.
 
 The hand-written `sim/payloads/sys/brunel_runtime.S` implements
 Additive and Morrison training on
@@ -473,11 +482,11 @@ This is a separate payload; it does not change the existing MNIST formats.
 Use **consecutive groups of four PUs with home-owned post-active learning**
 for both Additive and Morrison:
 `--proxy-groups consecutive --proxy-size 4 --proxy-updates home`.
-This was the selected common configuration for the flat-memory campaign;
-the quick HBM retest above measures it, but its HBM configuration ranking
-remains unverified. It is the best
-common configuration supported by those tested layouts and windows, and has the lowest
-cost among the completed long-run configurations for each rule. Morrison's
+This section records the flat-memory campaign's selection. The completed HBM
+group-comparison records above retain G4 as the common configuration; Additive
+G2 is slightly faster in the matched quick window. Only G4 was then measured
+over the full 10,000-step HBM interval. The remaining comparisons in this
+historical section use the original flat-memory checkpoints and windows. Morrison's
 short pilot was only 0.19% behind distant home G8; the missing longer comparison
 now favors consecutive home G4 by **3.64%**. A separate Morrison G8 recommendation
 is therefore unnecessary for these workloads.
@@ -563,7 +572,13 @@ The preceding experiments establish the other final choices:
 Select the configuration explicitly: compatibility CLI defaults and experimental
 variants remain available. Matching binaries are
 `sys/brunel_additive_proxy_home_g4.bin` and
-`sys/brunel_morrison_proxy_home_g4.bin`. For example, from the repository root:
+`sys/brunel_morrison_proxy_home_g4.bin`. The commands below record the older
+presimulated, flat-memory selection experiment. The retained HBM results instead
+import the exact settled checkpoints using `--load-genn-checkpoint` and
+`--presim 0`, as described in the model contract and frozen run records. These
+older commands are not the current benchmark recipe.
+
+From the repository root:
 
 ```sh
 nix develop --command bash -c '
@@ -579,7 +594,7 @@ nix develop --command bash -c '
 '
 ```
 
-Run the resulting sixteen images with the preserved 512-PU simulator using
+That historical flat-memory run used the preserved 512-PU simulator with
 `--soft --pu 512 --mc 16 --mc-size 0x100000000 --soft-threads 8 --init-icache
 --max-cycles 100000000`.
 The exact measured invocation, environment, hashes, validation and comparisons
@@ -1449,8 +1464,14 @@ independent for the entire run. Final DRAM weights are compared against those
 reference weights. Free-running reference spike counts are reported separately
 to assess the broader dynamics.
 
-Build and run through the Nix development shell, using an already-built 512-PU,
-16-MC, 256-bit, two-SMT, 8 KiB ICache simulator. Workload-only changes need no
+The following 60+60 example belongs to the earlier arithmetic/assembly
+diagnostic campaign. It uses a generated presimulation state and is not the
+settled-checkpoint quick/full benchmark contract at the top. Its flags also
+predate explicit frequency and timer-only statistics recording; use the frozen
+commands for historical interpretation, not as defaults for new benchmarks.
+
+For that diagnostic, build and run through the Nix development shell using an
+already-built 512-PU, 16-MC, 256-bit, two-SMT, 8 KiB ICache simulator. Workload-only changes need no
 simulator rebuild or re-elaboration. The following example assumes `sim_system`
 is that matching binary; use a preserved binary path if another session has
 changed the current elaboration. Its Ramulator flag selects HBM timing and is

@@ -1,3 +1,5 @@
+# Full Morrison workload
+
 <a id="selected-configuration"></a>
 
 As of **2026-10-14**, this Morrison optimization round is complete. Retain **SMT1-only reverse relay** as the best measured configuration from this round. This is the ABI4 distant G32 variant with individual synapses randomly assigned to workers and stored in their worker MCs (placement seed `0x20261011`). “SMT1-only” applies to reverse relay handler 4; shared updater handler 12 remains enabled on both SMT threads. Proxy acceptance uses handler 11 and the read issuer uses handler 8. The selected payload is `sys/morrison_bulk_worker_scheduled_smt1.bin`.
@@ -35,9 +37,39 @@ In the second pair, the initial physical state and graph match apart from policy
 
 The step-750,000 updater11/relay12 capture was interrupted during final archival. Its completed rerun used bounded host archive buffers and a 26 GiB process-group limit, reproducing the original timer, all 400 phase markers and all 100 SPM snapshots exactly. The interrupted capture is retained as incomplete evidence; only the completed rerun supplies the final comparison.
 
-The [selected run recipe](../copilot/tmp/morrison-checkpoint-750000-20261013/relay_smt1/layout-recipe.json) pins the ABI4 layout, handler policy and payload SHA-256 `c0df21626f61674a82d0b6bb5aa4f5a012056535652a4cc237b699e0c95c15b4`. [Checkpoint selection](../copilot/tmp/morrison-checkpoint-750000-20261013/selection.json), [complete metrics](../copilot/tmp/morrison-checkpoint-750000-20261013/results-updater11_relay12_recovered2.json), [pair validation](../copilot/tmp/morrison-checkpoint-750000-20261013/comparison.json) and the [independent results review](../copilot/tmp/morrison-checkpoint-750000-20261013/results-review.md) retain source identities and raw-evidence paths. The [earlier checkpoint review](../copilot/tmp/morrison-update-before-relay-20261013/results-review.md) covers the first pair. No further Morrison optimization work is scheduled for this round.
+The [selected run recipe](../copilot/tmp/morrison-checkpoint-750000-20261013/relay_smt1/layout-recipe.json) pins the ABI4 layout, handler policy and payload SHA-256 `c0df21626f61674a82d0b6bb5aa4f5a012056535652a4cc237b699e0c95c15b4`. [Checkpoint selection](../copilot/tmp/morrison-checkpoint-750000-20261013/selection.json), [complete metrics](../copilot/tmp/morrison-checkpoint-750000-20261013/results-updater11_relay12_recovered2.json), [pair validation](../copilot/tmp/morrison-checkpoint-750000-20261013/comparison.json) and the [independent results review](../copilot/tmp/morrison-checkpoint-750000-20261013/results-review.md) retain source identities and raw-evidence paths. The [earlier checkpoint review](../copilot/tmp/morrison-update-before-relay-20261013/results-review.md) covers the first pair. The measured optimization round is closed. Reproduction with newer RTL and
+backports to Brunel remain separate work; these historical pilot figures do not
+measure those changes.
 
-The remaining layout details and commands describe the original ABI1 baseline and its historical results. The [bulk variant document](morrison-bulk.md) records the earlier bulk implementation.
+## Selected source and integration status
+
+The selected build target is `sys/morrison_bulk_worker_scheduled_smt1.bin` in
+`sim/payloads/Makefile`. It uses `brunel.S`/`brunel_runtime.S` with the bulk,
+ready-queue and tree includes. `BR_BULK_WORKER=1` selects ABI4;
+`BR_BULK_SCHEDULED=1` and `BR_BULK_RELAY_SMT1=1` select the shared updater and
+SMT1 relay policy. The worker layout comes from `datagen/morrison_worker.py`;
+its `WorkerLayout` is a library, not a standalone image-generation CLI.
+The selected case's recorded launcher and `layout-recipe.json` supply the
+canonical ABI3 base, placement seed, helper library and checkpoint overlay.
+The later checkpoint also requires `checkpoint_stream.py`,
+`checkpoint_layout.py` and the reduced state under
+`copilot/tmp/morrison-checkpoint-750000-20261013/`.
+
+Write merging is enabled by `SOFT_MEMIF_WRITE_MERGE=1` in these retained runs.
+It remains an opt-in software MemIf experiment; the RTL has no equivalent
+merge path. The selected payload still uses its copy checker and marker/MC-idle
+completion protocol. The new async-copy and system-wide idle interfaces are
+present in current RTL but have not been integrated into this workload. The
+soft backend's global-idle alignment and refreshed generated targets remain
+necessary for that later work. See [the workload overview](workloads.md) for
+the shared integration status and archive dependencies.
+
+## Historical ABI1 baseline
+
+The remaining layout details and commands describe the original ABI1 baseline
+and its historical results. The [bulk variant document](morrison-bulk.md)
+distinguishes current ABI3/ABI4 targets from the historical ABI2 design.
+The ABI1 build/image commands below do not recreate the selected ABI4 result.
 
 The [bulk coroutine variant](morrison-bulk.md) adds whole-row range delegation and prefetch across jobs. The G1/G4 layout below remains the ABI1 baseline. Its home-update stores are posted, but its finish path waits only for read completions and software slots; it does not implement an explicit NoC/MemIf drain. ABI2 now supplies that timestep boundary with route markers followed by MC idle notifications. Historic passing runs do not by themselves prove the missing ABI1 ordering guarantee.
 
