@@ -1,16 +1,18 @@
 # Selected workloads and retained evidence
 
-Status as of **2026-10-14**. This is the entry point for the selected MNIST,
-Brunel and full-Morrison implementations. The detailed documents retain dated
-experiments pending archive migration; their historical commands and rankings
-do not override the selections below.
+Selections audited **2026-10-14**; procedure updated **2026-10-15**.
+This is the entry point for the selected MNIST,
+Brunel and full-Morrison implementations. Historical experiments and their original documentation are indexed in
+[archive/README.md](../archive/README.md); their rankings and commands do not
+override the selections below.
 
 The results are measurements of frozen payloads, inputs and simulators. A
 current-source build has not been rebenchmarked against them. Reproduction
-with newer RTL and a revised test protocol remains separate work. Until that
-protocol is agreed, the existing benchmark requirements in [AGENTS.md](../AGENTS.md)
-apply to new runs; historical flat-memory runs and short pilots do not establish
-new defaults.
+with newer RTL remains separate work. [sim.md](sim.md) now defines new-run
+procedures and artifact retention. Its 1.5 GHz/HBM2e/one-step-warmup policy
+makes the timings below outdated for the current target. They remain
+implementation references; no new target result is established by scaling them
+by 1.5. Historical flat-memory runs and short pilots do not establish defaults.
 
 ## Selected implementations
 
@@ -20,8 +22,8 @@ of the implementation identity.
 
 | Workload | Current source and selected build |
 | --- | --- |
-| [Dense MNIST](mnist_train.md) | `sys/mnist_train.S`, shared neuron/fifth-root includes; `sys/mnist_train.bin` with the selected `MNIST_RULE`, tree recurrence, unbundled traces, bit fifth-root seed and `MNIST_HORIZONTAL_GROUP_COUNT=8` |
-| [Sparse MNIST](mnist_sparse_train.md) | Same entrypoint plus `sys/mnist_sparse.inc`/`mnist_sparse_layout.inc`; `sys/mnist_sparse.bin` with setup extraction and explicit reverse mode 3 or 4 from that document's table |
+| [Dense MNIST](mnist_train.md) | `sys/mnist_train.S`, shared neuron/fifth-root includes; `sys/mnist_dense_<rule>.bin` with the selected trace rule, tree recurrence, unbundled traces, bit fifth-root seed and `MNIST_HORIZONTAL_GROUP_COUNT=8` |
+| [Sparse MNIST](mnist_sparse_train.md) | Same entrypoint plus `sys/mnist_sparse.inc`/`mnist_sparse_layout.inc`; `sys/mnist_sparse_<rule>_mode<3|4>.bin` with setup extraction and explicit reverse mode 3 or 4 from that document's table |
 | [Brunel](brunel.md) | `sys/brunel.S` and `sys/brunel_runtime.S` with common rule/layout/proxy includes; `sys/brunel_additive_proxy_home_g4.bin` and `sys/brunel_morrison_proxy_home_g4.bin`, diagnostics disabled |
 | [Full Morrison](morrison.md#selected-configuration) | Same Brunel entry/runtime plus bulk/ready/tree includes; `sys/morrison_bulk_worker_scheduled_smt1.bin`, ABI4 distant G32, individual-edge placement seed `0x20261011`, SMT1-only reverse relay and shared updater on both SMT pipes |
 
@@ -40,11 +42,11 @@ Current selected Brunel payload hashes are
 (Morrison rule). The selected full-Morrison payload hash is
 `c0df21626f61674a82d0b6bb5aa4f5a012056535652a4cc237b699e0c95c15b4`.
 Dense MNIST's retained `build.json` and the
-[sparse baseline manifest](mnist_sparse_baseline.json) pin its separate payloads.
+[historical sparse baseline manifest](../archive/workload/doc/mnist_sparse_baseline.json) pin its separate payloads.
 These identities identify retained binaries, not proof of a fresh byte-identical
 rebuild from the current source/toolchain.
 
-## Retained performance
+## Historical performance (previous target)
 
 The metric is the complete peripheral timer total divided by the measured
 step count in that same interval, excluding warmup. MNIST stops/restarts its
@@ -79,7 +81,7 @@ quick comparison, Additive G2 took 5,766.419 versus G4's 5,792.763 cycles/step;
 only G4 was subsequently measured over the full 10,000-step window. Full
 Morrison's two values reflect different starting states. The selected policy
 won the tested policy comparison within each state, but neither 100-step pilot
-is a standard 60+1,000 quick or 60+10,000 full benchmark.
+uses the then-standard 60+1,000 quick or 60+10,000 full benchmark window.
 
 ## Integration and validation still outstanding
 
@@ -108,69 +110,68 @@ artifact identities. It did not run new workloads, rebuild simulators or
 replay all numerical state. Historical validation reports retain their original
 limits, including Morrison's missing full-network pending-input-sum oracle.
 
-## Evidence and extraction inventory
+## Maintained tools and retained inputs
 
-Paths in this section are relative to `copilot/tmp/` unless stated otherwise.
-They are existing dependencies to retain through migration, not proposed
-permanent destinations. The [reviewed audit](../copilot/tmp/workspace-audit-20261014/audit.md)
-and its independent reviews provide the detailed identity/coverage record.
-Historical `copilot/tmp` evidence is ignored by Git; a source commit does not
-preserve it.
+`make -C sim/payloads -f selected.mk selected-workloads` builds the selected rule/mode matrix
+with distinct filenames. Run it through the Nix development shell. The exact
+profile/placement selections are in [workloads/profiles.json](../workloads/profiles.json).
+Here a build profile is a named firmware Make target with fixed compile-time
+options and a distinct output file; it is separate from simulator builds.
+[sim-retained.md](sim-retained.md) identifies existing simulator binaries that
+must remain in place through reproduction.
+The workload entrypoint includes the shared Makefile, whose existing integration
+test sources and recipes have been restored unchanged. Cleanup is limited to
+workload additions outside `next`, apart from requested documentation/path updates.
+Generic targets retain compatibility switches for functional tests and research;
+their defaults are not the selected benchmark configuration.
 
-| Workload | Primary retained run evidence | Additional roots needed |
+[workloads/retained.json](../workloads/retained.json) maps immutable local inputs
+to their original archive paths. Inputs live under `workloads/data/`; generated
+functional outputs belong in fresh `work/` directories; benchmark runs belong
+in `benchmark/rundir/` with reports under `benchmark/report/`.
+The local inputs are hard-linked to archive files until the archive is compressed;
+never overwrite them. Large input/output data are ignored by Git.
+
+| Workload | Maintained entrypoints | Retained input location |
 | --- | --- | --- |
-| Dense MNIST | `mnist-dense-consolidated-20260909/`: payloads, frozen source, commands/provenance, per-snapshot images/logs/results | `mnist-rule-native-30k-20260907/` frozen simulator/config/labels and one-trace snapshots; `mnist-two-trace-single-pass-20260907/full/snapshots`; `mnist-fired-vector-rules-20260907/frozen/snapshots`; `mnist-fifth-root-20260909/build.py` and retained initializer object |
-| Sparse MNIST | `mnist-sparse-baseline-full-20260913/`: all 1,800 case records, state dumps, frozen binaries/source | `mnist-sparse-setup-20260913/` build recipes/logs; `mnist-fanin-no-bound-check-20260910/reference/` original 900 snapshots and upstream training/input provenance; mask/drain pilot records for disposition |
-| Brunel | `brunel-hbm-full-20260928-v1/review-20260929-v1/full/`: full logs, manifests, dynamics, MC statistics; quick/group campaigns remain comparisons | `brunel-relay-20260925/source/` payloads/source; `brunel-morrison-seeds-20260920/` simulator/source/runtime; `brunel-settled-20260927/` checkpoint, generator and continuation records |
-| Full Morrison | `morrison-scheduling-controls-20261012/smt1/` and `morrison-checkpoint-750000-20261013/relay_smt1/`, with parent launch/source/review records | Canonical images, native graph/state, checkpoint overlay/reduced data and the XOR chains below; retain completed alternative and interrupted captures with their status |
+| Dense/sparse MNIST | `datagen/mnist_train.py`, `mnist_sparse.py`, `mnist_genn_snapshots.py`; snapshot readers and FP32 validators alongside them | `workloads/data/mnist/`: three dense and nine sparse snapshot corpora, frozen dataset |
+| Brunel | `datagen/brunel.py`, `brunel_checkpoint.py`; GeNN settle/resume in `tools/checkpoints/brunel/` | `workloads/data/brunel/`: one settled checkpoint per rule |
+| Full Morrison | `datagen/morrison_checkpoint.py`, `morrison_worker_images.py`, and shared model/graph/layout libraries | `workloads/data/morrison/`: original native graph/state, canonical ABI3 base/graph, later reduced state |
+| Functional/BOLT fixtures | Existing system payloads and small native/worker-layout fixtures | `workloads/data/fixtures/`, including the two `snn_shuffle` BOLT images |
 
-The maintained generators/importers already include `datagen/mnist_train.py`,
-`mnist_sparse.py`, `mnist_genn_snapshots.py`, `brunel.py`, `brunel_checkpoint.py`,
-`morrison.py`, `morrison_native.py`, `morrison_bulk.py` and
-`morrison_worker.py`. Selected execution/import/continuation glue remains outside
-those maintained entrypoints and must be inventoried before extraction:
+The old dense/sparse campaign runners, layout launchers, frozen simulators,
+source snapshots, analysis scripts and raw logs remain in `archive/tmp/`.
+They preserve old invocation paths as provenance. Resolve a retained asset or
+old input path with `python3 datagen/workload_paths.py INPUT`; use
+`--archive-root /mount/tmp` when the archived tree is mounted elsewhere.
+This resolves data paths; it does not make every historical script runnable
+without adapting its hardcoded paths. Current tools do not import archive code.
 
-- Dense/sparse benchmark `run.py` scripts and their frozen imports/build helpers.
-  The dense runner also consumes prior controls under
-  `mnist-native-activen-100-20260908/results/one-trace`,
-  `mnist-root-cached-20260909/results/bit`, and
-  `mnist-fired-vector-rules-20260907/results/three-trace`; retain these with its
-  snapshots and payload identities when consolidating.
-- Brunel's `brunel-settled-20260927/` continuation and checkpoint records,
-  including the frozen `gpu-source-v1/brunel/settled.py`; baseline-side scripts
-  also live in the sibling `../stdp-experiments` repository.
-- Morrison's `morrison-checkpoint-750000-20261013/checkpoint_stream.py` and
-  `checkpoint_layout.py`, reduced `ee_g.npy`/`neurons.npy`, import/selection
-  manifests, and the selected launcher/stream/archive dependencies. These
-  import and overlay the selected physical state; do not replace them with
-  time-zero generation or assume a generic generator fast-forwards to it.
+Primary evidence roots (relative to `archive/tmp/`):
 
-Morrison's input `dram.*` entries under `input-fifos` are FIFOs, not stored
-images. Final-memory XOR archives require reconstruction of the exact physical
-starting image from the recorded layout, payload and canonical inputs.
-`morrison-ready-fast-20261006/target-images` links into
-`morrison-bulk-20261002-v1/settled-images` and
-`morrison-native-20260929-v1/settled-g4/graph`. Selected SPM snapshots depend on
-`morrison-uncounted-20261009/distant/output`, whose XOR bases depend on
-`morrison-pilot100-20261008/distant/output/step-*.bin.zst`. Keep these manifests,
-base files, decoders and helper libraries together when relocating artifacts.
+| Workload | Evidence |
+| --- | --- |
+| Dense MNIST | `mnist-dense-consolidated-20260909/`, with the three upstream snapshot/training roots in the input catalog |
+| Sparse MNIST | `mnist-sparse-baseline-full-20260913/`, `mnist-sparse-setup-20260913/`, `mnist-fanin-no-bound-check-20260910/reference/` |
+| Brunel | `brunel-hbm-full-20260928-v1/review-20260929-v1/full/`, `brunel-settled-20260927/`, frozen `brunel-relay-20260925/source/` |
+| Full Morrison | `morrison-scheduling-controls-20261012/smt1/`, `morrison-checkpoint-750000-20261013/relay_smt1/`, with their complete parent records and XOR bases |
 
-Large Brunel input/final memories and 10,060 snapshot archives per rule remain
-on CRAFT-A100 under `/data/meow/ActiveN-stdp/brunel-hbm-full-20260928-v1/`, with
-settled checkpoints under `/data/meow/ActiveN-stdp/brunel-settled-20260927/`.
-The original later Morrison checkpoint remains under
+The [reviewed audit](../archive/tmp/workspace-audit-20261014/audit.md) retains
+measurement and identity coverage. Morrison input FIFOs are not saved images:
+rebuild the exact initial physical image before decoding final-memory XOR data.
+Its SPM chain includes `morrison-uncounted-20261009/distant/output` and
+`morrison-pilot100-20261008/distant/output/step-*.bin.zst`; all remain archived.
+
+Large Brunel input/final memories and 10,060 snapshots per rule remain on
+CRAFT-A100 under `/data/meow/ActiveN-stdp/brunel-hbm-full-20260928-v1/`.
+The later full native Morrison checkpoint remains under
 `/data/meow/baseline-rerun-20260928-v1/a100-full-morrison-r2/full-morrison/diagnostic/checkpoint-step-750000`.
-The audit confirmed remote metadata accessibility and selected manifest hashes;
-it did not decode or rehash every large blob. The `stdp` symlink alone does not
-preserve the sibling repository.
+The earlier audit checked remote metadata and selected manifest hashes, not
+every large blob. The sibling `stdp-experiments` repository and `stdp` link
+remain separate dependencies.
 
-The completed MNIST runs retain frozen binaries/configurations, but their exact
-historical simulator source-to-binary rebuild chain was not established. One
-failed dense attempt also has a stale runner hash at its recorded path; the
-failure log/status and correctly pinned resumed runner remain. Preserve these
-limitations and the original failed records along with successful runs.
-
-Archive migration must retain historical comparisons and reviews, remap path
-and symlink dependencies, and keep useful generators/checkpoint tools usable
-outside the old temporary tree. The current documentation update has not moved
-artifacts, consolidated assembly or defined the next benchmark protocol.
+The historical MNIST simulator source-to-binary rebuild chain is not fully
+established. One failed dense attempt also retains a stale runner hash; its
+failure status and correctly pinned resumed runner remain. Source commits do
+not preserve ignored local data or remote artifacts. Archive compression and
+reproduction under [sim.md](sim.md) remain separate steps.

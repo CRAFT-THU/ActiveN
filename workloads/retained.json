@@ -1,0 +1,206 @@
+{
+  "format": "activen-retained-workloads-v1",
+  "date": "2026-10-14",
+  "source_commit": "635a49fb967e374a59fe321aa1178da4eec8b301",
+  "legacy_roots": [
+    "/root/workspace/ActiveN"
+  ],
+  "storage": "immutable hard links; never overwrite; generate into fresh work directories",
+  "assets": {
+    "mnist-labels": {
+      "source": "copilot/tmp/mnist-rule-native-30k-20260907/frozen/data",
+      "path": "workloads/data/mnist/idx-and-pickles",
+      "files": 6,
+      "bytes": 268243001
+    },
+    "mnist-dense-one-trace": {
+      "source": "copilot/tmp/mnist-rule-native-30k-20260907/training/one-trace/snapshots",
+      "path": "workloads/data/mnist/dense/one-trace",
+      "manifest.json_sha256": "304017183de0aa727d46613235b0e5d1f354489ec9413b6f7e1a91e24282b496",
+      "files": 106,
+      "bytes": 98745827
+    },
+    "mnist-dense-two-trace": {
+      "source": "copilot/tmp/mnist-two-trace-single-pass-20260907/full/snapshots",
+      "path": "workloads/data/mnist/dense/two-trace",
+      "manifest.json_sha256": "348f5ce7a6c184f4defe4321bfe9c8c2cbe03a30da2c742c3ff8c64b71bb5063",
+      "files": 106,
+      "bytes": 101817113
+    },
+    "mnist-dense-three-trace": {
+      "source": "copilot/tmp/mnist-fired-vector-rules-20260907/frozen/snapshots",
+      "path": "workloads/data/mnist/dense/three-trace",
+      "files": 102,
+      "bytes": 119199219
+    },
+    "mnist-sparse-one-trace-0.125": {
+      "source": "copilot/tmp/mnist-fanin-no-bound-check-20260910/reference/one-trace-0.125/snapshots",
+      "path": "workloads/data/mnist/sparse/one-trace-0.125",
+      "manifest.json_sha256": "7c974113272b4415dedf21b7d8dfca46cf0685d8aec5603265e9bbd5987b5efb",
+      "files": 106,
+      "bytes": 31802746
+    },
+    "mnist-sparse-one-trace-0.25": {
+      "source": "copilot/tmp/mnist-fanin-no-bound-check-20260910/reference/one-trace-0.25/snapshots",
+      "path": "workloads/data/mnist/sparse/one-trace-0.25",
+      "manifest.json_sha256": "988a4fb86db4dd174d0e2c9d07d1f16a95e349b5ecb15a905f630f3689b76c69",
+      "files": 106,
+      "bytes": 45647236
+    },
+    "mnist-sparse-one-trace-0.5": {
+      "source": "copilot/tmp/mnist-fanin-no-bound-check-20260910/reference/one-trace-0.5/snapshots",
+      "path": "workloads/data/mnist/sparse/one-trace-0.5",
+      "manifest.json_sha256": "d846039a436f216fbaeba906992c4b2bee184e2245566ff3a391c80c704289f6",
+      "files": 106,
+      "bytes": 68410912
+    },
+    "mnist-sparse-two-trace-0.125": {
+      "source": "copilot/tmp/mnist-fanin-no-bound-check-20260910/reference/two-trace-0.125/snapshots",
+      "path": "workloads/data/mnist/sparse/two-trace-0.125",
+      "manifest.json_sha256": "d147276d0d0a747198b97c68b85b209ae6f1b835f4702413e8a62cbba51b12d6",
+      "files": 106,
+      "bytes": 32164770
+    },
+    "mnist-sparse-two-trace-0.25": {
+      "source": "copilot/tmp/mnist-fanin-no-bound-check-20260910/reference/two-trace-0.25/snapshots",
+      "path": "workloads/data/mnist/sparse/two-trace-0.25",
+      "manifest.json_sha256": "850053f192cc24fd80591f7efb7ef4f972358222acbbd29e53a2f9b6ce4653e7",
+      "files": 106,
+      "bytes": 46308655
+    },
+    "mnist-sparse-two-trace-0.5": {
+      "source": "copilot/tmp/mnist-fanin-no-bound-check-20260910/reference/two-trace-0.5/snapshots",
+      "path": "workloads/data/mnist/sparse/two-trace-0.5",
+      "manifest.json_sha256": "fb7889613985b1f89e3805cfea270ad2d841dca67357a2d79fb6ef38c3d4ab26",
+      "files": 106,
+      "bytes": 69492721
+    },
+    "mnist-sparse-three-trace-0.125": {
+      "source": "copilot/tmp/mnist-fanin-no-bound-check-20260910/reference/three-trace-0.125/snapshots",
+      "path": "workloads/data/mnist/sparse/three-trace-0.125",
+      "manifest.json_sha256": "4ad15d3b46c5d2920d557fde5e26f1a355fed8440222adb4f4272261ffd289a1",
+      "files": 106,
+      "bytes": 38669686
+    },
+    "mnist-sparse-three-trace-0.25": {
+      "source": "copilot/tmp/mnist-fanin-no-bound-check-20260910/reference/three-trace-0.25/snapshots",
+      "path": "workloads/data/mnist/sparse/three-trace-0.25",
+      "manifest.json_sha256": "00272840d273565bef37fed59c270ae491ac420713402dce9696e900bdc94228",
+      "files": 106,
+      "bytes": 57159258
+    },
+    "mnist-sparse-three-trace-0.5": {
+      "source": "copilot/tmp/mnist-fanin-no-bound-check-20260910/reference/three-trace-0.5/snapshots",
+      "path": "workloads/data/mnist/sparse/three-trace-0.5",
+      "manifest.json_sha256": "fdf7da84251ecf208c137e62117c42b8f5ea33f262345a49894e961f8625f603",
+      "files": 106,
+      "bytes": 87953692
+    },
+    "brunel-additive": {
+      "source": "copilot/tmp/brunel-settled-20260927/additive-settled-checkpoint.npz",
+      "path": "workloads/data/brunel/additive-settled-checkpoint.npz",
+      "sha256": "7cee2f6308035ef8ed18ba6e2fa48489a3dbff1ba6a7a741c4868c8eb6e609a0",
+      "files": 1,
+      "bytes": 56315092
+    },
+    "brunel-morrison": {
+      "source": "copilot/tmp/brunel-settled-20260927/morrison-settled-checkpoint.npz",
+      "path": "workloads/data/brunel/morrison-settled-checkpoint.npz",
+      "sha256": "e04d0e1a16dffd7d40786cc148c09499343e620e7b89e2ebf3253ffd7f015f02",
+      "files": 1,
+      "bytes": 60336721
+    },
+    "morrison-native": {
+      "source": "copilot/tmp/morrison-native-20260929-v1/checkpoint",
+      "path": "workloads/data/morrison/native",
+      "files": 42,
+      "bytes": 29374035978
+    },
+    "morrison-abi3": {
+      "source": "copilot/tmp/morrison-ready-fast-20261006/target-images",
+      "path": "workloads/data/morrison/abi3",
+      "manifest.json_sha256": "dbea1537a06fd331f1f768766aec8d5b26695d6e19fa91b3d7a47f7b157b457a",
+      "files": 30,
+      "bytes": 30051487372
+    },
+    "morrison-reduced-later": {
+      "source": "copilot/tmp/morrison-checkpoint-750000-20261013/reduced",
+      "path": "workloads/data/morrison/reduced-later",
+      "import.json_sha256": "70ac9eada776c3df376498683a183a998fe18c11d6998ca85eb1b908f8122752",
+      "files": 36,
+      "bytes": 3272475498
+    },
+    "morrison-native-fixture": {
+      "source": "copilot/tmp/morrison-native-20260929-v1/native-artifacts-v1/native",
+      "path": "workloads/data/fixtures/morrison-native",
+      "files": 43,
+      "bytes": 2654049
+    },
+    "morrison-reduced-fixture": {
+      "source": "copilot/tmp/morrison-checkpoint-750000-20261013/fixture-reduced",
+      "path": "workloads/data/fixtures/morrison-reduced",
+      "import.json_sha256": "e3af02aed00d477a128d876c4ed5809f9d8f33ff7beb7d6ad932a2a55c5c0c11",
+      "files": 36,
+      "bytes": 323430
+    },
+    "morrison-worker-canonical-fixture": {
+      "source": "copilot/tmp/morrison-scheduling-controls-20261012/functional-chunks-smt1/canonical",
+      "path": "workloads/data/fixtures/morrison-worker/canonical",
+      "manifest.json_sha256": "fbfe04995887d1e68e5cf8e03fbd14428aab3806abfb44abf583cdb5e0ff2e50",
+      "files": 5,
+      "bytes": 3172655
+    },
+    "morrison-worker-expected-fixture": {
+      "source": "copilot/tmp/morrison-scheduling-controls-20261012/functional-chunks-smt1/images",
+      "path": "workloads/data/fixtures/morrison-worker/expected",
+      "manifest.json_sha256": "e6bad162637f3775914af8ad9ae16a70a5ba3992d6a48ecac6f6a65b33c95012",
+      "files": 5,
+      "bytes": 3303902
+    },
+    "morrison-worker-payload-fixture": {
+      "source": "copilot/tmp/morrison-scheduling-controls-20261012/functional-chunks-smt1/morrison_bulk_worker_scheduled_smt1.bin",
+      "path": "workloads/data/fixtures/morrison-worker/payload.bin",
+      "sha256": "c0df21626f61674a82d0b6bb5aa4f5a012056535652a4cc237b699e0c95c15b4",
+      "files": 1,
+      "bytes": 7920
+    },
+    "bolt-snn-0": {
+      "source": "copilot/tmp/snn_shuffle/dram.0",
+      "path": "workloads/data/fixtures/snn_shuffle/dram.0",
+      "sha256": "f99d64e0d34908c0f15d2a392094d45a440468451ac7631b5197f7f0ac991f58",
+      "files": 1,
+      "bytes": 1388055460
+    },
+    "bolt-snn-1": {
+      "source": "copilot/tmp/snn_shuffle/dram.1",
+      "path": "workloads/data/fixtures/snn_shuffle/dram.1",
+      "sha256": "2bc10c8477887f126c27622c80f66bd12663a83e355c0c4b11ded8c8b9c2a55b",
+      "files": 1,
+      "bytes": 1387016016
+    },
+    "mnist-dense-frozen-payloads": {
+      "source": "copilot/tmp/mnist-dense-consolidated-20260909/payloads",
+      "path": "workloads/data/reference/mnist-dense-payloads",
+      "files": 12,
+      "bytes": 171488
+    },
+    "mnist-sparse-frozen": {
+      "source": "copilot/tmp/mnist-sparse-setup-20260913/setup/frozen",
+      "path": "workloads/data/reference/mnist-sparse",
+      "files": 43,
+      "bytes": 2887943
+    }
+  },
+  "external": [
+    {
+      "host": "CRAFT-A100",
+      "path": "/data/meow/ActiveN-stdp/brunel-hbm-full-20260928-v1/",
+      "contents": "large input/final memories and per-step snapshots"
+    },
+    {
+      "host": "CRAFT-A100",
+      "path": "/data/meow/baseline-rerun-20260928-v1/a100-full-morrison-r2/full-morrison/diagnostic/checkpoint-step-750000",
+      "contents": "full native later checkpoint; only reduced state is retained locally"
+    }
+  ]
+}

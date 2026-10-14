@@ -46,9 +46,9 @@ class Numerics(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         root = Path(__file__).resolve().parents[1]
-        (root / "copilot/tmp").mkdir(parents=True, exist_ok=True)
+        (root / "work/agent").mkdir(parents=True, exist_ok=True)
         cls.temp = tempfile.TemporaryDirectory(
-            prefix="brunel-numeric-", dir=root / "copilot/tmp"
+            prefix="brunel-numeric-", dir=root / "work/agent"
         )
         directory = Path(cls.temp.name)
         source = directory / "numeric.c"

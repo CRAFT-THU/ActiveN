@@ -6,13 +6,27 @@ exists below a directory.
 ## Mandatory interaction and Git rules
 
 These rules take priority over convenience, speed, and historical instructions
-under `copilot/`.
+under `copilot/` or `archive/`.
 
-1. **Never modify Git history.** Do not create, amend, delete, squash, rebase,
-   reset, or otherwise rewrite commits. Do not create, delete, or move branches
-   or tags, and do not force-push. Read-only Git operations such as `status`,
-   `diff`, `show`, `log`, `blame`, and inspecting old commits are allowed. Leave
-   repository changes for the user to review and commit.
+1. **Never modify Git history, the index, or the staging area.** Do not create,
+   amend, delete, squash, rebase, reset, or otherwise rewrite commits. Do not
+   create, delete, or move branches or tags, and do not force-push.
+   **Staging means the user has finished reviewing that content.** Preserve
+   staged content exactly as the user left it. Every agent edit must remain a
+   working-tree change for the user to review and stage, including edits to
+   files that already have staged changes.
+   Never stage, unstage, restage, refresh, repair, or replace the index. This
+   includes `git add`, `git rm`, `git mv`, `git reset`, `git update-index`,
+   `git restore --staged`, and `git apply --cached`/`--index`, as well as Git
+   libraries, alternate-index publication, or direct writes/renames to Git index
+   or lock files. Do not use another mechanism to bypass this prohibition.
+   There is no exception for uncommitted changes, cleanup, correcting an earlier
+   mistake, or keeping a staged build consistent. Implementation approval does
+   not authorize staging; the user controls review, staging, and commits.
+   Only read-only Git operations such as `status`, `diff`, `show`, `log`,
+   `blame`, and inspecting old commits are permitted. Use
+   `git --no-optional-locks ...` for inspection to avoid incidental index
+   refreshes. Leave all repository changes for the user to review and commit.
 2. **Never begin implementation without explicit user consent.** First perform
    read-only investigation, form a concrete plan, discuss it with the user, and
    wait for the user to explicitly approve carrying out that plan. An initial
@@ -32,13 +46,13 @@ under `copilot/`.
    before presenting a final summary, and before modifying any document.
    Review supplements explicit user approval; it never replaces it.
 5. **Use realistic benchmark defaults and separately approve exceptions.**
-   Follow the benchmark contract under "Building simulators". Approval of an
+   Follow [doc/sim.md](doc/sim.md) and the benchmark contract below. Approval of an
    implementation plan does not approve deviations from benchmark defaults.
 
 ### Independent review procedure
 
 - Write the exact pending plan, summary, or proposed document update to a
-  temporary file under `copilot/tmp/` before its review. For documentation,
+  temporary file under `work/agent/` before its review. For documentation,
   include the proposed diff and sufficient surrounding text. Include the
   task requirements, scope, assumptions, relevant source/configuration paths,
   and unresolved questions so the review is self-contained.
@@ -89,7 +103,7 @@ under `copilot/`.
 - The reviewer inspects source and evidence without modifying project files,
   running tests/benchmarks, or spawning further reviewers. Read-only analysis
   of existing artifacts is permitted, with temporary analysis scripts and
-  outputs kept under `copilot/tmp/`; this does not authorize rerunning the
+  outputs kept under `work/agent/`; this does not authorize rerunning the
   workload or test. It may also write its review report there. These temporary
   analysis artifacts, review packets, and reviewer reports are
   temporary process artifacts: creating or revising them is permitted before
@@ -128,18 +142,37 @@ under `copilot/`.
   requires a vendor modification.
 - `generated/` contains elaborated SystemVerilog and configuration JSON. Never
   hand-edit generated files; change Chisel and regenerate them.
-- `sim/build/`, `datagen/target/`, `work/`, and most of `copilot/tmp/` are build
-  or experiment artifacts, not source of truth.
+- `sim/build/`, `datagen/target/` and `work/` are build or experiment artifacts.
+  `archive/tmp/` preserves historical
+  experiments and `workloads/data/` holds immutable retained inputs; neither
+  supplies current implementation source.
+- Workload-cleanup scope is the `mnist` branch's workload additions. Compare
+  candidate paths with `next` before removing or reorganizing them. Preserve
+  existing integration tests, scripts and shared build rules already present
+  in `next`; age, naming or old CLI syntax is not permission to archive them.
+  Explicitly requested documentation/path updates remain allowed. Restore the
+  pre-cleanup `mnist` version when undoing a mistaken removal; do not overwrite
+  branch-specific changes with the contents of `next`.
 - The worktree may already be dirty. Start with `git status --short`, inspect
   relevant diffs, preserve user changes, and never revert unrelated work.
-- Put traces, logs, temporary scripts, generated debug data, and other
-  intermediate artifacts in `copilot/tmp/`. Artifacts with established
-  destinations stay there: generated RTL in `generated/`, payload binaries next
-  to payload sources, simulator binaries in `sim/build/`, and Rust outputs in
-  `datagen/target/`.
-- Historical notes under `copilot/` are useful research material, but many files
-  describe obsolete executables, environment variables, build targets, or old
-  task instructions. Cross-check every historical claim against current source.
+- Put new traces, logs, temporary scripts, generated debug data, and other
+  intermediate artifacts in `work/`; use `work/agent/` for review packets and
+  agent process artifacts. New benchmark runs/reports belong in
+  `benchmark/rundir/` and `benchmark/report/`; preserved benchmark simulators
+  and workloads belong in `benchmark/simulator/` and `benchmark/workload/`.
+  Follow [doc/sim.md](doc/sim.md) for clean builds, identity and retention.
+  Keep all existing `sim/build/` contents intact until historical results are
+  reproduced or superseded; use fresh directories under `work/` meanwhile.
+  Generated RTL, payload build outputs and Rust outputs retain their established
+  development locations; they are not substitutes for preserved benchmark inputs.
+- Historical notes under `archive/` and remaining local `copilot/` notes are
+  research material; they may describe obsolete commands or instructions.
+  Cross-check claims against current source. `archive/README.md` records moves,
+  extracted tools, retained input locations and unresolved external dependencies.
+- Treat `workloads/data/` as immutable input. Large files may be hard-linked to
+  archive originals to avoid duplicating storage; never overwrite them in place.
+  Generate functional scratch images in a fresh `work/` directory; place
+  benchmark run data under `benchmark/rundir/`.
 
 ## Project overview
 
@@ -176,7 +209,9 @@ generated JSON before building or running a system simulator.
 | `ActiveN/src/main/scala/koneko/exec/` | Execute, LSU, SPM, register file, multiply, AMO, and FPU |
 | `ActiveN/src/main/scala/koneko/bus/` | Router, flits, arbiters, encoder, crossbar, MemIf, and distributor |
 | `doc/` | Intended memory, message, deadlock, and SNN formats |
-| `doc/workloads.md` | Selected workloads, retained results, integration status, and artifact dependencies before archive migration |
+| `doc/workloads.md` | Selected workloads, historical results, integration status and retained evidence |
+| `doc/sim.md` | Authoritative simulator, benchmark, build-identity and artifact-retention policy |
+| `doc/sim-retained.md` | Existing simulator builds protected until historical results are reproduced or superseded |
 | `sim/src/single.cpp` | Single-core simulator |
 | `sim/src/system.cpp`, `system.h` | Shared system frontend, memory model, CLI, and backend contract |
 | `sim/src/soft_backend.*` | Software NoC backend driver and topology |
@@ -191,6 +226,9 @@ generated JSON before building or running a system simulator.
 
 ## Sources of truth
 
+- Use [doc/sim.md](doc/sim.md) for new simulation/benchmark procedures. Its
+  policy supersedes conflicting historical defaults in workload notes. Preserve
+  original parameters when describing historical results.
 - Use `doc/` and direct user clarification for architectural intent. Some RTL
   may be buggy and therefore may not express the intended design.
 - Use current Scala/C++/Rust source for current implementation behavior.
@@ -356,19 +394,12 @@ for agent workflows.
 
 ## Building simulators
 
-For the existing configured build tree:
-
-```sh
-nix develop --command bash -c \
-  "cd /root/workspace/ActiveN && ninja -C sim/build -j\$(nproc)"
-```
-
-For a fresh build tree:
-
-```sh
-nix develop --command bash -c \
-  "cd /root/workspace/ActiveN && cmake -S sim -B sim/build -G Ninja && ninja -C sim/build -j\$(nproc)"
-```
+[doc/sim.md](doc/sim.md) is the authoritative procedure for simulation modes,
+benchmark settings, clean-source builds, binary naming and retention. Preserve
+the existing `sim/build/` tree during result reproduction; it contains historical
+artifacts identified in [doc/sim-retained.md](doc/sim-retained.md). Use a fresh
+build/output directory for new work. Do not copy historical build commands
+unchanged when their parameters conflict with the current procedure.
 
 Important build details:
 
@@ -384,51 +415,107 @@ Important build details:
   `generated/core/`, so hard and soft cores use the same parameters.
 - The system-level simulator can be built with the full hard backend enabled
   or disabled using CMake's `-DENABLE_HARD_BACKEND=ON|OFF` switch. Disabling
-  it skips elaboration and linking of the Verilated full `System` model; the
+  it skips Verilation and linking of the full `System` model; the
   resulting `sim_system` binary supports `--soft` and rejects `--hard`.
 - CMake reads `generated/system/System.config.json`. Re-run CMake when PU/MC
   counts or other configuration values change; an incremental Ninja build is
   normally enough for RTL changes at the same configuration.
 - BOLT is enabled by default. Its system profiling command expects generated
-  SNN images under `copilot/tmp/snn_shuffle/`. For an ordinary fresh debug build
-  where post-link optimization is irrelevant, configure with
-  `-DUSE_BOLT=OFF`.
+  SNN images under `workloads/data/fixtures/snn_shuffle/`.
+  `-DBOLT_SYSTEM_IMAGE_DIR=<path>` selects another generated image directory;
+  the fresh-image example below writes `work/snn_shuffle/`. Keep `USE_BOLT=ON`
+  as required by `doc/sim.md`. The profile uses the selected system JSON shape
+  and exactly two default images; its shape must match that fixture. A soft-only
+  benchmark can later select 512/16 at runtime with the compiled Core geometry.
 - Build outputs are `sim/build/sim_single` and `sim/build/sim_system`.
 - The old standalone `sim_soft` and `sim_cosim` executables no longer exist.
   `sim_system --soft`, `--hard`, or both selects the backend mode.
 
-System-level regression tests generally use the 64-PU/2-MC configuration
-represented by the Scala system-test defaults and should run in `--soft --hard`
-cosimulation mode so that soft/hard request and timing alignment is checked.
-Workload benchmarks such as MNIST and Brunel target the 2x-HBM2-scale
-configuration with 512 PUs, 16 MCs, and a 256-bit external memory bus (32-byte
-memory lines). These workload simulators may be built with
-`-DENABLE_HARD_BACKEND=OFF`. Benchmark runs must use `--soft --soft-threads 8`
-without `--hard`; `--init-icache` is optional when a preloaded instruction cache
-represents the intended measurement. Record the preload choice and region;
-preloading does not replace workload warmup. Eight host threads are simulator
-parallelism, not the core's SMT pipe count. Hard/cosim validation remains
-required where specified below and is distinct from performance benchmarking.
+Use 64-PU/2-MC cosimulation without I-cache preload for system correctness.
+New benchmarks use the soft backend with eight host threads, 512 PUs/16 MCs,
+32-byte lines, 1.5 GHz core/NoC, the specified 1.6 GHz HBM2e memory target,
+I-cache preload and one warmup timestep. `doc/sim.md` owns these defaults and
+defines the intended procedure. The implementation notes below record current
+build/configuration gaps; the old HBM2 YAML must not silently stand in for the
+new target.
 
-**Every workload benchmark must enable Ramulator HBM2 timing**, including quick
-benchmarks. Pass `--ramulator-config sim/build/ramulator-hbm2-1ch.yaml` (or a
-hash-recorded copy of that configuration), specify the core frequency, verify
-the startup `Ramulator enabled` message and 32-byte transaction width, and
-retain per-MC memory statistics. `--soft` and `ENABLE_HARD_BACKEND=OFF` do not
-disable or replace Ramulator. Flat memory is only for explicitly labelled
-functional tests or diagnostic controls; never present it as target-memory
-benchmark performance.
+Brunel still imports the exact settled checkpoint per rule. Its measured
+lengths remain 1,000 steps (quick) and 10,000 steps (full); warmup now follows
+`doc/sim.md`. Retain passive E/I rates, update opportunities and weight moments
+for the same interval. The historical 60-step warmup remains part of historical
+result identity, not a new-run default. Keep payload diagnostics disabled.
 
-Brunel benchmarks start from the recorded settled GeNN checkpoint for each
-rule, retaining the exact graph and physical state. A **quick benchmark** has
-60 warmup plus **1,000 measured timesteps**; a **full benchmark** has 60 warmup
-plus **10,000 measured timesteps**. At 0.1 ms/timestep, these measure 100 ms and
-1,000 ms, respectively. Always collect macroscopic dynamics for the same
-measured interval: separate E/I firing rates, synapse-update opportunities and
-final weight mean/stddev, alongside phase and total cycles/timestep. Keep payload
-diagnostics disabled and use passive observations to avoid changing the timed
-instruction stream. Compare equal windows and starting states, especially when
-instruction scheduling or FP reordering changes the activity.
+### Current implementation notes
+
+These are implementation qualifications to [doc/sim.md](doc/sim.md), checked
+2026-10-15; they do not change the user's intended procedure.
+
+- `ENABLE_HARD_BACKEND=OFF` already builds the system executable with only the
+  Verilated Core and C++ system models. It omits the Verilated System backend.
+  However, CMake still unconditionally requires `System.config.json`, generates
+  system headers from it, and uses `GENERATED_SYSTEM_DIR/filelist.f` for the
+  soft Core. `GENERATED_CORE_DIR` is used by `sim_single`. A core-only Mill
+  export emits `Core.config.json`, not `System.config.json`; there is currently
+  no exposed mode consuming only that export for `sim_system`. The intended
+  independent core-elaboration path still needs build-system support. Do not
+  confuse avoiding System Verilation with avoiding system-elaboration inputs.
+- Soft PU/MC counts are selected at runtime for supported mesh/cluster shapes;
+  memory width, SMT count, SPM and cache geometry remain compiled properties.
+  `bus/Encoder.scala` also compiles scalar global-address routing from
+  `CoreParameters.memCtrlSizes`; runtime `--mc`/`--mc-size` changes do not
+  rewrite that map. Reuse across 64/2 profiling and 512/16 benchmarking requires
+  a compatible compiled address map/capacities over the addresses used, as well
+  as matching Core geometry and image format. In particular, do not assume a
+  default 4-GiB map can serve a 1-GiB-per-MC run merely because the CLI accepts
+  the new size. Runtime topology/capacity changes need this compatibility check.
+- BOLT profiles the instrumented version of the same executable. Its PU/MC/size
+  arguments currently come from the chosen system JSON, not a fixed 64/2
+  setting. The default fixture supplies two images. Select a matching 64/2
+  profiling geometry and compatible image/Core parameters; 512/16 arguments
+  with two images are invalid. Verify usable profiling data before publishing
+  a BOLT build; the current profile shell command tolerates a nonzero exit.
+  BOLT training is a host-optimization step, not a benchmark measurement.
+- The existing `hbm2-1ch.py` uses `HBM2_2000Mbps`, `tCK = 1 ns`. The pinned
+  Ramulator HBM2 presets cover 1600/2000/2400 Mbps, not 3200 Mbps. The new
+  1.6 GHz HBM2e memory-clock target means `tCK = 0.625 ns` and 3.2 Gbit/s
+  per data pin. A complete validated timing/organization configuration is
+  needed before compliant new benchmarks; merely changing the old clock or
+  relabelling the YAML is insufficient. Keep exact capacities, configuration
+  hashes and per-MC statistics with each run.
+- Enabling cosim checks the implemented comparison observables for that run;
+  it is not proof that every hardware/software behavior is aligned. Report
+  known divergence and require the explicit experimental authorization in
+  `doc/sim.md`; retain core-interface/ISA compatibility.
+
+### Preserved benchmark artifacts
+
+Follow `doc/sim.md` for clean committed inputs, fresh elaboration/builds,
+`benchmark/simulator/sim_<source-commit>` retention, workload binaries under
+`benchmark/workload/`, runtime directories and reports. Check all relevant
+source/build inputs, including untracked files and submodule changes. Record
+both the complete checkout commit and the last relevant source commit, plus
+configuration, toolchain, compiler options, BOLT inputs/logs, runtime libraries
+and executable SHA-256. Reports must identify the exact preserved executable.
+Reuse an already preserved binary when its source/configuration identity matches
+the intended run. Rebuild in a fresh directory when relevant sources change
+or a different compiled configuration is needed. After preserving the binary
+and its required provenance, the newly created temporary build directory may
+be removed; this does not lift the retention hold on existing `sim/build/`.
+
+A commit alone does not identify different compiled configurations. Never
+replace a different binary at an existing commit-named path: retain an added
+configuration/build suffix and manifest. Workload identities also include their
+rule/profile and generator/input/checkpoint hashes. Keep sidecar provenance
+with the artifacts and include the identifying records in benchmark reports.
+
+The new clock/memory/warmup policy supersedes old measurement conventions.
+Historical MNIST/Brunel/Morrison figures are outdated for the new target, though
+they remain useful implementation references. MNIST used flat memory and four
+warmup steps; Brunel used 1 GHz/HBM2 and 60 warmup steps; selected Morrison
+pilots used 1 GHz/HBM2 and zero warmup. Preserve those settings in historical
+records. A higher core clock changes time per cycle, not automatically cycles
+per timestep; the memory/core ratio and measured state also change. Do not
+convert old results to new measurements by assuming a uniform 1.5x speedup.
 
 ### Benchmark contract
 
@@ -444,12 +531,11 @@ instruction scheduling or FP reordering changes the activity.
   measurement interval; use `--ramulator-stats-timer-only` when it matches the
   verified workload interval. Keep required hard/cosim correctness checks as
   functional validation rather than benchmark performance claims.
-- Include workload-appropriate warmup timesteps before the measured interval,
-  even when instruction-cache preload is used. Declare warmup and measured
-  lengths and exact start/end conditions in advance. Use the Brunel lengths
-  and checkpoints above for Brunel; clarify unspecified workload requirements
-  with the user rather than guessing. Measure the complete declared interval,
-  including quiet and busy timesteps.
+- Use the one-step warmup required by `doc/sim.md`, even with cache preload.
+  Declare measured lengths and exact boundaries in advance. If a workload/test
+  contract conflicts with warmup, notify the user before running. Use the
+  retained measured lengths/checkpoints for Brunel; clarify unspecified lengths
+  for other workloads. Measure all declared quiet and busy timesteps.
 - Always use **average end-to-end simulated cycles per timestep** for benchmark
   performance comparisons. Here, **end-to-end means the workload's measured
   interval as delimited by the simulator timers, excluding warmup**. Compute
@@ -482,7 +568,7 @@ instruction scheduling or FP reordering changes the activity.
   explicit user approval **separate from plan approval**, before the run.
   State the reason, exact old/new values, affected cases, expected effect on
   realism/comparability, and how the departure ends. Use invocation-local
-  overrides or isolated temporary configurations under `copilot/tmp/`; do not
+  overrides or isolated configurations in the benchmark run directory; do not
   change persistent defaults to make an experiment convenient. Record the
   approval and overrides with the results, label diagnostic controls, and
   return to the documented defaults for subsequent runs. A failed or expensive
@@ -528,15 +614,18 @@ Rules:
 - Supply exactly one positional image per MC.
 - With `--hard`, `--pu`, `--mc`, and `--mc-size` must exactly match the
   compiled `System.config.json`.
-- Flat memory is the default, so a benchmark must explicitly select HBM2.
+- Flat memory is the default, so a benchmark must explicitly select its target
+  DRAM model.
   `--ramulator-config` enables timing in the shared frontend. CMake exports
   `sim/build/ramulator-hbm2-1ch.yaml` from `sim/ramulator-config/hbm2-1ch.py`
-  for the 32-byte-line workload target; the separate `ramulator.yaml` comes
+  for the historical 32-byte-line HBM2 target. It does not implement the new
+  HBM2e timing target in `doc/sim.md`. The separate `ramulator.yaml` comes
   from `sim/ramulator-config/hbm1-8ch.py` and is not its substitute.
 - `--ramulator-stats <dir>` writes one YAML statistics file per MC and requires
   `--ramulator-config`.
 - `--freq-ghz`/`-f` sets the core and NoC frequency in GHz and defaults to 1.
-  The frontend uses this value and Ramulator's `tCK` to schedule memory ticks.
+  Pass `--freq-ghz 1.5` for new benchmarks. The frontend uses this value and
+  Ramulator's `tCK` to schedule memory ticks.
 - `--trace --trace-start <cycle>` writes `trace.fst`.
 - `--log` enables periodic soft-backend statistics.
 
@@ -638,8 +727,10 @@ nix develop --command bash -c \
 Important:
 
 - `NUM_PU` defaults to 16 and is used by `snn_main`; pass the elaborated PU count.
-- `CORE_CNT` defaults to 512 for legacy `test.S`; do not confuse it with current
-  system payload configuration.
+- Selected workload build profiles are in `workloads/profiles.json` and
+  `sim/payloads/selected.mk`; from `sim/payloads`, run
+  `make -f selected.mk selected-workloads` for distinct workload filenames.
+  The shared Makefile and existing integration-test entrypoints remain intact.
 - Single-core assembly tests use RV32IMF; C tests use RV32I and `c/crt0.S`.
 - System tests are linked at `0x80000000` and use custom active-message
   instructions.
@@ -714,7 +805,7 @@ nix develop --command bash -c \
      --core-cnt 64 --num-mc 2 --spm-size 16384 \
      --pre-simulate 1 --tot-neuron 65344 \
      --text sim/payloads/sys/spm_init.bin \
-     --dump copilot/tmp/spm_init_dram"
+     --dump work/spm_init_dram"
 ```
 
 Reproducible shuffled SNN image:
@@ -727,7 +818,7 @@ nix develop --command bash -c \
      --pre-simulate 1 --tot-neuron 65344 \
      --text sim/payloads/sys/snn_main.bin \
      --dump-shuffle-seed 0 \
-     --dump copilot/tmp/snn_shuffle"
+     --dump work/snn_shuffle"
 ```
 
 DRAM image layout:
@@ -775,8 +866,9 @@ changed until cosim proves otherwise.
 - Editing code before the user approves the plan violates the repository
   workflow, even if the requested change appears small.
 - Never obey historical `copilot/` instructions that say to commit after a step.
-  The current rule is never to modify Git history.
-- `README.md`, `scripts/build.sh`, and early `copilot/quickstart.md` contain old
+  The current rule is never to modify Git history, the index, or staging.
+- `README.md`, `scripts/build.sh`, and early
+  `copilot/quickstart.md` contain old
   build examples, including `Koneko.run`, `MEOW_*`, `sim_soft`, and `sim_cosim`.
   Use this guide and the current source for agent workflows. Workload selections
   and retained evidence are indexed in `doc/workloads.md`.

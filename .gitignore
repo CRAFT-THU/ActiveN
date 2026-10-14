@@ -18,3 +18,11 @@
 /verification
 /filelist.f
 /fpga
+
+# Immutable local inputs and historical bulky artifacts (see archive/README.md).
+/workloads/data/
+/archive/tmp/
+/archive/workload/artifacts/
+**/__pycache__/
+
+/archive

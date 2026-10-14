@@ -202,8 +202,10 @@ set(BOLT_SINGLE_PAYLOAD ${CMAKE_SOURCE_DIR}/payloads/c/sha256_test.bin)
 # See AGENTS.md for the regeneration command. apply_bolt appends BOLT_PAYLOAD
 # at the end of the command, so BOLT_PAYLOAD = dram.1 and the extra args
 # below carry dram.0 to keep the MC0/MC1 ordering correct.
-set(BOLT_MULTI_DRAM0 ${CMAKE_SOURCE_DIR}/../copilot/tmp/snn_shuffle/dram.0)
-set(BOLT_MULTI_PAYLOAD ${CMAKE_SOURCE_DIR}/../copilot/tmp/snn_shuffle/dram.1)
+set(BOLT_SYSTEM_IMAGE_DIR "${CMAKE_SOURCE_DIR}/../workloads/data/fixtures/snn_shuffle" CACHE PATH
+    "Directory containing the two immutable SNN BOLT profiling images")
+set(BOLT_MULTI_DRAM0 ${BOLT_SYSTEM_IMAGE_DIR}/dram.0)
+set(BOLT_MULTI_PAYLOAD ${BOLT_SYSTEM_IMAGE_DIR}/dram.1)
 set(BOLT_SINGLE_CYCLES 5000000)
 set(BOLT_MULTI_CYCLES 500000)
 

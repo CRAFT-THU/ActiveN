@@ -1,0 +1,126 @@
+{
+  "format": "activen-selected-builds-v1",
+  "build_directory": "sim/payloads",
+  "profiles": {
+    "mnist_dense_one-trace": {
+      "target": "sys/mnist_dense_one-trace.bin",
+      "workload": "mnist-dense",
+      "rule": "one-trace",
+      "horizontal_partition": "full-8",
+      "input_pus": 288,
+      "neuron_pus": 224,
+      "asset": "mnist-dense-one-trace"
+    },
+    "mnist_sparse_one-trace_mode3": {
+      "target": "sys/mnist_sparse_one-trace_mode3.bin",
+      "workload": "mnist-sparse",
+      "rule": "one-trace",
+      "reverse_mode": 3
+    },
+    "mnist_sparse_one-trace_mode4": {
+      "target": "sys/mnist_sparse_one-trace_mode4.bin",
+      "workload": "mnist-sparse",
+      "rule": "one-trace",
+      "reverse_mode": 4
+    },
+    "mnist_dense_two-trace": {
+      "target": "sys/mnist_dense_two-trace.bin",
+      "workload": "mnist-dense",
+      "rule": "two-trace",
+      "horizontal_partition": "full-8",
+      "input_pus": 288,
+      "neuron_pus": 224,
+      "asset": "mnist-dense-two-trace"
+    },
+    "mnist_sparse_two-trace_mode3": {
+      "target": "sys/mnist_sparse_two-trace_mode3.bin",
+      "workload": "mnist-sparse",
+      "rule": "two-trace",
+      "reverse_mode": 3
+    },
+    "mnist_sparse_two-trace_mode4": {
+      "target": "sys/mnist_sparse_two-trace_mode4.bin",
+      "workload": "mnist-sparse",
+      "rule": "two-trace",
+      "reverse_mode": 4
+    },
+    "mnist_dense_three-trace": {
+      "target": "sys/mnist_dense_three-trace.bin",
+      "workload": "mnist-dense",
+      "rule": "three-trace",
+      "horizontal_partition": "full-8",
+      "input_pus": 288,
+      "neuron_pus": 224,
+      "asset": "mnist-dense-three-trace"
+    },
+    "mnist_sparse_three-trace_mode3": {
+      "target": "sys/mnist_sparse_three-trace_mode3.bin",
+      "workload": "mnist-sparse",
+      "rule": "three-trace",
+      "reverse_mode": 3
+    },
+    "mnist_sparse_three-trace_mode4": {
+      "target": "sys/mnist_sparse_three-trace_mode4.bin",
+      "workload": "mnist-sparse",
+      "rule": "three-trace",
+      "reverse_mode": 4
+    },
+    "brunel_additive": {
+      "target": "sys/brunel_additive_proxy_home_g4.bin",
+      "workload": "brunel",
+      "rule": "additive",
+      "proxy_groups": "consecutive",
+      "proxy_size": 4,
+      "proxy_updates": "home",
+      "asset": "brunel-additive"
+    },
+    "brunel_morrison": {
+      "target": "sys/brunel_morrison_proxy_home_g4.bin",
+      "workload": "brunel",
+      "rule": "morrison",
+      "proxy_groups": "consecutive",
+      "proxy_size": 4,
+      "proxy_updates": "home",
+      "asset": "brunel-morrison"
+    },
+    "morrison": {
+      "target": "sys/morrison_bulk_worker_scheduled_smt1.bin",
+      "workload": "morrison",
+      "abi": 4,
+      "placement_seed": "0x20261011",
+      "dispatch_width": 32,
+      "relay": "SMT1",
+      "updater": "both SMT pipes",
+      "assets": [
+        "morrison-abi3",
+        "morrison-reduced-later"
+      ]
+    }
+  },
+  "sparse_selection": {
+    "one-trace": {
+      "0.125": 3,
+      "0.25": 3,
+      "0.5": 3
+    },
+    "two-trace": {
+      "0.125": 3,
+      "0.25": 4,
+      "0.5": 4
+    },
+    "three-trace": {
+      "0.125": 3,
+      "0.25": 4,
+      "0.5": 4
+    }
+  },
+  "makefile": "selected.mk",
+  "build_command": [
+    "make",
+    "-C",
+    "sim/payloads",
+    "-f",
+    "selected.mk",
+    "selected-workloads"
+  ]
+}
