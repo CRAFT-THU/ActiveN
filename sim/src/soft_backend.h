@@ -181,7 +181,7 @@ class SoftSystemBackend : public SystemBackend {
     uint64_t cur_inflight_resp = 0;
 
     Stat operator-(const Stat &o) const;
-    void print(uint64_t cycles) const;
+    void print(uint64_t cycles, uint64_t numPUs) const;
     void printIcache(uint64_t cycles, uint64_t numPUs) const;
   };
 

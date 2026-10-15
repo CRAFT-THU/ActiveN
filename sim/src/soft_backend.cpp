@@ -248,7 +248,7 @@ SoftSystemBackend::Stat SoftSystemBackend::Stat::operator-(const Stat &o) const 
   return r;
 }
 
-void SoftSystemBackend::Stat::print(uint64_t cycles) const {
+void SoftSystemBackend::Stat::print(uint64_t cycles, uint64_t numPUs) const {
   auto avg = [cycles](uint64_t v) -> double {
     return cycles > 0 ? static_cast<double>(v) / cycles : 0.0;
   };
@@ -260,7 +260,7 @@ void SoftSystemBackend::Stat::print(uint64_t cycles) const {
   std::cerr << "  mem_requests:   " << total_mem_requests
             << " (avg " << avg(total_mem_requests) << "/cyc)\n";
   std::cerr << "  unicast_mem_requests: " << unicast_mem_requests << '\n';
-  printIcache(cycles, SYSTEM_NUM_PU);
+  printIcache(cycles, numPUs);
   std::cerr << "  idle_lanes:     " << idle_lane_cycles
             << " (avg " << avg(idle_lane_cycles) << "/cyc)\n";
   std::cerr << "  idle_cores:     " << idle_core_cycles
@@ -1751,7 +1751,7 @@ void SoftSystemBackend::step(uint64_t cycle) {
     uint64_t span = cycle - last_periodic_cycle_;
     std::cerr << "[Soft] Periodic stats (cycles " << last_periodic_cycle_
               << ".." << cycle << ", span=" << span << "):\n";
-    delta.print(span);
+    delta.print(span, cfg.numPU);
     last_periodic_ = stats_;
     last_periodic_cycle_ = cycle;
   }
@@ -2923,7 +2923,7 @@ bool SoftSystemBackend::printStats(uint64_t cycles, bool final_print) {
             "uncore=%.3fms (%.1f%%) total=%.3fms\n",
             (unsigned long)cycles,
             v_ms, pct(v_ms), u_ms, pct(u_ms), tot_ms);
-    stats_.print(cycles);
+    stats_.print(cycles, cfg.numPU);
     printWorkProfile();
     if (const char *path = std::getenv("SOFT_MNIST_SPARSE_DUMP")) {
       // Portable little-endian initialized-SPM dump for independent state

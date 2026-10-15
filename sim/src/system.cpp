@@ -15,7 +15,8 @@
  *   sim/src/soft_backend.cpp   Soft NoC backend implementation
  *   sim/src/single.cpp         Single-core simulation driver (sim_single)
  *   sim/src/devices.h          PeripheralDevice
- *   sim/gen_system_header.py   Generates hard_backend.h + system_config.h
+ *   sim/gen_core_header.py     Generates core_config.h from Core parameters
+ *   sim/gen_system_header.py   Generates hard_backend.h from System topology
  *
  * Usage:
  *   sim_system <image>... --soft|--hard [options]

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "system_config.h"
+#include "core_config.h"
 #include "icache_init.h"
 #include "verilated_fst_c.h"
 #include <bit>

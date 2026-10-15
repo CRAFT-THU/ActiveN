@@ -12,3 +12,5 @@
 !/tests/morrison_worker_check.py
 !/tests/soft_memif_merge.cpp
 !/tests/soft_noc_reservation.cpp
+!/tests/hbm2e_timing.cpp
+!/tests/test_bolt_optimize.py

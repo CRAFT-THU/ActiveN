@@ -25,7 +25,6 @@ object Main extends App {
   def systemConfigJson(p: SystemParameters): ujson.Value = ujson.Obj(
     "numMC" -> p.numMC,
     "numPU" -> p.numPU,
-    "core" -> coreConfigJson(p.coreParams),
   )
 
   def writeJson(filename: String, content: ujson.Value): Unit = {
@@ -157,6 +156,7 @@ object Main extends App {
     ))
     ChiselStage.emitSystemVerilogFile(new System, chiselArgs, firtoolArgs)
     writeJson(s"$outputUnwrapped/System.config.json", systemConfigJson(sysParam))
+    writeJson(s"$outputUnwrapped/Core.config.json", coreConfigJson(sysParam.coreParams))
   } else {
     ChiselStage.emitSystemVerilogFile(new Core()(param), chiselArgs, firtoolArgs)
     writeJson(s"$outputUnwrapped/Core.config.json", coreConfigJson(param))

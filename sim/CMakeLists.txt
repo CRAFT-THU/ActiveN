@@ -60,35 +60,27 @@ if(USE_BOLT)
 endif()
 
 # Apply BOLT instrumentation-based optimization as a post-build step.
-function(apply_bolt TARGET BOLT_PAYLOAD BOLT_MAX_CYCLES)
+function(apply_bolt TARGET CONFIGS BOLT_MAX_CYCLES)
   if(NOT USE_BOLT)
     return()
   endif()
-  # Extra positional args become BOLT_EXTRA_ARGS
-  set(BOLT_RUN_ARGS ${ARGN})
-  # Flatten the list for sh -c (avoid semicolon-separation when expanding).
-  string(REPLACE ";" " " BOLT_RUN_ARGS_STR "${BOLT_RUN_ARGS}")
-  set(FDATA "${CMAKE_BINARY_DIR}/${TARGET}.fdata")
+  # Keep argv structured, and retain each profiling attempt independently.
+  set(BOLT_HELPER ${CMAKE_SOURCE_DIR}/bolt_optimize.py)
+  set(BOLT_CONFIG_ARGS)
+  foreach(CONFIG IN LISTS CONFIGS)
+    list(APPEND BOLT_CONFIG_ARGS --input ${CONFIG})
+  endforeach()
+  set_property(TARGET ${TARGET} APPEND PROPERTY LINK_DEPENDS ${BOLT_HELPER})
   add_custom_command(TARGET ${TARGET} POST_BUILD
     COMMENT "BOLT: optimizing ${TARGET}"
-    # Instrument
-    COMMAND ${LLVM_BOLT} $<TARGET_FILE:${TARGET}>
-            --instrument --instrumentation-file=${FDATA}
-            -o $<TARGET_FILE:${TARGET}>.inst
-    # Profile (ignore non-zero exit from simulation timeout)
-    COMMAND sh -c "$<TARGET_FILE:${TARGET}>.inst --max-cycles ${BOLT_MAX_CYCLES} ${BOLT_RUN_ARGS_STR} ${BOLT_PAYLOAD} > /dev/null 2>&1 || true"
-    # Optimize
-    COMMAND ${LLVM_BOLT} $<TARGET_FILE:${TARGET}>
-            -o $<TARGET_FILE:${TARGET}>.bolted
-            -data=${FDATA}
-            -reorder-blocks=ext-tsp
-            -reorder-functions=hfsort
-            -split-functions
-            -split-all-cold
-    # Swap
-    COMMAND ${CMAKE_COMMAND} -E rename $<TARGET_FILE:${TARGET}>.bolted $<TARGET_FILE:${TARGET}>
-    # Cleanup
-    COMMAND ${CMAKE_COMMAND} -E rm -f $<TARGET_FILE:${TARGET}>.inst ${FDATA}
+    COMMAND ${Python3_EXECUTABLE} -B ${BOLT_HELPER}
+            --llvm-bolt ${LLVM_BOLT} --binary $<TARGET_FILE:${TARGET}>
+            --evidence-root ${CMAKE_BINARY_DIR}/bolt/${TARGET}
+            --kind ${TARGET} --max-cycles ${BOLT_MAX_CYCLES}
+            ${BOLT_CONFIG_ARGS}
+            --input ${CMAKE_BINARY_DIR}/CMakeCache.txt
+            --input ${CMAKE_SOURCE_DIR}/CMakeLists.txt
+            -- ${ARGN}
     VERBATIM
   )
 endfunction()
@@ -104,8 +96,10 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 set(RAMULATOR_CONFIG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/ramulator-config)
 set(RAMULATOR_CONFIG_PY ${RAMULATOR_CONFIG_DIR}/hbm1-8ch.py)
 set(RAMULATOR_CONFIG_HBM2_PY ${RAMULATOR_CONFIG_DIR}/hbm2-1ch.py)
+set(RAMULATOR_CONFIG_HBM2E_PY ${RAMULATOR_CONFIG_DIR}/hbm2e-1ch.py)
 set(RAMULATOR_CONFIG_YAML ${CMAKE_CURRENT_BINARY_DIR}/ramulator.yaml)
 set(RAMULATOR_CONFIG_HBM2_YAML ${CMAKE_CURRENT_BINARY_DIR}/ramulator-hbm2-1ch.yaml)
+set(RAMULATOR_CONFIG_HBM2E_YAML ${CMAKE_CURRENT_BINARY_DIR}/ramulator-hbm2e-1ch.yaml)
 add_custom_command(
     OUTPUT ${RAMULATOR_CONFIG_YAML}
     COMMAND ${Python3_EXECUTABLE} -m ramulator export
@@ -122,9 +116,26 @@ add_custom_command(
     COMMENT "Exporting one-channel HBM2 Ramulator configuration"
     VERBATIM
 )
+add_custom_command(
+    OUTPUT ${RAMULATOR_CONFIG_HBM2E_YAML}
+    COMMAND ${Python3_EXECUTABLE} -B -m ramulator export
+            ${RAMULATOR_CONFIG_HBM2E_PY} -o ${RAMULATOR_CONFIG_HBM2E_YAML}
+    DEPENDS ${RAMULATOR_CONFIG_HBM2E_PY}
+    COMMENT "Exporting the 1.6-GHz HBM2-derived extension configuration"
+    VERBATIM
+)
 add_custom_target(gen_ramulator_config DEPENDS
     ${RAMULATOR_CONFIG_YAML}
     ${RAMULATOR_CONFIG_HBM2_YAML}
+    ${RAMULATOR_CONFIG_HBM2E_YAML}
+)
+
+add_executable(test_hbm2e_timing EXCLUDE_FROM_ALL tests/hbm2e_timing.cpp)
+target_link_libraries(test_hbm2e_timing PRIVATE Ramulator::ramulator)
+add_custom_target(check_hbm2e_timing
+    COMMAND $<TARGET_FILE:test_hbm2e_timing> ${RAMULATOR_CONFIG_HBM2E_YAML}
+    DEPENDS test_hbm2e_timing gen_ramulator_config
+    VERBATIM
 )
 
 # ---------------------------------------------------------------------------
@@ -156,7 +167,7 @@ else()
 endif()
 
 # Generated RTL directories
-set(GENERATED_CORE_DIR ${CMAKE_SOURCE_DIR}/../generated/core CACHE PATH "Single-core RTL directory")
+set(GENERATED_CORE_DIR ${CMAKE_SOURCE_DIR}/../generated/core CACHE PATH "Core RTL directory for sim_single and soft-only sim_system")
 set(GENERATED_SYSTEM_DIR ${CMAKE_SOURCE_DIR}/../generated/system CACHE PATH "System RTL directory")
 
 set(CORE_CONFIG_JSON ${GENERATED_CORE_DIR}/Core.config.json)
@@ -165,6 +176,37 @@ if(NOT EXISTS ${CORE_CONFIG_JSON})
 endif()
 file(READ ${CORE_CONFIG_JSON} CORE_CONFIG_CONTENT)
 string(JSON CORE_MEM_BUS_WIDTH GET ${CORE_CONFIG_CONTENT} "memBusWidth")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CORE_CONFIG_JSON})
+
+# A cosim build takes both backend cores from the same System elaboration.
+# A soft-only build needs only the selected Core export.
+if(ENABLE_HARD_BACKEND)
+  set(SYSTEM_CONFIG_JSON ${GENERATED_SYSTEM_DIR}/System.config.json)
+  if(NOT EXISTS ${SYSTEM_CONFIG_JSON})
+    message(FATAL_ERROR "System.config.json not found at ${SYSTEM_CONFIG_JSON}. Run system elaboration first.")
+  endif()
+  file(READ ${SYSTEM_CONFIG_JSON} SYSTEM_CONFIG_CONTENT)
+  string(JSON SYSTEM_NUM_PU GET ${SYSTEM_CONFIG_CONTENT} "numPU")
+  string(JSON SYSTEM_NUM_MC GET ${SYSTEM_CONFIG_CONTENT} "numMC")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${SYSTEM_CONFIG_JSON})
+  set(SYSTEM_CORE_DIR ${GENERATED_SYSTEM_DIR})
+else()
+  set(SYSTEM_CORE_DIR ${GENERATED_CORE_DIR})
+endif()
+set(SYSTEM_CORE_CONFIG_JSON ${SYSTEM_CORE_DIR}/Core.config.json)
+if(NOT EXISTS ${SYSTEM_CORE_CONFIG_JSON})
+  message(FATAL_ERROR "Core.config.json not found at ${SYSTEM_CORE_CONFIG_JSON}. Regenerate the selected RTL export.")
+endif()
+file(READ ${SYSTEM_CORE_CONFIG_JSON} SYSTEM_CORE_CONFIG)
+string(JSON SYSTEM_CORE_MC_COUNT LENGTH ${SYSTEM_CORE_CONFIG} "memCtrlSizes")
+if(SYSTEM_CORE_MC_COUNT LESS 1)
+  message(FATAL_ERROR "Core.config.json must provide at least one MC capacity")
+endif()
+string(JSON SYSTEM_MC_SIZE_0 GET ${SYSTEM_CORE_CONFIG} "memCtrlSizes" 0)
+if(ENABLE_HARD_BACKEND AND NOT SYSTEM_CORE_MC_COUNT EQUAL SYSTEM_NUM_MC)
+  message(FATAL_ERROR "Core.config.json memCtrlSizes count must match System.config.json numMC")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${SYSTEM_CORE_CONFIG_JSON})
 
 # Geometry is taken from the same elaboration as each Verilated model.
 function(icache_dpi_args OUT CONFIG)
@@ -175,6 +217,7 @@ function(icache_dpi_args OUT CONFIG)
              -DAN_ICACHE_ASSOC=${ASSOC} PARENT_SCOPE)
 endfunction()
 icache_dpi_args(CORE_ICACHE_ARGS "${CORE_CONFIG_CONTENT}")
+icache_dpi_args(SYSTEM_ICACHE_ARGS "${SYSTEM_CORE_CONFIG}")
 set(ICACHE_DPI_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/icache_dpi.sv)
 
 # cvfpu source files
@@ -198,14 +241,9 @@ set(CVFPU_SOURCES
 
 # BOLT profiling payloads
 set(BOLT_SINGLE_PAYLOAD ${CMAKE_SOURCE_DIR}/payloads/c/sha256_test.bin)
-# SNN cosim workload: two distinct DRAM images generated by datagen.
-# See AGENTS.md for the regeneration command. apply_bolt appends BOLT_PAYLOAD
-# at the end of the command, so BOLT_PAYLOAD = dram.1 and the extra args
-# below carry dram.0 to keep the MC0/MC1 ordering correct.
+# SNN workload: one compatible DRAM image per profiling MC.
 set(BOLT_SYSTEM_IMAGE_DIR "${CMAKE_SOURCE_DIR}/../workloads/data/fixtures/snn_shuffle" CACHE PATH
-    "Directory containing the two immutable SNN BOLT profiling images")
-set(BOLT_MULTI_DRAM0 ${BOLT_SYSTEM_IMAGE_DIR}/dram.0)
-set(BOLT_MULTI_PAYLOAD ${BOLT_SYSTEM_IMAGE_DIR}/dram.1)
+    "Directory containing compatible SNN BOLT profiling images")
 set(BOLT_SINGLE_CYCLES 5000000)
 set(BOLT_MULTI_CYCLES 500000)
 
@@ -261,41 +299,36 @@ verilate(
     INCLUDE_DIRS ${GENERATED_CORE_DIR}
     VERILATOR_ARGS "-f" "${GENERATED_CORE_DIR}/filelist.f" ${VERILATOR_CORE_ARGS} ${CORE_ICACHE_ARGS}
 )
-apply_bolt(sim_single ${BOLT_SINGLE_PAYLOAD} ${BOLT_SINGLE_CYCLES})
+apply_bolt(sim_single ${CORE_CONFIG_JSON} ${BOLT_SINGLE_CYCLES} ${BOLT_SINGLE_PAYLOAD})
 
-# System-level simulation driver (multicore + NoC)
-# Read config from System.config.json (generated by Mill/Chisel elaboration)
-set(SYSTEM_CONFIG_JSON ${GENERATED_SYSTEM_DIR}/System.config.json)
-if(NOT EXISTS ${SYSTEM_CONFIG_JSON})
-  message(FATAL_ERROR "System.config.json not found at ${SYSTEM_CONFIG_JSON}. Run Mill elaboration first.")
-endif()
-
-# Read numPU, numMC, and per-MC size from JSON for gen_system_header.py,
-# Verilator, and for passing into sim_system's now-required CLI args (used by
-# BOLT profiling below).
-file(READ ${SYSTEM_CONFIG_JSON} SYSTEM_CONFIG_CONTENT)
-string(JSON SYSTEM_NUM_PU GET ${SYSTEM_CONFIG_CONTENT} "numPU")
-string(JSON SYSTEM_NUM_MC GET ${SYSTEM_CONFIG_CONTENT} "numMC")
-string(JSON SYSTEM_MC_SIZE_0 GET ${SYSTEM_CONFIG_CONTENT} "core" "memCtrlSizes" 0)
-string(JSON SYSTEM_CORE_CONFIG GET ${SYSTEM_CONFIG_CONTENT} "core")
-icache_dpi_args(SYSTEM_ICACHE_ARGS "${SYSTEM_CORE_CONFIG}")
-
+# Shared Core geometry has no fixed runtime PU/MC topology.
 add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/system_config.h
-           ${CMAKE_CURRENT_BINARY_DIR}/hard_backend.h
-    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/gen_system_header.py
-            ${SYSTEM_CONFIG_JSON} ${CMAKE_CURRENT_BINARY_DIR}
-    DEPENDS ${SYSTEM_CONFIG_JSON}
-            ${CMAKE_CURRENT_SOURCE_DIR}/gen_system_header.py
-    COMMENT "Generating system_config.h and hard_backend.h from System.config.json"
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/core_config.h
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/gen_core_header.py
+            --config ${SYSTEM_CORE_CONFIG_JSON}
+            --output ${CMAKE_CURRENT_BINARY_DIR}/core_config.h
+    DEPENDS ${SYSTEM_CORE_CONFIG_JSON} ${CMAKE_CURRENT_SOURCE_DIR}/gen_core_header.py
+    COMMENT "Generating core_config.h from Core.config.json"
+    VERBATIM
 )
-add_custom_target(gen_system_headers DEPENDS
-    ${CMAKE_CURRENT_BINARY_DIR}/system_config.h
-    ${CMAKE_CURRENT_BINARY_DIR}/hard_backend.h
+add_custom_target(gen_core_header DEPENDS
+    ${CMAKE_CURRENT_BINARY_DIR}/core_config.h
 )
 
 # Hard backend: Verilated System RTL
 if(ENABLE_HARD_BACKEND)
+  add_custom_command(
+      OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/hard_backend.h
+      COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/gen_system_header.py
+              --config ${SYSTEM_CONFIG_JSON}
+              --output ${CMAKE_CURRENT_BINARY_DIR}/hard_backend.h
+      DEPENDS ${SYSTEM_CONFIG_JSON} ${CMAKE_CURRENT_SOURCE_DIR}/gen_system_header.py
+      COMMENT "Generating hard_backend.h from System.config.json"
+      VERBATIM
+  )
+  add_custom_target(gen_hard_backend_header DEPENDS
+      ${CMAKE_CURRENT_BINARY_DIR}/hard_backend.h
+  )
   file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/hard_backend_stub.cpp "// stub for verilator linkage\n")
   add_library(hard_backend_lib STATIC
       ${CMAKE_CURRENT_BINARY_DIR}/hard_backend_stub.cpp
@@ -312,7 +345,7 @@ if(ENABLE_HARD_BACKEND)
 endif()
 
 # Soft backend: many Core instances + C++ NoC model
-# Uses Core.sv from generated/system so config matches the hard backend exactly.
+# Uses the selected Core export, or the matching System export for cosim.
 add_library(soft_backend_lib STATIC
     src/soft_backend.cpp
 )
@@ -323,8 +356,8 @@ verilate(
     PREFIX soft_rtl
     TRACE_FST
     DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/soft_verilated
-    INCLUDE_DIRS ${GENERATED_SYSTEM_DIR}
-    VERILATOR_ARGS "-f" "${GENERATED_SYSTEM_DIR}/filelist.f" ${VERILATOR_CORE_ARGS} ${SYSTEM_ICACHE_ARGS}
+    INCLUDE_DIRS ${SYSTEM_CORE_DIR}
+    VERILATOR_ARGS "-f" "${SYSTEM_CORE_DIR}/filelist.f" ${VERILATOR_CORE_ARGS} ${SYSTEM_ICACHE_ARGS}
 )
 
 # Unified binary: sim_system --soft / --hard / --soft --hard (cosim)
@@ -333,8 +366,8 @@ add_executable(sim_system
   src/system.cpp
   src/devices.cpp
 )
-add_dependencies(sim_system gen_system_headers gen_bootrom gen_ramulator_config)
-add_dependencies(soft_backend_lib gen_system_headers)
+add_dependencies(sim_system gen_core_header gen_bootrom gen_ramulator_config)
+add_dependencies(soft_backend_lib gen_core_header)
 target_link_libraries(sim_system PRIVATE
   soft_backend_lib
   Ramulator::ramulator
@@ -345,19 +378,58 @@ target_compile_definitions(sim_system PRIVATE
 
 if(ENABLE_HARD_BACKEND)
   target_link_libraries(sim_system PRIVATE hard_backend_lib)
+  add_dependencies(sim_system gen_hard_backend_header)
 endif()
 
+# These values are derived from backend mode, not independent cache options.
+unset(BOLT_SYSTEM_NUM_PU CACHE)
+unset(BOLT_SYSTEM_NUM_MC CACHE)
+set(BOLT_SYSTEM_NUM_PU 64)
+set(BOLT_SYSTEM_NUM_MC 2)
+set(BOLT_SYSTEM_CONFIGS ${SYSTEM_CORE_CONFIG_JSON})
 if(ENABLE_HARD_BACKEND)
   set(BOLT_SYSTEM_BACKEND_ARGS "--soft" "--hard")
+  set(BOLT_SYSTEM_NUM_PU ${SYSTEM_NUM_PU})
+  set(BOLT_SYSTEM_NUM_MC ${SYSTEM_NUM_MC})
+  list(APPEND BOLT_SYSTEM_CONFIGS ${SYSTEM_CONFIG_JSON})
 else()
   set(BOLT_SYSTEM_BACKEND_ARGS "--soft")
 endif()
 
-apply_bolt(sim_system "${BOLT_MULTI_PAYLOAD}" "${BOLT_MULTI_CYCLES}"
+if(USE_BOLT)
+  if(NOT BOLT_SYSTEM_NUM_PU MATCHES "^[1-9][0-9]*$" OR
+     NOT BOLT_SYSTEM_NUM_MC MATCHES "^[1-9][0-9]*$")
+    message(FATAL_ERROR "BOLT training PU and MC counts must be positive integers")
+  endif()
+  math(EXPR BOLT_MC_CAPACITY "${SYSTEM_MC_SIZE_0}")
+  if(ENABLE_HARD_BACKEND)
+    math(EXPR CORE_LAST_MC "${SYSTEM_CORE_MC_COUNT} - 1")
+    foreach(MC RANGE ${CORE_LAST_MC})
+      string(JSON MC_CAPACITY GET ${SYSTEM_CORE_CONFIG} "memCtrlSizes" ${MC})
+      math(EXPR MC_CAPACITY "${MC_CAPACITY}")
+      if(NOT MC_CAPACITY EQUAL BOLT_MC_CAPACITY)
+        message(FATAL_ERROR "BOLT's --mc-size argument requires uniform hardware MC capacities")
+      endif()
+    endforeach()
+  endif()
+  math(EXPR BOLT_LAST_MC "${BOLT_SYSTEM_NUM_MC} - 1")
+  set(BOLT_SYSTEM_IMAGES)
+  foreach(MC RANGE ${BOLT_LAST_MC})
+    set(BOLT_IMAGE ${BOLT_SYSTEM_IMAGE_DIR}/dram.${MC})
+    if(NOT EXISTS ${BOLT_IMAGE})
+      message(FATAL_ERROR "Missing BOLT training image: ${BOLT_IMAGE}")
+    endif()
+    file(SIZE ${BOLT_IMAGE} BOLT_IMAGE_BYTES)
+    if(BOLT_IMAGE_BYTES GREATER BOLT_MC_CAPACITY)
+      message(FATAL_ERROR "BOLT image ${BOLT_IMAGE} exceeds compiled per-MC capacity")
+    endif()
+    list(APPEND BOLT_SYSTEM_IMAGES ${BOLT_IMAGE})
+  endforeach()
+endif()
+
+apply_bolt(sim_system "${BOLT_SYSTEM_CONFIGS}" ${BOLT_MULTI_CYCLES}
   ${BOLT_SYSTEM_BACKEND_ARGS}
   "--soft-threads" "8"
-  "--pu" "${SYSTEM_NUM_PU}" "--mc" "${SYSTEM_NUM_MC}"
+  "--pu" "${BOLT_SYSTEM_NUM_PU}" "--mc" "${BOLT_SYSTEM_NUM_MC}"
   "--mc-size" "${SYSTEM_MC_SIZE_0}"
-  # apply_bolt appends BOLT_PAYLOAD (= dram.1) at the end, so dram.0 goes
-  # here to satisfy the MC0/MC1 positional ordering.
-  "${BOLT_MULTI_DRAM0}")
+  ${BOLT_SYSTEM_IMAGES})
