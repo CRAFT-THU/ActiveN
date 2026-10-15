@@ -203,7 +203,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
   lsu.ac.gBase := acGBase
   lsu.ac.sBase := acSBase
   lsu.ac.len := acLen
-  lsu.ac.notify := acNotify
+  lsu.ac.notifyEnable := acNotify
   lsu.ac.handler := acHandler
   // Default connection
   lsu.ac.start.valid := false.B

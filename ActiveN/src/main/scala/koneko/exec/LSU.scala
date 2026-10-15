@@ -44,7 +44,7 @@ class LSU(implicit val param: CoreParameters) extends Module {
     val remaining = Output(UInt(16.W))
 
     // Completion notification
-    val notify = Input(Bool())
+    val notifyEnable = Input(Bool())
     val handler = Input(UInt(4.W))
   })
 
@@ -301,7 +301,7 @@ class LSU(implicit val param: CoreParameters) extends Module {
     pushingData.regs(1) := mem.resp.bits.extra1
     pushingData.regs(2) := DontCare
     pushingData.regs(3) := DontCare
-  } .elsewhen (acCompletion && ac.notify) {
+  } .elsewhen (acCompletion && ac.notifyEnable) {
     pushing := COMPLETION_TIMEOUT.U
     pushingData.handler := ac.handler
     pushingData.regs(0) := DontCare
