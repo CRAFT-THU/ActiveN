@@ -150,7 +150,6 @@ class SoftSystemBackend : public SystemBackend {
   static constexpr size_t ROUTER_Q_DEPTH = 8;
 
  public:
-  std::pair<uint32_t, uint32_t> morrisonProbePhase() const override;
   // Per-period stats. Counters are running totals; periodic prints emit
   // delta vs. the prior snapshot. cur_* fields are instantaneous and
   // are not subtracted.
@@ -239,6 +238,7 @@ class SoftSystemBackend : public SystemBackend {
 
   static_assert(alignof(WrappedRouter) >= DESTRUCTIVE_INTERFERENCE_SIZE);
 
+  const soft_mem::ExperimentConfig memoryExperiment;
   SystemConfig cfg;
 
   // The cycle EDGE after which reset is released. For K cycles of reset
@@ -346,11 +346,6 @@ class SoftSystemBackend : public SystemBackend {
   std::vector<BrunelMemoryEvent> brunelMemoryEvents_;
   std::vector<std::array<uint32_t,4>> brunelBulkBanks_; // state0/1, issuing-job ticket0/1
   void observeBrunelMemory(uint64_t cycle);
-  void observeMorrisonPhase(uint64_t cycle);
-  void observeMorrisonFlow(uint64_t cycle);
-  void observeMorrisonInlet(uint64_t cycle);
-  void observeMorrisonSpatial(uint64_t cycle);
-  void observeMorrisonRing(uint64_t cycle);
   void observeMorrisonBoundary(uint64_t cycle, const char *directory,
                                 uint32_t completed);
   void observeBrunelProfile(uint64_t cycle, const char *directory,
@@ -382,16 +377,20 @@ class SoftSystemBackend : public SystemBackend {
     uint64_t max_occupancy = 0;
   };
 
-  static constexpr size_t MSHR_HIST_SIZE = 513;
   struct NocMemifProfile {
-    std::array<uint64_t, MSHR_HIST_SIZE> allocated{};
-    std::array<uint64_t, MSHR_HIST_SIZE> unissued{};
-    std::array<uint64_t, MSHR_HIST_SIZE> issued_unfulfilled{};
-    std::array<uint64_t, MSHR_HIST_SIZE> fulfilled{};
-    std::array<uint64_t, MSHR_HIST_SIZE> broadcast{};
-    std::array<uint64_t, MSHR_HIST_SIZE> broadcast_queue{};
-    std::array<uint64_t, MSHR_HIST_SIZE> bulk_queue{};
+    std::vector<uint64_t> allocated;
+    std::vector<uint64_t> allocatable;
+    std::vector<uint64_t> unissued;
+    std::vector<uint64_t> issued_unfulfilled;
+    std::vector<uint64_t> fulfilled;
+    std::vector<uint64_t> broadcast;
+    std::vector<uint64_t> broadcast_queue;
+    std::vector<uint64_t> bulk_queue;
+    uint64_t allocation_full_cycles = 0;
+    uint64_t allocation_blocked_cycles = 0;
+    uint64_t cursor_blocked_cycles = 0;
     uint64_t broadcast_blocked_cycles = 0;
+    uint64_t bulk_reservation_blocked_cycles = 0;
     uint64_t external_request_presented = 0;
     uint64_t external_request_accepted = 0;
     uint64_t external_response_accepted = 0;
@@ -619,7 +618,8 @@ class SoftSystemBackend : public SystemBackend {
   }
 
  public:
-  explicit SoftSystemBackend(SystemConfig cfg, size_t threads = 8);
+  explicit SoftSystemBackend(SystemConfig cfg, size_t threads = 8,
+                             soft_mem::ExperimentConfig experiment = {});
   ~SoftSystemBackend() override = default;
   SoftSystemBackend(const SoftSystemBackend &) = delete;
   SoftSystemBackend &operator=(const SoftSystemBackend &) = delete;

@@ -33,7 +33,8 @@ struct alignas(MEM_BUS_WIDTH_B) AlignedMemLine {
 using mem_mask_t = std::conditional_t<(MEM_BUS_WIDTH_B <= 32), uint32_t, uint64_t>;
 
 struct GlobalMemReq {
-  uint8_t id;
+  // Software MemIf IDs are direct MSHR indices; RTL ports remain 8 bits.
+  uint16_t id;
 
   // Size of the access, 2^size bytes
   uint8_t size;
@@ -62,7 +63,7 @@ struct GlobalMemReq {
 };
 
 struct GlobalMemResp {
-  uint8_t id;
+  uint16_t id;
   // Small endian, lane-aligned response data
   MemLine data;
 };
@@ -152,9 +153,6 @@ public:
   // Workload-timer boundaries for optional backend-local profiling.
   virtual void timerStatsStart(uint64_t cycle) {}
   virtual void timerStatsStop(uint64_t cycle) {}
-
-  // Optional passive workload phase query: {completed + 1, phase}, or zeros.
-  virtual std::pair<uint32_t, uint32_t> morrisonProbePhase() const { return {}; }
 
   // Print stat into stderr.
   // The backend should allocate a context object to store relevant information

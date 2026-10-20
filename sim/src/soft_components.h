@@ -32,6 +32,12 @@ inline unsigned spaceMultiplier() {
 }
 }
 
+// Occupancy metrics have independent bounds (MSHRs, descriptor queues, etc.).
+inline void recordOccupancy(std::vector<uint64_t> &histogram, size_t value) {
+  if (value >= histogram.size()) histogram.resize(value + 1);
+  ++histogram[value];
+}
+
 // Fixed-length 1-based vector.
 //
 // Backed by std::vector<T>. For types that are neither movable nor
@@ -400,16 +406,6 @@ public:
   size_t inputQueueSize(size_t input) const {
     return _input_queues.at(input).size();
   }
-
-  // Passive queue inspection; slot order is the tie-break order of peekIdx.
-  template <typename Visitor>
-  void visitInputQueue(size_t input, Visitor visitor) const {
-    const auto &queue = _input_queues.at(input);
-    for (size_t slot = 0; slot < Q_DEPTH; ++slot)
-      if (queue.occupiedAt(slot)) visitor(slot, *queue[slot]);
-  }
-
-  size_t outputFor(uint16_t destination) const { return _tbl(destination); }
 
   // Inspect every resident flit, including those hidden behind arbitration.
   template <typename Predicate>

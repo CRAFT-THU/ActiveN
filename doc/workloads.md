@@ -1,18 +1,25 @@
 # Selected workloads and retained evidence
 
-Selections audited **2026-10-14**; procedure updated **2026-10-15**.
+Selections audited **2026-10-14**; reproduction accepted **2026-10-20**.
 This is the entry point for the selected MNIST,
 Brunel and full-Morrison implementations. Historical experiments and their original documentation are indexed in
 [archive/README.md](../archive/README.md); their rankings and commands do not
 override the selections below.
 
-The results are measurements of frozen payloads, inputs and simulators. A
-current-source build has not been rebenchmarked against them. Reproduction
-with newer RTL remains separate work. [sim.md](sim.md) now defines new-run
-procedures and artifact retention. Its 1.5 GHz/HBM2e/one-step-warmup policy
-makes the timings below outdated for the current target. They remain
-implementation references; no new target result is established by scaling them
-by 1.5. Historical flat-memory runs and short pilots do not establish defaults.
+Reproduction of the retained ActiveN cases is complete and accepted. The
+[reproduction report](../benchmark/report/reproduction-133a679-20261015.md),
+[timing controls](../benchmark/report/morrison-timing-diagnosis-133a679-20261017.md)
+and [MemIf pilot](../benchmark/report/morrison-memif-pilot-20261020.md) retain
+results, exact simulator identities, raw evidence and validation limits. The
+later [stall diagnosis](../benchmark/report/morrison-memif-stall-20261020.md)
+supersedes the pilot report's preliminary, inconclusive stall discussion.
+
+The historical table below remains a record of the previous target.
+[sim.md](sim.md) defines new-run procedures and artifact retention. Its
+1.5 GHz/HBM2e/one-step-warmup policy changes both the conversion to time and the
+core/memory relationship; do not obtain new timings by scaling historical
+cycles by 1.5. Acceptance of reproduction does not establish equivalence to
+every upstream neural model or complete the later full sweep.
 
 ## Selected implementations
 
@@ -45,6 +52,152 @@ Dense MNIST's retained `build.json` and the
 [historical sparse baseline manifest](../archive/workload/doc/mnist_sparse_baseline.json) pin its separate payloads.
 These identities identify retained binaries, not proof of a fresh byte-identical
 rebuild from the current source/toolchain.
+
+## Findings to carry into the full sweep
+
+The reproduction covered three dense MNIST corpora, nine sparse corpora in
+both retained delivery modes, both Brunel rules and both retained full-Morrison
+checkpoint ages. It did not include the sibling baseline's newer fixed-fan-in
+MNIST, Fashion-MNIST or CIFAR-10 cases. Pin the next sweep's case matrix and
+canonical checkpoint identities independently. The sibling
+`../stdp-experiments/BASELINE.md` can change; preserve the exact version used
+with the selected inputs rather than referring to its current contents.
+
+The accepted numerical comparisons are in the linked reports. Carry forward
+these interpretations and limits:
+
+- MNIST and Brunel reproduce the retained ActiveN implementations under the
+  approved new settings. Dense MNIST's historical lack of preload is one
+  changed condition, not an isolated explanation of its reduction.
+- Full Morrison closely reproduces historical cycles when historical
+  core/memory timing is restored. For the later checkpoint with matched one-warmup/100-measured-step windows
+  and fixed HBM2 timing, reverse elapsed time barely improves with the higher
+  core clock, so its core-cycle count grows; forward scales more strongly. This is compatible with a bank-service
+  bottleneck and does not establish insufficient MSHRs to hide individual-read
+  latency. Archived bank-probe CSVs provide context, but an original
+  checksum binding was not found in the retained ledgers; the current clock controls did not collect that detailed
+  bank breakdown. The [retained mechanism assessment](../benchmark/rundir/reproduction-closeout-20261020/clock-mechanism/pending-answer-v4.md)
+  and its [review](../benchmark/rundir/reproduction-closeout-20261020/clock-mechanism/scope-review.md)
+  record those limits. That assessment predates the later MSHR pilot.
+- The later first-free MSHR pilot changes allocation, admission and reservation
+  semantics relative to the original reproduction binary. Compare its pool
+  sizes against its own control. It is a short pilot, not a general scaling
+  result or a replacement for the full matrix.
+- Strict sequential allocation is excluded from the intended sweep. The
+  reviewed deadlocks have fulfilled broadcasts pinning the cursor, unusable
+  free holes, and scalar-store/NoC/send-queue backpressure preventing the
+  broadcast handler from meeting its scheduling margin. No pending I-cache
+  miss is required to sustain that cycle. Available-first (`first-free`)
+  allocation remains the selected policy for the current design.
+
+### Measurement and configuration
+
+Use the complete peripheral-timer total divided by all completed measured
+steps, including quiet steps. For MNIST, sum its separate timed intervals
+without adding untimed gaps. At 1.5 GHz, `us/timestep = cycles/timestep / 1500`.
+Phase spans are supplemental; retain the timer residual. Accepted PU1 markers
+use 2 for integration, 3 for forward, 4 for reverse and 5 for finish. Older
+Morrison probes use different header conventions; decode each format against
+the exact executed source.
+
+The reproduction used soft mode, eight workers, 512 PUs/16 MCs, one GiB per MC,
+32-byte lines, two SMT pipes, 16-KiB SPM, 8-KiB I-cache preload, 1.5-GHz core/NoC,
+one warmup step and merging enabled. Its memory model is a complete 625-ps
+HBM2-derived extension representing two eight-channel stacks, not a
+manufacturer-calibrated HBM2e part. Preserve its YAML hash and effective startup
+configuration. A frequency override alone does not rescale cycle-based DRAM
+timings. Retained measured lengths were 12 steps per MNIST snapshot, 10,000 per
+Brunel rule and 100 per Morrison age; these do not silently select the broader
+sweep's lengths.
+
+Preload and one warmup step do not imply zero measured I-cache refills. Normal
+replacement remains active, boot-ROM fetches can displace preloaded lines, and
+one event-driven step need not exercise every handler on every PU. Record
+refill counts; cumulative refills are not concurrent MSHR occupancy.
+
+Identify each memory-statistics interval. Reproduction MNIST statistics included
+initialization and warmup; recurrent timer-only statistics cover their measured
+interval with the recorded boundary phases. Memory ticks, request
+presentations, accepted transactions, logical accesses and changed weights are
+different quantities. Merging can change physical write counts while spikes
+and final initialized DRAM agree. Heartbeat request counters count
+presentations; the printed pending-response field samples MC 0. Neither is an
+all-controller-empty or accepted-traffic oracle.
+
+Use explicit soft-MemIf controls: `--soft-memif-mshrs` (1..65536, default 256),
+`--soft-memif-allocation first-free`, `--soft-memif-unicast-reserve` (0..N,
+default 32), and `--soft-memif-write-merge on|off|true|false` (default off).
+Counts below 32 need a smaller reservation; `R=N` is valid but leaves no
+bulk allocation headroom. Reservation covers both scatter and unicast bulk
+allocations. Scalar acceptance requires a free allocatable
+slot even when a write could merge. External IDs are direct 16-bit MSHR indices;
+the former 256-ID mapping limit is gone. `SOFT_MEMIF_WRITE_MERGE` is removed.
+These controls affect the software backend and do not certify matching RTL.
+
+The proposed hardware `canMerge` bit is a future direction, not an implemented
+result. Mark at most one unissued eligible posted write per line; any later
+same-line access clears older eligibility, including reads and bulk read beats.
+A merge keeps its FIFO position and updates byte masks/data. Clear eligibility
+on issue/free without reviving older entries, and exclude a request accepted
+by memory with its old payload. Freezing at first presentation is a conservative
+alternative that narrows today's software merge window. Receipt-bearing stores
+need additional completion bookkeeping. This supports first-free allocation
+without deriving age from indices; no RTL timing benefit has been measured.
+
+### Validation and retained identity
+
+Keep performance acceptance separate from upstream model agreement. The
+[original report](../benchmark/report/reproduction-133a679-20261015.md) records
+these unresolved inherited differences:
+
+- MNIST trace decays differ from available corpus time-constant manifests.
+  Reproducing the retained FP32 arithmetic does not resolve that mismatch.
+  Dense final-state/membrane coverage is incomplete. Sparse modes retain a
+  one-ULP neuron-state difference under the historical allowance, not universal
+  bit equality.
+- Brunel's Morrison-rule payload differs from inspected retained GeNN source
+  in old/new weight delivery and tied LTD/LTP ordering. The checkpoint creator's
+  exact execution and a matching autonomous stochastic trajectory were not
+  established.
+- Full Morrison replay is conditioned on observed spikes. Its weight, trace
+  and transport checks do not certify autonomous membrane trajectories, all
+  pending-current sums or every upstream conversion. Matching final DRAM and
+  spikes does not make every intermediate neuron word identical.
+- The reproduction records an unresolved hard/soft SNN mismatch and a
+  single-core SHA assertion. Later CSR checks do not resolve those separate failures.
+  Software-only merging and documented idle differences were explicitly
+  authorized; this is not universal RTL/software equivalence.
+
+The original reproduction and timing controls use preserved simulator SHA-256
+`54a3a0677256f5bae81b313c2c00655da021aa060670f6dccac73ba5fbc15f77`.
+The MemIf pilot and stall captures use
+`1d784885a1f1d8e64f2bf8fd18984a12581533353142569718c9d2a29843e73f`,
+from an explicitly authorized frozen uncommitted snapshot. Commit labels alone
+do not identify these different source/configurations. The reports link their
+source manifests, payloads, configs, execution scripts and raw logs. Preserve
+those artifacts unchanged when cleaning active source.
+
+After cleanup and user commit, a new benchmark needs a fresh build and preserved
+identity under [sim.md](sim.md). Select the intended Core export; default
+generated directories may be stale. The scalar MC address map, line size and
+SMT/cache/SPM geometry are compiled properties. Runtime PU/MC arguments do not
+rewrite that map. Soft-only BOLT training uses 64/2 with compatible two-image
+inputs; benchmark topology is selected at runtime. Keep successful BOLT
+training evidence, runtime libraries and configuration hashes.
+
+The seven dedicated `morrison_*_probe` files are optional deep observers from
+earlier Morrison optimization work, not requirements for workload execution or
+normal sweep evidence. Their source remains recoverable with preserved
+simulators. Keep ordinary timer/phase and NoC profiling, SPM/DRAM dumps,
+spike/receipt observations and completion-boundary checks. In particular,
+`MORRISON_SHARED_UPDATER`, `MORRISON_SHARED_UPDATER_ID` and
+`MORRISON_UNCOUNTED_SPIKE_PC` select passive boundary/receipt observations for
+the retained payload; they do not enable its functional updater algorithm.
+Bind the observed completion PC to the exact payload if it changes.
+
+The user owns old build-directory removal. Source cleanup does not delete
+`sim/build*`, immutable workload inputs, preserved binaries or raw evidence.
+The broader sweep has not been launched by this closeout.
 
 ## Historical performance (previous target)
 
@@ -88,15 +241,16 @@ uses the then-standard 60+1,000 quick or 60+10,000 full benchmark window.
 - Morrison's newer proxy/range-dispatch and shared-updater mechanisms remain
   candidates for backporting to Brunel. They are not included in the retained
   home-G4 results, and no backport speedup is measured.
-- The retained MNIST/Brunel runs precede MemIf write merging. Full Morrison
-  explicitly enables `SOFT_MEMIF_WRITE_MERGE=1`; merging is off by default in
-  the soft model and has no equivalent RTL implementation.
+- Historical MNIST/Brunel merging settings were not authenticated. Historical
+  full Morrison explicitly enabled the former environment option. Current
+  runs select merging through the CLI; it remains off by default and has no
+  equivalent RTL implementation.
 - Async-copy notification (`acnotify`, CSR `0x734`) and system-wide idle
-  notification are present in current RTL, but these payloads still use their
-  earlier completion/drain protocols. The soft backend lacks the new global
-  idle reduction and ring-empty condition. The inspected `generated/system`
-  and `generated/morrison-512` targets also predate both additions. Regeneration,
-  soft-model alignment/cosimulation and workload integration are pending.
+  notification are present in RTL, but these payloads still use their earlier
+  completion/drain protocols. The soft backend lacks the new global idle
+  reduction and ring-empty condition. Reproduction used a fresh Core export
+  and explicit authorization for these differences; software alignment and
+  adoption of newer completion protocols remain separate work.
 - Async completion is [documented as volatile](mem.md#async-copy). Event-queue
   pressure can lose notifications; adoption must preserve the workload's
   completion-accounting requirements.
@@ -173,5 +327,6 @@ remain separate dependencies.
 The historical MNIST simulator source-to-binary rebuild chain is not fully
 established. One failed dense attempt also retains a stale runner hash; its
 failure status and correctly pinned resumed runner remain. Source commits do
-not preserve ignored local data or remote artifacts. Archive compression and
-reproduction under [sim.md](sim.md) remain separate steps.
+not preserve ignored local data or remote artifacts. The completed reproduction
+retains its own build/runtime/input evidence; future cases still need pinned
+checkpoints and simulator identities under [sim.md](sim.md).

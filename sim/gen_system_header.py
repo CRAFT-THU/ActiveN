@@ -27,6 +27,7 @@ with args.output.open("w") as f:
     f.write('#include <cstdlib>\n')
     f.write('#include <iostream>\n')
     f.write('#include <vector>\n')
+    f.write('#include <stdexcept>\n')
     f.write('#include <verilated.h>\n')
     f.write('#include <verilated_fst_c.h>\n')
     f.write('\n')
@@ -158,8 +159,10 @@ with args.output.open("w") as f:
             auto &p = mem_ports[mc];
             if (in[mc + 1].resp) {
                 auto &r = *in[mc + 1].resp;
+                if (r.id > UINT8_MAX)
+                    throw std::out_of_range("DRAM response ID exceeds the 8-bit RTL port");
                 *p.resp_valid = 1;
-                *p.resp_id = r.id;
+                *p.resp_id = static_cast<uint8_t>(r.id);
                 std::memcpy(p.resp_rdata, r.data.data(), MEM_BUS_WORDS * 4);
             } else {
                 *p.resp_valid = 0;
@@ -169,8 +172,10 @@ with args.output.open("w") as f:
         // Drive peripheral response signals
         if (in[0].resp) {
             auto &r = *in[0].resp;
+            if (r.id > UINT8_MAX)
+                throw std::out_of_range("Peripheral response ID exceeds the 8-bit RTL port");
             sys->io_periph_resp_valid = 1;
-            sys->io_periph_resp_bits_id = r.id;
+            sys->io_periph_resp_bits_id = static_cast<uint8_t>(r.id);
             std::memcpy(sys->io_periph_resp_bits_rdata, r.data.data(), MEM_BUS_WORDS * 4);
         } else {
             sys->io_periph_resp_valid = 0;

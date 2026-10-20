@@ -71,7 +71,6 @@
 #include <ramulator/base/request.h>
 #include <ramulator/frontend/i_frontend.h>
 #include <ramulator/memory_system/i_memory_system.h>
-#include "morrison_hbm_probe.h"
 #include <verilated_fst_c.h>
 
 using namespace std;
@@ -303,16 +302,6 @@ struct System::Impl {
     float tck_ns = 0.0f;
     for (int i = 0; i < num_mc; ++i) {
       auto config = Ramulator::Config::parse_config_file(rcfg.configFile);
-      if (morrison_probe::enabled()) {
-        auto mem=config["memory_system"];
-        auto controllers=mem["controllers"];
-        Ramulator::ConfigNode observed;
-        if (controllers.size()!=1 || controllers.seq()[0]["impl"].as<string>()!="HBM12")
-          throw runtime_error("Morrison probe requires one native HBM12 controller per MC");
-        auto controller=controllers.seq()[0];
-        controller.set("impl","MorrisonHBMProbe"); observed.push_back(controller);
-        mem.set("controllers",observed); config.set("memory_system",mem);
-      }
       auto &r = ramulator_mcs[i];
       r.frontend.reset(Ramulator::Factory::create_frontend(config));
       r.memory.reset(Ramulator::Factory::create_memory_system(config));
@@ -536,7 +525,6 @@ struct System::Impl {
       ramulator_tick_phase += ramulator_ticks_per_core_cycle;
       while (ramulator_tick_phase + 1e-12L >= 1.0L) {
         for (auto &r : ramulator_mcs) {
-          morrison_probe::mc=&r-ramulator_mcs.data();
           r.memory->tick();
         }
         ramulator_tick_phase -= 1.0L;
@@ -797,11 +785,6 @@ bool System::run(uint64_t maxCycles) {
     if (exiting) break;
 
     // Phase 2: tick frontend memory + build bus_in + serve presented requests.
-    if (morrison_probe::enabled()) {
-      const auto [step,phase]=impl_->backends.front()->morrisonProbePhase();
-      morrison_probe::cycle=cycle; morrison_probe::step=step; morrison_probe::phase=phase;
-      morrison_probe::timerActive=impl_->periph.timer_enabled;
-    }
     impl_->tickMemory(cycle);
     impl_->buildBusInAndServe(cycle);
 
@@ -974,6 +957,17 @@ int main(int argc, char **argv) {
     .default_value(uint32_t(8))
     .scan<'u', uint32_t>();
 
+  program.add_argument("--soft-memif-mshrs")
+    .help("Software DRAM MSHR count, 1..65536 (default: 256; overrides SOFT_MEMIF_MSHRS)");
+  program.add_argument("--soft-memif-allocation")
+    .help("Software MSHR allocation policy (default: first-free)")
+    .choices("first-free", "sequential");
+  program.add_argument("--soft-memif-write-merge")
+    .help("Software posted-write merging, on/off or true/false (default: off)")
+    .choices("on", "off", "true", "false");
+  program.add_argument("--soft-memif-unicast-reserve")
+    .help("Software DRAM unicast reservation, 0..MSHR count (default: 32)");
+
   program.add_argument("--bootrom")
     .help("Boot ROM image served at 0x60000000 (default: built-in)");
 
@@ -1012,6 +1006,28 @@ int main(int argc, char **argv) {
   if (!use_soft && !use_hard) {
     cerr << "Error: specify at least one of --soft or --hard" << endl;
     cerr << program;
+    return 1;
+  }
+
+  const soft_mem::ExperimentOptions memoryOptions{
+    .slots = program.present<string>("--soft-memif-mshrs"),
+    .allocation = program.present<string>("--soft-memif-allocation"),
+    .merge = program.present<string>("--soft-memif-write-merge"),
+    .unicastReserve = program.present<string>("--soft-memif-unicast-reserve"),
+  };
+  if (memoryOptions.any() && !use_soft) {
+    cerr << "Error: --soft-memif options require --soft\n";
+    return 1;
+  }
+  soft_mem::ExperimentConfig memoryExperiment;
+  try {
+    memoryExperiment = soft_mem::experimentConfig(memoryOptions);
+  } catch (const std::exception &error) {
+    cerr << "Error: " << error.what() << '\n';
+    return 1;
+  }
+  if (use_hard && !memoryExperiment.isBaseline()) {
+    cerr << "Error: experimental MemIf settings require --soft without --hard\n";
     return 1;
   }
 
@@ -1113,13 +1129,8 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  const auto memoryExperiment=soft_mem::experimentConfig();
   if (use_hard && soft_noc::spaceMultiplier() != 1) {
     cerr << "Experimental router reservation requires --soft without --hard\n";
-    return 1;
-  }
-  if (use_hard && (memoryExperiment.merge || memoryExperiment.slots != 256)) {
-    cerr << "Experimental MemIf merging/capacity requires --soft without --hard\n";
     return 1;
   }
   System system(dramInitFiles, ramulator_cfg, program.present<uint32_t>("--init-icache"));
@@ -1171,7 +1182,7 @@ int main(int argc, char **argv) {
 #endif
 
   if (use_soft) {
-    auto soft = make_unique<SoftSystemBackend>(cli_cfg, soft_threads);
+    auto soft = make_unique<SoftSystemBackend>(cli_cfg, soft_threads, memoryExperiment);
     soft->setLogging(enable_logging);
     soft->setNocProfileDir(noc_profile_dir);
     soft->setNocProfileWindow(noc_profile_start, noc_profile_stop);

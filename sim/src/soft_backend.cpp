@@ -29,16 +29,9 @@
 #include "soft_components.h"
 #include "soft_mem.h"
 #include "soft_verilated/soft_rtl___024root.h"
-#include "morrison_phase_probe.h"
 #include "../payloads/sys/mnist_sparse_layout.inc"
 
 using namespace std;
-
-#include "morrison_cpu_probe.inc"
-#include "morrison_flow_probe.inc"
-#include "morrison_inlet_probe.inc"
-#include "morrison_spatial_probe.inc"
-#include "morrison_ring_probe.inc"
 
 // Wall-clock accumulator (ns) for time spent inside soft_rtl Verilator
 // eval() calls, summed across all PUs. Thread-local because Verilated
@@ -476,8 +469,10 @@ bool SoftSystemBackend::ringCanInject(size_t memifIdx) const {
          (!ring.validAt(memifIdx) || memif_ring_accept[memifIdx]);
 }
 
-SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads)
-  : cfg(std::move(cfg_in)),
+SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads,
+                                     soft_mem::ExperimentConfig experiment)
+  : memoryExperiment(soft_mem::checkedExperimentConfig(experiment)),
+    cfg(std::move(cfg_in)),
     releaseResetAfter(10),
     topo(cfg.numPU, cfg.numMC),
     periph(0, 16, [&]() {
@@ -562,11 +557,16 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads)
 
   const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
   const size_t CLUSTER_PER_MC = PU_PER_MC / soft_mem::CLUSTER_SIZE;
-  const auto memoryExperiment=soft_mem::experimentConfig();
   std::cerr << "[Soft NoC] space_multiplier=" << soft_noc::spaceMultiplier()
             << " router_queue_depth=" << ROUTER_Q_DEPTH << '\n';
   std::cerr << "[Soft MemIf] slots=" << memoryExperiment.slots
-            << " merge=" << memoryExperiment.merge << " external_ids=256 unicast_reserve=32\n";
+            << " merge=" << (memoryExperiment.merge ? "on" : "off")
+            << " allocation=" << soft_mem::allocationName(memoryExperiment.allocation)
+            << " external_ids=" << memoryExperiment.slots
+            << " id_mapping=direct unicast_reserve=" << memoryExperiment.unicastReserve
+            << " bulk_classes=all bulk_reservation="
+            << (memoryExperiment.allocation == soft_mem::AllocationMode::Sequential
+                ? "consecutive-slots" : "free-slots") << '\n';
   drams.reserve(cfg.numMC);
   for (size_t m = 0; m < cfg.numMC; ++m) {
     drams.emplace_back(m + 1, CLUSTER_PER_MC, 2,
@@ -1668,11 +1668,6 @@ void SoftSystemBackend::step(uint64_t cycle) {
   const uint64_t statsStart = profile ? workProfileNowNs() : 0;
   accumulateStats(cycle);
   observeBrunelMemory(cycle);
-  observeMorrisonPhase(cycle);
-  observeMorrisonFlow(cycle);
-  observeMorrisonInlet(cycle);
-  observeMorrisonSpatial(cycle);
-  observeMorrisonRing(cycle);
   if (morrisonUncountedSpikePc_) {
     for (unsigned pu = 1; pu <= cfg.numPU; ++pu) {
       const auto &r = *cores[pu]->rootp;
@@ -2333,9 +2328,6 @@ void SoftSystemBackend::accumulateNocProfile(uint64_t cycle) {
   for (const auto &accepted : memif_eject_accept)
     if (accepted) ++sample.memif_arrivals;
 
-  auto recordHistogram = [](auto &histogram, size_t value) {
-    ++histogram.at(std::min(value, histogram.size() - 1));
-  };
   for (size_t mc = 0; mc < cfg.numMC; ++mc) {
     const auto &dram = drams[mc];
     auto &profile = nocMemifProfiles_[mc];
@@ -2344,14 +2336,19 @@ void SoftSystemBackend::accumulateNocProfile(uint64_t cycle) {
     const size_t broadcasts = dram.broadcastInflightCount();
     const size_t fulfilled = dram.mshrFulfilledCount();
     const size_t broadcastQueues = dram.bcstQueueOccupancy();
-    recordHistogram(profile.allocated, allocated);
-    recordHistogram(profile.unissued, dram.mshrUnissuedCount());
-    recordHistogram(profile.issued_unfulfilled,
+    recordOccupancy(profile.allocated, allocated);
+    recordOccupancy(profile.allocatable, dram.mshrAllocatableCount());
+    recordOccupancy(profile.unissued, dram.mshrUnissuedCount());
+    recordOccupancy(profile.issued_unfulfilled,
                     dram.mshrIssuedUnfulfilledCount());
-    recordHistogram(profile.fulfilled, fulfilled);
-    recordHistogram(profile.broadcast, broadcasts);
-    recordHistogram(profile.broadcast_queue, broadcastQueues);
-    recordHistogram(profile.bulk_queue, dram.bulkQueueOccupancy());
+    recordOccupancy(profile.fulfilled, fulfilled);
+    recordOccupancy(profile.broadcast, broadcasts);
+    recordOccupancy(profile.broadcast_queue, broadcastQueues);
+    recordOccupancy(profile.bulk_queue, dram.bulkQueueOccupancy());
+    profile.allocation_full_cycles += allocated == dram.mshrCapacity();
+    profile.allocation_blocked_cycles += dram.mshrAllocationBlocked();
+    profile.cursor_blocked_cycles += dram.mshrCursorBlocked();
+    profile.bulk_reservation_blocked_cycles += dram.bulkReservationBlocked();
     if (dram.broadcastAllocationBlocked()) {
       ++profile.broadcast_blocked_cycles;
       ++sample.broadcast_blocked_mcs;
@@ -2540,6 +2537,7 @@ void SoftSystemBackend::writeNocProfile() {
   for (size_t mc = 0; mc < cfg.numMC; ++mc) {
     const auto &profile = nocMemifProfiles_[mc];
     emitHistogram(mc, "allocated", profile.allocated);
+    emitHistogram(mc, "allocatable", profile.allocatable);
     emitHistogram(mc, "unissued", profile.unissued);
     emitHistogram(mc, "issued_unfulfilled", profile.issued_unfulfilled);
     emitHistogram(mc, "fulfilled", profile.fulfilled);
@@ -2553,7 +2551,8 @@ void SoftSystemBackend::writeNocProfile() {
             "external_request_presented,external_request_accepted,"
             "external_response_accepted,mshr_unicast_local_retired,"
             "mshr_unicast_remote_injected,ring_unicast_local_delivered,"
-            "broadcast_retired\n";
+            "broadcast_retired,allocation_full_cycles,allocation_blocked_cycles,"
+            "cursor_blocked_cycles,bulk_reservation_blocked_cycles\n";
   for (size_t mc = 0; mc < cfg.numMC; ++mc) {
     const auto blocked = nocMemifProfiles_[mc].broadcast_blocked_cycles;
     const auto &profile = nocMemifProfiles_[mc];
@@ -2565,7 +2564,11 @@ void SoftSystemBackend::writeNocProfile() {
            << profile.mshr_unicast_local_retired << ','
            << profile.mshr_unicast_remote_injected << ','
            << profile.ring_unicast_local_delivered << ','
-           << profile.broadcast_retired << '\n';
+           << profile.broadcast_retired << ','
+           << profile.allocation_full_cycles << ','
+           << profile.allocation_blocked_cycles << ','
+           << profile.cursor_blocked_cycles << ','
+           << profile.bulk_reservation_blocked_cycles << '\n';
   }
 
   std::ofstream destinations(*nocProfileDir_ + "/blocked_destinations.csv");
@@ -2908,10 +2911,6 @@ void SoftSystemBackend::printWorkProfile() const {
 
 bool SoftSystemBackend::printStats(uint64_t cycles, bool final_print) {
   if (final_print) {
-    if (const char *directory = std::getenv("MORRISON_FLOW_PROFILE"))
-      for (const auto &dram : drams) dram.dumpFlowProbe(directory);
-    if (const char *directory = std::getenv("MORRISON_WRITE_PROBE"))
-      for (const auto &dram : drams) dram.dumpWriteProbe(directory);
     if (nocProfileActive_) timerStatsStop(cycles);
     double v_ms = verilator_ns_ / 1e6;
     double u_ms = uncore_ns_ / 1e6;
