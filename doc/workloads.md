@@ -112,8 +112,10 @@ sweep's lengths.
 
 Preload and one warmup step do not imply zero measured I-cache refills. Normal
 replacement remains active, boot-ROM fetches can displace preloaded lines, and
-one event-driven step need not exercise every handler on every PU. Record
-refill counts; cumulative refills are not concurrent MSHR occupancy.
+one event-driven step need not exercise every handler on every PU. Retained
+reproduction evidence includes refill counts; cumulative refills are not
+concurrent MSHR occupancy. Cleaned simulator builds no longer report these
+refill counters.
 
 Identify each memory-statistics interval. Reproduction MNIST statistics included
 initialization and warmup; recurrent timer-only statistics cover their measured
@@ -185,15 +187,22 @@ rewrite that map. Soft-only BOLT training uses 64/2 with compatible two-image
 inputs; benchmark topology is selected at runtime. Keep successful BOLT
 training evidence, runtime libraries and configuration hashes.
 
-The seven dedicated `morrison_*_probe` files are optional deep observers from
-earlier Morrison optimization work, not requirements for workload execution or
-normal sweep evidence. Their source remains recoverable with preserved
-simulators. Keep ordinary timer/phase and NoC profiling, SPM/DRAM dumps,
-spike/receipt observations and completion-boundary checks. In particular,
-`MORRISON_SHARED_UPDATER`, `MORRISON_SHARED_UPDATER_ID` and
-`MORRISON_UNCOUNTED_SPIKE_PC` select passive boundary/receipt observations for
-the retained payload; they do not enable its functional updater algorithm.
-Bind the observed completion PC to the exact payload if it changes.
+The simulator cleanup removes workload-specific SPM/DRAM dumps, hardcoded
+completion-PC and receipt observers, phase/NoC/core profiling, the event-queue-1
+spike assumption, and I-cache refill counters. This includes profiling inherited
+from `next`. The system `--log` and `--noc-profile*` options are removed; the
+single-core packet log remains available. Functional MemIf changes, sequential
+allocation and router reservation controls, I-cache preload (`--init-icache`),
+peripheral timers/results, FST/cosim and Ramulator statistics are retained.
+
+Older benchmark scripts that consume those observers or dumps need replacement
+integration before they can validate runs with the cleaned simulator. The
+agreed follow-up is to reduce firing counts across all populations in the
+workload, print their sum through PU1's peripheral output, and compare that sum
+and final state. Generic SPM export through VPI/DPI and generic DRAM output
+for mutable weights are deferred; this cleanup does not implement them or add
+replacement architectural completion checks. Historical binaries and evidence
+retain their original behavior and output formats.
 
 The user owns old build-directory removal. Source cleanup does not delete
 `sim/build*`, immutable workload inputs, preserved binaries or raw evidence.
@@ -274,8 +283,10 @@ options and a distinct output file; it is separate from simulator builds.
 [sim-retained.md](sim-retained.md) identifies existing simulator binaries that
 must remain in place through reproduction.
 The workload entrypoint includes the shared Makefile, whose existing integration
-test sources and recipes have been restored unchanged. Cleanup is limited to
-workload additions outside `next`, apart from requested documentation/path updates.
+test sources and recipes have been restored unchanged. That earlier workload
+reorganization was limited to workload additions outside `next`, apart from
+requested documentation/path updates. The later simulator cleanup also removes
+profiling inherited from `next`, as described above.
 Generic targets retain compatibility switches for functional tests and research;
 their defaults are not the selected benchmark configuration.
 
