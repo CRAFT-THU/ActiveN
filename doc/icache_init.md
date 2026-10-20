@@ -54,9 +54,5 @@ both backends receive the same backing-image bytes at this boundary. Reasserting
 reset invalidates inserted lines normally; the CLI preload is a one-time
 startup operation.
 
-At exit, `[ICache ...]` reports accepted refill beat requests, the subset
-targeting global memory (`global_refill_requests`), and completed line fills.
-These counters exclude DPI insertion and include startup. They do not count
-ordinary cache hits as memory traffic. System counters are summed over PUs,
-with one report per backend. The existing soft timer-interval statistics can
-separately measure instruction-cache fills during benchmark execution.
+The simulator retains preload and ordinary cache behavior without the former
+refill/fill counters or soft timer-interval I-cache profiling output.

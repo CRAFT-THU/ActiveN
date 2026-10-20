@@ -149,19 +149,6 @@ public:
    * - Finally, step
    */
   virtual void step(uint64_t cycle) = 0;
-
-  // Workload-timer boundaries for optional backend-local profiling.
-  virtual void timerStatsStart(uint64_t cycle) {}
-  virtual void timerStatsStop(uint64_t cycle) {}
-
-  // Print stat into stderr.
-  // The backend should allocate a context object to store relevant information
-  // needed for incremental stats (the last counter values, the last cycle, etc.)
-  // If this backend does not support stats, returns false
-  // Arguments:
-  // - The current cycle count
-  // - Whether this is the final print at the end
-  virtual bool printStats(uint64_t cycles, bool final) = 0;
 };
 
 struct RamulatorConfig {

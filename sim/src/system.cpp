@@ -32,11 +32,7 @@
  *   --ramulator-config PATH  Ramulator YAML configuration file
  *   --ramulator-stats DIR    Optional directory for per-MC statistics
  *   --ramulator-stats-timer-only  Measure only while the workload timer is enabled
- *   --noc-profile DIR  Write soft-backend congestion statistics
- *   --noc-profile-start N  Start profiling at this cycle instead of timer start
- *   --noc-profile-stop N   Stop profiling at this cycle instead of timer stop
  *   --trace             Enable FST tracing
- *   --log               Enable verbose logging
  *   --rng-seed N        RNG seed for peripheral device
  */
 
@@ -263,7 +259,6 @@ struct System::Impl {
   uint64_t current_cycle = 0;
   TimedMemoryStats timed_memory_stats;
   bool ramulator_stats_written = false;
-  bool timer_stopped_this_cycle = false;
 
   // FST tracer (single dump per cycle between stage and step).
   VerilatedFstC *tracer = nullptr;
@@ -646,7 +641,6 @@ struct System::Impl {
     }
     if (!timer_was_enabled && periph.timer_enabled) {
       beginTimedMemoryStats(cycle);
-      for (auto &backend : backends) backend->timerStatsStart(cycle);
     }
     for (int mc = 0; mc < num_mc; ++mc) {
       int idx = mc + 1;
@@ -666,7 +660,6 @@ struct System::Impl {
     }
     if (timer_was_enabled && !periph.timer_enabled) {
       finishTimedMemoryStats(cycle);
-      timer_stopped_this_cycle = true;
     }
   }
 };
@@ -799,10 +792,6 @@ bool System::run(uint64_t maxCycles) {
     // Phase 5: step all backends (commit posedge).
     for (auto &b : impl_->backends) b->step(cycle);
     if (!pending_icaches.empty()) serviceICachePreload(*preload, pending_icaches);
-    if (impl_->timer_stopped_this_cycle) {
-      for (auto &b : impl_->backends) b->timerStatsStop(cycle);
-      impl_->timer_stopped_this_cycle = false;
-    }
 
     // Count requests for heartbeat
     auto &out = impl_->per_backend_out[0];
@@ -837,13 +826,6 @@ bool System::run(uint64_t maxCycles) {
        << " cycles/s" << endl;
   cerr << "[System] Runtime: " << fixed << setprecision(3) << wall_secs << "s" << endl;
 
-  // Print backend stats
-  for (const auto& group : icaches)
-    printICacheStats(group, group.front().name.c_str());
-  for (auto &b : impl_->backends) {
-    b->printStats(cycle, true);
-  }
-
   // Print Ramulator stats
   if (impl_->use_ramulator) {
     if (!impl_->ramulator_cfg->timerStatsOnly) {
@@ -859,20 +841,6 @@ bool System::run(uint64_t maxCycles) {
     for (auto &r : impl_->ramulator_mcs) {
       r.frontend->finalize();
       r.memory->finalize();
-    }
-  }
-
-  // Opt-in Brunel validation captures backing weights as well as PU cache state.
-  // Only initialized image extents are exported; the Brunel generator keeps
-  // every mutable weight within those extents.
-  if (const char *directory = std::getenv("SOFT_BRUNEL_DUMP")) {
-    for (size_t mc = 0; mc < mc_images.size(); ++mc) {
-      const auto &image = mc_images[mc];
-      std::ofstream dump(std::string(directory) + "/dram." + std::to_string(mc), std::ios::binary);
-      // Host I/O only: the dense line array is contiguous and byte-identical
-      // to the previous line-at-a-time dump, including initialized padding.
-      dump.write(reinterpret_cast<const char *>(image.dense.get()),image.dense_size);
-      if (!dump) throw runtime_error("cannot dump Brunel backing memory");
     }
   }
 
@@ -930,22 +898,6 @@ int main(int argc, char **argv) {
   program.add_argument("--trace-start")
     .help("First cycle at which tracing is enabled (requires --trace)")
     .default_value(uint64_t(0))
-    .scan<'u', uint64_t>();
-
-  program.add_argument("--log")
-    .help("Enable verbose logging")
-    .default_value(false)
-    .implicit_value(true);
-
-  program.add_argument("--noc-profile")
-    .help("Directory for soft-backend congestion statistics");
-
-  program.add_argument("--noc-profile-start")
-    .help("First cycle for an explicit pre-timer congestion profile")
-    .scan<'u', uint64_t>();
-
-  program.add_argument("--noc-profile-stop")
-    .help("Last cycle for an explicit pre-timer congestion profile")
     .scan<'u', uint64_t>();
 
   program.add_argument("--rng-seed")
@@ -1087,31 +1039,6 @@ int main(int argc, char **argv) {
     PeripheralDevice::global_bootrom_override = std::move(buf);
   }
 
-  // Logging is wired below on the soft backend instance (if used).
-  bool enable_logging = program.get<bool>("--log");
-  auto noc_profile_dir = program.present<string>("--noc-profile");
-  auto noc_profile_start = program.present<uint64_t>("--noc-profile-start");
-  auto noc_profile_stop = program.present<uint64_t>("--noc-profile-stop");
-  if (noc_profile_dir && !use_soft) {
-    cerr << "Error: --noc-profile requires --soft" << endl;
-    return 1;
-  }
-  if ((noc_profile_start || noc_profile_stop) && !noc_profile_dir) {
-    cerr << "Error: --noc-profile-start and --noc-profile-stop require "
-            "--noc-profile" << endl;
-    return 1;
-  }
-  if (noc_profile_stop && !noc_profile_start) {
-    cerr << "Error: --noc-profile-stop requires --noc-profile-start" << endl;
-    return 1;
-  }
-  if (noc_profile_start && noc_profile_stop &&
-      *noc_profile_stop < *noc_profile_start) {
-    cerr << "Error: --noc-profile-stop must not precede --noc-profile-start"
-         << endl;
-    return 1;
-  }
-
   // Build init files list
   vector<string_view> dramInitFiles;
   for (auto &p : image_paths) dramInitFiles.push_back(p);
@@ -1183,9 +1110,6 @@ int main(int argc, char **argv) {
 
   if (use_soft) {
     auto soft = make_unique<SoftSystemBackend>(cli_cfg, soft_threads, memoryExperiment);
-    soft->setLogging(enable_logging);
-    soft->setNocProfileDir(noc_profile_dir);
-    soft->setNocProfileWindow(noc_profile_start, noc_profile_stop);
     if (fst_tracer) soft->attachTrace(fst_tracer.get(), 0);
     system.addBackend(std::move(soft));
     cerr << "[Main] Soft backend enabled" << endl;

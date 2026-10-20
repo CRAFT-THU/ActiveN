@@ -3,12 +3,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <utility>
-#include <unordered_map>
 #include <vector>
 #include <thread>
 
@@ -19,9 +17,6 @@
 #include "soft_mem.h"
 #include "system.h"
 #include "util.h"
-
-// Toggle verbose soft-model logging. (Member function — see
-// SoftSystemBackend::setLogging.)
 
 // Topology mirrors koneko.Topology (see
 // ActiveN/src/main/scala/koneko/System.scala).
@@ -149,42 +144,6 @@ struct Topology {
 class SoftSystemBackend : public SystemBackend {
   static constexpr size_t ROUTER_Q_DEPTH = 8;
 
- public:
-  // Per-period stats. Counters are running totals; periodic prints emit
-  // delta vs. the prior snapshot. cur_* fields are instantaneous and
-  // are not subtracted.
-  struct Stat {
-    static constexpr uint64_t PERIOD = 1000;
-
-    uint64_t total_hops = 0;
-    uint64_t total_injections = 0;
-    uint64_t total_mem_requests = 0;
-    uint64_t unicast_mem_requests = 0;
-    uint64_t icache_accesses = 0;
-    uint64_t icache_line_fills = 0;
-    uint64_t icache_stall_core_cycles = 0;
-    uint64_t mnist_feedforward_messages = 0;
-    uint64_t mnist_trace_messages = 0;
-    uint64_t mnist_post_fired_trace_messages = 0;
-    uint64_t mnist_inhibitory_spikes = 0;
-    uint64_t idle_lane_cycles = 0;
-    uint64_t idle_core_cycles = 0;
-    uint64_t blocked_structural = 0;
-    uint64_t inflight_messages_sum = 0;
-    uint64_t inflight_dram_sum = 0;
-    uint64_t inflight_resp_sum = 0;
-
-    // Instantaneous snapshots, copied through subtraction.
-    uint64_t cur_inflight_messages = 0;
-    uint64_t cur_inflight_dram = 0;
-    uint64_t cur_inflight_resp = 0;
-
-    Stat operator-(const Stat &o) const;
-    void print(uint64_t cycles, uint64_t numPUs) const;
-    void printIcache(uint64_t cycles, uint64_t numPUs) const;
-  };
-
- private:
   // Each MemIf owner resolves its ejections from the source routers. Retain
   // the token so the source-router owner can move the selected flit at commit.
   struct MemifEject {
@@ -275,301 +234,14 @@ class SoftSystemBackend : public SystemBackend {
   // must outlive routers, which is enforced by member-declaration order.
   IndexVector<WrappedRouter> routers;
 
-  // Wall-clock accounting (snapshot by PhaseTimer).
-  uint64_t verilator_ns_ = 0;
-  uint64_t uncore_ns_ = 0;
-
-  // Stat tracking and verbose logging.
-  Stat stats_;
-  Stat last_periodic_;
-  uint64_t last_periodic_cycle_ = 0;
-  Stat timer_stats_baseline_;
-  uint64_t timer_stats_start_cycle_ = 0;
-  uint64_t timer_stats_intervals_ = 0;
-  uint32_t sparse_observed_steps_ = 0;
-  uint32_t brunel_observed_steps_ = 0;
-  uint32_t brunelBoundaryPending_ = 0;
-  // Optional host-only spike completion observation; never gates the model.
-  uint32_t morrisonUncountedSpikePc_ = 0;
-  std::vector<uint64_t> morrisonUncountedReceipts_;
-  // Optional observation only: sampled target cycles, never host wall time.
-  struct BrunelPuProfile {
-    uint64_t samples = 0, active0 = 0, active1 = 0;
-    uint64_t executing = 0, stalled = 0, outstanding = 0;
-    uint64_t egress = 0, injection_blocked = 0;
-    uint64_t reverse_full = 0, spike_full = 0;
-    uint64_t mshr_occupancy = 0, mshr_full = 0, credit_full = 0;
-    uint64_t issued0 = 0, issued1 = 0, neurons0 = 0, neurons1 = 0;
-    uint64_t ac_wait_cycles = 0, biu_blocked_cycles = 0;
-    uint64_t last_forward_injection = 0;
-    uint64_t bulk_banks = 0, bulk_emitting = 0, bulk_wait = 0;
-    uint64_t bulk_commands = 0, bulk_lines = 0, bulk_overlap = 0, cross_job_overlap = 0;
-  };
-  std::vector<std::array<BrunelPuProfile, 4>> brunelPuProfile_;
-  struct BrunelMcProfile {
-    uint64_t cycles = 0, presented = 0, accepted = 0, responses = 0;
-    uint64_t inflight = 0, unissued = 0, fulfilled = 0, max_inflight = 0;
-    uint64_t accepted_reads = 0, accepted_writes = 0;
-    uint64_t refused_reads = 0, refused_writes = 0;
-    uint64_t return_samples = 0, returned_total = 0, returned_unicast = 0, returned_scatter = 0;
-  };
-  std::vector<std::array<BrunelMcProfile, 4>> brunelMcProfile_;
-  struct BrunelMshrProfile {
-    uint64_t samples = 0, full = 0, transient = 0, head_ready = 0;
-    uint64_t head_loading_younger_ready = 0, head_loading_none_ready = 0;
-    std::array<uint64_t, 17> ready_entries{};
-  };
-  std::vector<BrunelMshrProfile> brunelMshrProfile_;
-  // Eight little-endian words per full-pool observation; schema in the writer.
-  std::vector<std::array<uint32_t, 8>> brunelMshrSamples_;
-  struct BrunelExecutionProfile {
-    uint64_t cycles = 0, advanced0 = 0, advanced1 = 0;
-    uint64_t stalled0 = 0, stalled1 = 0, no_valid = 0;
-    uint64_t fp0 = 0, fp1 = 0, memory = 0, message = 0, delayed = 0;
-    uint64_t active0 = 0, active1 = 0;
-  };
-  std::vector<BrunelExecutionProfile> brunelExecutionProfile_;
-  struct MorrisonReadyProfile {
-    uint64_t cycles=0, credit_sum=0, ready_sum=0, occupied_sum=0;
-    uint64_t max_credit=0, max_ready=0, max_occupied=0, max_tail=0;
-    uint64_t pending=0, next_busy=0, credit_full=0;
-    uint64_t lr=0, sc0=0, sc1=0, sc_failed=0, lrsc_dma_stall=0, dma_reserved=0;
-  };
-  std::vector<MorrisonReadyProfile> morrisonReadyProfile_;
-  // Reverse only, indexed by SMT, 8KiB payload word, advance/stall.
-  std::array<std::array<std::array<uint64_t, 2>, 2048>, 2> brunelExecutionPcs_{};
-  // cycle low/high, step, PU, count/head/tail, masks, exec PC/flags, fetch PCs.
-  std::vector<std::array<uint32_t, 12>> brunelExecutionSamples_;
-  std::unordered_map<uint64_t, uint64_t> brunelPcProfile_;
-  uint32_t brunelProfileCompleted_ = 0;
-  struct BrunelMemoryEvent { uint64_t cycle; uint32_t pu, kind, token, address; };
-  std::vector<BrunelMemoryEvent> brunelMemoryEvents_;
-  std::vector<std::array<uint32_t,4>> brunelBulkBanks_; // state0/1, issuing-job ticket0/1
-  void observeBrunelMemory(uint64_t cycle);
-  void observeMorrisonBoundary(uint64_t cycle, const char *directory,
-                                uint32_t completed);
-  void observeBrunelProfile(uint64_t cycle, const char *directory,
-                           uint32_t completed);
-  std::array<uint64_t, 9> brunel_last_counts_{};
-  bool timer_stats_start_pending_ = false;
-  bool timer_stats_active_ = false;
-  bool log_ = false;
-
-  struct NocLinkProfile {
-    uint64_t presented = 0;
-    uint64_t accepted = 0;
-    uint64_t blocked = 0;
-    uint64_t queue_occupancy_sum = 0;
-    uint64_t queue_full_cycles = 0;
-    uint64_t current_stall = 0;
-    uint64_t longest_stall = 0;
-    std::vector<uint64_t> blocked_by_mc;
-  };
-
-  struct NocRouterProfile {
-    uint64_t injection_presented = 0;
-    uint64_t injection_accepted = 0;
-    uint64_t injection_blocked = 0;
-    uint64_t current_injection_stall = 0;
-    uint64_t longest_injection_stall = 0;
-    uint64_t occupancy_sum = 0;
-    uint64_t full_input_queue_cycles = 0;
-    uint64_t max_occupancy = 0;
-  };
-
-  struct NocMemifProfile {
-    std::vector<uint64_t> allocated;
-    std::vector<uint64_t> allocatable;
-    std::vector<uint64_t> unissued;
-    std::vector<uint64_t> issued_unfulfilled;
-    std::vector<uint64_t> fulfilled;
-    std::vector<uint64_t> broadcast;
-    std::vector<uint64_t> broadcast_queue;
-    std::vector<uint64_t> bulk_queue;
-    uint64_t allocation_full_cycles = 0;
-    uint64_t allocation_blocked_cycles = 0;
-    uint64_t cursor_blocked_cycles = 0;
-    uint64_t broadcast_blocked_cycles = 0;
-    uint64_t bulk_reservation_blocked_cycles = 0;
-    uint64_t external_request_presented = 0;
-    uint64_t external_request_accepted = 0;
-    uint64_t external_response_accepted = 0;
-    uint64_t mshr_unicast_local_retired = 0;
-    uint64_t mshr_unicast_remote_injected = 0;
-    uint64_t ring_unicast_local_delivered = 0;
-    uint64_t broadcast_retired = 0;
-  };
-
-  struct NocCycleProfile {
-    uint64_t cycle = 0;
-    uint8_t mnist_phase = 0;
-    uint64_t router_flits = 0;
-    uint64_t full_input_queues = 0;
-    uint64_t links_presented = 0;
-    uint64_t links_accepted = 0;
-    uint64_t links_blocked = 0;
-    uint64_t injections_presented = 0;
-    uint64_t injections_accepted = 0;
-    uint64_t injections_blocked = 0;
-    uint64_t memif_arrivals = 0;
-    uint64_t max_router_flits = 0;
-    uint64_t total_mshrs = 0;
-    uint64_t broadcast_mshrs = 0;
-    uint64_t fulfilled_mshrs = 0;
-    uint64_t broadcast_queues = 0;
-    uint64_t broadcast_blocked_mcs = 0;
-    uint64_t external_requests_presented = 0;
-    uint64_t external_requests_accepted = 0;
-    uint64_t external_responses_accepted = 0;
-    uint64_t mshr_unicasts_local_retired = 0;
-    uint64_t mshr_unicasts_remote_injected = 0;
-    uint64_t ring_unicasts_local_delivered = 0;
-    uint64_t active_pus = 0;
-    uint64_t active_threads = 0;
-    uint64_t executing_pus = 0;
-    uint64_t stalled_pus = 0;
-    uint64_t retired_instructions = 0;
-    uint64_t sc_attempts = 0;
-    uint64_t sc_failures = 0;
-    uint64_t spike_queue_entries = 0;
-    uint64_t spike_queue_nonempty_pus = 0;
-    uint64_t spike_queue_full_pus = 0;
-    uint64_t idle_pus_with_spikes = 0;
-  };
-
-  struct NocPuProfile {
-    uint64_t active_cycles = 0;
-    uint64_t active_thread_cycles = 0;
-    uint64_t one_active_thread_cycles = 0;
-    uint64_t two_active_thread_cycles = 0;
-    uint64_t executing_cycles = 0;
-    uint64_t stalled_cycles = 0;
-    uint64_t retired_instructions = 0;
-    uint64_t sc_attempts = 0;
-    uint64_t sc_failures = 0;
-    uint64_t spike_queue_occupancy_sum = 0;
-    uint64_t spike_queue_empty_cycles = 0;
-    uint64_t spike_queue_full_cycles = 0;
-    uint64_t idle_with_spikes_cycles = 0;
-    uint64_t spike_enqueues = 0;
-    uint64_t spike_dequeues = 0;
-    uint64_t max_spike_queue_occupancy = 0;
-  };
-
-  std::optional<std::string> nocProfileDir_;
-  bool nocProfileActive_ = false;
-  bool nocProfileWritten_ = false;
-  uint64_t nocProfileStartCycle_ = 0;
-  uint64_t nocProfileStopCycle_ = 0;
-  std::optional<uint64_t> nocProfileManualStart_;
-  std::optional<uint64_t> nocProfileManualStop_;
-  std::vector<NocLinkProfile> nocLinkProfiles_;
-  std::vector<NocRouterProfile> nocRouterProfiles_;
-  std::vector<NocMemifProfile> nocMemifProfiles_;
-  std::vector<NocPuProfile> nocPuProfiles_;
-  std::array<uint64_t, ROUTER_Q_DEPTH + 1> nocQueueOccupancy_{};
-  std::vector<NocCycleProfile> nocCycleProfiles_;
-  uint8_t currentMnistPhase_ = 0;
-
   // Parallelism
   size_t numThreads = 8; // Overridden by the ctor's threads parameter.
-
-  enum class WorkProfilePhase : uint8_t {
-    StageStart,
-    StageDone,
-    StepStart,
-    StepDone,
-    Count,
-  };
-
-  enum class WorkProfileUnit : uint8_t {
-    Stats,
-    PeekMC,
-    AcceptPeriph,
-    AcceptMC,
-    StepPeriph,
-    StepMC,
-    RingUpdate,
-    RingProgress,
-  };
-
-  enum class WorkProfileSubstep : uint8_t {
-    StageResolveLinks,
-    StageDriveInputs,
-    StageNegedgeEval,
-    StageCaptureAccepts,
-    StageMemIf,
-    StepPosedge,
-    StepTransfer,
-    StepMemIf,
-    StepPrepareMem,
-    StepCleanup,
-    Count,
-  };
-
-  static constexpr size_t WORK_PROFILE_SAMPLE_PERIOD = 256;
-  static constexpr size_t WORK_PROFILE_PHASE_COUNT =
-      static_cast<size_t>(WorkProfilePhase::Count);
-  static constexpr size_t WORK_PROFILE_SUBSTEP_COUNT =
-      static_cast<size_t>(WorkProfileSubstep::Count);
-
-  // Each thread writes only its own slot. The leader reads all slots after the
-  // corresponding barrier, whose acquire/release ordering publishes them.
-  struct alignas(DESTRUCTIVE_INTERFERENCE_SIZE) WorkProfileThreadTimes {
-    std::array<uint64_t, WORK_PROFILE_PHASE_COUNT> local_done{};
-    std::array<uint64_t, WORK_PROFILE_PHASE_COUNT> barrier_arrival{};
-    std::array<uint64_t, WORK_PROFILE_SUBSTEP_COUNT> substep_duration{};
-  };
-
-  struct WorkProfilePhaseSample {
-    uint64_t cycle;
-    WorkProfilePhase phase;
-    uint64_t local_spread_ns;
-    uint64_t worker_spread_ns;
-    uint64_t leader_extra_ns;
-    uint64_t arrival_spread_ns;
-    uint64_t critical_extension_ns;
-  };
-
-  struct WorkProfileUnitSample {
-    uint64_t cycle;
-    WorkProfilePhase phase;
-    WorkProfileUnit unit;
-    uint16_t index;
-    uint64_t duration_ns;
-  };
-
-  struct WorkProfileSubstepSample {
-    uint64_t cycle;
-    WorkProfileSubstep substep;
-    uint16_t thread;
-    uint64_t duration_ns;
-  };
-
-  static_assert(alignof(WorkProfileThreadTimes) >=
-                DESTRUCTIVE_INTERFERENCE_SIZE);
-
-  bool workProfileEnabled = false;
-  std::vector<WorkProfileThreadTimes> workProfileTimes;
-  std::vector<WorkProfilePhaseSample> workProfilePhaseSamples;
-  std::vector<WorkProfileUnitSample> workProfileUnitSamples;
-  std::vector<WorkProfileSubstepSample> workProfileSubstepSamples;
 
   std::atomic_bool halted = false;
   SpinBarrier stageStart, stageDone;
   SpinBarrier stepStart, stepDone;
   bool resetReleaseNow;
   std::vector<std::thread> workers; // Should be numThreads - 1
-
-  // RAII helper that attributes wall time between verilator eval
-  // (tracked separately via a thread-local accumulator) and uncore.
-  struct PhaseTimer {
-    SoftSystemBackend &owner;
-    std::chrono::high_resolution_clock::time_point t0;
-    uint64_t v_at_entry;
-    PhaseTimer(SoftSystemBackend &o);
-    ~PhaseTimer();
-  };
 
   // Construct one router given its 1-based PU id. Used by the routers
   // factory.
@@ -579,32 +251,13 @@ class SoftSystemBackend : public SystemBackend {
   std::unique_ptr<Flit> takeMemifFlit(size_t memifIdx);
   bool ringCanInject(size_t memifIdx) const;
 
-  // Per-cycle stat accumulation. Called at the end of stage()/step().
-  void accumulateStats(uint64_t cycle);
-  void accumulateNocProfile(uint64_t cycle);
-  void startNocProfile(uint64_t cycle);
-  void writeNocProfile();
-
-  static uint64_t workProfileNowNs();
-  bool workProfileSampleCycle(uint64_t cycle) const;
-  void workProfileMark(size_t threadId, WorkProfilePhase phase,
-                       uint64_t localDone, uint64_t barrierArrival);
-  void workProfileRecordPhase(uint64_t cycle, WorkProfilePhase phase);
-  void workProfileRecordUnit(uint64_t cycle, WorkProfilePhase phase,
-                             WorkProfileUnit unit, size_t index,
-                             uint64_t duration);
-  void workProfileRecordSubsteps(uint64_t cycle,
-                                 WorkProfileSubstep first,
-                                 WorkProfileSubstep last);
-  void printWorkProfile() const;
-
-  void stageWorkResolve(size_t threadId, bool profile);
-  void stageMemifWork(size_t threadId, bool profile);
-  void prepareNextCoreMem(size_t threadId, bool profile);
-  void stepWork(size_t threadId, bool profile);
+  void stageWorkResolve(size_t threadId);
+  void stageMemifWork(size_t threadId);
+  void prepareNextCoreMem(size_t threadId);
+  void stepWork(size_t threadId);
   void stepPeriphWork(size_t threadId);
-  void stepMemifWork(size_t threadId, bool profile);
-  void stepCleanup(size_t threadId, bool profile);
+  void stepMemifWork(size_t threadId);
+  void stepCleanup(size_t threadId);
   void worker(size_t threadId);
 
   std::pair<size_t, size_t> puWorkRange(size_t threadId) const {
@@ -625,15 +278,6 @@ class SoftSystemBackend : public SystemBackend {
   SoftSystemBackend &operator=(const SoftSystemBackend &) = delete;
 
   void attachTrace(VerilatedFstC *tracer, int depth);
-  void setLogging(bool enabled) { log_ = enabled; }
-  void setNocProfileDir(std::optional<std::string> dir) {
-    nocProfileDir_ = std::move(dir);
-  }
-  void setNocProfileWindow(std::optional<uint64_t> start,
-                           std::optional<uint64_t> stop) {
-    nocProfileManualStart_ = start;
-    nocProfileManualStop_ = stop;
-  }
 
   // SystemBackend interface
   SystemConfig config() const override;
@@ -641,7 +285,4 @@ class SoftSystemBackend : public SystemBackend {
   void peek(uint64_t cycle, std::vector<MemBusOut *> out) override;
   void stage(uint64_t cycle, const std::vector<MemBusIn> &in) override;
   void step(uint64_t cycle) override;
-  void timerStatsStart(uint64_t cycle) override;
-  void timerStatsStop(uint64_t cycle) override;
-  bool printStats(uint64_t cycles, bool final) override;
 };

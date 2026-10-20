@@ -25,7 +25,6 @@
 #include <iomanip>
 #include <verilated_fst_c.h>
 #include "verilated/rtl.h"
-#include "verilated/rtl___024root.h"
 
 #include "include/argparse.h"
 #include "devices.h"
@@ -402,7 +401,6 @@ int main(int argc, char **argv) {
   cerr << "[Single] Runtime: " << fixed << setprecision(3) << wall_secs << "s" << endl;
 
   cerr << "[Single] Total events captured: " << sim.events.size() << endl;
-  printICacheStats(icaches, "single");
   for(auto &ev : sim.events) {
     cerr << "[Single]   @" << dec << ev.cycle
          << " dst=" << ev.dst << " tag=0x" << hex << ev.tag

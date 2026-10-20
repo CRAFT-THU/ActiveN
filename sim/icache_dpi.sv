@@ -15,42 +15,15 @@ module ICacheDpi;
   export "DPI-C" function icacheWays;
   function automatic int unsigned icacheWays(); return ASSOC; endfunction
 
-  // Counting accepted requests (not presented valid cycles) also works under
-  // backpressure and distinguishes memory beats from completed cache lines.
-  longint unsigned refillRequests;
-  longint unsigned globalRequests;
-  longint unsigned lineFills;
+  // Preload is allowed only before the first accepted fetch.
   bit fetchStarted;
   always @(posedge ICache.clock) begin
     if (ICache.reset) begin
-      refillRequests <= 0;
-      globalRequests <= 0;
-      lineFills <= 0;
       fetchStarted <= 0;
     end else begin
       if (ICache.input_ready && ICache.input_valid) fetchStarted <= 1;
-      if (ICache.mem_req_valid && ICache.mem_req_ready)
-        refillRequests <= refillRequests + 1;
-      if (ICache.mem_req_valid && ICache.mem_req_ready && ICache.mem_req_bits_addr[31])
-        globalRequests <= globalRequests + 1;
-      if (ICache.s1refillComplete) lineFills <= lineFills + 1;
     end
   end
-
-  export "DPI-C" function icacheRefillRequests;
-  function automatic longint unsigned icacheRefillRequests();
-    return refillRequests;
-  endfunction
-
-  export "DPI-C" function icacheGlobalRequests;
-  function automatic longint unsigned icacheGlobalRequests();
-    return globalRequests;
-  endfunction
-
-  export "DPI-C" function icacheLineFills;
-  function automatic longint unsigned icacheLineFills();
-    return lineFills;
-  endfunction
 
   export "DPI-C" function icacheInitReady;
   function automatic bit icacheInitReady();

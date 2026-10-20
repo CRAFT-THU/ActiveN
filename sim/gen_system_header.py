@@ -196,7 +196,4 @@ with args.output.open("w") as f:
     }
 """)
 
-    # printStats()
-    f.write("    bool printStats(uint64_t, bool) override { return false; }\n")
-
     f.write("};\n")

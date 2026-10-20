@@ -1,6 +1,3 @@
-#include "../payloads/sys/brunel.h"
-#include "../payloads/sys/morrison_layout.h"
-#include "../payloads/sys/morrison_bulk_layout.h"
 /**
  * Software NoC system simulator.
  *
@@ -9,54 +6,22 @@
  */
 
 #include <algorithm>
-#include <bit>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <iomanip>
 #include <iostream>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 
 #include "soft_backend.h"
 #include "soft_components.h"
 #include "soft_mem.h"
-#include "soft_verilated/soft_rtl___024root.h"
-#include "../payloads/sys/mnist_sparse_layout.inc"
 
 using namespace std;
-
-// Wall-clock accumulator (ns) for time spent inside soft_rtl Verilator
-// eval() calls, summed across all PUs. Thread-local because Verilated
-// contexts are per-thread; we use this to attribute soft-model runtime
-// between "verilator" (CPU spent inside soft_rtl::eval) and "uncore"
-// (everything else inside peek/stage/step). Incremented at batch
-// granularity by the per-cycle eval loops in stage()/step();
-// snapshotted by PhaseTimer.
-static thread_local uint64_t g_soft_verilator_ns = 0;
-
-static bool softTimerMnistActivityEnabled() {
-  static const bool enabled = [] {
-    const char *value = std::getenv("SOFT_TIMER_MNIST_ACTIVITY");
-    return value != nullptr && std::strcmp(value, "0") != 0;
-  }();
-  return enabled;
-}
-
-static bool softMnistPhaseLogEnabled() {
-  static const bool enabled = [] {
-    const char *value = std::getenv("SOFT_MNIST_PHASE_LOG");
-    return value != nullptr && std::strcmp(value, "0") != 0;
-  }();
-  return enabled;
-}
 
 // ===========================================================================
 // Topology
@@ -210,185 +175,6 @@ Topology::Topology(size_t num_pu, size_t num_mc)
 // SoftSystemBackend
 // ===========================================================================
 
-SoftSystemBackend::Stat SoftSystemBackend::Stat::operator-(const Stat &o) const {
-  Stat r;
-  r.total_hops          = total_hops          - o.total_hops;
-  r.total_injections    = total_injections    - o.total_injections;
-  r.total_mem_requests  = total_mem_requests  - o.total_mem_requests;
-  r.unicast_mem_requests =
-      unicast_mem_requests - o.unicast_mem_requests;
-  r.icache_accesses     = icache_accesses     - o.icache_accesses;
-  r.icache_line_fills   = icache_line_fills   - o.icache_line_fills;
-  r.icache_stall_core_cycles =
-      icache_stall_core_cycles - o.icache_stall_core_cycles;
-  r.mnist_feedforward_messages =
-      mnist_feedforward_messages - o.mnist_feedforward_messages;
-  r.mnist_trace_messages =
-      mnist_trace_messages - o.mnist_trace_messages;
-  r.mnist_post_fired_trace_messages =
-      mnist_post_fired_trace_messages - o.mnist_post_fired_trace_messages;
-  r.mnist_inhibitory_spikes =
-      mnist_inhibitory_spikes - o.mnist_inhibitory_spikes;
-  r.idle_lane_cycles    = idle_lane_cycles    - o.idle_lane_cycles;
-  r.idle_core_cycles    = idle_core_cycles    - o.idle_core_cycles;
-  r.blocked_structural  = blocked_structural  - o.blocked_structural;
-  r.inflight_messages_sum = inflight_messages_sum - o.inflight_messages_sum;
-  r.inflight_dram_sum   = inflight_dram_sum   - o.inflight_dram_sum;
-  r.inflight_resp_sum   = inflight_resp_sum   - o.inflight_resp_sum;
-  r.cur_inflight_messages = cur_inflight_messages;
-  r.cur_inflight_dram   = cur_inflight_dram;
-  r.cur_inflight_resp   = cur_inflight_resp;
-  return r;
-}
-
-void SoftSystemBackend::Stat::print(uint64_t cycles, uint64_t numPUs) const {
-  auto avg = [cycles](uint64_t v) -> double {
-    return cycles > 0 ? static_cast<double>(v) / cycles : 0.0;
-  };
-  std::cerr << std::fixed << std::setprecision(2);
-  std::cerr << "  hops:           " << total_hops
-            << " (avg " << avg(total_hops) << "/cyc)\n";
-  std::cerr << "  injections:     " << total_injections
-            << " (avg " << avg(total_injections) << "/cyc)\n";
-  std::cerr << "  mem_requests:   " << total_mem_requests
-            << " (avg " << avg(total_mem_requests) << "/cyc)\n";
-  std::cerr << "  unicast_mem_requests: " << unicast_mem_requests << '\n';
-  printIcache(cycles, numPUs);
-  std::cerr << "  idle_lanes:     " << idle_lane_cycles
-            << " (avg " << avg(idle_lane_cycles) << "/cyc)\n";
-  std::cerr << "  idle_cores:     " << idle_core_cycles
-            << " (avg " << avg(idle_core_cycles) << "/cyc)\n";
-  std::cerr << "  blocked_hazard: " << blocked_structural
-            << " (avg " << avg(blocked_structural) << "/cyc)\n";
-  std::cerr << "  inflight_msg:   " << inflight_messages_sum
-            << " (avg " << avg(inflight_messages_sum)
-            << "/cyc, cur " << cur_inflight_messages << ")\n";
-  std::cerr << "  inflight_dram:  " << inflight_dram_sum
-            << " (avg " << avg(inflight_dram_sum)
-            << "/cyc, cur " << cur_inflight_dram << ")\n";
-  std::cerr << "  inflight_resp:  " << inflight_resp_sum
-            << " (avg " << avg(inflight_resp_sum)
-            << "/cyc, cur " << cur_inflight_resp << ")\n";
-}
-
-void SoftSystemBackend::Stat::printIcache(uint64_t cycles,
-                                          uint64_t numPUs) const {
-  const double missRate = icache_accesses
-      ? 100.0 * static_cast<double>(icache_line_fills) / icache_accesses
-      : 0.0;
-  const double stallShare = cycles && numPUs
-      ? 100.0 * static_cast<double>(icache_stall_core_cycles) /
-            (cycles * numPUs)
-      : 0.0;
-  std::cerr << std::fixed << std::setprecision(5)
-            << "  icache_accesses: " << icache_accesses << '\n'
-            << "  icache_fills:    " << icache_line_fills
-            << " (miss rate " << missRate << "%)\n"
-            << "  icache_stalls:   " << icache_stall_core_cycles
-            << " core-cycles (" << stallShare << "% of PU cycles)\n"
-            << std::setprecision(2);
-}
-
-SoftSystemBackend::PhaseTimer::PhaseTimer(SoftSystemBackend &o)
-  : owner(o),
-    t0(std::chrono::high_resolution_clock::now()),
-    v_at_entry(g_soft_verilator_ns) {}
-
-SoftSystemBackend::PhaseTimer::~PhaseTimer() {
-  auto t1 = std::chrono::high_resolution_clock::now();
-  uint64_t total =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-  uint64_t v = g_soft_verilator_ns - v_at_entry;
-  owner.verilator_ns_ += v;
-  owner.uncore_ns_ += (total > v ? total - v : 0);
-}
-
-uint64_t SoftSystemBackend::workProfileNowNs() {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-      std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-
-bool SoftSystemBackend::workProfileSampleCycle(uint64_t cycle) const {
-  return workProfileEnabled && cycle > releaseResetAfter &&
-         cycle % WORK_PROFILE_SAMPLE_PERIOD == 0;
-}
-
-void SoftSystemBackend::workProfileMark(size_t threadId,
-                                        WorkProfilePhase phase,
-                                        uint64_t localDone,
-                                        uint64_t barrierArrival) {
-  const size_t p = static_cast<size_t>(phase);
-  workProfileTimes[threadId].local_done[p] = localDone;
-  workProfileTimes[threadId].barrier_arrival[p] = barrierArrival;
-}
-
-void SoftSystemBackend::workProfileRecordPhase(uint64_t cycle,
-                                               WorkProfilePhase phase) {
-  const size_t p = static_cast<size_t>(phase);
-  uint64_t localMin = workProfileTimes[0].local_done[p];
-  uint64_t localMax = localMin;
-  uint64_t arrivalMin = workProfileTimes[0].barrier_arrival[p];
-  uint64_t arrivalMax = arrivalMin;
-  uint64_t workerMin = numThreads > 1 ? workProfileTimes[1].local_done[p]
-                                      : localMin;
-  uint64_t workerMax = workerMin;
-
-  for (size_t t = 1; t < numThreads; ++t) {
-    localMin = std::min(localMin, workProfileTimes[t].local_done[p]);
-    localMax = std::max(localMax, workProfileTimes[t].local_done[p]);
-    arrivalMin = std::min(arrivalMin,
-                          workProfileTimes[t].barrier_arrival[p]);
-    arrivalMax = std::max(arrivalMax,
-                          workProfileTimes[t].barrier_arrival[p]);
-    workerMin = std::min(workerMin, workProfileTimes[t].local_done[p]);
-    workerMax = std::max(workerMax, workProfileTimes[t].local_done[p]);
-  }
-
-  const uint64_t leaderLocal = workProfileTimes[0].local_done[p];
-  const uint64_t leaderArrival = workProfileTimes[0].barrier_arrival[p];
-  workProfilePhaseSamples.push_back({
-      .cycle = cycle,
-      .phase = phase,
-      .local_spread_ns = localMax - localMin,
-      .worker_spread_ns = workerMax - workerMin,
-      .leader_extra_ns = leaderArrival - leaderLocal,
-      .arrival_spread_ns = arrivalMax - arrivalMin,
-      .critical_extension_ns = arrivalMax > localMax
-                                   ? arrivalMax - localMax
-                                   : 0,
-  });
-}
-
-void SoftSystemBackend::workProfileRecordUnit(uint64_t cycle,
-                                              WorkProfilePhase phase,
-                                              WorkProfileUnit unit,
-                                              size_t index,
-                                              uint64_t duration) {
-  workProfileUnitSamples.push_back({
-      .cycle = cycle,
-      .phase = phase,
-      .unit = unit,
-      .index = static_cast<uint16_t>(index),
-      .duration_ns = duration,
-  });
-}
-
-void SoftSystemBackend::workProfileRecordSubsteps(
-    uint64_t cycle, WorkProfileSubstep first, WorkProfileSubstep last) {
-  const size_t firstIndex = static_cast<size_t>(first);
-  const size_t lastIndex = static_cast<size_t>(last);
-  for (size_t s = firstIndex; s <= lastIndex; ++s) {
-    for (size_t thread = 0; thread < numThreads; ++thread) {
-      workProfileSubstepSamples.push_back({
-          .cycle = cycle,
-          .substep = static_cast<WorkProfileSubstep>(s),
-          .thread = static_cast<uint16_t>(thread),
-          .duration_ns = workProfileTimes[thread].substep_duration[s],
-      });
-    }
-  }
-}
-
 SoftSystemBackend::WrappedRouter SoftSystemBackend::buildRouter(uint16_t pu) const {
   LinkStatus links;
   Topology::DirectionToLinkIdx dir_to_link{};
@@ -520,11 +306,6 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads,
     routers(cfg.numPU,
             [this](size_t i) { return buildRouter(static_cast<uint16_t>(i)); }),
     numThreads(threads),
-    workProfileEnabled([] {
-      const char *value = std::getenv("SOFT_WORK_PROFILE");
-      return value != nullptr && std::strcmp(value, "0") != 0;
-    }()),
-    workProfileTimes(numThreads),
     stageStart(numThreads),
     stageDone(numThreads),
     stepStart(numThreads),
@@ -534,26 +315,6 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads,
   if (cfg.numPU % cfg.numMC != 0) throw std::invalid_argument("numPU must be divisible by numMC");
   if ((cfg.numPU / cfg.numMC) % soft_mem::CLUSTER_SIZE != 0) throw std::invalid_argument("PU per MC must be a multiple of cluster size");
   if (numThreads < 1 || numThreads > cfg.numPU) throw std::invalid_argument("numThreads must be between 1 and numPU");
-
-  if (const char *value = std::getenv("MORRISON_UNCOUNTED_SPIKE_PC")) {
-    size_t consumed = 0;
-    const auto pc = std::stoul(value, &consumed, 0);
-    if (consumed != std::strlen(value) || pc < 0x80000010ul ||
-        pc >= 0x80002000ul || (pc & 3) || !std::getenv("SOFT_BRUNEL_DUMP"))
-      throw std::invalid_argument("invalid MORRISON_UNCOUNTED_SPIKE_PC/dump configuration");
-    morrisonUncountedSpikePc_ = pc;
-    morrisonUncountedReceipts_.resize(cfg.numPU + 1);
-    std::cerr << "[Morrison uncounted observer] spike_pc=0x" << std::hex
-              << pc << std::dec << " passive=1\n";
-  }
-
-  if (workProfileEnabled) {
-    workProfilePhaseSamples.reserve(1 << 18);
-    workProfileUnitSamples.reserve(1 << 20);
-    workProfileSubstepSamples.reserve(1 << 20);
-    std::cerr << "[Soft work profile] sampling every "
-              << WORK_PROFILE_SAMPLE_PERIOD << " cycles\n";
-  }
 
   const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
   const size_t CLUSTER_PER_MC = PU_PER_MC / soft_mem::CLUSTER_SIZE;
@@ -583,7 +344,7 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads,
     thread_memifs[memif_owner[memifIdx]].push_back(memifIdx);
   }
   for (size_t thread = 0; thread < numThreads; ++thread)
-    prepareNextCoreMem(thread, false);
+    prepareNextCoreMem(thread);
 
   // Size per-memif eject buffers: one slot per request port (matches
   // topo.memif_req_at[i].size()).
@@ -701,7 +462,6 @@ static void presentCoreMem(soft_rtl &core, const soft_mem::DRAMIf::PUResp &resp)
 }
 
 void SoftSystemBackend::peek(uint64_t cycle, std::vector<MemBusOut *> out) {
-  PhaseTimer _t(*this);
   if constexpr (ASSERTIONS_ENABLED) {
     if (out.size() != cfg.numMC + 1)
       throw std::invalid_argument("peek: out size mismatch");
@@ -711,737 +471,12 @@ void SoftSystemBackend::peek(uint64_t cycle, std::vector<MemBusOut *> out) {
     return;
   }
 
-  static const bool sparseSteps = [] {
-    const char *value = std::getenv("SOFT_MNIST_SPARSE_STEPS");
-    return value && std::strcmp(value, "0") != 0;
-  }();
-  if (sparseSteps) {
-    const auto word = [&](unsigned pu, unsigned offset) -> uint32_t {
-      const auto &spm = cores[pu]->rootp->Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
-      return spm[offset / MEM_BUS_WIDTH_B][(offset % MEM_BUS_WIDTH_B) / 4];
-    };
-    const uint32_t magic = word(1, H_MAGIC);
-    const uint32_t steps = word(1, H_STEPS);
-    // The root increments STEPS only after the reverse completion barrier.
-    // Observe warm-up as well as timed steps for independent FP32 replay.
-    if (magic >= 0x4d535031 && magic <= 0x4d535034
-        && word(1, H_PHASE) == 4 && steps != sparse_observed_steps_) {
-      if (steps != sparse_observed_steps_ + 1)
-        throw runtime_error("sparse observer skipped a completed step");
-      std::array<uint64_t, 8> posts{};
-      unsigned leaders = 0;
-      for (unsigned pu = 1; pu <= cfg.numPU; ++pu) {
-        if (word(pu, H_LEADER) != pu) continue;
-        const unsigned group = word(pu, H_GROUP);
-        if (group >= posts.size()) throw runtime_error("invalid sparse group");
-        posts[group] = word(pu, H_POST_LO) | (uint64_t{word(pu, H_POST_HI)} << 32);
-        ++leaders;
-      }
-      if (leaders != posts.size()) throw runtime_error("invalid sparse group count");
-      std::ostringstream line;
-      line << "[Sparse step] completed=" << steps << " posts=" << std::hex << std::setfill('0');
-      for (unsigned group = 0; group < posts.size(); ++group)
-        line << (group ? "," : "") << std::setw(16) << posts[group];
-      std::cerr << line.str() << '\n';
-      sparse_observed_steps_ = steps;
-    }
-  }
-
-  if (const char *directory = std::getenv("SOFT_BRUNEL_DUMP")) {
-    const auto word = [&](unsigned pu, unsigned offset) -> uint32_t {
-      const auto &spm = cores[pu]->rootp->Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
-      return spm[offset / MEM_BUS_WIDTH_B][(offset % MEM_BUS_WIDTH_B) / 4];
-    };
-    const auto completed = word(1, offsetof(BrHeader, completed));
-    const bool compact = word(1, 0) == MR_MAGIC;
-    const bool recognized = compact || word(1, 0) == BR_MAGIC;
-    const bool summaryOnly = std::getenv("SOFT_BRUNEL_SUMMARY_ONLY") != nullptr;
-    if (recognized)
-      observeBrunelProfile(cycle, directory, completed);
-    if (recognized && completed != brunel_observed_steps_) {
-      if (completed != brunel_observed_steps_ + 1)
-        throw runtime_error("Brunel observer missed step");
-      if (compact && word(1, MR_PARAMETERS+16) >= 2)
-        brunelBoundaryPending_ = completed;
-      std::ostringstream name;
-      name << directory << "/step-" << std::setfill('0') << std::setw(4) << completed << ".bin";
-      std::ofstream stream;
-      if (!summaryOnly) stream.open(name.str(), std::ios::binary);
-      auto emit = [&](uint32_t v) {
-        if (!summaryOnly)
-          for (unsigned b = 0; b < 32; b += 8) stream.put(static_cast<char>(v >> b));
-      };
-      emit(0x42534431); emit(cfg.numPU);
-      std::array<uint64_t,9> counts{};
-      uint32_t excitatory=0,inhibitory=0,resident=0,pending=0;
-      uint64_t forwardReceipts=0, reverseReceipts=0;
-      std::vector<uint32_t> firedIds;
-      const unsigned ne = compact ? word(1, MR_PARAMETERS) : 9000;
-      for (unsigned pu=1;pu<=cfg.numPU;pu++) {
-        if (word(pu, offsetof(BrHeader,step)) != completed)
-          throw runtime_error("Brunel completed before all PUs");
-        emit(pu); emit(BR_DATA_END);
-        for (unsigned offset=0;offset<BR_DATA_END;offset+=4) emit(word(pu,offset));
-        for(unsigned i=0;i<8;i++) counts[i]+=word(pu,offsetof(BrHeader,buffer_updates)+4*i);
-        counts[8] += word(pu,offsetof(BrHeader,allocation_waits));
-        for(unsigned i=0;i<word(pu,offsetof(BrHeader,nn));i++) {
-          unsigned n=BR_NEURONS+i*(compact ? sizeof(MrNeuron) : sizeof(BrNeuron));
-          const unsigned fired = compact ? ((word(pu,n+28) >> 8) & 255)
-                                         : word(pu,n+offsetof(BrNeuron,fire));
-          if(fired) {
-            const unsigned gid = compact ? (pu-1+i*cfg.numPU)
-                                         : word(pu,n+offsetof(BrNeuron,gid));
-            if(gid<ne) excitatory++; else inhibitory++;
-            if (compact) firedIds.push_back(gid);
-          }
-        }
-        forwardReceipts += morrisonUncountedSpikePc_ ? morrisonUncountedReceipts_[pu]
-                                                    : word(pu, offsetof(BrHeader,received));
-        reverseReceipts += word(pu, offsetof(BrHeader,reverse_received));
-        resident += word(pu, offsetof(BrHeader,buffer_bytes)) / 4;
-        pending += word(pu, offsetof(BrHeader,mshr_count));
-      }
-      if(!summaryOnly && !stream) throw runtime_error("cannot write Brunel state");
-      if (compact) {
-        const auto mode = completed == 1 ? std::ios::out : std::ios::app;
-        std::ofstream activity(std::filesystem::path(directory) / "morrison-activity.csv", mode);
-        if (completed == 1) activity << "step,cycle,e_spikes,i_spikes,forward_deliveries,reverse_visits\n";
-        activity << completed << ',' << cycle << ',' << excitatory << ',' << inhibitory
-                 << ',' << forwardReceipts << ',' << reverseReceipts << '\n';
-        std::ofstream spikes(std::filesystem::path(directory) / "morrison-spikes.bin", mode | std::ios::binary);
-        const auto write = [&](uint32_t value) {
-          for (unsigned b=0; b<32; b+=8) spikes.put(static_cast<char>(value >> b));
-        };
-        if (completed == 1) {
-          write(MR_MAGIC); write(ne); write(word(1, MR_PARAMETERS+4)); write(cfg.numPU);
-        }
-        write(completed); write(firedIds.size());
-        for (auto gid : firedIds) write(gid);
-        if (!activity || !spikes) throw runtime_error("cannot write Morrison activity");
-      }
-      if (morrisonUncountedSpikePc_) {
-        std::ofstream receipts(std::filesystem::path(directory) / "uncounted-receipts.csv",
-                               completed == 1 ? std::ios::out : std::ios::app);
-        if (completed == 1) receipts << "step,pu,completed\n";
-        for (unsigned pu = 1; pu <= cfg.numPU; ++pu)
-          receipts << completed << ',' << pu << ',' << morrisonUncountedReceipts_[pu] << '\n';
-        receipts.close();
-        if (!receipts) throw runtime_error("cannot write uncounted receipt observation");
-        if (forwardReceipts != word(1, offsetof(BrHeader,expected_forward)))
-          throw runtime_error("uncounted timestep completed with missing/excess spike deliveries: observed=" +
-                              std::to_string(forwardReceipts) + " expected=" +
-                              std::to_string(word(1, offsetof(BrHeader,expected_forward))));
-        // peek(K) has captured edge K-1. step(K) will count edge K in the
-        // next interval. No architectural counter or barrier is changed.
-        std::fill(morrisonUncountedReceipts_.begin(), morrisonUncountedReceipts_.end(), 0);
-      }
-      std::cerr << (compact ? "[Morrison step] step=" : "[Brunel step] step=") << completed << " cycle=" << cycle
-                << " E=" << excitatory << " I=" << inhibitory;
-      const char *keys[]={"buffer_updates","mshr_loads","mshr_commits","overflow_rows","write_words","pool_full","forward_weights","reverse_events","allocation_waits"};
-      for(unsigned i=0;i<9;i++)std::cerr << ' ' << keys[i] << '=' << counts[i]-brunel_last_counts_[i];
-      std::cerr << " buffered_words=" << resident << " live_mshrs=" << pending << '\n';
-      brunel_last_counts_=counts; brunel_observed_steps_=completed;
-    }
-  }
-
   out[0]->req = periph.peekMem();
   for (size_t i = 0; i < cfg.numMC; ++i)
     out[i + 1]->req = drams[i].peekMem();
 }
 
-// Workers finish Router::step after stepDone. Inspect queues only after the
-// following stageDone: prior cleanup is published and workers wait for stepStart.
-// This is the same target cycle as the corresponding peek observation, before
-// its posedge; no extra host barrier or target-cycle delay is introduced.
-void SoftSystemBackend::observeMorrisonBoundary(uint64_t cycle, const char *directory,
-                                                uint32_t completed) {
-  const auto word = [&](unsigned pu, unsigned offset) -> uint32_t {
-    const auto &spm = cores[pu]->rootp->Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
-    return spm[offset / MEM_BUS_WIDTH_B][(offset % MEM_BUS_WIDTH_B) / 4];
-  };
-  const auto posted = [](unsigned dst, unsigned tag) {
-    return dst >= 0x8001 && (tag & 255) == 2;
-  };
-  size_t coreStores = 0, networkStores = 0, memoryStores = 0;
-  static const bool sharedUpdater = [] {
-    const char *value = std::getenv("MORRISON_SHARED_UPDATER");
-    return value && std::strcmp(value, "0") != 0;
-  }();
-  static const unsigned sharedUpdaterId = [] {
-    const char *value = std::getenv("MORRISON_SHARED_UPDATER_ID");
-    if (!value || std::strcmp(value, "12") == 0) return 12u;
-    if (std::strcmp(value, "11") == 0) return 11u;
-    throw runtime_error("MORRISON_SHARED_UPDATER_ID must be 11 or 12");
-  }();
-  size_t updaterEvents = 0, secondUpdaterEvents = 0, cleanupEvents = 0;
-  for (unsigned pu = 1; pu <= cfg.numPU; ++pu) {
-    const auto *root = cores[pu]->rootp;
-    if (word(pu,MR_PARAMETERS+16)==3 || word(pu,MR_PARAMETERS+16)==4) {
-      const auto queued = [](unsigned enq, unsigned deq, bool full) {
-        return full ? 16u : ((enq-deq)&15u);
-      };
-      if (sharedUpdater) {
-        if (sharedUpdaterId == 11) {
-          updaterEvents += queued(root->Core__DOT__exec__DOT__biu__DOT__evq_11__DOT__enq_ptr_value,
-              root->Core__DOT__exec__DOT__biu__DOT__evq_11__DOT__deq_ptr_value,
-              root->Core__DOT__exec__DOT__biu__DOT__evq_11__DOT__full);
-        } else {
-          updaterEvents += queued(root->Core__DOT__exec__DOT__biu__DOT__evq_12__DOT__enq_ptr_value,
-              root->Core__DOT__exec__DOT__biu__DOT__evq_12__DOT__deq_ptr_value,
-              root->Core__DOT__exec__DOT__biu__DOT__evq_12__DOT__full);
-        }
-        cleanupEvents += queued(root->Core__DOT__exec__DOT__biu__DOT__evq_13__DOT__enq_ptr_value,
-            root->Core__DOT__exec__DOT__biu__DOT__evq_13__DOT__deq_ptr_value,
-            root->Core__DOT__exec__DOT__biu__DOT__evq_13__DOT__full);
-      } else {
-        updaterEvents += queued(root->Core__DOT__exec__DOT__biu__DOT__evq_8__DOT__enq_ptr_value,
-            root->Core__DOT__exec__DOT__biu__DOT__evq_8__DOT__deq_ptr_value,
-            root->Core__DOT__exec__DOT__biu__DOT__evq_8__DOT__full);
-      }
-      secondUpdaterEvents += queued(root->Core__DOT__exec__DOT__biu__DOT__evq_15__DOT__enq_ptr_value,
-          root->Core__DOT__exec__DOT__biu__DOT__evq_15__DOT__deq_ptr_value,
-          root->Core__DOT__exec__DOT__biu__DOT__evq_15__DOT__full);
-    }
-    // Both configured workload cores have 32 BIU send slots. Checking
-    // just ext_out would miss a store behind hardware I-cache traffic.
-#define CHECK_POSTED_SLOT(N) \
-    coreStores += root->Core__DOT__exec__DOT__biu__DOT__sendQueue__DOT__valid_##N && \
-        posted(root->Core__DOT__exec__DOT__biu__DOT__sendQueue__DOT__buffer_##N##_dst, \
-               root->Core__DOT__exec__DOT__biu__DOT__sendQueue__DOT__buffer_##N##_tag)
-    CHECK_POSTED_SLOT(0); CHECK_POSTED_SLOT(1); CHECK_POSTED_SLOT(2); CHECK_POSTED_SLOT(3);
-    CHECK_POSTED_SLOT(4); CHECK_POSTED_SLOT(5); CHECK_POSTED_SLOT(6); CHECK_POSTED_SLOT(7);
-    CHECK_POSTED_SLOT(8); CHECK_POSTED_SLOT(9); CHECK_POSTED_SLOT(10); CHECK_POSTED_SLOT(11);
-    CHECK_POSTED_SLOT(12); CHECK_POSTED_SLOT(13); CHECK_POSTED_SLOT(14); CHECK_POSTED_SLOT(15);
-    CHECK_POSTED_SLOT(16); CHECK_POSTED_SLOT(17); CHECK_POSTED_SLOT(18); CHECK_POSTED_SLOT(19);
-    CHECK_POSTED_SLOT(20); CHECK_POSTED_SLOT(21); CHECK_POSTED_SLOT(22); CHECK_POSTED_SLOT(23);
-    CHECK_POSTED_SLOT(24); CHECK_POSTED_SLOT(25); CHECK_POSTED_SLOT(26); CHECK_POSTED_SLOT(27);
-    CHECK_POSTED_SLOT(28); CHECK_POSTED_SLOT(29); CHECK_POSTED_SLOT(30); CHECK_POSTED_SLOT(31);
-#undef CHECK_POSTED_SLOT
-    networkStores += routers[pu].rt.countFlits([&](const Flit &flit) {
-      return posted(flit.dst, flit.tag);
-    });
-    if (word(pu, offsetof(BrHeader, work_mc)) != cfg.numMC ||
-        word(pu, MB_CONTROL+B_QUERY) != 15)
-      throw runtime_error("Morrison timestep bypassed marker/idle barrier");
-  }
-  for (const auto &dram : drams) memoryStores += dram.postedStoreCount();
-  std::ofstream boundary(std::filesystem::path(directory) / "morrison-boundary.csv",
-                         completed == 1 ? std::ios::out : std::ios::app);
-  if (completed == 1) {
-    boundary << "step,cycle,core_stores,network_stores,mc_stores,";
-    boundary << (sharedUpdater ? "updater" + std::to_string(sharedUpdaterId) +
-                                   "_events,cleanup15_events,cleanup13_events\n"
-                              : "updater8_events,updater15_events\n");
-  }
-  boundary << completed << ',' << cycle << ',' << coreStores << ','
-           << networkStores << ',' << memoryStores << ',' << updaterEvents << ',' << secondUpdaterEvents;
-  if (sharedUpdater) boundary << ',' << cleanupEvents;
-  boundary << '\n';
-  if (!boundary) throw runtime_error("cannot write Morrison boundary observation");
-  if (coreStores || networkStores || memoryStores)
-    throw runtime_error("Morrison completed with posted stores in flight");
-  if (updaterEvents || secondUpdaterEvents || cleanupEvents)
-    throw runtime_error("Morrison completed with updater continuations queued");
-}
-
-// Sample pre-edge state every 256 target cycles. PC histograms cover the timed
-// interval; per-PU samples cover every timestep and flush at the global barrier.
-// Fetch PCs are approximate attribution (pipeline/lookahead), not retired PCs.
-void SoftSystemBackend::observeBrunelProfile(uint64_t cycle,
-                                            const char *directory,
-                                            uint32_t completed) {
-  static const bool enabled = std::getenv("SOFT_BRUNEL_PROFILE") != nullptr;
-  if (!enabled) return;
-  static const bool detailedMshr = [] {
-    const char *value = std::getenv("SOFT_BRUNEL_MSHR_PROFILE");
-    return value && std::strcmp(value, "0") != 0;
-  }();
-  static const bool executionProfile = [] {
-    const char *value = std::getenv("SOFT_BRUNEL_EXEC_PROFILE");
-    return value && std::strcmp(value, "0") != 0;
-  }();
-  if (brunelPuProfile_.empty()) brunelPuProfile_.resize(cfg.numPU + 1);
-  if (brunelBulkBanks_.empty()) brunelBulkBanks_.resize(cfg.numPU + 1);
-  if (brunelMcProfile_.empty()) brunelMcProfile_.resize(cfg.numMC);
-  if (detailedMshr && brunelMshrProfile_.empty())
-    brunelMshrProfile_.resize(cfg.numPU + 1);
-  if (executionProfile && brunelExecutionProfile_.empty())
-    brunelExecutionProfile_.resize(cfg.numPU + 1);
-  const auto word = [&](unsigned pu, unsigned offset) -> uint32_t {
-    const auto &s = cores[pu]->rootp->Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
-    return s[offset / MEM_BUS_WIDTH_B][(offset % MEM_BUS_WIDTH_B) / 4];
-  };
-  const unsigned last = word(1, offsetof(BrHeader, steps));
-  if (completed != brunelProfileCompleted_) {
-    const auto path = std::filesystem::path(directory) / "pu-profile.csv";
-    std::ofstream out(path, completed == 1 ? std::ios::out : std::ios::app);
-    if (completed == 1)
-      out << "step,phase,pu,samples,active0,active1,executing,stalled,outstanding,egress,injection_blocked,reverse_full,spike_full,mshr_occupancy,mshr_full,credit_full,issued0,issued1,neurons0,neurons1,"
-          << (word(1,0) == MR_MAGIC ? "ac_active_cycles" : "ac_wait_cycles")
-          << ",biu_blocked_cycles,last_forward_injection,bulk_bank_samples,bulk_emitting_samples,bulk_wait_samples,bulk_commands,bulk_lines,bulk_overlap_commands,cross_job_overlap_commands\n";
-    constexpr unsigned phases[] = {1, 2, 3, 6};
-    for (unsigned pu = 1; pu <= cfg.numPU; ++pu)
-      for (unsigned ph = 0; ph < 4; ++ph) {
-        auto &p = brunelPuProfile_[pu][ph];
-        if (p.samples)
-          out << completed << ',' << phases[ph] << ',' << pu << ','
-              << p.samples << ',' << p.active0 << ',' << p.active1 << ','
-              << p.executing << ',' << p.stalled << ',' << p.outstanding << ','
-              << p.egress << ',' << p.injection_blocked << ','
-              << p.reverse_full << ',' << p.spike_full << ',' << p.mshr_occupancy << ',' << p.mshr_full << ',' << p.credit_full << ','
-              << p.issued0 << ',' << p.issued1 << ',' << p.neurons0 << ',' << p.neurons1 << ','
-              << p.ac_wait_cycles << ',' << p.biu_blocked_cycles << ',' << p.last_forward_injection << ','
-              << p.bulk_banks << ',' << p.bulk_emitting << ',' << p.bulk_wait << ','
-              << p.bulk_commands << ','
-              << p.bulk_lines << ',' << p.bulk_overlap << ',' << p.cross_job_overlap << '\n';
-        p = {};
-      }
-    if (!out) throw runtime_error("cannot write Brunel PU profile");
-    std::ofstream mc(std::filesystem::path(directory) / "mc-profile.csv",
-                     completed == 1 ? std::ios::out : std::ios::app);
-    if (completed == 1)
-      mc << "step,phase,mc,cycles,presented,accepted,responses,inflight,unissued,fulfilled,max_inflight,"
-            "accepted_reads,accepted_writes,refused_reads,refused_writes,return_samples,returned_total,returned_unicast,returned_scatter\n";
-    for (unsigned id = 0; id < cfg.numMC; ++id)
-      for (unsigned ph = 0; ph < 4; ++ph) {
-        auto &p = brunelMcProfile_[id][ph];
-        if (p.cycles)
-          mc << completed << ',' << phases[ph] << ',' << id << ',' << p.cycles
-             << ',' << p.presented << ',' << p.accepted << ',' << p.responses
-             << ',' << p.inflight << ',' << p.unissued << ',' << p.fulfilled
-             << ',' << p.max_inflight << ',' << p.accepted_reads << ',' << p.accepted_writes
-             << ',' << p.refused_reads << ',' << p.refused_writes
-             << ',' << p.return_samples << ',' << p.returned_total << ',' << p.returned_unicast << ',' << p.returned_scatter << '\n';
-        p = {};
-      }
-    if (!mc) throw runtime_error("cannot write Brunel MC profile");
-    if (detailedMshr && word(1, MR_PARAMETERS+16) < 3) {
-      std::ofstream pools(std::filesystem::path(directory) / "mshr-pool-profile.csv",
-                          completed == 1 ? std::ios::out : std::ios::app);
-      if (completed == 1) {
-        pools << "step,pu,samples,full,transient,head_ready,head_loading_younger_ready,head_loading_none_ready";
-        for (unsigned n = 0; n <= BR_MSHRS; ++n) pools << ",stable_full_ready_" << n;
-        pools << '\n';
-      }
-      for (unsigned pu = 1; pu <= cfg.numPU; ++pu) {
-        auto &p = brunelMshrProfile_[pu];
-        pools << completed << ',' << pu << ',' << p.samples << ',' << p.full << ','
-              << p.transient << ',' << p.head_ready << ','
-              << p.head_loading_younger_ready << ',' << p.head_loading_none_ready;
-        for (auto n : p.ready_entries) pools << ',' << n;
-        pools << '\n';
-        p = {};
-      }
-      if (!pools) throw runtime_error("cannot write Brunel MSHR pool profile");
-
-      std::ofstream states(std::filesystem::path(directory) / "mshr-pool-samples.bin",
-                           std::ios::binary | (completed == 1 ? std::ios::out : std::ios::app));
-      // Header: magic/version/record words/PUs/slots/entry bytes/cadence/root phase/
-      // SPM base, then seven reserved words. Records: cycle low/high, step, PU,
-      // count, head, tail, ready-mask | (loading-mask << 16). No truncated indices.
-      static_assert(std::endian::native == std::endian::little);
-      static_assert(BR_MSHRS == 16);
-      if (completed == 1) {
-        const std::array<uint32_t, 16> header{
-            0x4d535031, 1, 8, uint32_t(cfg.numPU), BR_MSHRS, sizeof(BrMshr), 256, 3, BR_MSHR};
-        states.write(reinterpret_cast<const char *>(header.data()), sizeof(header));
-      }
-      if (!brunelMshrSamples_.empty())
-        states.write(reinterpret_cast<const char *>(brunelMshrSamples_.data()),
-                     brunelMshrSamples_.size() * sizeof(brunelMshrSamples_[0]));
-      if (!states) throw runtime_error("cannot write Brunel MSHR pool samples");
-      brunelMshrSamples_.clear();
-    }
-    if (executionProfile) {
-      std::ofstream execution(std::filesystem::path(directory) / "reverse-execution.csv",
-                               completed == 1 ? std::ios::out : std::ios::app);
-      if (completed == 1)
-        execution << "step,pu,cycles,advanced0,advanced1,stalled0,stalled1,no_valid,fp0,fp1,memory,message,delayed,active0,active1\n";
-      for (unsigned pu = 1; pu <= cfg.numPU; ++pu) {
-        auto &p = brunelExecutionProfile_[pu];
-        execution << completed << ',' << pu << ',' << p.cycles << ','
-                  << p.advanced0 << ',' << p.advanced1 << ',' << p.stalled0 << ',' << p.stalled1 << ','
-                  << p.no_valid << ',' << p.fp0 << ',' << p.fp1 << ',' << p.memory << ','
-                  << p.message << ',' << p.delayed << ',' << p.active0 << ',' << p.active1 << '\n';
-        p = {};
-      }
-      if (!execution) throw runtime_error("cannot write reverse execution profile");
-
-      std::ofstream pcs(std::filesystem::path(directory) / "reverse-execution-pc.csv",
-                         completed == 1 ? std::ios::out : std::ios::app);
-      if (completed == 1) pcs << "step,thread,pc,advanced,stalled\n";
-      for (unsigned thread = 0; thread < 2; ++thread)
-        for (unsigned index = 0; index < 2048; ++index) {
-          auto &counts = brunelExecutionPcs_[thread][index];
-          if (counts[0] || counts[1])
-            pcs << completed << ',' << thread << ',' << (0x80000000u + index * 4) << ','
-                << counts[0] << ',' << counts[1] << '\n';
-          counts = {};
-        }
-      if (!pcs) throw runtime_error("cannot write reverse execution PCs");
-
-      if (word(1, MR_PARAMETERS+16) < 3) {
-      std::ofstream joint(std::filesystem::path(directory) / "reverse-execution-samples.bin",
-                           std::ios::binary | (completed == 1 ? std::ios::out : std::ios::app));
-      static_assert(std::endian::native == std::endian::little);
-      if (completed == 1) {
-        const std::array<uint32_t, 16> header{
-            0x4d455831, 1, 12, uint32_t(cfg.numPU), BR_MSHRS, sizeof(BrMshr), 256, 3,
-            BR_MSHR, 0x80000000u, 8192};
-        joint.write(reinterpret_cast<const char *>(header.data()), sizeof(header));
-      }
-      if (!brunelExecutionSamples_.empty())
-        joint.write(reinterpret_cast<const char *>(brunelExecutionSamples_.data()),
-                    brunelExecutionSamples_.size() * sizeof(brunelExecutionSamples_[0]));
-      if (!joint) throw runtime_error("cannot write reverse execution samples");
-      brunelExecutionSamples_.clear();
-      }
-      if (!morrisonReadyProfile_.empty()) {
-        std::ofstream ready(std::filesystem::path(directory) / "ready-queue-profile.csv",
-                            completed == 1 ? std::ios::out : std::ios::app);
-        if (completed == 1) ready << "step,pu,cycles,credit_sum,ready_sum,occupied_sum,max_credit,max_ready,max_occupied,max_tail,pending,next_busy,credit_full,lr,sc0,sc1,sc_failed,lrsc_dma_stall,dma_reserved\n";
-        for (unsigned pu=1;pu<=cfg.numPU;++pu) {
-          auto &r=morrisonReadyProfile_[pu];
-          ready << completed << ',' << pu << ',' << r.cycles << ',' << r.credit_sum << ','
-                << r.ready_sum << ',' << r.occupied_sum << ',' << r.max_credit << ',' << r.max_ready << ','
-                << r.max_occupied << ',' << r.max_tail << ',' << r.pending << ',' << r.next_busy << ','
-                << r.credit_full << ',' << r.lr << ',' << r.sc0 << ',' << r.sc1 << ',' << r.sc_failed << ','
-                << r.lrsc_dma_stall << ',' << r.dma_reserved << '\n';
-          r={};
-        }
-        if (!ready) throw runtime_error("cannot write Morrison ready profile");
-      }
-    }
-    std::ofstream memory(std::filesystem::path(directory) / "mshr-memory.csv",
-                         completed == 1 ? std::ios::out : std::ios::app);
-    if (completed == 1) memory << "step,cycle,pu,kind,token,address\n";
-    std::ofstream copies(std::filesystem::path(directory) / "ac-memory.csv",
-                         completed == 1 ? std::ios::out : std::ios::app);
-    if (completed == 1) copies << "step,cycle,pu,kind,lines_or_ident,address\n";
-    for (const auto &e : brunelMemoryEvents_) {
-      auto &stream = e.kind < 2 ? memory : copies;
-      stream << completed << ',' << e.cycle << ',' << e.pu << ',' << e.kind
-             << ',' << e.token << ',' << e.address << '\n';
-    }
-    if (!copies) throw runtime_error("cannot write Brunel AC profile");
-    if (!memory) throw runtime_error("cannot write Brunel memory profile");
-    brunelMemoryEvents_.clear();
-    brunelProfileCompleted_ = completed;
-    if (completed == last) {
-      std::ofstream pc(std::filesystem::path(directory) / "pc-profile.csv");
-      pc << "phase,pu,thread,pc,samples\n";
-      for (const auto &[key, count] : brunelPcProfile_)
-        pc << (key >> 43) << ',' << ((key >> 32) & 1023) << ','
-           << ((key >> 42) & 1) << ',' << uint32_t(key) << ',' << count << '\n';
-      if (!pc) throw runtime_error("cannot write Brunel PC profile");
-    }
-  }
-  if (completed >= last) return;
-  const unsigned phase = word(1, offsetof(BrHeader, phase));
-  if (phase != 1 && phase != 2 && phase != 3 && phase != 6) return;
-  const unsigned ph = phase == 6 ? 3 : phase - 1;
-  for (unsigned id = 0; id < cfg.numMC; ++id) {
-    auto &p = brunelMcProfile_[id][ph];
-    const auto &d = drams[id];
-    const auto &event = d.cycleEvents();
-    ++p.cycles;
-    p.presented += event.externalRequestPresented;
-    p.accepted += event.externalRequestAccepted;
-    if (event.externalRequestAccepted)
-      (event.externalRequestWrite ? p.accepted_writes : p.accepted_reads)++;
-    else if (event.externalRequestPresented)
-      (event.externalRequestWrite ? p.refused_writes : p.refused_reads)++;
-    p.responses += event.externalResponseAccepted;
-    const uint64_t occupancy = d.mshrInflightCount();
-    p.inflight += occupancy;
-    p.unissued += d.mshrUnissuedCount();
-    p.fulfilled += d.mshrFulfilledCount();
-    p.max_inflight = std::max(p.max_inflight, occupancy);
-    if (detailedMshr && !(cycle & 255)) {
-      const auto returned = d.mshrFulfilledByClass();
-      ++p.return_samples;
-      p.returned_total += d.mshrFulfilledCount();
-      p.returned_unicast += returned[0];
-      p.returned_scatter += returned[1];
-    }
-  }
-  if (cycle & 255) return;
-  const bool timed = completed >= word(1, offsetof(BrHeader, warmup));
-  for (unsigned pu = 1; pu <= cfg.numPU; ++pu) {
-    const auto *root = cores[pu]->rootp;
-    auto &p = brunelPuProfile_[pu][ph];
-    const unsigned idle = root->Core__DOT__exec__DOT__idlings;
-    ++p.samples;
-    p.active0 += !(idle & 1);
-    p.active1 += !(idle & 2);
-    const bool executing = root->Core__DOT__exec__DOT__valid;
-    p.executing += executing;
-    p.stalled += executing && !root->Core__DOT__exec__DOT__s0step;
-    const bool readyRuntime = word(pu,0) == MR_MAGIC &&
-        (word(pu,MR_PARAMETERS+16) == 3 || word(pu,MR_PARAMETERS+16) == 4);
-    const auto outstanding = readyRuntime ? word(pu,MB_READY_CONTROL+R_CREDIT) :
-        word(pu,offsetof(BrHeader,issued))-word(pu,offsetof(BrHeader,consumed));
-    p.outstanding += outstanding;
-    const auto occupancy = word(pu, offsetof(BrHeader,mshr_count));
-    p.mshr_occupancy += occupancy;
-    p.mshr_full += occupancy >= (readyRuntime ? MB_MSHRS : BR_MSHRS);
-    p.credit_full += outstanding >= (readyRuntime ? MB_READ_CREDITS : BR_CREDITS);
-    p.egress += root->Core__DOT__exec__DOT__biu__DOT__sendQueue__DOT__cnt;
-    const auto &buf = routers[pu].buf;
-    p.injection_blocked += buf.core_inject_presenting && !buf.core_inject_accepting;
-    p.reverse_full += root->Core__DOT__exec__DOT__biu__DOT__evq_4__DOT__full;
-    const bool bulk = word(pu, 0) == MR_MAGIC && word(pu, MR_PARAMETERS+16) >= 2;
-    if (detailedMshr && bulk && word(pu, MR_PARAMETERS+16) == 2 && phase == 3) {
-      auto &probe = brunelMshrProfile_[pu];
-      ++probe.samples;
-      if (occupancy >= BR_MSHRS) {
-        ++probe.full;
-        const uint32_t head = word(pu, offsetof(BrHeader, mshr_head));
-        const uint32_t tail = word(pu, offsetof(BrHeader, mshr_tail));
-        uint32_t ready = 0, loading = 0;
-        for (unsigned slot = 0; slot < BR_MSHRS; ++slot) {
-          const uint32_t state = word(pu, BR_MSHR + slot * sizeof(BrMshr) + offsetof(BrMshr, state));
-          if (state == 1) loading |= 1u << slot;
-          if (state == 2) ready |= 1u << slot;
-        }
-        brunelMshrSamples_.push_back({uint32_t(cycle), uint32_t(cycle >> 32), completed + 1,
-                                     pu, occupancy, head, tail, ready | (loading << 16)});
-        const bool stable = occupancy == BR_MSHRS && head < BR_MSHRS && tail == head &&
-                            (ready & loading) == 0 && (ready | loading) == 0xffff;
-        if (!stable) ++probe.transient;
-        else {
-          ++probe.ready_entries[std::popcount(ready)];
-          if (ready & (1u << head)) ++probe.head_ready;
-          else if (ready) ++probe.head_loading_younger_ready;
-          else ++probe.head_loading_none_ready;
-        }
-      }
-    }
-    p.spike_full += bulk ? root->Core__DOT__exec__DOT__biu__DOT__evq_5__DOT__full
-                         : root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__full;
-    if (bulk) {
-      p.bulk_banks += (word(pu,MB_CONTROL+B_BANK0+B_STATE)!=0) + (word(pu,MB_CONTROL+B_BANK1+B_STATE)!=0);
-      p.bulk_emitting += word(pu,MB_CONTROL+B_EMITTING)!=0;
-      p.bulk_wait += word(pu,MB_CONTROL+B_ISSUING)!=0 &&
-                     (root->Core__DOT__exec__DOT__lsu__DOT__acRemaining!=0 ||
-                      (word(pu,MB_CONTROL+B_BANK0+B_STATE)!=0 && word(pu,MB_CONTROL+B_BANK1+B_STATE)!=0));
-    }
-    if (timed) {
-      const uint32_t pcs[] = {root->Core__DOT__fetch__DOT__pcs_0,
-                              root->Core__DOT__fetch__DOT__pcs_1};
-      for (unsigned thread = 0; thread < 2; ++thread)
-        if (!(idle & (1 << thread)))
-          ++brunelPcProfile_[(uint64_t(phase) << 43) | (uint64_t(thread) << 42)
-                            | (uint64_t(pu) << 32) | pcs[thread]];
-    }
-  }
-}
-
-// Passive observation of resolved pre-edge handshakes, with no timing changes.
-// kind 0: MSHR read accepted by the source router; kind 1: response at source PU.
-void SoftSystemBackend::observeBrunelMemory(uint64_t cycle) {
-  static const bool enabled = std::getenv("SOFT_BRUNEL_PROFILE") && std::getenv("SOFT_BRUNEL_DUMP");
-  if (!enabled) return;
-  static const bool executionProfile = [] {
-    const char *value = std::getenv("SOFT_BRUNEL_EXEC_PROFILE");
-    return value && std::strcmp(value, "0") != 0;
-  }();
-  const auto &rootSpm = cores[1]->rootp->Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
-  const auto rootWord = [&](unsigned offset) -> uint32_t {
-    return rootSpm[offset / MEM_BUS_WIDTH_B][(offset % MEM_BUS_WIDTH_B) / 4];
-  };
-  const bool reverseExecution = executionProfile && rootWord(0) == MR_MAGIC &&
-      rootWord(MR_PARAMETERS + 16) >= 2 &&
-      rootWord(offsetof(BrHeader, phase)) == 3 &&
-      rootWord(offsetof(BrHeader, completed)) < rootWord(offsetof(BrHeader, steps));
-  const uint32_t executionStep = reverseExecution ? rootWord(offsetof(BrHeader, completed)) + 1 : 0;
-  static const bool recordEvents = [] {
-    const char *value = std::getenv("SOFT_BRUNEL_PROFILE_EVENTS");
-    return value == nullptr || std::strcmp(value,"0") != 0;
-  }();
-  for (unsigned pu = 1; pu <= cfg.numPU; ++pu) {
-    const auto &c = *cores[pu];
-    const auto &root = *c.rootp;
-    const auto &spm = root.Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
-    const auto word = [&](unsigned offset) {
-      return spm[offset / MEM_BUS_WIDTH_B][(offset % MEM_BUS_WIDTH_B) / 4];
-    };
-    const bool compact = word(0) == MR_MAGIC;
-    const bool bulk = compact && word(MR_PARAMETERS+16) >= 2;
-    if ((!compact && word(0) != BR_MAGIC) || brunelPuProfile_.empty()) continue;
-    if (reverseExecution) {
-      if (!bulk || brunelExecutionProfile_.size() != cfg.numPU + 1)
-        throw runtime_error("reverse execution observer requires initialized ABI2 PUs");
-      auto &p = brunelExecutionProfile_[pu];
-      const bool valid = root.Core__DOT__exec__DOT__valid;
-      const bool advance = root.Core__DOT__exec__DOT__s0step;
-      const uint32_t smsel = root.Core__DOT__exec__DOT__uop_smsel;
-      const uint32_t pc = root.Core__DOT__exec__DOT__uop_pc;
-      const uint32_t idle = root.Core__DOT__exec__DOT__idlings;
-      ++p.cycles;
-      p.active0 += !(idle & 1);
-      p.active1 += !(idle & 2);
-      if (!valid) ++p.no_valid;
-      else {
-        if ((smsel != 1 && smsel != 2) || pc < 0x80000000u || pc >= 0x80002000u || (pc & 3))
-          throw runtime_error("invalid reverse execution PC or context");
-        const unsigned thread = smsel == 1 ? 0 : 1;
-        ++brunelExecutionPcs_[thread][(pc - 0x80000000u) / 4][advance ? 0 : 1];
-        if (advance) {
-          (thread ? p.advanced1 : p.advanced0)++;
-          if (root.Core__DOT__exec__DOT__uop_isFP) (thread ? p.fp1 : p.fp0)++;
-          p.memory += root.Core__DOT__exec__DOT__uop_isMem;
-          p.message += root.Core__DOT__exec__DOT__uop_isAM;
-          p.delayed += root.Core__DOT__exec__DOT__delayed;
-        } else (thread ? p.stalled1 : p.stalled0)++;
-      }
-      if (!(cycle & 255) && word(MR_PARAMETERS+16) == 2) {
-        const uint32_t count = word(offsetof(BrHeader, mshr_count));
-        const uint32_t head = word(offsetof(BrHeader, mshr_head));
-        const uint32_t tail = word(offsetof(BrHeader, mshr_tail));
-        uint32_t ready = 0, loading = 0;
-        for (unsigned slot = 0; slot < BR_MSHRS; ++slot) {
-          const uint32_t state = word(BR_MSHR + slot * sizeof(BrMshr) + offsetof(BrMshr, state));
-          if (state == 1) loading |= 1u << slot;
-          if (state == 2) ready |= 1u << slot;
-        }
-        // Flags0..7: valid, advance, FP, memory, AM, branch, jump, delayed.
-        // Bits8..9 select the uop's SMT;10..11 idle;12..13 busy. Fetch PCs are
-        // lookahead context only. This hook sees resolved ready/valid pre-edge.
-        const uint32_t flags = uint32_t(valid) | (uint32_t(advance) << 1) |
-            (uint32_t(root.Core__DOT__exec__DOT__uop_isFP) << 2) |
-            (uint32_t(root.Core__DOT__exec__DOT__uop_isMem) << 3) |
-            (uint32_t(root.Core__DOT__exec__DOT__uop_isAM) << 4) |
-            (uint32_t(root.Core__DOT__exec__DOT__uop_isBr) << 5) |
-            (uint32_t(root.Core__DOT__exec__DOT__uop_isJump) << 6) |
-            (uint32_t(root.Core__DOT__exec__DOT__delayed) << 7) |
-            (smsel << 8) | (idle << 10) | (uint32_t(root.Core__DOT__exec__DOT__busy) << 12);
-        brunelExecutionSamples_.push_back({uint32_t(cycle), uint32_t(cycle >> 32), executionStep, pu,
-            count, head, tail, ready | (loading << 16), pc, flags,
-            root.Core__DOT__fetch__DOT__pcs_0, root.Core__DOT__fetch__DOT__pcs_1});
-      }
-    }
-    const auto phase = word(offsetof(BrHeader, phase));
-    if (reverseExecution && (word(MR_PARAMETERS+16) == 3 || word(MR_PARAMETERS+16) == 4) &&
-        word(MB_CONTROL+B_REVERSE_STARTED)) {
-      if (morrisonReadyProfile_.empty()) morrisonReadyProfile_.resize(cfg.numPU+1);
-      auto &r=morrisonReadyProfile_[pu];
-      const auto credits=word(MB_READY_CONTROL+R_CREDIT);
-      const uint32_t tail=word(MB_READY_CONTROL+R_TAIL);
-      const uint32_t ready=tail-word(MB_READY_CONTROL+R_HEAD);
-      const auto occupied=word(offsetof(BrHeader,mshr_count));
-      if (credits>MB_READ_CREDITS || ready>MB_MSHRS)
-        throw runtime_error("Morrison credit/ready bound exceeded");
-      ++r.cycles; r.credit_sum+=credits; r.ready_sum+=ready; r.occupied_sum+=occupied;
-      r.max_credit=std::max(r.max_credit,uint64_t(credits));
-      r.max_ready=std::max(r.max_ready,uint64_t(ready));
-      r.max_occupied=std::max(r.max_occupied,uint64_t(occupied));
-      r.max_tail=std::max(r.max_tail,uint64_t(tail));
-      const auto pending=word(MB_READY_CONTROL+R_PENDING);
-      r.pending+=pending!=0; r.credit_full+=credits==MB_READ_CREDITS;
-      const auto cursor=word(MB_READY_CONTROL+R_ALLOC);
-      if (cursor>=MB_MSHRS) throw runtime_error("Morrison allocation cursor exceeded pool");
-      const auto slot=(cursor<32 ? MB_SHARED0 : MB_SHARED1)+(cursor&31)*sizeof(BrMshr);
-      r.next_busy+=pending && word(slot+offsetof(BrMshr,state));
-      const bool valid=root.Core__DOT__exec__DOT__valid;
-      const bool advanced=valid && root.Core__DOT__exec__DOT__s0step;
-      const bool queueAtomic=valid && root.Core__DOT__exec__DOT__uop_isMem &&
-          root.Core__DOT__exec__DOT____Vcellinp__lsu__req_bits_lrsc &&
-          root.Core__DOT__exec__DOT____Vcellinp__lsu__req_bits_addr==BR_BASE+MB_READY_CONTROL+R_HEAD;
-      const bool sc=root.Core__DOT__exec__DOT____Vcellinp__lsu__req_bits_write;
-      const bool dma=root.Core__DOT__exec__DOT__lsu__DOT__respMcwb;
-      r.lr+=queueAtomic && advanced && !sc;
-      if (queueAtomic && advanced && sc) {
-        (root.Core__DOT__exec__DOT__uop_smsel==1 ? r.sc0 : r.sc1)++;
-        r.sc_failed+=!root.Core__DOT__exec__DOT__lsu__DOT__reserved;
-      }
-      r.lrsc_dma_stall+=queueAtomic && dma && !advanced;
-      r.dma_reserved+=dma &&
-          ((root.Core__DOT__exec__DOT__lsu__DOT__spmReserved_0 &&
-            root.Core__DOT__exec__DOT__lsu__DOT__spmReservedAddr_0==MB_READY_CONTROL+R_HEAD) ||
-           (root.Core__DOT__exec__DOT__lsu__DOT__spmReserved_1 &&
-            root.Core__DOT__exec__DOT__lsu__DOT__spmReservedAddr_1==MB_READY_CONTROL+R_HEAD));
-    }
-    if (bulk && phase == 2) {
-      auto &banks = brunelBulkBanks_[pu];
-      for (unsigned bank=0;bank<2;++bank) {
-        const auto state=word(MB_CONTROL+B_BANK0+bank*B_BANK_BYTES+B_STATE);
-        // FILLING is published before issue and before the final-chunk job
-        // counter increments. This passively labels the immutable bank context.
-        if (state==B_FILLING && banks[bank]!=B_FILLING)
-          banks[2+bank]=word(MB_CONTROL+B_EXPANDED);
-        banks[bank]=state;
-      }
-      if (routers[pu].buf.core_inject_accepting && c.ext_out_valid &&
-          (c.ext_out_bits_tag&255)==0x11 && (c.ext_out_bits_data_1&65535)==0x8001) {
-        auto &p=brunelPuProfile_[pu][1];
-        ++p.bulk_commands; p.bulk_lines+=c.ext_out_bits_data_1>>16;
-        const auto emitting=word(MB_CONTROL+B_EMITTING);
-        if (emitting) {
-          ++p.bulk_overlap;
-          const unsigned old=emitting==BR_BASE+MB_CONTROL+B_BANK1 ? 1 : 0;
-          for (unsigned bank=0;bank<2;++bank)
-            if (banks[bank]==B_FILLING &&
-                word(MB_CONTROL+B_BANK0+bank*B_BANK_BYTES+B_ADDRESS)==c.ext_out_bits_data_0 &&
-                word(MB_CONTROL+B_BANK0+bank*B_BANK_BYTES+B_MC)==c.ext_out_bits_dst)
-              p.cross_job_overlap+=banks[2+bank]!=banks[2+old];
-        }
-      }
-    }
-    if (phase == 1 || phase == 2 || phase == 3 || phase == 6) {
-      auto &p = brunelPuProfile_[pu][phase == 6 ? 3 : phase - 1];
-      const bool issued = root.Core__DOT__exec__DOT__valid && root.Core__DOT__exec__DOT__s0step;
-      const auto smsel = root.Core__DOT__exec__DOT__uop_smsel;
-      p.issued0 += issued && (smsel & 1);
-      p.issued1 += issued && (smsel & 2);
-      const uint32_t address = root.Core__DOT__exec__DOT____Vcellinp__lsu__req_bits_addr;
-      const unsigned neuronBytes = compact ? sizeof(MrNeuron) : sizeof(BrNeuron);
-      const unsigned neuronEnd = compact ? word(offsetof(BrHeader,neuron_end)) : BR_BASE + BR_BUFFER;
-      if (phase == (compact ? 1u : 2u) && issued && root.Core__DOT__exec__DOT__uop_isMem &&
-          root.Core__DOT__exec__DOT____Vcellinp__lsu__req_bits_write &&
-          address >= BR_BASE + BR_NEURONS && address < neuronEnd &&
-          (address - BR_BASE - BR_NEURONS) % neuronBytes == (compact ? 0u : offsetof(BrNeuron, fire))) {
-        p.neurons0 += (smsel & 1) != 0;
-        p.neurons1 += (smsel & 2) != 0;
-      }
-      p.ac_wait_cycles += (compact ? phase == 2 : phase == 1 && word(BR_STREAM) == 1) &&
-                          root.Core__DOT__exec__DOT__lsu__DOT__acRemaining != 0;
-      p.biu_blocked_cycles += root.Core__DOT__exec__DOT__biu_msg_valid &&
-                             !root.Core__DOT__exec__DOT__biu__DOT__sendQueue__DOT__enq_ready_0;
-      if (phase == (compact ? 2u : 1u) && routers[pu].buf.core_inject_accepting && c.ext_out_valid &&
-          c.ext_out_bits_tag == (bulk ? 0x405 : 0xc01) && c.ext_out_bits_data_2 != 0)
-        p.last_forward_injection = cycle;
-    }
-    if (!recordEvents) continue;
-    if (compact ? phase == 2 : phase == 1 && word(BR_STREAM) != 0) {
-      if (routers[pu].buf.core_inject_accepting && c.ext_out_valid &&
-          (c.ext_out_bits_tag & 255) == 0x11 && (c.ext_out_bits_data_1 & 65535) == 0x8001)
-        brunelMemoryEvents_.push_back({cycle, pu, 2, c.ext_out_bits_data_1 >> 16, c.ext_out_bits_data_0});
-      if (core_mem_accept[pu].unicast && c.mem_unicast_bits_id == 0x8001)
-        brunelMemoryEvents_.push_back({cycle, pu, 3, c.mem_unicast_bits_ident, 0});
-    }
-    const auto descriptorToken = [&](uint32_t token) {
-      if (bulk && (word(MR_PARAMETERS+16)==3 || word(MR_PARAMETERS+16)==4))
-        return !(token&63) && ((token>=MB_SHARED0 && token<MB_SHARED0+MB_SHARED_BYTES) ||
-                              (token>=MB_SHARED1 && token<MB_SHARED1+MB_SHARED_BYTES));
-      return token>=BR_MSHR && token<BR_READ;
-    };
-    if (routers[pu].buf.core_inject_accepting && c.ext_out_valid &&
-        (c.ext_out_bits_tag & 255) == 0 &&
-        (c.ext_out_bits_data_1 & 65535) == 0x8002 &&
-        descriptorToken(c.ext_out_bits_data_3)) {
-      brunelMemoryEvents_.push_back({cycle, pu, 0, c.ext_out_bits_data_3, c.ext_out_bits_data_0});
-    }
-    if (core_mem_accept[pu].unicast && c.mem_unicast_bits_id == 0x8002 &&
-        descriptorToken(c.mem_unicast_bits_extra1)) {
-      brunelMemoryEvents_.push_back({cycle, pu, 1, c.mem_unicast_bits_extra1, 0});
-    }
-  }
-}
-
 void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
-  PhaseTimer _t(*this);
-  const bool profile = workProfileSampleCycle(cycle);
   if constexpr (ASSERTIONS_ENABLED) {
     if (in.size() != cfg.numMC + 1)
       throw std::invalid_argument("stage: input size mismatch");
@@ -1452,17 +487,7 @@ void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
 
   // Publish completion of the preceding cleanup before any thread reads a
   // neighboring router's committed queues.
-  if (profile) {
-    const uint64_t now = workProfileNowNs();
-    workProfileMark(0, WorkProfilePhase::StageStart, now, now);
-  }
   stageStart.arrive_and_wait();
-  if (cycle > 0 && workProfileSampleCycle(cycle - 1))
-    workProfileRecordSubsteps(cycle - 1,
-                              WorkProfileSubstep::StepPrepareMem,
-                              WorkProfileSubstep::StepCleanup);
-  if (profile)
-    workProfileRecordPhase(cycle, WorkProfilePhase::StageStart);
   try {
     if constexpr (ASSERTIONS_ENABLED) {
       if (cycle <= releaseResetAfter) {
@@ -1472,44 +497,18 @@ void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
       }
     }
 
-    stageWorkResolve(0, profile);
-    const uint64_t memifStart = profile ? workProfileNowNs() : 0;
-    stageMemifWork(0, profile);
-    if (profile)
-      workProfileTimes[0]
-          .substep_duration[static_cast<size_t>(
-              WorkProfileSubstep::StageMemIf)] =
-          workProfileNowNs() - memifStart;
-    if (profile)
-      workProfileTimes[0].local_done[static_cast<size_t>(
-          WorkProfilePhase::StageDone)] = workProfileNowNs();
-
+    stageWorkResolve(0);
+    stageMemifWork(0);
   } catch (const std::exception &e) {
     std::cerr << "Exception at thread " << 0 << ": " << e.what() << std::endl;
     std::exit(1);
   }
 
-  if (profile)
-    workProfileTimes[0].barrier_arrival[static_cast<size_t>(
-        WorkProfilePhase::StageDone)] = workProfileNowNs();
   stageDone.arrive_and_wait();
-  if (brunelBoundaryPending_) {
-    observeMorrisonBoundary(cycle, std::getenv("SOFT_BRUNEL_DUMP"), brunelBoundaryPending_);
-    brunelBoundaryPending_ = 0;
-  }
-
-  if (profile) {
-    workProfileRecordPhase(cycle, WorkProfilePhase::StageDone);
-    workProfileRecordSubsteps(cycle,
-                              WorkProfileSubstep::StageResolveLinks,
-                              WorkProfileSubstep::StageMemIf);
-  }
 }
 
-void SoftSystemBackend::stageWorkResolve(size_t threadId, bool profile) {
+void SoftSystemBackend::stageWorkResolve(size_t threadId) {
   auto [puStart, puEnd] = puWorkRange(threadId);
-  auto &substeps = workProfileTimes[threadId].substep_duration;
-  uint64_t substepStart = profile ? workProfileNowNs() : 0;
 
   // Resolve each incoming transfer from committed source-router state. Router
   // queues are read-only throughout stage and are not committed until step.
@@ -1541,13 +540,9 @@ void SoftSystemBackend::stageWorkResolve(size_t threadId, bool profile) {
     }
     local.buf.core_eject_presenting = local.rt.peekToken(nf);
   }
-  if (profile)
-    substeps[static_cast<size_t>(WorkProfileSubstep::StageResolveLinks)] =
-        workProfileNowNs() - substepStart;
 
   // Drive PU inputs and settle on the negedge. Contract: accept signals
   // from the cores are read post-eval (after combinational settle).
-  if (profile) substepStart = workProfileNowNs();
   for (uint16_t i = puStart; i < puEnd; ++i) {
     auto &router = routers[i];
     const Flit *core_eject = router.buf.core_eject_presenting
@@ -1557,23 +552,8 @@ void SoftSystemBackend::stageWorkResolve(size_t threadId, bool profile) {
     cores[i]->ext_out_ready = router.buf.core_inject_accepting;
     cores[i]->clock = false; // negedge
   }
-  if (profile) {
-    substeps[static_cast<size_t>(WorkProfileSubstep::StageDriveInputs)] =
-        workProfileNowNs() - substepStart;
-    substepStart = workProfileNowNs();
-  }
-  auto v0 = std::chrono::high_resolution_clock::now();
   for (uint16_t i = puStart; i < puEnd; ++i) {
     cores[i]->eval();
-  }
-  auto v1 = std::chrono::high_resolution_clock::now();
-  // TODO: move into non-thread local atomic member variable
-  g_soft_verilator_ns +=
-      std::chrono::duration_cast<std::chrono::nanoseconds>(v1 - v0).count();
-  if (profile) {
-    substeps[static_cast<size_t>(WorkProfileSubstep::StageNegedgeEval)] =
-        workProfileNowNs() - substepStart;
-    substepStart = workProfileNowNs();
   }
   for (uint16_t i = puStart; i < puEnd; ++i) {
     routers[i].buf.core_eject_accepting =
@@ -1583,9 +563,6 @@ void SoftSystemBackend::stageWorkResolve(size_t threadId, bool profile) {
     core_mem_accept[i].broadcast =
         cores[i]->mem_broadcast_ready && cores[i]->mem_broadcast_valid;
   }
-  if (profile)
-    substeps[static_cast<size_t>(WorkProfileSubstep::StageCaptureAccepts)] =
-        workProfileNowNs() - substepStart;
 
   auto &threadMasks = thread_bcst_accept[threadId];
   std::fill(threadMasks.begin(), threadMasks.end(), 0);
@@ -1595,10 +572,9 @@ void SoftSystemBackend::stageWorkResolve(size_t threadId, bool profile) {
     threadMasks[puZero / soft_mem::CLUSTER_SIZE] |=
         static_cast<uint16_t>(1u << (puZero % soft_mem::CLUSTER_SIZE));
   }
-
 }
 
-void SoftSystemBackend::stageMemifWork(size_t threadId, bool) {
+void SoftSystemBackend::stageMemifWork(size_t threadId) {
   auto resolveMemifTokens = [this](size_t memifIdx) {
     for (size_t port = 0; port < memif_eject[memifIdx].size(); ++port) {
       const uint16_t pu = topo.memif_req_at[memifIdx][port];
@@ -1633,9 +609,7 @@ void SoftSystemBackend::stageMemifWork(size_t threadId, bool) {
   }
 }
 
-void SoftSystemBackend::prepareNextCoreMem(size_t threadId, bool profile) {
-  auto &substeps = workProfileTimes[threadId].substep_duration;
-  const uint64_t substepStart = profile ? workProfileNowNs() : 0;
+void SoftSystemBackend::prepareNextCoreMem(size_t threadId) {
   const auto [threadStart, threadEnd] = puWorkRange(threadId);
   const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
   for (size_t m = 0; m < cfg.numMC; ++m) {
@@ -1649,68 +623,22 @@ void SoftSystemBackend::prepareNextCoreMem(size_t threadId, bool profile) {
     // stage, after the current DRAMIf and ring state has committed.
     drams[m].peekPUs(rangeStart, bufferSpan);
   }
-  if (profile)
-    substeps[static_cast<size_t>(WorkProfileSubstep::StepPrepareMem)] =
-        workProfileNowNs() - substepStart;
 }
 
 void SoftSystemBackend::step(uint64_t cycle) {
-  PhaseTimer _t(*this);
-  const bool profile = workProfileSampleCycle(cycle);
-
-  // Accumulate per-cycle stats BEFORE committing this cycle's
-  // transfers. The accepting signals computed in stage() are still
-  // valid; queue/inflight occupancies reflect the state entering
-  // this cycle.
-  if (profile)
-    workProfileTimes[0].local_done[static_cast<size_t>(
-        WorkProfilePhase::StepStart)] = workProfileNowNs();
-  const uint64_t statsStart = profile ? workProfileNowNs() : 0;
-  accumulateStats(cycle);
-  observeBrunelMemory(cycle);
-  if (morrisonUncountedSpikePc_) {
-    for (unsigned pu = 1; pu <= cfg.numPU; ++pu) {
-      const auto &r = *cores[pu]->rootp;
-      if (r.Core__DOT__exec__DOT__valid && r.Core__DOT__exec__DOT__s0step &&
-          r.Core__DOT__exec__DOT__uop_pc == morrisonUncountedSpikePc_)
-        ++morrisonUncountedReceipts_[pu];
-    }
-  }
-  if (profile)
-    workProfileRecordUnit(cycle, WorkProfilePhase::StepStart,
-                          WorkProfileUnit::Stats, 0,
-                          workProfileNowNs() - statsStart);
-
   resetReleaseNow = cycle == releaseResetAfter;
 
-  if (profile)
-    workProfileTimes[0].barrier_arrival[static_cast<size_t>(
-        WorkProfilePhase::StepStart)] = workProfileNowNs();
   stepStart.arrive_and_wait();
-  if (profile)
-    workProfileRecordPhase(cycle, WorkProfilePhase::StepStart);
-
   try {
-    stepWork(0, profile);
+    stepWork(0);
     stepPeriphWork(0);
-    stepMemifWork(0, profile);
-    if (profile)
-      workProfileTimes[0].local_done[static_cast<size_t>(
-          WorkProfilePhase::StepDone)] = workProfileNowNs();
+    stepMemifWork(0);
   } catch (const std::exception &e) {
     std::cerr << "Exception at thread " << 0 << ": " << e.what() << std::endl;
     std::exit(1);
   }
 
-  if (profile)
-    workProfileTimes[0].barrier_arrival[static_cast<size_t>(
-        WorkProfilePhase::StepDone)] = workProfileNowNs();
   stepDone.arrive_and_wait();
-  if (profile) {
-    workProfileRecordPhase(cycle, WorkProfilePhase::StepDone);
-    workProfileRecordSubsteps(cycle, WorkProfileSubstep::StepPosedge,
-                              WorkProfileSubstep::StepMemIf);
-  }
 
   // The RTL holds every MemIf idle-notification register in reset through
   // this edge. Other soft MemIf state cannot change while requests are gated.
@@ -1719,37 +647,16 @@ void SoftSystemBackend::step(uint64_t cycle) {
       memifAt(memifIdx).resetIdle();
   }
 
-  uint64_t unitStart = profile ? workProfileNowNs() : 0;
   for (size_t memifIdx = 0; memifIdx < memif_step_decisions.size();
        ++memifIdx) {
     ring.updateValidAt(memifIdx,
                        memif_step_decisions[memifIdx].ring_injected,
                        memif_ring_accept[memifIdx]);
   }
-  if (profile)
-    workProfileRecordUnit(cycle, WorkProfilePhase::StepDone,
-                          WorkProfileUnit::RingUpdate, 0,
-                          workProfileNowNs() - unitStart);
-  unitStart = profile ? workProfileNowNs() : 0;
   ring.progress();
-  if (profile)
-    workProfileRecordUnit(cycle, WorkProfilePhase::StepDone,
-                          WorkProfileUnit::RingProgress, 0,
-                          workProfileNowNs() - unitStart);
 
-  prepareNextCoreMem(0, profile);
-  stepCleanup(0, profile);
-
-  // Periodic delta print.
-  if (log_ && cycle > 0 && cycle % Stat::PERIOD == 0) {
-    auto delta = stats_ - last_periodic_;
-    uint64_t span = cycle - last_periodic_cycle_;
-    std::cerr << "[Soft] Periodic stats (cycles " << last_periodic_cycle_
-              << ".." << cycle << ", span=" << span << "):\n";
-    delta.print(span, cfg.numPU);
-    last_periodic_ = stats_;
-    last_periodic_cycle_ = cycle;
-  }
+  prepareNextCoreMem(0);
+  stepCleanup(0);
 }
 
 void SoftSystemBackend::stepPeriphWork(size_t threadId) {
@@ -1773,9 +680,7 @@ void SoftSystemBackend::stepPeriphWork(size_t threadId) {
       memif_ext[0], flitView, memifNocAccepted(0));
 }
 
-void SoftSystemBackend::stepMemifWork(size_t threadId, bool profile) {
-  auto &substeps = workProfileTimes[threadId].substep_duration;
-  const uint64_t substepStart = profile ? workProfileNowNs() : 0;
+void SoftSystemBackend::stepMemifWork(size_t threadId) {
   const size_t clustersPerMC =
       (cfg.numPU / cfg.numMC) / soft_mem::CLUSTER_SIZE;
 
@@ -1811,20 +716,13 @@ void SoftSystemBackend::stepMemifWork(size_t threadId, bool profile) {
                   std::span<const uint16_t>(acceptedMasks),
                   memifNocAccepted(memifIdx));
   }
-
-  if (profile)
-    substeps[static_cast<size_t>(WorkProfileSubstep::StepMemIf)] =
-        workProfileNowNs() - substepStart;
 }
 
-void SoftSystemBackend::stepWork(size_t threadId, bool profile) {
+void SoftSystemBackend::stepWork(size_t threadId) {
   auto [puStart, puEnd] = puWorkRange(threadId);
-  auto &substeps = workProfileTimes[threadId].substep_duration;
-  const uint64_t posedgeStart = profile ? workProfileNowNs() : 0;
 
   // Materialize accepted core-inject flits from RTL BEFORE the posedge (the
   // posedge consumes ext_out), then posedge-eval every core.
-  auto v0 = std::chrono::high_resolution_clock::now();
   for (size_t i = puStart; i < puEnd; ++i) {
     auto &router = routers[i];
     if (router.buf.core_inject_accepting)
@@ -1842,15 +740,8 @@ void SoftSystemBackend::stepWork(size_t threadId, bool profile) {
       cores[i]->eval();
     }
   }
-  auto v1 = std::chrono::high_resolution_clock::now();
-  g_soft_verilator_ns +=
-      std::chrono::duration_cast<std::chrono::nanoseconds>(v1 - v0).count();
-  if (profile)
-    substeps[static_cast<size_t>(WorkProfileSubstep::StepPosedge)] =
-        workProfileNowNs() - posedgeStart;
 
   // Each destination router moves accepted flits directly from source slots.
-  const uint64_t transferStart = profile ? workProfileNowNs() : 0;
   for (size_t i = puStart; i < puEnd; ++i) {
     auto &router = routers[i];
     const auto &links = router.links;
@@ -1864,14 +755,10 @@ void SoftSystemBackend::stepWork(size_t threadId, bool profile) {
     if (router.buf.core_eject_accepting)
       (void)router.rt.take(*router.buf.core_eject_presenting);
   }
-  if (profile)
-    substeps[static_cast<size_t>(WorkProfileSubstep::StepTransfer)] =
-        workProfileNowNs() - transferStart;
 }
 
-void SoftSystemBackend::stepCleanup(size_t threadId, bool profile) {
+void SoftSystemBackend::stepCleanup(size_t threadId) {
   auto [puStart, puEnd] = puWorkRange(threadId);
-  const uint64_t cleanupStart = profile ? workProfileNowNs() : 0;
   for (size_t i = puStart; i < puEnd; ++i) {
     auto &router = routers[i];
     const size_t nf = router.links.num_forwards;
@@ -1889,1120 +776,33 @@ void SoftSystemBackend::stepCleanup(size_t threadId, bool profile) {
       accepted[nf + 1] = memif_eject[router.links.memif->first][router.links.memif->second].token;
     router.rt.step(accepted);
   }
-  if (profile)
-    workProfileTimes[threadId]
-        .substep_duration[static_cast<size_t>(
-            WorkProfileSubstep::StepCleanup)] =
-        workProfileNowNs() - cleanupStart;
-}
-
-void SoftSystemBackend::accumulateStats(uint64_t cycle) {
-  static const bool traceTimerUnicast = [] {
-    const char *value = std::getenv("SOFT_TIMER_UNICAST_TRACE");
-    return value != nullptr && std::strcmp(value, "0") != 0;
-  }();
-  uint64_t hops = 0;
-  uint64_t idle_lanes = 0;
-  uint64_t blocked = 0;
-  uint64_t injections = 0;
-  uint64_t mem_reqs = 0;
-  uint64_t unicast_mem_reqs = 0;
-  uint64_t inflight_msgs = 0;
-  uint64_t idle_cores = 0;
-  uint64_t icache_accesses = 0;
-  uint64_t icache_line_fills = 0;
-  uint64_t icache_stalls = 0;
-  uint64_t mnist_feedforward_messages = 0;
-  uint64_t mnist_trace_messages = 0;
-  uint64_t mnist_post_fired_trace_messages = 0;
-  uint64_t mnist_inhibitory_spikes = 0;
-
-  for (uint16_t i = 1; i <= cfg.numPU; ++i) {
-    const auto &r = routers[i];
-    const auto *root = cores[i]->rootp;
-    const bool icacheHit =
-        root->Core__DOT__fetch__DOT__icache__DOT__s1hitmap_0 ||
-        root->Core__DOT__fetch__DOT__icache__DOT__s1hitWay;
-    const bool icacheValid =
-        root->Core__DOT__fetch__DOT__icache__DOT__s1valid;
-    const bool refillCompleted =
-        root->Core__DOT__fetch__DOT__icache__DOT__s1refillCompleted;
-    if (icacheValid && (icacheHit || refillCompleted)) ++icache_accesses;
-    if (root->Core__DOT__fetch__DOT__icache__DOT__s1refillComplete)
-      ++icache_line_fills;
-    if (icacheValid && !icacheHit && !refillCompleted) ++icache_stalls;
-    // Inflight router messages = total queued flits across all input
-    // queues of every router.
-    inflight_msgs += r.rt.totalFlits();
-    // Core inject: an injection means a flit transferred from the PU
-    // into the local router this cycle.
-    if (r.buf.core_inject_presenting) {
-      if (r.buf.core_inject_accepting) {
-        ++hops;
-        ++injections;
-        if (i == 1 && (nocProfileDir_ || softMnistPhaseLogEnabled())) {
-          const Flit flit = peekCoreInjectFlit(*cores[i], i);
-          if (flit.tag == 0x00a && flit.data[0] >= 2 && flit.data[0] <= 6) {
-            currentMnistPhase_ = static_cast<uint8_t>(flit.data[0]);
-            if (softMnistPhaseLogEnabled()) {
-              std::cerr << "[Soft] MNIST phase start cycle=" << cycle
-                        << " phase=" << flit.data[0]
-                        << " low=" << flit.data[1]
-                        << " high=" << flit.data[2] << '\n';
-            }
-          }
-        }
-      } else {
-        ++blocked;
-      }
-    }
-    // Core eject: flit delivered to the local PU.
-    if (r.buf.core_eject_presenting && r.buf.core_eject_accepting) {
-      ++hops;
-      if (softTimerMnistActivityEnabled()) {
-        const Flit *flit = r.rt.peek(*r.buf.core_eject_presenting);
-        if (flit != nullptr && flit->tag == 0xc02) {
-          ++mnist_feedforward_messages;
-          if (softMnistPhaseLogEnabled()) {
-            const auto &spm = root->Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
-            const uint32_t phase = spm[188 / 32][(188 % 32) / 4];
-            if (phase != 2 && phase != 3 && phase != 5) {
-              std::cerr << "[Soft] invalid MNIST feedforward cycle=" << cycle
-                        << " dst=" << i << " src=" << flit->src
-                        << " phase=" << phase
-                        << " expected=" << spm[200 / 32][(200 % 32) / 4]
-                        << " received=" << spm[204 / 32][(204 % 32) / 4]
-                        << " done=" << spm[208 / 32][(208 % 32) / 4]
-                        << '\n';
-            }
-          }
-        } else if (flit != nullptr && flit->tag == 0x804) {
-          ++mnist_trace_messages;
-          // Bundled payloads use bits 18/19; optimized unbundled payloads use
-          // the sign bit so their receiver can test it with one branch.
-          if ((flit->data[0] & ((1U << 18) | (1U << 31))) != 0)
-            ++mnist_post_fired_trace_messages;
-        } else if (flit != nullptr && flit->tag == 0x409 &&
-                   flit->dst == 1 &&
-                   (flit->data[0] == 3 || flit->data[0] == 4)) {
-          // Fused phase 3 or legacy phase 4 packs this count in bits 9:0.
-          mnist_inhibitory_spikes += flit->data[2] & 0x3ffU;
-        }
-      }
-    }
-    // Each incoming forward link corresponds one-to-one with a mesh egress
-    // lane, so destination-owned decisions can count the same global totals.
-    for (size_t o = 0; o < r.links.num_forwards; ++o) {
-      const auto &fwd = r.buf.forward_presenting[o];
-      if (fwd) {
-        if (r.buf.forward_accepting[o]) ++hops;
-        else ++blocked;
-      } else {
-        ++idle_lanes;
-      }
-    }
-    // A core is "idle" this cycle if it has nothing to inject and
-    // nothing being delivered to it.
-    if (!r.buf.core_inject_presenting && !r.buf.core_eject_presenting)
-      ++idle_cores;
-  }
-
-  // Memif eject (from router into memif) counts as a memory request
-  // arriving at the memif this cycle.
-  for (size_t memifIdx = 0; memifIdx < memif_eject_accept.size(); ++memifIdx) {
-    const auto &accepted = memif_eject_accept[memifIdx];
-    if (!accepted) continue;
-    ++hops;
-    ++mem_reqs;
-    if (memifIdx == 0) continue;
-
-    const uint8_t port = *accepted;
-    const auto &token = memif_eject[memifIdx][port].token;
-    if (!token) continue;
-    const uint16_t pu = topo.memif_req_at[memifIdx][port];
-    const Flit *flit = routers[pu].rt.peek(*token);
-    if (!flit) continue;
-    const uint8_t requestClass = static_cast<uint8_t>(flit->tag);
-    if (requestClass == 0x00 || requestClass == 0x01 ||
-        requestClass == 0x11) {
-      ++unicast_mem_reqs;
-      if (traceTimerUnicast && timer_stats_active_) {
-        std::cerr << "[Soft timer unicast] cycle=" << cycle
-                  << " pu=" << flit->src
-                  << " class=0x" << std::hex
-                  << static_cast<unsigned>(requestClass)
-                  << " addr=0x" << flit->data[0] << std::dec << '\n';
-      }
-    }
-  }
-
-  // DRAM inflight includes shared MSHRs and buffered broadcast responses.
-  uint64_t inflight_dram = 0;
-  for (const auto &d : drams) {
-    inflight_dram += d.mshrInflightCount();
-    inflight_dram += d.bulkQueueOccupancy();
-    inflight_dram += d.bcstQueueOccupancy();
-  }
-  inflight_dram += periph.mshrInflightCount();
-
-  // Response ring occupancy = number of valid slots on the ringbus.
-  uint64_t inflight_resp = 0;
-  for (size_t i = 0; i < cfg.numMC + 1; ++i)
-    if (ring.validAt(i)) ++inflight_resp;
-
-  stats_.total_hops          += hops;
-  stats_.total_injections    += injections;
-  stats_.total_mem_requests  += mem_reqs;
-  stats_.unicast_mem_requests += unicast_mem_reqs;
-  stats_.icache_accesses     += icache_accesses;
-  stats_.icache_line_fills   += icache_line_fills;
-  stats_.icache_stall_core_cycles += icache_stalls;
-  stats_.mnist_feedforward_messages += mnist_feedforward_messages;
-  stats_.mnist_trace_messages += mnist_trace_messages;
-  stats_.mnist_post_fired_trace_messages +=
-      mnist_post_fired_trace_messages;
-  stats_.mnist_inhibitory_spikes += mnist_inhibitory_spikes;
-  stats_.idle_lane_cycles    += idle_lanes;
-  stats_.idle_core_cycles    += idle_cores;
-  stats_.blocked_structural  += blocked;
-  stats_.inflight_messages_sum += inflight_msgs;
-  stats_.inflight_dram_sum   += inflight_dram;
-  stats_.inflight_resp_sum   += inflight_resp;
-  stats_.cur_inflight_messages = inflight_msgs;
-  stats_.cur_inflight_dram     = inflight_dram;
-  stats_.cur_inflight_resp     = inflight_resp;
-
-  if (timer_stats_start_pending_ && cycle >= timer_stats_start_cycle_) {
-    timer_stats_baseline_ = stats_;
-    timer_stats_start_pending_ = false;
-    timer_stats_active_ = true;
-  }
-
-  if (nocProfileManualStart_ && !nocProfileActive_ && !nocProfileWritten_ &&
-      cycle >= *nocProfileManualStart_) {
-    startNocProfile(cycle);
-  }
-  if (nocProfileActive_) {
-    accumulateNocProfile(cycle);
-    if (nocProfileManualStop_ && cycle >= *nocProfileManualStop_) {
-      nocProfileStopCycle_ = cycle;
-      nocProfileActive_ = false;
-      writeNocProfile();
-    }
-  }
-}
-
-void SoftSystemBackend::startNocProfile(uint64_t cycle) {
-  if (!nocProfileDir_ || nocProfileActive_ || nocProfileWritten_) return;
-
-  nocProfileActive_ = true;
-  nocProfileStartCycle_ = cycle;
-  nocProfileStopCycle_ = 0;
-  nocLinkProfiles_.assign((cfg.numPU + 1) * 4, {});
-  for (auto &profile : nocLinkProfiles_)
-    profile.blocked_by_mc.assign(cfg.numMC, 0);
-  nocRouterProfiles_.assign(cfg.numPU + 1, {});
-  nocMemifProfiles_.assign(cfg.numMC, {});
-  nocPuProfiles_.assign(cfg.numPU + 1, {});
-  nocQueueOccupancy_.fill(0);
-  nocCycleProfiles_.clear();
-  nocCycleProfiles_.reserve(1 << 17);
-  std::cerr << "[NoC profile] Starts at cycle " << nocProfileStartCycle_
-            << '\n';
-}
-
-void SoftSystemBackend::timerStatsStart(uint64_t cycle) {
-  timer_stats_start_cycle_ = cycle;
-  timer_stats_start_pending_ = true;
-  if (!nocProfileManualStart_) {
-    // The peripheral starts counting on the cycle after the start write.
-    startNocProfile(cycle + 1);
-  }
-}
-
-void SoftSystemBackend::timerStatsStop(uint64_t cycle) {
-  if (timer_stats_active_) {
-    const uint64_t span = cycle - timer_stats_start_cycle_;
-    const Stat interval = stats_ - timer_stats_baseline_;
-    ++timer_stats_intervals_;
-    std::cerr << "[Soft] Timer interval " << timer_stats_intervals_
-              << " (cycles " << (timer_stats_start_cycle_ + 1) << ".."
-              << cycle << ", span=" << span << "):\n";
-    std::cerr << "  unicast_mem_requests: "
-              << interval.unicast_mem_requests << '\n';
-    interval.printIcache(span, cfg.numPU);
-    if (softTimerMnistActivityEnabled()) {
-      std::cerr << "  mnist_feedforward_messages: "
-                << interval.mnist_feedforward_messages << '\n';
-      std::cerr << "  mnist_trace_messages: "
-                << interval.mnist_trace_messages << '\n';
-      std::cerr << "  mnist_post_fired_trace_messages: "
-                << interval.mnist_post_fired_trace_messages << '\n';
-      std::cerr << "  mnist_inhibitory_spikes: "
-                << interval.mnist_inhibitory_spikes << '\n';
-    }
-    if (std::getenv("SOFT_MNIST_SPARSE_STATS")) {
-      // Read completed-step counters only at the timer boundary. This observes
-      // the payload ABI without changing target execution or per-cycle work.
-      uint64_t inputs = 0, exc = 0, inh = 0, forward = 0, reverse = 0;
-      for (unsigned pu = 1; pu <= cfg.numPU; ++pu) {
-        const auto &spm = cores[pu]->rootp->Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
-        const auto word = [&](unsigned offset) -> uint32_t {
-          return spm[offset / MEM_BUS_WIDTH_B][(offset % MEM_BUS_WIDTH_B) / 4];
-        };
-        if (word(H_MAGIC) < 0x4d535031 || word(H_MAGIC) > 0x4d535034)
-          throw runtime_error("sparse statistics require sparse SPM ABI v1/v2/v3");
-        if (word(H_PREPARED)) {
-          // Input preparation can already belong to the next timestep.
-          // Input PUs retain the sent-step totals in unused reverse-sender slots.
-          inputs += word(H_REV_MINUS);
-          forward += word(H_REV_PLUS);
-        } else for (unsigned n = 0; n < word(H_INPUT_COUNT); ++n) {
-          const unsigned state = word(H_INPUT_BASE) + n * 28;
-          if (word(state + 16)) {
-            inputs += word(state) >> 31;
-            forward += word(state + 24);
-          }
-        }
-        if (word(H_LEADER) == pu)
-          exc += std::popcount(word(H_POST_LO)) + std::popcount(word(H_POST_HI));
-        if (word(H_EXC_COUNT)) inh += word(H_LOCAL_SPIKES);
-        else reverse += word(H_RECEIVED);
-      }
-      std::cerr << "  sparse_input_spikes: " << inputs << '\n'
-                << "  sparse_excitatory_spikes: " << exc << '\n'
-                << "  sparse_inhibitory_spikes: " << inh << '\n'
-                << "  sparse_feedforward_messages: " << forward << '\n'
-                << "  sparse_reverse_messages: " << reverse << '\n';
-    }
-    timer_stats_active_ = false;
-  }
-  timer_stats_start_pending_ = false;
-  if (nocProfileActive_) {
-    nocProfileStopCycle_ = cycle;
-    nocProfileActive_ = false;
-    writeNocProfile();
-  }
-}
-
-void SoftSystemBackend::accumulateNocProfile(uint64_t cycle) {
-  if (cycle < nocProfileStartCycle_) return;
-
-  NocCycleProfile sample{
-    .cycle = cycle,
-    .mnist_phase = currentMnistPhase_,
-  };
-
-  static_assert(SYSTEM_PIPE_CNT > 0 && SYSTEM_PIPE_CNT <= 8);
-  constexpr unsigned allIdleMask = (1U << SYSTEM_PIPE_CNT) - 1;
-  constexpr size_t spikeQueueDepth = 16;
-
-  for (uint16_t pu = 1; pu <= cfg.numPU; ++pu) {
-    const auto *root = cores[pu]->rootp;
-    const unsigned idlings = root->Core__DOT__exec__DOT__idlings & allIdleMask;
-    const unsigned activeThreads = SYSTEM_PIPE_CNT - std::popcount(idlings);
-    const bool active = activeThreads != 0;
-    const bool executing = root->Core__DOT__exec__DOT__valid;
-    const bool stalled = executing && !root->Core__DOT__exec__DOT__s0step;
-    const bool retired = executing && root->Core__DOT__exec__DOT__s0step;
-    const bool isSC = root->Core__DOT__exec__DOT__uop_memIsAtomic
-        && ((root->Core__DOT__exec__DOT__uop_funct7 >> 2) & 0x1f) == 3;
-    const bool scAttempt = retired && isSC;
-    const bool scFailure = scAttempt
-        && !root->Core__DOT__exec__DOT__lsu__DOT__reserved;
-
-    const bool morrison=root->Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory[0][0]==MR_MAGIC;
-    const size_t enq = morrison ? root->Core__DOT__exec__DOT__biu__DOT__evq_5__DOT__enq_ptr_value : root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__enq_ptr_value;
-    const size_t deq = morrison ? root->Core__DOT__exec__DOT__biu__DOT__evq_5__DOT__deq_ptr_value : root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__deq_ptr_value;
-    const bool maybeFull = morrison ? root->Core__DOT__exec__DOT__biu__DOT__evq_5__DOT__maybe_full : root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__maybe_full;
-    const size_t spikeQueueOccupancy = enq == deq
-        ? (maybeFull ? spikeQueueDepth : 0)
-        : ((enq - deq) & (spikeQueueDepth - 1));
-
-    sample.active_pus += active;
-    sample.active_threads += activeThreads;
-    sample.executing_pus += executing;
-    sample.stalled_pus += stalled;
-    sample.retired_instructions += retired;
-    sample.sc_attempts += scAttempt;
-    sample.sc_failures += scFailure;
-    sample.spike_queue_entries += spikeQueueOccupancy;
-    sample.spike_queue_nonempty_pus += spikeQueueOccupancy != 0;
-    sample.spike_queue_full_pus += spikeQueueOccupancy == spikeQueueDepth;
-    sample.idle_pus_with_spikes += !active && spikeQueueOccupancy != 0;
-
-    auto &profile = nocPuProfiles_[pu];
-    profile.active_cycles += active;
-    profile.active_thread_cycles += activeThreads;
-    profile.one_active_thread_cycles += activeThreads == 1;
-    profile.two_active_thread_cycles += activeThreads == 2;
-    profile.executing_cycles += executing;
-    profile.stalled_cycles += stalled;
-    profile.retired_instructions += retired;
-    profile.sc_attempts += scAttempt;
-    profile.sc_failures += scFailure;
-    profile.spike_queue_occupancy_sum += spikeQueueOccupancy;
-    profile.spike_queue_empty_cycles += spikeQueueOccupancy == 0;
-    profile.spike_queue_full_cycles += spikeQueueOccupancy == spikeQueueDepth;
-    profile.idle_with_spikes_cycles += !active && spikeQueueOccupancy != 0;
-    profile.spike_enqueues += root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__do_enq;
-    profile.spike_dequeues += root->Core__DOT__exec__DOT__biu__DOT__evq_1__DOT__unnamedblk1__DOT__do_deq;
-    profile.max_spike_queue_occupancy = std::max(
-        profile.max_spike_queue_occupancy,
-        static_cast<uint64_t>(spikeQueueOccupancy));
-  }
-
-  for (uint16_t dst = 1; dst <= cfg.numPU; ++dst) {
-    const auto &router = routers[dst];
-    auto &routerProfile = nocRouterProfiles_[dst];
-    const size_t occupancy = router.rt.totalFlits();
-    sample.router_flits += occupancy;
-    sample.max_router_flits = std::max(sample.max_router_flits,
-                                        static_cast<uint64_t>(occupancy));
-    routerProfile.occupancy_sum += occupancy;
-    routerProfile.max_occupancy = std::max(
-        routerProfile.max_occupancy, static_cast<uint64_t>(occupancy));
-
-    for (size_t input = 0; input < router.rt.numInputs(); ++input) {
-      const size_t queueOccupancy = router.rt.inputQueueSize(input);
-      ++nocQueueOccupancy_.at(queueOccupancy);
-      if (queueOccupancy == ROUTER_Q_DEPTH) {
-        ++sample.full_input_queues;
-        ++routerProfile.full_input_queue_cycles;
-      }
-    }
-
-    if (router.buf.core_inject_presenting) {
-      ++sample.injections_presented;
-      ++routerProfile.injection_presented;
-      if (router.buf.core_inject_accepting) {
-        ++sample.injections_accepted;
-        ++routerProfile.injection_accepted;
-        routerProfile.current_injection_stall = 0;
-      } else {
-        ++sample.injections_blocked;
-        ++routerProfile.injection_blocked;
-        ++routerProfile.current_injection_stall;
-        routerProfile.longest_injection_stall = std::max(
-            routerProfile.longest_injection_stall,
-            routerProfile.current_injection_stall);
-      }
-    } else {
-      routerProfile.current_injection_stall = 0;
-    }
-
-    for (size_t input = 0; input < router.links.num_forwards; ++input) {
-      const auto src = router.links.forwards[input]->first;
-      auto &link = nocLinkProfiles_[dst * 4 + input];
-      const size_t queueOccupancy = router.rt.inputQueueSize(input);
-      link.queue_occupancy_sum += queueOccupancy;
-      if (queueOccupancy == ROUTER_Q_DEPTH) ++link.queue_full_cycles;
-
-      const auto &token = router.buf.forward_presenting[input];
-      if (!token) {
-        link.current_stall = 0;
-        continue;
-      }
-
-      ++sample.links_presented;
-      ++link.presented;
-      if (router.buf.forward_accepting[input]) {
-        ++sample.links_accepted;
-        ++link.accepted;
-        link.current_stall = 0;
-      } else {
-        ++sample.links_blocked;
-        ++link.blocked;
-        ++link.current_stall;
-        link.longest_stall = std::max(link.longest_stall,
-                                      link.current_stall);
-        const Flit *flit = routers[src].rt.peek(*token);
-        if (flit && flit->dst >= 0x8001 &&
-            flit->dst < 0x8001 + cfg.numMC) {
-          ++link.blocked_by_mc[flit->dst - 0x8001];
-        }
-      }
-    }
-  }
-
-  for (const auto &accepted : memif_eject_accept)
-    if (accepted) ++sample.memif_arrivals;
-
-  for (size_t mc = 0; mc < cfg.numMC; ++mc) {
-    const auto &dram = drams[mc];
-    auto &profile = nocMemifProfiles_[mc];
-    const auto &events = dram.cycleEvents();
-    const size_t allocated = dram.mshrInflightCount();
-    const size_t broadcasts = dram.broadcastInflightCount();
-    const size_t fulfilled = dram.mshrFulfilledCount();
-    const size_t broadcastQueues = dram.bcstQueueOccupancy();
-    recordOccupancy(profile.allocated, allocated);
-    recordOccupancy(profile.allocatable, dram.mshrAllocatableCount());
-    recordOccupancy(profile.unissued, dram.mshrUnissuedCount());
-    recordOccupancy(profile.issued_unfulfilled,
-                    dram.mshrIssuedUnfulfilledCount());
-    recordOccupancy(profile.fulfilled, fulfilled);
-    recordOccupancy(profile.broadcast, broadcasts);
-    recordOccupancy(profile.broadcast_queue, broadcastQueues);
-    recordOccupancy(profile.bulk_queue, dram.bulkQueueOccupancy());
-    profile.allocation_full_cycles += allocated == dram.mshrCapacity();
-    profile.allocation_blocked_cycles += dram.mshrAllocationBlocked();
-    profile.cursor_blocked_cycles += dram.mshrCursorBlocked();
-    profile.bulk_reservation_blocked_cycles += dram.bulkReservationBlocked();
-    if (dram.broadcastAllocationBlocked()) {
-      ++profile.broadcast_blocked_cycles;
-      ++sample.broadcast_blocked_mcs;
-    }
-    sample.total_mshrs += allocated;
-    sample.broadcast_mshrs += broadcasts;
-    sample.fulfilled_mshrs += fulfilled;
-    sample.broadcast_queues += broadcastQueues;
-    profile.external_request_presented += events.externalRequestPresented;
-    profile.external_request_accepted += events.externalRequestAccepted;
-    profile.external_response_accepted += events.externalResponseAccepted;
-    profile.mshr_unicast_local_retired += events.mshrUnicastLocalRetired;
-    profile.mshr_unicast_remote_injected +=
-        events.mshrUnicastRemoteInjected;
-    profile.ring_unicast_local_delivered +=
-        events.ringUnicastLocalDelivered;
-    profile.broadcast_retired += events.broadcastRetired;
-    sample.external_requests_presented += events.externalRequestPresented;
-    sample.external_requests_accepted += events.externalRequestAccepted;
-    sample.external_responses_accepted += events.externalResponseAccepted;
-    sample.mshr_unicasts_local_retired += events.mshrUnicastLocalRetired;
-    sample.mshr_unicasts_remote_injected +=
-        events.mshrUnicastRemoteInjected;
-    sample.ring_unicasts_local_delivered +=
-        events.ringUnicastLocalDelivered;
-  }
-
-  nocCycleProfiles_.push_back(sample);
-}
-
-void SoftSystemBackend::writeNocProfile() {
-  if (!nocProfileDir_ || nocProfileWritten_) return;
-  namespace fs = std::filesystem;
-  fs::create_directories(*nocProfileDir_);
-  const uint64_t samples = nocCycleProfiles_.size();
-
-  std::ofstream cycles(*nocProfileDir_ + "/cycles.csv");
-  cycles << "cycle,mnist_phase,router_flits,full_input_queues,links_presented,"
-            "links_accepted,links_blocked,injections_presented,"
-            "injections_accepted,injections_blocked,memif_arrivals,"
-            "max_router_flits,total_mshrs,broadcast_mshrs,fulfilled_mshrs,"
-            "broadcast_queues,broadcast_blocked_mcs,"
-            "external_requests_presented,external_requests_accepted,"
-            "external_responses_accepted,mshr_unicasts_local_retired,"
-            "mshr_unicasts_remote_injected,ring_unicasts_local_delivered,"
-            "active_pus,active_threads,executing_pus,stalled_pus,"
-            "retired_instructions,sc_attempts,sc_failures,"
-            "spike_queue_entries,spike_queue_nonempty_pus,"
-            "spike_queue_full_pus,idle_pus_with_spikes\n";
-  for (const auto &s : nocCycleProfiles_) {
-    cycles << s.cycle << ',' << static_cast<unsigned>(s.mnist_phase) << ','
-           << s.router_flits << ','
-           << s.full_input_queues << ',' << s.links_presented << ','
-           << s.links_accepted << ',' << s.links_blocked << ','
-           << s.injections_presented << ',' << s.injections_accepted << ','
-           << s.injections_blocked << ',' << s.memif_arrivals << ','
-           << s.max_router_flits << ',' << s.total_mshrs << ','
-           << s.broadcast_mshrs << ',' << s.fulfilled_mshrs << ','
-           << s.broadcast_queues << ',' << s.broadcast_blocked_mcs << ','
-           << s.external_requests_presented << ','
-           << s.external_requests_accepted << ','
-           << s.external_responses_accepted << ','
-           << s.mshr_unicasts_local_retired << ','
-           << s.mshr_unicasts_remote_injected << ','
-           << s.ring_unicasts_local_delivered << ','
-           << s.active_pus << ',' << s.active_threads << ','
-           << s.executing_pus << ',' << s.stalled_pus << ','
-           << s.retired_instructions << ',' << s.sc_attempts << ','
-           << s.sc_failures << ','
-           << s.spike_queue_entries << ',' << s.spike_queue_nonempty_pus << ','
-           << s.spike_queue_full_pus << ',' << s.idle_pus_with_spikes << '\n';
-  }
-
-  std::ofstream pusFile(*nocProfileDir_ + "/pus.csv");
-  pusFile << "pu,col,row,active_cycles,active_fraction,active_thread_cycles,"
-             "thread_utilization,one_active_thread_cycles,"
-             "two_active_thread_cycles,executing_cycles,executing_fraction,"
-             "stalled_cycles,retired_instructions,sc_attempts,sc_failures,"
-             "avg_spike_queue,max_spike_queue,"
-             "spike_queue_empty_cycles,spike_queue_full_cycles,"
-             "idle_with_spikes_cycles,spike_enqueues,spike_dequeues\n";
-  for (uint16_t pu = 1; pu <= cfg.numPU; ++pu) {
-    const auto [col, row] = topo.pu_to_coord[pu];
-    const auto &profile = nocPuProfiles_[pu];
-    const double activeFraction = samples
-        ? static_cast<double>(profile.active_cycles) / samples : 0.0;
-    const double threadUtilization = samples
-        ? static_cast<double>(profile.active_thread_cycles) /
-              (samples * SYSTEM_PIPE_CNT)
-        : 0.0;
-    const double executingFraction = samples
-        ? static_cast<double>(profile.executing_cycles) / samples : 0.0;
-    const double avgSpikeQueue = samples
-        ? static_cast<double>(profile.spike_queue_occupancy_sum) / samples
-        : 0.0;
-    pusFile << pu << ',' << col << ',' << row << ','
-            << profile.active_cycles << ',' << activeFraction << ','
-            << profile.active_thread_cycles << ',' << threadUtilization << ','
-            << profile.one_active_thread_cycles << ','
-            << profile.two_active_thread_cycles << ','
-            << profile.executing_cycles << ',' << executingFraction << ','
-            << profile.stalled_cycles << ',' << profile.retired_instructions
-            << ',' << profile.sc_attempts << ',' << profile.sc_failures << ','
-            << avgSpikeQueue << ','
-            << profile.max_spike_queue_occupancy << ','
-            << profile.spike_queue_empty_cycles << ','
-            << profile.spike_queue_full_cycles << ','
-            << profile.idle_with_spikes_cycles << ','
-            << profile.spike_enqueues << ',' << profile.spike_dequeues << '\n';
-  }
-
-  std::ofstream links(*nocProfileDir_ + "/links.csv");
-  links << "src_pu,dst_pu,src_col,src_row,dst_col,dst_row,presented,"
-           "accepted,blocked,blocked_fraction,avg_dst_queue,"
-           "dst_queue_full_cycles,longest_stall";
-  for (size_t mc = 0; mc < cfg.numMC; ++mc) links << ",blocked_mc" << mc;
-  links << '\n';
-
-  uint64_t totalPresented = 0;
-  uint64_t totalAccepted = 0;
-  uint64_t totalBlocked = 0;
-  std::vector<std::pair<uint64_t, std::pair<uint16_t, uint16_t>>> hotspots;
-  std::vector<uint64_t> blockedByMc(cfg.numMC, 0);
-  for (uint16_t dst = 1; dst <= cfg.numPU; ++dst) {
-    const auto &router = routers[dst];
-    auto [dstCol, dstRow] = topo.pu_to_coord[dst];
-    for (size_t input = 0; input < router.links.num_forwards; ++input) {
-      const auto src = router.links.forwards[input]->first;
-      auto [srcCol, srcRow] = topo.pu_to_coord[src];
-      const auto &profile = nocLinkProfiles_[dst * 4 + input];
-      const double blockedFraction = profile.presented
-          ? static_cast<double>(profile.blocked) / profile.presented : 0.0;
-      const double avgQueue = samples
-          ? static_cast<double>(profile.queue_occupancy_sum) / samples : 0.0;
-      links << src << ',' << dst << ',' << srcCol << ',' << srcRow << ','
-            << dstCol << ',' << dstRow << ',' << profile.presented << ','
-            << profile.accepted << ',' << profile.blocked << ','
-            << blockedFraction << ',' << avgQueue << ','
-            << profile.queue_full_cycles << ',' << profile.longest_stall;
-      for (size_t mc = 0; mc < cfg.numMC; ++mc) {
-        links << ',' << profile.blocked_by_mc[mc];
-        blockedByMc[mc] += profile.blocked_by_mc[mc];
-      }
-      links << '\n';
-      totalPresented += profile.presented;
-      totalAccepted += profile.accepted;
-      totalBlocked += profile.blocked;
-      hotspots.push_back({profile.blocked, {src, dst}});
-    }
-  }
-
-  std::ofstream routersFile(*nocProfileDir_ + "/routers.csv");
-  routersFile << "pu,col,row,injection_presented,injection_accepted,"
-                 "injection_blocked,blocked_fraction,longest_injection_stall,"
-                 "avg_flits,max_flits,full_input_queue_cycles\n";
-  for (uint16_t pu = 1; pu <= cfg.numPU; ++pu) {
-    auto [col, row] = topo.pu_to_coord[pu];
-    const auto &profile = nocRouterProfiles_[pu];
-    const double blockedFraction = profile.injection_presented
-        ? static_cast<double>(profile.injection_blocked) /
-          profile.injection_presented : 0.0;
-    const double avgFlits = samples
-        ? static_cast<double>(profile.occupancy_sum) / samples : 0.0;
-    routersFile << pu << ',' << col << ',' << row << ','
-                << profile.injection_presented << ','
-                << profile.injection_accepted << ','
-                << profile.injection_blocked << ',' << blockedFraction << ','
-                << profile.longest_injection_stall << ',' << avgFlits << ','
-                << profile.max_occupancy << ','
-                << profile.full_input_queue_cycles << '\n';
-  }
-
-  std::ofstream queueHist(*nocProfileDir_ + "/queue_histogram.csv");
-  queueHist << "occupancy,samples\n";
-  for (size_t occupancy = 0; occupancy < nocQueueOccupancy_.size(); ++occupancy)
-    queueHist << occupancy << ',' << nocQueueOccupancy_[occupancy] << '\n';
-
-  std::ofstream memifHist(*nocProfileDir_ + "/memif_histograms.csv");
-  memifHist << "mc,metric,value,cycles\n";
-  auto emitHistogram = [&](size_t mc, const char *name, const auto &histogram) {
-    for (size_t value = 0; value < histogram.size(); ++value)
-      if (histogram[value])
-        memifHist << mc << ',' << name << ',' << value << ','
-                  << histogram[value] << '\n';
-  };
-  for (size_t mc = 0; mc < cfg.numMC; ++mc) {
-    const auto &profile = nocMemifProfiles_[mc];
-    emitHistogram(mc, "allocated", profile.allocated);
-    emitHistogram(mc, "allocatable", profile.allocatable);
-    emitHistogram(mc, "unissued", profile.unissued);
-    emitHistogram(mc, "issued_unfulfilled", profile.issued_unfulfilled);
-    emitHistogram(mc, "fulfilled", profile.fulfilled);
-    emitHistogram(mc, "broadcast", profile.broadcast);
-    emitHistogram(mc, "broadcast_queue", profile.broadcast_queue);
-    emitHistogram(mc, "bulk_queue", profile.bulk_queue);
-  }
-
-  std::ofstream memifs(*nocProfileDir_ + "/memifs.csv");
-  memifs << "mc,broadcast_blocked_cycles,broadcast_blocked_fraction,"
-            "external_request_presented,external_request_accepted,"
-            "external_response_accepted,mshr_unicast_local_retired,"
-            "mshr_unicast_remote_injected,ring_unicast_local_delivered,"
-            "broadcast_retired,allocation_full_cycles,allocation_blocked_cycles,"
-            "cursor_blocked_cycles,bulk_reservation_blocked_cycles\n";
-  for (size_t mc = 0; mc < cfg.numMC; ++mc) {
-    const auto blocked = nocMemifProfiles_[mc].broadcast_blocked_cycles;
-    const auto &profile = nocMemifProfiles_[mc];
-    memifs << mc << ',' << blocked << ','
-           << (samples ? static_cast<double>(blocked) / samples : 0.0) << ','
-           << profile.external_request_presented << ','
-           << profile.external_request_accepted << ','
-           << profile.external_response_accepted << ','
-           << profile.mshr_unicast_local_retired << ','
-           << profile.mshr_unicast_remote_injected << ','
-           << profile.ring_unicast_local_delivered << ','
-           << profile.broadcast_retired << ','
-           << profile.allocation_full_cycles << ','
-           << profile.allocation_blocked_cycles << ','
-           << profile.cursor_blocked_cycles << ','
-           << profile.bulk_reservation_blocked_cycles << '\n';
-  }
-
-  std::ofstream destinations(*nocProfileDir_ + "/blocked_destinations.csv");
-  destinations << "mc,blocked_link_cycles\n";
-  for (size_t mc = 0; mc < cfg.numMC; ++mc)
-    destinations << mc << ',' << blockedByMc[mc] << '\n';
-
-  std::sort(hotspots.begin(), hotspots.end(), std::greater<>());
-  const uint64_t topOne = hotspots.empty() ? 0 : hotspots.front().first;
-  uint64_t topFive = 0;
-  for (size_t i = 0; i < std::min<size_t>(5, hotspots.size()); ++i)
-    topFive += hotspots[i].first;
-  size_t linksFor90Percent = 0;
-  uint64_t cumulative = 0;
-  while (linksFor90Percent < hotspots.size() &&
-         cumulative * 10 < totalBlocked * 9) {
-    cumulative += hotspots[linksFor90Percent++].first;
-  }
-
-  std::ofstream summary(*nocProfileDir_ + "/summary.txt");
-  summary << "start_cycle=" << nocProfileStartCycle_ << '\n'
-          << "stop_cycle=" << nocProfileStopCycle_ << '\n'
-          << "samples=" << samples << '\n'
-          << "num_pus=" << cfg.numPU << '\n'
-          << "pipe_count=" << SYSTEM_PIPE_CNT << '\n'
-          << "link_presented=" << totalPresented << '\n'
-          << "link_accepted=" << totalAccepted << '\n'
-          << "link_blocked=" << totalBlocked << '\n'
-          << "link_blocked_fraction="
-          << (totalPresented ? static_cast<double>(totalBlocked) /
-                               totalPresented : 0.0) << '\n'
-          << "top_link_blocked_share="
-          << (totalBlocked ? static_cast<double>(topOne) / totalBlocked : 0.0)
-          << '\n'
-          << "top_5_links_blocked_share="
-          << (totalBlocked ? static_cast<double>(topFive) / totalBlocked : 0.0)
-          << '\n'
-          << "links_for_90_percent_blocking=" << linksFor90Percent << '\n';
-  uint64_t activePuCycles = 0;
-  uint64_t activeThreadCycles = 0;
-  uint64_t executingPuCycles = 0;
-  uint64_t idleWithSpikesCycles = 0;
-  for (const auto &sample : nocCycleProfiles_) {
-    activePuCycles += sample.active_pus;
-    activeThreadCycles += sample.active_threads;
-    executingPuCycles += sample.executing_pus;
-    idleWithSpikesCycles += sample.idle_pus_with_spikes;
-  }
-  const uint64_t puSlots = samples * cfg.numPU;
-  const uint64_t threadSlots = puSlots * SYSTEM_PIPE_CNT;
-  summary << "pu_utilization="
-          << (puSlots ? static_cast<double>(activePuCycles) / puSlots : 0.0)
-          << '\n'
-          << "thread_utilization="
-          << (threadSlots
-                  ? static_cast<double>(activeThreadCycles) / threadSlots
-                  : 0.0)
-          << '\n'
-          << "execute_utilization="
-          << (puSlots
-                  ? static_cast<double>(executingPuCycles) / puSlots
-                  : 0.0)
-          << '\n'
-          << "idle_with_spikes_fraction="
-          << (puSlots
-                  ? static_cast<double>(idleWithSpikesCycles) / puSlots
-                  : 0.0)
-          << '\n';
-  for (size_t i = 0; i < std::min<size_t>(20, hotspots.size()); ++i) {
-    summary << "hotspot_" << i << "_src=" << hotspots[i].second.first
-            << " dst=" << hotspots[i].second.second
-            << " blocked=" << hotspots[i].first << '\n';
-  }
-
-  nocProfileWritten_ = true;
-  std::cerr << "[NoC profile] Wrote " << samples << " samples to "
-            << *nocProfileDir_ << '\n';
-}
-
-void SoftSystemBackend::printWorkProfile() const {
-  if (!workProfileEnabled || workProfilePhaseSamples.empty()) return;
-
-  struct Distribution {
-    double mean;
-    uint64_t p50;
-    uint64_t p90;
-    uint64_t p99;
-    uint64_t max;
-  };
-  auto distribution = [](std::vector<uint64_t> values) -> Distribution {
-    std::sort(values.begin(), values.end());
-    long double sum = 0;
-    for (uint64_t value : values) sum += value;
-    auto percentile = [&values](size_t numerator) {
-      const size_t index =
-          ((values.size() - 1) * numerator + 99) / 100;
-      return values[index];
-    };
-    return {
-      .mean = static_cast<double>(sum / values.size()),
-      .p50 = percentile(50),
-      .p90 = percentile(90),
-      .p99 = percentile(99),
-      .max = values.back(),
-    };
-  };
-  auto phaseName = [](WorkProfilePhase phase) {
-    switch (phase) {
-      case WorkProfilePhase::StageStart: return "stageStart";
-      case WorkProfilePhase::StageDone: return "stageDone";
-      case WorkProfilePhase::StepStart: return "stepStart";
-      case WorkProfilePhase::StepDone: return "stepDone";
-      case WorkProfilePhase::Count: break;
-    }
-    return "unknown";
-  };
-  auto unitName = [](WorkProfileUnit unit) {
-    switch (unit) {
-      case WorkProfileUnit::Stats: return "stats";
-      case WorkProfileUnit::PeekMC: return "peekMC";
-      case WorkProfileUnit::AcceptPeriph: return "acceptPeriph";
-      case WorkProfileUnit::AcceptMC: return "acceptMC";
-      case WorkProfileUnit::StepPeriph: return "stepPeriph";
-      case WorkProfileUnit::StepMC: return "stepMC";
-      case WorkProfileUnit::RingUpdate: return "ringUpdate";
-      case WorkProfileUnit::RingProgress: return "ringProgress";
-    }
-    return "unknown";
-  };
-  auto substepName = [](WorkProfileSubstep substep) {
-    switch (substep) {
-      case WorkProfileSubstep::StageResolveLinks: return "stageResolveLinks";
-      case WorkProfileSubstep::StageDriveInputs: return "stageDriveInputs";
-      case WorkProfileSubstep::StageNegedgeEval: return "stageNegedgeEval";
-      case WorkProfileSubstep::StageCaptureAccepts:
-        return "stageCaptureAccepts";
-      case WorkProfileSubstep::StageMemIf: return "stageMemIf";
-      case WorkProfileSubstep::StepPosedge: return "stepPosedge";
-      case WorkProfileSubstep::StepTransfer: return "stepTransfer";
-      case WorkProfileSubstep::StepMemIf: return "stepMemIf";
-      case WorkProfileSubstep::StepPrepareMem: return "stepPrepareMem";
-      case WorkProfileSubstep::StepCleanup: return "stepCleanup";
-      case WorkProfileSubstep::Count: break;
-    }
-    return "unknown";
-  };
-  auto printDistribution = [](const Distribution &d) {
-    std::cerr << "mean=" << std::fixed << std::setprecision(1) << d.mean
-              << " p50=" << d.p50
-              << " p90=" << d.p90
-              << " p99=" << d.p99
-              << " max=" << d.max;
-  };
-  auto printScaledDistribution = [](const Distribution &d, double scale,
-                                    const char *suffix) {
-    std::cerr << "mean=" << std::fixed << std::setprecision(2)
-              << d.mean / scale
-              << " p50=" << d.p50 / scale
-              << " p90=" << d.p90 / scale
-              << " p99=" << d.p99 / scale
-              << " max=" << d.max / scale << suffix;
-  };
-
-  std::cerr << "[Soft work profile] times are nanoseconds; local-spread is "
-               "the optimistic first-arriver task budget\n";
-  for (size_t p = 0; p < WORK_PROFILE_PHASE_COUNT; ++p) {
-    const auto phase = static_cast<WorkProfilePhase>(p);
-    std::vector<uint64_t> localSpread;
-    std::vector<uint64_t> workerSpread;
-    std::vector<uint64_t> leaderExtra;
-    std::vector<uint64_t> arrivalSpread;
-    std::vector<uint64_t> criticalExtension;
-    for (const auto &sample : workProfilePhaseSamples) {
-      if (sample.phase != phase) continue;
-      localSpread.push_back(sample.local_spread_ns);
-      workerSpread.push_back(sample.worker_spread_ns);
-      leaderExtra.push_back(sample.leader_extra_ns);
-      arrivalSpread.push_back(sample.arrival_spread_ns);
-      criticalExtension.push_back(sample.critical_extension_ns);
-    }
-    if (localSpread.empty()) continue;
-    std::cerr << "[Soft work profile] phase " << phaseName(phase)
-              << " samples=" << localSpread.size() << " local-spread ";
-    printDistribution(distribution(std::move(localSpread)));
-    std::cerr << "\n[Soft work profile] phase " << phaseName(phase)
-              << " worker-spread ";
-    printDistribution(distribution(std::move(workerSpread)));
-    std::cerr << "\n[Soft work profile] phase " << phaseName(phase)
-              << " leader-extra ";
-    printDistribution(distribution(std::move(leaderExtra)));
-    std::cerr << "\n[Soft work profile] phase " << phaseName(phase)
-              << " arrival-spread ";
-    printDistribution(distribution(std::move(arrivalSpread)));
-    std::cerr << "\n[Soft work profile] phase " << phaseName(phase)
-              << " critical-extension ";
-    printDistribution(distribution(std::move(criticalExtension)));
-    std::cerr << '\n';
-  }
-
-  auto phaseKey = [](uint64_t cycle, WorkProfilePhase phase) {
-    return cycle * WORK_PROFILE_PHASE_COUNT + static_cast<size_t>(phase);
-  };
-  auto availableSlack = [&](const WorkProfileUnitSample &unit) {
-    const uint64_t key = phaseKey(unit.cycle, unit.phase);
-    auto it = std::lower_bound(
-        workProfilePhaseSamples.begin(), workProfilePhaseSamples.end(), key,
-        [&](const WorkProfilePhaseSample &sample, uint64_t wanted) {
-          return phaseKey(sample.cycle, sample.phase) < wanted;
-        });
-    return it != workProfilePhaseSamples.end() &&
-                   phaseKey(it->cycle, it->phase) == key
-               ? it->local_spread_ns
-               : uint64_t{0};
-  };
-
-  constexpr size_t UNIT_COUNT =
-      static_cast<size_t>(WorkProfileUnit::RingProgress) + 1;
-  for (size_t u = 0; u < UNIT_COUNT; ++u) {
-    const auto unit = static_cast<WorkProfileUnit>(u);
-    size_t maxIndex = 0;
-    bool present = false;
-    for (const auto &sample : workProfileUnitSamples) {
-      if (sample.unit == unit) {
-        present = true;
-        maxIndex = std::max(maxIndex, static_cast<size_t>(sample.index));
-      }
-    }
-    if (!present) continue;
-    for (size_t index = 0; index <= maxIndex; ++index) {
-      std::vector<uint64_t> durations;
-      size_t hidden = 0;
-      for (const auto &sample : workProfileUnitSamples) {
-        if (sample.unit != unit || sample.index != index) continue;
-        durations.push_back(sample.duration_ns);
-        if (sample.duration_ns <= availableSlack(sample)) ++hidden;
-      }
-      if (durations.empty()) continue;
-      std::cerr << "[Soft work profile] unit " << unitName(unit)
-                << '[' << index << "] samples=" << durations.size()
-                << " duration ";
-      printDistribution(distribution(durations));
-      std::cerr << " hidden-by-local-spread=" << std::fixed
-                << std::setprecision(1)
-                << (100.0 * hidden / durations.size()) << "%\n";
-    }
-  }
-
-  for (size_t s = 0; s < WORK_PROFILE_SUBSTEP_COUNT; ++s) {
-    const auto substep = static_cast<WorkProfileSubstep>(s);
-    std::vector<const WorkProfileSubstepSample *> samples;
-    std::vector<std::vector<uint64_t>> byThread(numThreads);
-    for (const auto &sample : workProfileSubstepSamples) {
-      if (sample.substep != substep) continue;
-      samples.push_back(&sample);
-      byThread[sample.thread].push_back(sample.duration_ns);
-    }
-    if (samples.empty()) continue;
-
-    for (size_t thread = 0; thread < numThreads; ++thread) {
-      if (byThread[thread].empty()) continue;
-      const auto [puStart, puEnd] = puWorkRange(thread);
-      std::cerr << "[Soft work profile] substep " << substepName(substep)
-                << " thread=" << thread << " pu=" << puStart << '-'
-                << (puEnd - 1) << " samples=" << byThread[thread].size()
-                << " duration ";
-      printDistribution(distribution(std::move(byThread[thread])));
-      std::cerr << '\n';
-    }
-
-    std::vector<uint64_t> maxMinusMin;
-    std::vector<uint64_t> maxMinusMean;
-    std::vector<uint64_t> efficiencyBasisPoints;
-    std::vector<uint64_t> idealSpeedupMilli;
-    std::vector<size_t> slowestCount(numThreads, 0);
-    uint64_t totalMax = 0;
-    long double totalMean = 0;
-    size_t completeCycles = 0;
-    for (size_t offset = 0; offset + numThreads <= samples.size();
-         offset += numThreads) {
-      const uint64_t cycle = samples[offset]->cycle;
-      bool complete = true;
-      uint64_t sum = 0;
-      uint64_t minimum = samples[offset]->duration_ns;
-      uint64_t maximum = minimum;
-      for (size_t thread = 0; thread < numThreads; ++thread) {
-        const auto &sample = *samples[offset + thread];
-        if (sample.cycle != cycle || sample.thread != thread) {
-          complete = false;
-          break;
-        }
-        sum += sample.duration_ns;
-        minimum = std::min(minimum, sample.duration_ns);
-        maximum = std::max(maximum, sample.duration_ns);
-      }
-      if (!complete) continue;
-
-      const uint64_t mean = sum / numThreads;
-      maxMinusMin.push_back(maximum - minimum);
-      maxMinusMean.push_back(maximum - mean);
-      efficiencyBasisPoints.push_back(
-          maximum == 0 ? 10000 : (sum * 10000) / (numThreads * maximum));
-      idealSpeedupMilli.push_back(
-          sum == 0 ? 1000 : (maximum * numThreads * 1000) / sum);
-      for (size_t thread = 0; thread < numThreads; ++thread) {
-        if (samples[offset + thread]->duration_ns == maximum)
-          ++slowestCount[thread];
-      }
-      totalMax += maximum;
-      totalMean += static_cast<long double>(sum) / numThreads;
-      ++completeCycles;
-    }
-    if (completeCycles == 0) continue;
-
-    std::cerr << "[Soft work profile] substep " << substepName(substep)
-              << " cycles=" << completeCycles << " max-minus-min ";
-    printDistribution(distribution(std::move(maxMinusMin)));
-    std::cerr << "\n[Soft work profile] substep " << substepName(substep)
-              << " max-minus-mean ";
-    printDistribution(distribution(std::move(maxMinusMean)));
-    std::cerr << "\n[Soft work profile] substep " << substepName(substep)
-              << " balance-efficiency ";
-    printScaledDistribution(distribution(std::move(efficiencyBasisPoints)),
-                            100.0, "%");
-    std::cerr << "\n[Soft work profile] substep " << substepName(substep)
-              << " ideal-balance-speedup ";
-    printScaledDistribution(distribution(std::move(idealSpeedupMilli)),
-                            1000.0, "x");
-    std::cerr << " aggregate=" << std::fixed << std::setprecision(3)
-              << (totalMean > 0 ? totalMax / totalMean : 1.0L) << "x";
-    std::cerr << "\n[Soft work profile] substep " << substepName(substep)
-              << " tied-for-slowest";
-    for (size_t thread = 0; thread < numThreads; ++thread) {
-      std::cerr << " t" << thread << '=' << std::fixed
-                << std::setprecision(1)
-                << (100.0 * slowestCount[thread] / completeCycles) << '%';
-    }
-    std::cerr << '\n';
-  }
-}
-
-bool SoftSystemBackend::printStats(uint64_t cycles, bool final_print) {
-  if (final_print) {
-    if (nocProfileActive_) timerStatsStop(cycles);
-    double v_ms = verilator_ns_ / 1e6;
-    double u_ms = uncore_ns_ / 1e6;
-    double tot_ms = v_ms + u_ms;
-    auto pct = [&](double x) { return tot_ms > 0 ? (100.0 * x / tot_ms) : 0.0; };
-    fprintf(stderr,
-            "[Soft] Final stats (over %lu cycles):\n"
-            "[Soft] Time breakdown: verilator=%.3fms (%.1f%%) "
-            "uncore=%.3fms (%.1f%%) total=%.3fms\n",
-            (unsigned long)cycles,
-            v_ms, pct(v_ms), u_ms, pct(u_ms), tot_ms);
-    stats_.print(cycles, cfg.numPU);
-    printWorkProfile();
-    if (const char *path = std::getenv("SOFT_MNIST_SPARSE_DUMP")) {
-      // Portable little-endian initialized-SPM dump for independent state
-      // validation: magic, PU count, then (PU id, byte count, bytes) per PU.
-      std::ofstream stream(path, std::ios::binary);
-      const auto emit = [&](uint32_t value) {
-        for (unsigned shift = 0; shift < 32; shift += 8)
-          stream.put(static_cast<char>(value >> shift));
-      };
-      emit(0x4d535044);
-      emit(cfg.numPU);
-      for (unsigned pu = 1; pu <= cfg.numPU; ++pu) {
-        const auto &spm = cores[pu]->rootp->Core__DOT__exec__DOT__lsu__DOT__spm__DOT__scratchpad_ext__DOT__Memory;
-        const auto word = [&](unsigned offset) -> uint32_t {
-          return spm[offset / MEM_BUS_WIDTH_B][(offset % MEM_BUS_WIDTH_B) / 4];
-        };
-        const unsigned bytes = (word(H_DATA_END) + 3) & ~3U;
-        if ((word(H_MAGIC) < 0x4d535031 || word(H_MAGIC) > 0x4d535034)
-            || bytes > 0x3000 || bytes < 256)
-          throw runtime_error("invalid sparse SPM dump layout");
-        emit(pu);
-        emit(bytes);
-        for (unsigned offset = 0; offset < bytes; offset += 4) emit(word(offset));
-      }
-      if (!stream) throw runtime_error("cannot write sparse SPM dump");
-    }
-  }
-  return true;
 }
 
 void SoftSystemBackend::worker(size_t threadId) {
-  uint64_t cycle = 0;
   while (true) {
     if (halted) return;
-    ++cycle;
-    const bool profile = workProfileSampleCycle(cycle);
-    if (profile) {
-      const uint64_t now = workProfileNowNs();
-      workProfileMark(threadId, WorkProfilePhase::StageStart, now, now);
-    }
     stageStart.arrive_and_wait();
     try {
-      stageWorkResolve(threadId, profile);
-      const uint64_t memifStart = profile ? workProfileNowNs() : 0;
-      stageMemifWork(threadId, profile);
-      if (profile)
-        workProfileTimes[threadId]
-            .substep_duration[static_cast<size_t>(
-                WorkProfileSubstep::StageMemIf)] =
-            workProfileNowNs() - memifStart;
+      stageWorkResolve(threadId);
+      stageMemifWork(threadId);
     } catch (const std::exception &e) {
       std::cerr << "Exception at thread " << threadId << ": " << e.what() << std::endl;
       std::exit(1);
-    }
-    if (profile) {
-      const uint64_t now = workProfileNowNs();
-      workProfileMark(threadId, WorkProfilePhase::StageDone, now, now);
     }
     stageDone.arrive_and_wait();
-    if (profile) {
-      const uint64_t now = workProfileNowNs();
-      workProfileMark(threadId, WorkProfilePhase::StepStart, now, now);
-    }
     stepStart.arrive_and_wait();
     try {
-      stepWork(threadId, profile);
+      stepWork(threadId);
       stepPeriphWork(threadId);
-      stepMemifWork(threadId, profile);
+      stepMemifWork(threadId);
     } catch (const std::exception &e) {
       std::cerr << "Exception at thread " << threadId << ": " << e.what() << std::endl;
       std::exit(1);
-    }
-    if (profile) {
-      const uint64_t now = workProfileNowNs();
-      workProfileMark(threadId, WorkProfilePhase::StepDone, now, now);
     }
     stepDone.arrive_and_wait();
     try {
-      prepareNextCoreMem(threadId, profile);
-      stepCleanup(threadId, profile);
+      prepareNextCoreMem(threadId);
+      stepCleanup(threadId);
     } catch (const std::exception &e) {
       std::cerr << "Exception at thread " << threadId << ": " << e.what() << std::endl;
       std::exit(1);

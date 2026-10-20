@@ -32,12 +32,6 @@ inline unsigned spaceMultiplier() {
 }
 }
 
-// Occupancy metrics have independent bounds (MSHRs, descriptor queues, etc.).
-inline void recordOccupancy(std::vector<uint64_t> &histogram, size_t value) {
-  if (value >= histogram.size()) histogram.resize(value + 1);
-  ++histogram[value];
-}
-
 // Fixed-length 1-based vector.
 //
 // Backed by std::vector<T>. For types that are neither movable nor
@@ -234,10 +228,6 @@ public:
     return std::popcount(occupied);
   }
 
-  bool occupiedAt(size_t idx) const {
-    return (occupied & (1ull << idx)) != 0;
-  }
-
   bool canEnq(uint8_t prio, unsigned spaceMultiplier = 1) const {
     size_t cnt = std::popcount(occupied);
     size_t space = N_DEPTH - cnt;
@@ -399,21 +389,5 @@ public:
     size_t n = 0;
     for (auto &q : _input_queues) n += q.size();
     return n;
-  }
-
-  size_t numInputs() const noexcept { return _num_inputs; }
-
-  size_t inputQueueSize(size_t input) const {
-    return _input_queues.at(input).size();
-  }
-
-  // Inspect every resident flit, including those hidden behind arbitration.
-  template <typename Predicate>
-  size_t countFlits(Predicate predicate) const {
-    size_t count = 0;
-    for (const auto &queue : _input_queues)
-      for (size_t slot = 0; slot < Q_DEPTH; ++slot)
-        if (queue.occupiedAt(slot) && predicate(*queue[slot])) ++count;
-    return count;
   }
 };

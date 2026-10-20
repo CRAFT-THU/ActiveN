@@ -369,7 +369,6 @@ public:
 
   size_t mshrCapacity() const { return inflight; }
   AllocationMode mshrAllocationMode() const { return allocationMode; }
-  bool mshrAllocationBlocked() const { return !mshrAllocSlot(); }
   bool mshrCursorBlocked() const {
     return allocationMode == AllocationMode::Sequential &&
            allocated.test(allocationCursor) && mshrInflightCount() < inflight;
@@ -387,14 +386,6 @@ public:
     return allocated.count();
   }
 
-  // Passive timestep-boundary validation; includes unissued posted stores.
-  size_t postedStoreCount() const noexcept {
-    size_t count = 0;
-    for (size_t slot = 0; slot < inflight; ++slot)
-      count += allocated.test(slot) && mshrs[slot].write && mshrs[slot].isNoReceipt();
-    return count;
-  }
-
   size_t mshrUnissuedCount() const noexcept {
     return issueQueue.size();
   }
@@ -405,15 +396,6 @@ public:
 
   size_t mshrFulfilledCount() const noexcept {
     return allocated.countAnd(fulfilled);
-  }
-
-  // Passive sampled occupancy: ordinary/bulk unicast versus scatter returns.
-  std::array<size_t, 2> mshrFulfilledByClass() const noexcept {
-    std::array<size_t, 2> counts{};
-    for (size_t slot = 0; slot < inflight; ++slot)
-      if (allocated.test(slot) && fulfilled.test(slot))
-        ++counts[mshrs[slot].isBroadcast() ? 1 : 0];
-    return counts;
   }
 
   std::optional<MshrSlot> mshrAllocSlot() const noexcept __attribute__((always_inline)) {
@@ -737,11 +719,6 @@ public:
   size_t bulkQueueOccupancy() const noexcept { return bulkQueue.size(); }
   size_t broadcastInflightCount() const noexcept { return bcstInflight; }
   const CycleEvents &cycleEvents() const noexcept { return lastCycleEvents; }
-  size_t bcstQueueOccupancy() const noexcept {
-    size_t n = bcstEgressQueue.size();
-    for (const auto &q : bcstQueues) n += q.size();
-    return n;
-  }
 
   bool broadcastAllocationBlocked() const noexcept {
     auto head = bulkQueue.front();

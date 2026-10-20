@@ -7,7 +7,6 @@
 #include <optional>
 #include <unordered_set>
 #include <functional>
-#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -21,7 +20,6 @@ struct ICacheEndpoint {
   std::function<bool()> ready;
   std::function<void(uint32_t, unsigned, const svBitVecVal*)> insert;
   std::function<void()> settle;
-  std::function<uint64_t()> requests, fills, globalRequests;
 
   struct Scope {
     svScope previous;
@@ -40,25 +38,9 @@ struct ICacheEndpoint {
       [scope](uint32_t addr, unsigned way, const svBitVecVal* data) {
         Scope guard(scope); Model::insertLine(addr, way, data);
       },
-      [&model] { model.eval(); },
-      [scope] { Scope guard(scope); return Model::icacheRefillRequests(); },
-      [scope] { Scope guard(scope); return Model::icacheLineFills(); },
-      [scope] { Scope guard(scope); return Model::icacheGlobalRequests(); }};
+      [&model] { model.eval(); }};
   }
 };
-
-inline void printICacheStats(const std::vector<ICacheEndpoint>& caches,
-                            const char* backend) {
-  uint64_t requests = 0, fills = 0, globalRequests = 0;
-  for (const auto& cache : caches) {
-    requests += cache.requests();
-    fills += cache.fills();
-    globalRequests += cache.globalRequests();
-  }
-  std::cerr << "[ICache " << backend << "] refill_requests=" << requests
-            << " global_refill_requests=" << globalRequests
-            << " line_fills=" << fills << '\n';
-}
 
 // argparse treats optional values as positional filenames. Normalize a bare
 // flag before parsing so `--init-icache program.bin` keeps its usual meaning.

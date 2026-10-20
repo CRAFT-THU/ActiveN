@@ -1,8 +1,6 @@
 #include "soft_mem.h"
 #include <algorithm>
 #include <iostream>
-#include <map>
-#include <numeric>
 #include <random>
 
 using namespace soft_mem;
@@ -167,20 +165,6 @@ static void admission() {
   std::cout << "PASS admission modes/merge choices/full/holes/same-edge/backpressure/ID assertion\n";
 }
 
-static void histograms() {
-  std::vector<uint64_t> histogram;
-  std::map<size_t, uint64_t> oracle;
-  const std::vector<size_t> observed{0, 513, 32, 65536, 513, 1, 32, 0, 65535, 65536};
-  for (size_t n : observed) { recordOccupancy(histogram, n); ++oracle[n]; }
-  require(std::accumulate(histogram.begin(), histogram.end(), uint64_t{0}) == observed.size(),
-          "histogram sample count changed");
-  for (size_t i = 0; i < histogram.size(); ++i)
-    require(histogram[i] == oracle[i], "histogram clamped or mixed occupancy values");
-  require(histogram[32] == 2 && histogram[513] == 2 && histogram[65536] == 2,
-          "independent queue/high MSHR bins were lost");
-  std::cout << "PASS exact histograms samples=10 max_value=65536 queue occupancy above small pools\n";
-}
-
 static void reservation() {
   for (auto mode : {AllocationMode::FirstFree, AllocationMode::Sequential})
   for (bool broadcast : {false, true}) {
@@ -274,5 +258,5 @@ static void simultaneousRetirement() {
 }
 
 int main() {
-  configuration(); ageOracle(); admission(); histograms(); reservation(); simultaneousRetirement();
+  configuration(); ageOracle(); admission(); reservation(); simultaneousRetirement();
 }

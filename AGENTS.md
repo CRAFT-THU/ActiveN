@@ -627,7 +627,8 @@ Rules:
   Pass `--freq-ghz 1.5` for new benchmarks. The frontend uses this value and
   Ramulator's `tCK` to schedule memory ticks.
 - `--trace --trace-start <cycle>` writes `trace.fst`.
-- `--log` enables periodic soft-backend statistics.
+- System profiling options (`--log` and `--noc-profile*`) have been removed.
+  The single-core `--log` packet logger remains available.
 
 The frontend cycle order is:
 
