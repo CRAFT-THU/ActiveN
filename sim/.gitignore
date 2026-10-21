@@ -3,6 +3,9 @@
 /.vscode
 /.ccls-cache
 /tests/*
+!/tests/spm_dump.S
+!/tests/check_spm_dump.py
+!/tests/spm_dpi.cpp
 !/tests/brunel_buffer_image.py
 !/tests/brunel_asm_numeric.S
 !/tests/brunel_pow04.cpp

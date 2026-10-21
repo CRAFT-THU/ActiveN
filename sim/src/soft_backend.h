@@ -278,6 +278,8 @@ class SoftSystemBackend : public SystemBackend {
   SoftSystemBackend &operator=(const SoftSystemBackend &) = delete;
 
   void attachTrace(VerilatedFstC *tracer, int depth);
+  std::string_view name() const override { return "soft"; }
+  std::vector<SpmEndpoint> spms() override;
 
   // SystemBackend interface
   SystemConfig config() const override;

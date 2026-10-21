@@ -2,6 +2,7 @@
 
 #include "core_config.h"
 #include "icache_init.h"
+#include "spm_dump.h"
 #include "verilated_fst_c.h"
 #include <bit>
 #include <cwchar>
@@ -101,6 +102,8 @@ public:
 
   virtual SystemConfig config() const = 0;
   virtual std::vector<ICacheEndpoint> icaches() = 0;
+  virtual std::string_view name() const = 0;
+  virtual std::vector<SpmEndpoint> spms() = 0;
 
   /**
    * Peek the outgoing memory requests presented by the backend for the next cycle
@@ -181,6 +184,6 @@ public:
   void setTracer(VerilatedFstC *tracer, uint64_t trace_start = 0);
 
   // Run the simulation until all backends have finished, or it's timed out, or a discrepancy is found.
-  // Return true for sucessful finish, false for timeout or failure
-  bool run(uint64_t maxCycles);
+  // Return process status: 0 on success, 1 on timeout or failure.
+  int run(uint64_t maxCycles, std::optional<std::string> dumpSpm = std::nullopt);
 };

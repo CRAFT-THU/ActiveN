@@ -374,6 +374,13 @@ void SoftSystemBackend::attachTrace(VerilatedFstC *trace_file, int depth) {
 
 SystemConfig SoftSystemBackend::config() const { return cfg; }
 
+std::vector<SpmEndpoint> SoftSystemBackend::spms() {
+  std::vector<SpmEndpoint> result;
+  for (size_t pu = 1; pu <= cfg.numPU; ++pu)
+    result.push_back(SpmEndpoint::create(*cores[pu], pu, "Core.exec.lsu.spm"));
+  return result;
+}
+
 std::vector<ICacheEndpoint> SoftSystemBackend::icaches() {
   std::vector<ICacheEndpoint> result;
   for (size_t pu = 1; pu <= cfg.numPU; ++pu)

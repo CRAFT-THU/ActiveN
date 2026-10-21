@@ -33,6 +33,7 @@
  *   --ramulator-stats DIR    Optional directory for per-MC statistics
  *   --ramulator-stats-timer-only  Measure only while the workload timer is enabled
  *   --trace             Enable FST tracing
+ *   --dump-spm DIR      Export each PU's SPM when the run stops
  *   --rng-seed N        RNG seed for peripheral device
  */
 
@@ -245,6 +246,7 @@ struct TimedMemoryStats {
 // ---- System implementation ----
 struct System::Impl {
   vector<unique_ptr<SystemBackend>> backends;
+  bool cosim_stopped = false;
   PeripheralDevice periph;
   deque<GlobalMemResp> periph_resps;
 
@@ -575,7 +577,7 @@ struct System::Impl {
                  << ": port " << p
                  << " backend 0 req=" << first_has
                  << " backend " << bi << " req=" << cur_has << endl;
-            if (!COSIM_KEEP_GOING) { exiting = true; return; }
+            if (!COSIM_KEEP_GOING) { cosim_stopped = true; exiting = true; return; }
             continue;
           }
           if (first_has && cur_has) {
@@ -600,7 +602,7 @@ struct System::Impl {
                 for (int i = 7; i >= 0; --i) cerr << hex << (int)b.wdata[i];
               }
               cerr << dec << endl;
-              if (!COSIM_KEEP_GOING) { exiting = true; return; }
+              if (!COSIM_KEEP_GOING) { cosim_stopped = true; exiting = true; return; }
               continue;
             }
           }
@@ -694,15 +696,31 @@ void System::setTracer(VerilatedFstC *tracer, uint64_t trace_start) {
   impl_->trace_start = trace_start;
 }
 
-bool System::run(uint64_t maxCycles) {
+int System::run(uint64_t maxCycles, optional<string> dumpSpm) {
   if (impl_->backends.empty()) {
     cerr << "[System] Error: no backends added" << endl;
-    return false;
+    return 1;
   }
 
   // Initialize MC bases from first backend's config
   auto cfg = impl_->backends[0]->config();
   impl_->initMcBases(cfg);
+
+  optional<SpmDump> spm_dump;
+  if (dumpSpm) {
+    try {
+      vector<SpmDumpBackend> models;
+      for (auto& backend : impl_->backends) {
+        const auto shape = backend->config();
+        models.push_back({string(backend->name()), unsigned(shape.numPU),
+                          unsigned(shape.numMC), backend->spms()});
+      }
+      spm_dump.emplace(*dumpSpm, std::move(models), SYSTEM_SCRATCHPAD_SIZE, MEM_BUS_WIDTH_B);
+    } catch (const exception& error) {
+      cerr << "[SPM] Cannot prepare dump: " << error.what() << '\n';
+      return 1;
+    }
+  }
 
   // Initialize config ROM in peripheral device
   uint64_t mc0_size = cfg.core.mcSizes.empty() ? 0 : cfg.core.mcSizes[0];
@@ -744,7 +762,7 @@ bool System::run(uint64_t maxCycles) {
            << hex << *impl_->init_icache << dec << '\n';
     } catch (const exception& error) {
       cerr << "Error: " << error.what() << '\n';
-      return false;
+      return 1;
     }
   }
 
@@ -768,6 +786,8 @@ bool System::run(uint64_t maxCycles) {
   auto wall_start = chrono::steady_clock::now();
 
   uint64_t cycle = 0;
+  uint64_t last_completed_cycle = 0;
+  const char* stop_phase = "initial";
   uint64_t mc_req_count = 0, periph_req_count = 0;
 
   while (!impl_->periph.result && cycle < maxCycles && !exiting) {
@@ -775,6 +795,7 @@ bool System::run(uint64_t maxCycles) {
 
     // Phase 1: peek all backends + cosim verify.
     impl_->peekAndCompare(cycle);
+    stop_phase = "after_peek";
     if (exiting) break;
 
     // Phase 2: tick frontend memory + build bus_in + serve presented requests.
@@ -792,6 +813,8 @@ bool System::run(uint64_t maxCycles) {
     // Phase 5: step all backends (commit posedge).
     for (auto &b : impl_->backends) b->step(cycle);
     if (!pending_icaches.empty()) serviceICachePreload(*preload, pending_icaches);
+    last_completed_cycle = cycle;
+    stop_phase = "after_step";
 
     // Count requests for heartbeat
     auto &out = impl_->per_backend_out[0];
@@ -844,9 +867,27 @@ bool System::run(uint64_t maxCycles) {
     }
   }
 
+  bool dump_failed = false;
+  if (spm_dump) {
+    // Every RTL eval has returned. Soft workers may finish NoC housekeeping,
+    // but cannot enter another RTL eval before the next frontend stageStart.
+    // Reading these endpoints does not call eval() or advance either clock.
+    const string reason = impl_->cosim_stopped ? "cosim_mismatch" :
+      impl_->periph.result ? (*impl_->periph.result == 0 ? "success" : "failure") :
+      exiting ? "interrupted" : "timeout";
+    try {
+      spm_dump->write({cycle, last_completed_cycle, impl_->periph.timer_count,
+                       stop_phase, reason, impl_->periph.result});
+      cerr << "[SPM] Wrote snapshot to " << *dumpSpm << '\n';
+    } catch (const exception& error) {
+      cerr << "[SPM] Dump failed: " << error.what() << '\n';
+      dump_failed = true;
+    }
+  }
+
   mc_images.clear();
 
-  return impl_->periph.result && *impl_->periph.result == 0 ? 0 : 1;
+  return !dump_failed && impl_->periph.result && *impl_->periph.result == 0 ? 0 : 1;
 }
 
 int main(int argc, char **argv) {
@@ -899,6 +940,9 @@ int main(int argc, char **argv) {
     .help("First cycle at which tracing is enabled (requires --trace)")
     .default_value(uint64_t(0))
     .scan<'u', uint64_t>();
+
+  program.add_argument("--dump-spm")
+    .help("Export final SPM bytes and stop metadata to a new directory");
 
   program.add_argument("--rng-seed")
     .help("RNG seed for peripheral device")
@@ -1131,7 +1175,7 @@ int main(int argc, char **argv) {
          << endl;
   }
 
-  int rc = system.run(max_cycles);
+  int rc = system.run(max_cycles, program.present<string>("--dump-spm"));
 
   if (fst_tracer) {
     fst_tracer->flush();

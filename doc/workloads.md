@@ -238,9 +238,30 @@ MNIST uses SPM offsets `[0x3020, 0x302c)`, after the existing sparse scratch;
 Brunel/Morrison use `[0x2de8, 0x2df4)`, after stream metadata. MNIST model-data
 allocation remains bounded by `0x3000`; its remaining startup stack is
 `[0x3040, 0x3800)`. SPM header formats and local model-data offsets are unchanged,
-and the runtime initializes these counters after copying SPM data. Generic SPM
-export through VPI/DPI and generic DRAM output for mutable weights remain
-pending. No replacement architectural completion observers are added.
+and the runtime initializes these counters after copying SPM data.
+
+The system simulator accepts `--dump-spm DIR` to export SPM when the run stops.
+Use a new destination directory; an existing directory is rejected before the
+run. Each selected backend writes one full SPM image per PU, for example
+`DIR/soft/pu-1.bin` or `DIR/hard/pu-1.bin`. PU IDs are one-based. Bytes appear in
+increasing SPM offset order, with little-endian words. In cosimulation, both
+backends have separate output directories.
+
+`DIR/manifest.json` identifies the schema, backend, PU, geometry, scope and file
+for every image. It also records the stop reason, peripheral result, timer cycles,
+stop-loop cycle and phase, and last completed cycle. A mismatch during `peek`
+can stop iteration K before its clock edge; in that case the last completed
+cycle is K-1. Timeout, interruption and nonzero-result snapshots are identified
+as incomplete or failed runs by these fields. Fatal process termination is not
+an opportunity to export a snapshot. The manifest is published only after all
+binary files close successfully; dump errors make the process fail.
+
+SPM export uses a simulation-only, read-only DPI bridge after RTL evaluation
+has returned. It adds no LSU requests or clock edges, and preserves the existing
+workload timers. Geometry comes from the selected elaboration and is checked
+against the bound array. No replacement architectural completion observers are
+added. A snapshot at an arbitrary stop does not establish a completed neuronal
+timestep. Generic DRAM output for mutable weights remains pending.
 
 The user owns old build-directory removal. Source cleanup does not delete
 `sim/build*`, immutable workload inputs, preserved binaries or raw evidence.

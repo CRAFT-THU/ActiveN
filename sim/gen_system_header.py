@@ -80,6 +80,13 @@ with args.output.open("w") as f:
 
     f.write("    ~HardSystemBackend() override { sys->final(); }\n\n")
 
+    f.write('    std::string_view name() const override { return "hard"; }\n')
+    f.write("    std::vector<SpmEndpoint> spms() override {\n")
+    f.write("        std::vector<SpmEndpoint> result;\n")
+    for i in range(1, num_pu + 1):
+        f.write(f'        result.push_back(SpmEndpoint::create(*sys, {i}, "System.pu_{i}.exec.lsu.spm"));\n')
+    f.write("        return result;\n    }\n\n")
+
     f.write("    std::vector<ICacheEndpoint> icaches() override {\n")
     f.write("        std::vector<ICacheEndpoint> result;\n")
     for i in range(1, num_pu + 1):
