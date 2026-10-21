@@ -1048,6 +1048,10 @@ br_report_leaf:
  beq a0,t0,.Lmb_memory_drained
  # Finish6: all posted stores drained and all PUs incremented the step.
  lw t0,H_STEP(gp)
+ lw t2,H_WARMUP(gp)
+ bleu t0,t2,.Lmb_spikes_counted
+ SPIKE_COUNT_ADD t1, (BR_BASE + SPIKE_COUNT_BRUNEL), t3, t4, t5, t6
+.Lmb_spikes_counted:
  sw t0,H_COMPLETED(gp)
  lw t1,H_WARMUP(gp)
  bne t0,t1,1f
@@ -1058,6 +1062,7 @@ br_report_leaf:
  bne t0,t1,.Lmb_next_step
  li t1,0x40000004
  sw zero,0(t1)
+ SPIKE_COUNT_EMIT (BR_BASE + SPIKE_COUNT_BRUNEL), t3, t4, t5
  li a0,0
  j br_halt
 .Lmb_boot_report:
@@ -1335,6 +1340,6 @@ mb_finish:
  bnez t1,1b
 3: INC H_STEP,t0
  li a0,6
- li a1,0
+ lw a1,H_FIRE_COUNT(gp)
  YIELDI 7
  j br_idle

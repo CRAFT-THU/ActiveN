@@ -189,11 +189,15 @@ sys/snn_cond.bin: sys/snn_cond.S sys/snn_main.S sys/snn_init.c sys/linker_system
 	${PREFIX}gcc -mabi=ilp32 -march=rv32imaf_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DNUM_PU=${NUM_PU} -DSNN_VERIFY_RESULT=${SNN_VERIFY_RESULT} -DSNN_WARMUP_STEPS=0 -DSNN_TIMED_STEPS=1 -DSNN_DRAIN_MODE=${SNN_DRAIN_MODE} -DMEM_LINE_BYTES=${MEM_LINE_BYTES} -O1 -o sys/snn_cond.elf sys/snn_cond.S sys/snn_init.c
 	${PREFIX}objcopy -j .text -j .data -O binary sys/snn_cond.elf $@
 
-sys/mnist_train.bin: force-mnist-train sys/mnist_train.S sys/mnist_neuron_pair.inc sys/mnist_fifth_root.inc sys/mnist_fifth_root_config.inc sys/snn_init.c sys/linker_mnist_train.ld
+sys/spike_count_test.bin: sys/spike_count_test.S sys/spike_count.h sys/linker_system.ld
+	${PREFIX}gcc -mabi=ilp32 -march=rv32ima_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -Isys -o $(@:.bin=.elf) $<
+	${PREFIX}objcopy -j .text -j .data -O binary $(@:.bin=.elf) $@
+
+sys/mnist_train.bin: force-mnist-train sys/mnist_train.S sys/mnist_neuron_pair.inc sys/mnist_fifth_root.inc sys/mnist_fifth_root_config.inc sys/snn_init.c sys/linker_mnist_train.ld sys/spike_count.h
 	${PREFIX}gcc -mabi=ilp32 -march=$(MNIST_ARCH) -nostdlib -nostartfiles -Wl,-T,sys/linker_mnist_train.ld -Isys -DMEM_LINE_BYTES=32 -DMNIST_TRAIN=1 $(MNIST_DEFINES) $(MNIST_CFLAGS) -o sys/mnist_train.elf sys/mnist_train.S sys/snn_init.c
 	${PREFIX}objcopy --wildcard -j .text -j '.rodata*' -j '.srodata*' -j .data -O binary sys/mnist_train.elf $@
 
-sys/mnist_sparse.bin: force-mnist-train sys/mnist_train.S sys/mnist_sparse.inc sys/mnist_sparse_layout.inc sys/mnist_numeric.inc sys/mnist_neuron_pair.inc sys/mnist_fifth_root.inc sys/mnist_fifth_root_config.inc sys/snn_init.c sys/linker_mnist_train.ld
+sys/mnist_sparse.bin: force-mnist-train sys/mnist_train.S sys/mnist_sparse.inc sys/mnist_sparse_layout.inc sys/mnist_numeric.inc sys/mnist_neuron_pair.inc sys/mnist_fifth_root.inc sys/mnist_fifth_root_config.inc sys/snn_init.c sys/linker_mnist_train.ld sys/spike_count.h
 	${PREFIX}gcc -mabi=ilp32 -march=$(MNIST_ARCH) -nostdlib -nostartfiles -Wl,-T,sys/linker_mnist_train.ld -Isys -DMEM_LINE_BYTES=32 -DMNIST_TRAIN=1 -DMNIST_SPARSE_MODE=$(MNIST_SPARSE_MODE) $(MNIST_SPARSE_DEFINES) $(MNIST_CFLAGS) -o sys/mnist_sparse.elf sys/mnist_train.S sys/snn_init.c
 	${PREFIX}objcopy --wildcard -j .text -j '.rodata*' -j '.srodata*' -j .data -O binary sys/mnist_sparse.elf $@
 
@@ -214,7 +218,7 @@ $(error BRUNEL_RULE must be additive or morrison)
 endif
 BRUNEL_ASM_FLAGS ?=
 BRUNEL_SOURCES = Makefile sys/brunel.S sys/brunel_runtime.S sys/brunel_asm_layout.inc sys/brunel_rule.inc sys/brunel_proxy_config.h sys/linker_brunel.ld
-BRUNEL_SOURCES += sys/morrison_layout.h
+BRUNEL_SOURCES += sys/morrison_layout.h sys/spike_count.h
 BRUNEL_BUILD_FLAGS = -mabi=ilp32 -march=rv32ia_zmmul_zfinx_zicsr -Os -msmall-data-limit=0 -ffreestanding -fno-builtin -nostdlib -nostartfiles -Wl,-T,sys/linker_brunel.ld -DMNIST_TRAIN=1 -DMEM_LINE_BYTES=32 -DBR_ASM_RUNTIME=1
 .PHONY: brunel-select-rule
 brunel-select-rule:

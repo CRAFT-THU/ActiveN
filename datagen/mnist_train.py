@@ -47,8 +47,11 @@ WEIGHT_RECORD_SIZE = 4
 EXC_TARGET_RECORD_SIZE = 4
 FIRED_VECTOR_RECORD_SIZE = 8
 STACK_SIZE = 2 * 1024
-STACK0_BASE = 0x3000
-STACK0_TOP = STACK0_BASE + STACK_SIZE
+SPM_DATA_LIMIT = 0x3000
+SPIKE_COUNT_OFFSET = 0x3020
+SPIKE_COUNT_BYTES = 12
+STACK0_BASE = 0x3040
+STACK0_TOP = 0x3800
 STACK1_BASE = STACK0_TOP
 STACK1_TOP = STACK1_BASE + STACK_SIZE
 FIFTH_ROOT_LUT_OFFSET = 0x2000
@@ -85,6 +88,8 @@ NEURON_ZONE_ORDERS = {
 # one-past-SPM stack pointer is retained as a guard against accidental use.
 assert STACK0_TOP <= SPM_SIZE
 assert STACK1_TOP == SPM_SIZE
+assert SPM_DATA_LIMIT <= SPIKE_COUNT_OFFSET
+assert SPIKE_COUNT_OFFSET + SPIKE_COUNT_BYTES <= STACK0_BASE
 
 
 def f32(value: float) -> float:
@@ -1189,10 +1194,10 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
             if required > FIFTH_ROOT_LUT_OFFSET:
                 raise ValueError(f"PU {pu + 1} data overlaps the fifth-root LUT")
             required = FIFTH_ROOT_LUT_OFFSET + root_lut_bytes
-        if required > STACK0_BASE:
+        if required > SPM_DATA_LIMIT:
             raise ValueError(
-                f"PU {pu + 1} layout ends at {required}, overlapping the first "
-                f"SMT stack at {STACK0_BASE}"
+                f"PU {pu + 1} layout ends at {required}, overlapping runtime "
+                f"scratch at {SPM_DATA_LIMIT}"
             )
         spm = bytearray(SPM_SIZE)
         if root_lut_bytes:
@@ -1477,6 +1482,11 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
         ),
         "warmup_steps": args.warmup_steps,
         "timed_steps": args.timed_steps,
+        "runtime_scratch_region": {
+            "offset": SPM_DATA_LIMIT, "bytes": STACK0_BASE - SPM_DATA_LIMIT,
+        },
+        "spike_count_state": {"offset": SPIKE_COUNT_OFFSET, "bytes": SPIKE_COUNT_BYTES},
+        "startup_stack": {"base": STACK0_BASE, "top": STACK0_TOP},
         "expected_input_spikes": expected_input_spikes,
         "expected_active_input_pus": expected_active_input_pus,
         "expected_active_physical_input_pus": sorted(

@@ -89,6 +89,7 @@
 #define STOP_ADDR 0x40000000
 #define TIMER_ADDR 0x40000004
 #define PRINT_ADDR 0x4000000c
+#include "spike_count.h"
 #define INPUT_SIZE 28
 #define EXC_SIZE 44
 #define INH_SIZE 20
@@ -187,6 +188,7 @@ _start:
   li sp, SPM_BASE + 0x3800
   call snn_init
   li gp, SPM_BASE
+  SPIKE_COUNT_INIT (SPM_BASE + SPIKE_COUNT_MNIST), t0
   lw t0, H_MAGIC(gp)
   li t1, 0x4d535034
   bne t0, t1, sparse_fail
@@ -328,10 +330,15 @@ sparse_start_children:
 sparse_start_local:
   YIELDI zero, TAG_PHASE
   j sparse_wait
-/* Reduction input: phase, subtree size, additive value, terminal XOR. */
+/* Reduction input: phase, subtree size, additive value, reverse spike sum or
+ * terminal XOR. The spike word refers to this step even after preparation. */
 sparse_reduce_local:
   lw a0, H_PHASE(gp)
   li a1, 1
+  li t0, PH_REVERSE
+  bne a0, t0, sparse_reduce
+  li t0, SPM_BASE + SPIKE_COUNT_MNIST
+  lw a3, SPIKE_COUNT_LOCAL(t0)
 sparse_reduce:
   lw t0, H_PHASE(gp)
   bne a0, t0, sparse_fail
@@ -344,7 +351,13 @@ sparse_reduce:
   add t2, t2, a2
   sw t2, H_REDUCE_VALUE(gp)
   lw t3, H_CHECKSUM(gp)
+  li t4, PH_REVERSE
+  beq a0, t4, sparse_reduce_spikes
   xor t3, t3, a3
+  j sparse_reduce_store
+sparse_reduce_spikes:
+  add t3, t3, a3
+sparse_reduce_store:
   sw t3, H_CHECKSUM(gp)
   bne t0, t1, sparse_wait
   mv a1, t1
@@ -400,6 +413,7 @@ sparse_step_done:
   sw t0, H_STEPS(gp)
   lw t1, H_WARMUP(gp)
   bleu t0, t1, sparse_timer_stopped
+  SPIKE_COUNT_ADD a3, (SPM_BASE + SPIKE_COUNT_MNIST), t2, t3, t4, t5
   li t2, TIMER_ADDR
   sw zero, 0(t2)
 sparse_timer_stopped:
@@ -435,6 +449,7 @@ sparse_final_done:
   beqz t1, sparse_final_success
   bne a3, t1, sparse_fail
 sparse_final_success:
+  SPIKE_COUNT_EMIT (SPM_BASE + SPIKE_COUNT_MNIST), t3, t4, t5
   li t0, STOP_ADDR
   sw zero, 0(t0)
   j sparse_wait
@@ -1013,9 +1028,12 @@ sparse_neuron:
   li s4, 0
   li s5, 0
   li s6, 0
+  li s1, 0
 sparse_neuron_loop:
   jal s7, neuron_pair_update
   add s6, s6, s8
+  add s1, s1, s8
+  add s1, s1, s9
   lw t0, EXC_SLOT(s0)
   li t1, 32
   bgeu t0, t1, sparse_neuron_hi
@@ -1031,6 +1049,8 @@ sparse_neuron_next:
   addi s3, s3, -1
   bnez s3, sparse_neuron_loop
   sw s6, H_LOCAL_SPIKES(gp)
+  li t0, SPM_BASE + SPIKE_COUNT_MNIST
+  sw s1, SPIKE_COUNT_LOCAL(t0)
   mv a0, s4
   mv a1, s5
   li a2, 0
@@ -1880,9 +1900,13 @@ sparse_reverse_drained:
   lw t0, H_INPUT_BASE(gp)
   add t0, t0, gp
   lw t1, H_INPUT_COUNT(gp)
+  li t4, 0
 sparse_pre_commit_loop:
   lw t2, IN_FLAGS(t0)
   beqz t2, sparse_pre_commit_next
+  lw t5, IN_GLOBAL(t0)
+  srli t5, t5, 31
+  add t4, t4, t5
   li t3, F_ONE
 #if MNIST_RULE != MT_RULE_THREE
   lw t2, IN_PRE_TRACE(t0)
@@ -1893,6 +1917,8 @@ sparse_pre_commit_next:
   addi t0, t0, INPUT_SIZE
   addi t1, t1, -1
   bnez t1, sparse_pre_commit_loop
+  li t0, SPM_BASE + SPIKE_COUNT_MNIST
+  sw t4, SPIKE_COUNT_LOCAL(t0)
 #if MNIST_SPARSE_COMPACT_SCHEDULE
   /* All reverse handlers have finished their weight/state reads before the
    * last received increment. Prepare the next input step before reducing,
@@ -1912,7 +1938,8 @@ sparse_reverse_terminal:
   li a0, PH_REVERSE
   li a1, 1
   li a2, 0
-  li a3, 0
+  li t0, SPM_BASE + SPIKE_COUNT_MNIST
+  lw a3, SPIKE_COUNT_LOCAL(t0)
   YIELDI zero, TAG_REDUCE
   j sparse_wait
 #if MNIST_SPARSE_MC_DRAIN

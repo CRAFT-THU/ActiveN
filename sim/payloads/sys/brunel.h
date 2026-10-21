@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "brunel_proxy_config.h"
+#include "spike_count.h"
 #ifdef __cplusplus
 #define BR_ASSERT static_assert
 #else
@@ -103,7 +104,9 @@ BR_ASSERT(BR_PROXY_JOBS + BR_PROXY_CAPACITY * 4 <= BR_PROXY_ROWS, "proxy job lis
 BR_ASSERT(BR_PROXY_ROWS + BR_PROXY_CAPACITY * sizeof(BrProxyRow) <= BR_MSHR, "proxy descriptors");
 BR_ASSERT(BR_RECORDS + BR_RECORD_CAPACITY * 8 == BR_PING, "record/staging boundary");
 BR_ASSERT(BR_PING + BR_PING_BYTES == BR_STACK0, "staging/stack boundary");
-BR_ASSERT(BR_STREAM + sizeof(BrStream) <= BR_DIRTY_BITMAP, "stream metadata");
+BR_ASSERT(BR_STREAM + sizeof(BrStream) <= SPIKE_COUNT_BRUNEL, "stream metadata");
+BR_ASSERT(SPIKE_COUNT_BRUNEL + SPIKE_COUNT_BYTES <= BR_DIRTY_BITMAP,
+          "spike totals must precede the dirty bitmap/Morrison parameters");
 BR_ASSERT(sizeof(BrHeader) == 256, "header ABI");
 BR_ASSERT(sizeof(BrNeuron) == 80, "neuron ABI");
 BR_ASSERT(BR_NEURONS + BR_MAX_NEURONS * sizeof(BrNeuron) <= BR_BUFFER,

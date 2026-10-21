@@ -4,7 +4,7 @@ include Makefile
 
 # Selected workload builds. Explicit flags and separate filenames fix identity.
 # Historical experiments remain available through generic Makefile switches.
-SELECTED_MNIST_SOURCES = Makefile selected.mk sys/mnist_train.S sys/mnist_sparse.inc sys/mnist_sparse_layout.inc sys/mnist_numeric.inc sys/mnist_neuron_pair.inc sys/mnist_fifth_root.inc sys/mnist_fifth_root_config.inc sys/snn_init.c sys/linker_mnist_train.ld
+SELECTED_MNIST_SOURCES = Makefile selected.mk sys/spike_count.h sys/mnist_train.S sys/mnist_sparse.inc sys/mnist_sparse_layout.inc sys/mnist_numeric.inc sys/mnist_neuron_pair.inc sys/mnist_fifth_root.inc sys/mnist_fifth_root_config.inc sys/snn_init.c sys/linker_mnist_train.ld
 SELECTED_MNIST_FLAGS = -mabi=ilp32 -march=rv32ima_zfinx_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_mnist_train.ld -Isys -DMEM_LINE_BYTES=32 -DMNIST_TRAIN=1 -O3 -fomit-frame-pointer -ffp-contract=off -fno-jump-tables
 SELECTED_MNIST_COMMON = -DMNIST_RECURRENT_MODE=1 -DMNIST_TRACE_BUNDLE=0 -DMNIST_FIFTH_ROOT_LUT=0
 

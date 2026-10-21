@@ -196,13 +196,42 @@ allocation and router reservation controls, I-cache preload (`--init-icache`),
 peripheral timers/results, FST/cosim and Ramulator statistics are retained.
 
 Older benchmark scripts that consume those observers or dumps need replacement
-integration before they can validate runs with the cleaned simulator. The
-agreed follow-up is to reduce firing counts across all populations in the
-workload, print their sum through PU1's peripheral output, and compare that sum
-and final state. Generic SPM export through VPI/DPI and generic DRAM output
-for mutable weights are deferred; this cleanup does not implement them or add
-replacement architectural completion checks. Historical binaries and evidence
-retain their original behavior and output formats.
+integration before they can validate runs with the cleaned simulator. Historical
+binaries and evidence retain their original behavior and output formats.
+
+The selected workloads now reduce a firing total through their existing
+end-of-step trees. Classification counts logical input, excitatory and
+inhibitory firings; only the primary owner counts a replicated input. Brunel
+and Morrison count home excitatory and inhibitory firings, excluding proxy
+notifications and Poisson drive events. MNIST captures the current count before
+preparing the next input step. PU1 accumulates a 64-bit total over measured
+steps only, excluding warmup. Per-step counting work is included in the existing measured
+timer intervals; no synchronization or timer phase boundary is replaced.
+
+After the final timer stop and existing success/checksum checks, PU1 writes
+three words to the ordinary auxiliary peripheral (`0x4000000c`): `0x53504b31`
+(`SPK1`), the low 32 bits, then the high 32 bits. These are the final three
+`[Periph] Output:` records on success; earlier MNIST checksum output remains
+separate. Decode a retained log with:
+
+```sh
+nix develop --command python3 datagen/spike_counts.py path/to/run.log
+```
+
+The reader returns `{"spike_total": N}` and requires one successful simulator
+result. Callers must also check the process exit status and compare the total
+with the reference for the same measured window. `parse_spike_total` exposes
+the same reader for a sweep runner. The count frame alone does not establish
+reference-model agreement or replace final-state comparison.
+
+The workload-owned state is defined in `sim/payloads/sys/spike_count.h`:
+MNIST uses SPM offsets `[0x3020, 0x302c)`, after the existing sparse scratch;
+Brunel/Morrison use `[0x2de8, 0x2df4)`, after stream metadata. MNIST model-data
+allocation remains bounded by `0x3000`; its remaining startup stack is
+`[0x3040, 0x3800)`. SPM header formats and local model-data offsets are unchanged,
+and the runtime initializes these counters after copying SPM data. Generic SPM
+export through VPI/DPI and generic DRAM output for mutable weights remain
+pending. No replacement architectural completion observers are added.
 
 The user owns old build-directory removal. Source cleanup does not delete
 `sim/build*`, immutable workload inputs, preserved binaries or raw evidence.

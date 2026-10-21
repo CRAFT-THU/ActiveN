@@ -12,6 +12,7 @@
  */
 #include "brunel_asm_layout.inc"
 #include "brunel_rule.inc"
+#include "spike_count.h"
 .option norelax
 .equ BUFFER, 0x900
 #if BR_MORRISON
@@ -1123,6 +1124,10 @@ br_report_leaf:
  beq a0,t0,.Lquery_reverse
  /* Finish: all nodes and memory notifications are drained. */
  lw t0,H_STEP(gp)
+ lw t2,H_WARMUP(gp)
+ bleu t0,t2,.Lreport_spikes_counted
+ SPIKE_COUNT_ADD t1, (BR_BASE + SPIKE_COUNT_BRUNEL), t3, t4, t5, t6
+.Lreport_spikes_counted:
  sw t0,H_COMPLETED(gp)
  lw t1,H_WARMUP(gp)
  bne t0,t1,1f
@@ -1133,6 +1138,7 @@ br_report_leaf:
  bne t0,t1,.Lnext_forward
  li t1,0x40000004
  sw zero,0(t1)
+ SPIKE_COUNT_EMIT (BR_BASE + SPIKE_COUNT_BRUNEL), t3, t4, t5
  li a0,0
  j br_halt
 .Lreport_boot:
@@ -1443,6 +1449,7 @@ br_boot:
  sw zero,H_ISSUED(gp)
  sw zero,H_CONSUMED(gp)
 .Lboot_report:
+ SPIKE_COUNT_INIT (BR_BASE + SPIKE_COUNT_BRUNEL), t0
 #if !BR_MORRISON
  addi t0,gp,256
  lw t1,N_RNG(t0)
@@ -2003,7 +2010,7 @@ br_work_flush:
 #endif
  INC H_STEP,t0
  li a0,6
- li a1,0
+ lw a1,H_FIRE_COUNT(gp)
  j .Lwork_send_report
 br_work_report:
 .Lwork_report:

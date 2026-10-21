@@ -28,6 +28,7 @@ NEURON_PUS = 28
 GROUP_PUS = 64
 LINE_BYTES = 32
 SPM_LIMIT = 0x3000
+assert SPM_LIMIT + 32 <= dense.SPIKE_COUNT_OFFSET
 
 # Keep offsets in sync with sys/mnist_sparse.inc; all pointers are SPM offsets.
 HEADER = {name: index * 4 for index, name in enumerate((
@@ -313,6 +314,8 @@ def make_images(args: argparse.Namespace) -> tuple[list[bytes], dict]:
             checksum ^= dense.f32_bits(w)
     manifest = dict(schema="activen-mnist-sparse-v4", rule=args.rule, reverse_mode=args.reverse_mode,
         relevant_masks=relevant_masks, experimental_scratch_region=dict(offset=SPM_LIMIT, bytes=32),
+        spike_count_state=dict(offset=dense.SPIKE_COUNT_OFFSET, bytes=dense.SPIKE_COUNT_BYTES),
+        startup_stack=dict(base=dense.STACK0_BASE, top=dense.STACK0_TOP),
         connection_rate=args.connection_rate, connectivity_seed=args.connectivity_seed,
         structural_synapses=sum(mask), mask_sha256=hashlib.sha256(bytes(mask)).hexdigest(),
         payload_sha256=hashlib.sha256(payload).hexdigest(), horizontal_partition="full-8",

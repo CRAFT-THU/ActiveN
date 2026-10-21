@@ -89,6 +89,7 @@
 #define TIMER_ADDR                  0x40000004
 #define PRINT_ADDR                  0x4000000c
 #define MC_DST_BASE                 0x8001
+#include "spike_count.h"
 
 #define MT_MAGIC                    0x4d543132
 #define MT_PU_COUNT                 512
@@ -370,6 +371,7 @@ _start:
 
   call  snn_init
   li    gp, SPM_BASE
+  SPIKE_COUNT_INIT (SPM_BASE + SPIKE_COUNT_MNIST), t0
   call  install_handlers
 #if MNIST_RULE == MT_RULE_THREE
   /* Thread 0 does not execute setup_thread1/report_ready. */
@@ -1409,6 +1411,12 @@ root_weight_done:
 #if MNIST_PIPELINE_INPUT_PREPARE == 1
   sw    a1, H_FF_EXPECTED(gp)
 #endif
+  /* a2 is this step's spike sum; a1 may already describe the next input step. */
+  lw    t0, H_COMPLETED_STEPS(gp)
+  lw    t1, H_WARMUP_STEPS(gp)
+  bltu  t0, t1, root_spikes_counted
+  SPIKE_COUNT_ADD a2, (SPM_BASE + SPIKE_COUNT_MNIST), t3, t4, t5, t6
+root_spikes_counted:
 #if MNIST_RECURRENT_MODE == MT_REC_SCATTER
   li    ROOT_PHASE_TMP, 1
   sw    ROOT_PHASE_TMP, H_ROOT_STEP_DONE(gp)
@@ -1427,6 +1435,7 @@ root_final_done:
   beqz  t1, root_success
   bne   t1, a1, root_checksum_fail
 root_success:
+  SPIKE_COUNT_EMIT (SPM_BASE + SPIKE_COUNT_MNIST), t3, t4, t5
   li    ROOT_PHASE_TMP, STOP_ADDR
   sw    zero, 0(ROOT_PHASE_TMP)
   j     do_wfi
@@ -1442,6 +1451,10 @@ fail_root:
 /* Terminal helpers: a0=phase, a2/a3=low/high value. */
 reduce_local:
   li    a3, 0
+  li    a1, PHASE_WEIGHT_UPDATE
+  bne   a0, a1, reduce_local_pair
+  li    a1, SPM_BASE + SPIKE_COUNT_MNIST
+  lw    a3, SPIKE_COUNT_LOCAL(a1)
 reduce_local_pair:
   li    a1, 1
   YIELDI zero, TAG_REDUCE
@@ -2081,7 +2094,10 @@ input_prepare_join_done:
 #include "mnist_neuron_pair.inc"
 
 neuron_update_finalize:
-
+  /* Both local SMT results have joined; count actual E and I firings once. */
+  add   t0, s8, s9
+  li    t1, SPM_BASE + SPIKE_COUNT_MNIST
+  sw    t0, SPIKE_COUNT_LOCAL(t1)
 #if MNIST_TRACE_BUNDLE == 0
   li    s10, 0
   li    s11, 0
@@ -2749,6 +2765,7 @@ finish_input_traces:
   bnez  t2, do_wfi
   li    t0, 4
   csrw  0x714, t0
+  li    t6, 0
   lw    t1, H_FIRED_COUNT(gp)
   beqz  t1, finish_input_trace_done
   lw    t0, H_FIRED_VECTOR_OFFSET(gp)
@@ -2756,6 +2773,9 @@ finish_input_traces:
   add   t0, t0, gp
 finish_input_trace_loop:
   lw    t2, 4(t0)
+  lw    t3, IN_GLOBAL(t2)
+  srli  t3, t3, 31
+  add   t6, t6, t3
 #if MNIST_RULE == MT_RULE_THREE
   li    t3, F_ONE
   sw    t3, IN_PRE_TRACE(t2)
@@ -2770,6 +2790,9 @@ finish_input_trace_loop:
   addi  t1, t1, -1
   bnez  t1, finish_input_trace_loop
 finish_input_trace_done:
+  /* Preserve the current logical count before pipelined next-step preparation. */
+  li    t0, SPM_BASE + SPIKE_COUNT_MNIST
+  sw    t6, SPIKE_COUNT_LOCAL(t0)
 #if MNIST_PIPELINE_INPUT_PREPARE == 1
   lw    t0, H_NEURON_LOCAL_VALUE(gp)
   bltz  t0, phase_input_prepare
