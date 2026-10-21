@@ -199,30 +199,39 @@ Older benchmark scripts that consume those observers or dumps need replacement
 integration before they can validate runs with the cleaned simulator. Historical
 binaries and evidence retain their original behavior and output formats.
 
-The selected workloads now reduce a firing total through their existing
-end-of-step trees. Classification counts logical input, excitatory and
-inhibitory firings; only the primary owner counts a replicated input. Brunel
-and Morrison count home excitatory and inhibitory firings, excluding proxy
-notifications and Poisson drive events. MNIST captures the current count before
-preparing the next input step. PU1 accumulates a 64-bit total over measured
-steps only, excluding warmup. Per-step counting work is included in the existing measured
-timer intervals; no synchronization or timer phase boundary is replaced.
+The selected workloads now maintain one u32 firing counter in each PU's
+existing local SPM. Classification counts primary logical input, excitatory and
+inhibitory firings; replicated input records are counted only by their primary
+owner. Brunel and Morrison count home excitatory and inhibitory firings,
+excluding proxy notifications and Poisson drive events. Counters are reset when
+the first measured step begins, after warmup. The existing phase trees retain
+their synchronization and functional payloads; the firing-statistic count is
+no longer carried or added through those trees. Per-spike counter updates remain inside
+the workload's timed execution.
 
-After the final timer stop and existing success/checksum checks, PU1 writes
-three words to the ordinary auxiliary peripheral (`0x4000000c`): `0x53504b31`
-(`SPK1`), the low 32 bits, then the high 32 bits. These are the final three
-`[Periph] Output:` records on success; earlier MNIST checksum output remains
-separate. Decode a retained log with:
+After the final timer stop and existing success/checksum checks, the final
+start-of-step broadcast carries a terminate/report marker. Each PU forwards that
+marker, writes one tagged word to the ordinary auxiliary peripheral
+(`0x4000000c`), acknowledges completion through the existing report tree, and
+then waits. PU1 ends the simulation after all report acknowledgements arrive. A
+report word has the form `0x40000000 | local_count`; the stored counter is u32,
+but this tagged representation reserves the upper bits, so selected emitted
+counts must remain below `2^30`. Output order is not a PU identity channel, so
+the benchmark compares the expected per-PU record multiset.
+Earlier MNIST checksum output remains separate. Decode a retained log with:
 
 ```sh
-nix develop --command python3 datagen/spike_counts.py path/to/run.log
+nix develop --command python3 datagen/spike_counts.py --expected-pus 512 path/to/run.log
 ```
 
-The reader returns `{"spike_total": N}` and requires one successful simulator
-result. Callers must also check the process exit status and compare the total
-with the reference for the same measured window. `parse_spike_total` exposes
-the same reader for a sweep runner. The count frame alone does not establish
-reference-model agreement or replace final-state comparison.
+The reader returns `{"spike_counts": [...], "spike_total": N}` and requires
+one successful simulator result. Callers must also check process exit status and
+compare the per-PU records with the reference for the same measured window.
+`parse_spike_counts` exposes the record reader for a sweep runner. With
+`--expected-pus`, it selects the trailing expected records; a strict runner
+should also verify the complete tagged suffix because an earlier auxiliary word
+can share the tag. Tagged output only reports local counters; it does not
+establish final-state agreement.
 
 The workload-owned state is defined in `sim/payloads/sys/spike_count.h`:
 MNIST uses SPM offsets `[0x3020, 0x302c)`, after the existing sparse scratch;

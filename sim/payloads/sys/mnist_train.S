@@ -838,15 +838,19 @@ start_step_phase:
   li    a0, PHASE_INPUT_SEND
   lw    a1, H_FF_EXPECTED(gp)
   li    a2, 0
-  li    a3, 0
-  YIELDI zero, TAG_PHASE_START
-  j     do_wfi
+  j     start_step_payload
 start_step_first_prepare:
 #endif
   li    a0, PHASE_INPUT_PREPARE
   li    a1, 0
   li    a2, 0
+start_step_payload:
   li    a3, 0
+  lw    t0, H_COMPLETED_STEPS(gp)
+  lw    t1, H_WARMUP_STEPS(gp)
+  bne   t0, t1, start_step_send
+  li    a3, SPIKE_COUNT_START
+start_step_send:
   YIELDI zero, TAG_PHASE_START
   j     do_wfi
 
@@ -875,6 +879,17 @@ complete_timer_done:
  * s10/s11 are temporary only while this non-yielding handler fans out.
  */
 phase_start_handler:
+  li    t0, SPIKE_COUNT_REPORT
+  beq   a3, t0, phase_start_report
+  li    t0, SPIKE_COUNT_START
+  bne   a3, t0, phase_start_marker_done
+  SPIKE_COUNT_RESET (SPM_BASE + SPIKE_COUNT_MNIST), t0, t1
+  li    t0, SPM_BASE + SPIKE_COUNT_MNIST
+  lw    t1, SPIKE_COUNT_STATE(t0)
+  ori   t1, t1, SPIKE_COUNT_STATE_START_PENDING
+  sw    t1, SPIKE_COUNT_STATE(t0)
+  li    a3, 0
+phase_start_marker_done:
   mv    s10, a0
   mv    PHASE_VALUE, a1
 #if MNIST_HORIZONTAL_GROUP_COUNT == 16
@@ -1213,6 +1228,17 @@ phase_start_fanout:
 #else
   li    a3, 0
 #endif
+  li    t0, SPM_BASE + SPIKE_COUNT_MNIST
+  lw    t1, SPIKE_COUNT_STATE(t0)
+  andi  t1, t1, SPIKE_COUNT_STATE_START_PENDING
+  beqz  t1, phase_start_no_counter_marker
+  li    a3, SPIKE_COUNT_START
+  lw    t1, SPIKE_COUNT_STATE(t0)
+  li    t2, -1
+  xori  t2, t2, SPIKE_COUNT_STATE_START_PENDING
+  and   t1, t1, t2
+  sw    t1, SPIKE_COUNT_STATE(t0)
+phase_start_no_counter_marker:
 #if MNIST_TRACE_BUNDLE == 0
   /* Reverse events may run before the local phase handler after this yield. */
   lw    PHASE_TMP, H_INPUT_COUNT(gp)
@@ -1223,6 +1249,38 @@ phase_start_fanout:
 phase_start_cursor_ready:
 #endif
   YIELDI zero, TAG_PHASE
+  j     do_wfi
+
+/* Final report broadcast: forward the marker through the existing phase tree,
+ * emit one tagged local count, then acknowledge the subtree to the root. */
+phase_start_report:
+  lw    t1, H_PU_ID(gp)
+  lw    ra, H_REDUCE_EXPECTED(gp)
+  srli  t2, ra, 1
+phase_report_children:
+  beqz  t2, phase_report_local
+  add   t3, t1, t2
+  li    a0, 0
+  li    a1, 0
+  li    a2, 0
+  li    a3, SPIKE_COUNT_REPORT
+  SENDI t3, TAG_PHASE_START
+  srli  t2, t2, 1
+  j     phase_report_children
+
+phase_report_local:
+  SPIKE_COUNT_EMIT (SPM_BASE + SPIKE_COUNT_MNIST), t0, t1, t2
+  li    t0, SPM_BASE + SPIKE_COUNT_MNIST
+  li    t1, 1
+  sw    t1, SPIKE_COUNT_ACK(t0)
+  lw    t0, H_REDUCE_PARENT(gp)
+  beqz  t0, phase_report_root_wait
+  li    a0, SPIKE_COUNT_ACK_PHASE
+  li    a1, 1
+  li    a2, 0
+  li    a3, 0
+  SENDI t0, TAG_REDUCE
+phase_report_root_wait:
   j     do_wfi
 
 fail_phase_start:
@@ -1237,6 +1295,8 @@ fail_phase_start:
  * The tree count itself serializes this thread-0-only handler.
  */
 reduce_handler:
+  li    t0, SPIKE_COUNT_ACK_PHASE
+  beq   a0, t0, spike_count_ack
 #if MNIST_HORIZONTAL_GROUP_COUNT == 16
   srli  t6, a0, 3
   srli  REDUCE_EXTRA, a1, 31
@@ -1321,6 +1381,27 @@ reduce_send_parent:
 fail_reduce:
   li    a0, 0xbadc0000
   j     fail
+
+spike_count_ack:
+  li    t0, SPM_BASE + SPIKE_COUNT_MNIST
+  lw    t1, SPIKE_COUNT_ACK(t0)
+  add   t1, t1, a1
+  sw    t1, SPIKE_COUNT_ACK(t0)
+  lw    t2, H_REDUCE_EXPECTED(gp)
+  bne   t1, t2, do_wfi
+  lw    t3, H_REDUCE_PARENT(gp)
+  beqz  t3, spike_count_ack_root
+  mv    a1, t2
+  li    a0, SPIKE_COUNT_ACK_PHASE
+  li    a2, 0
+  li    a3, 0
+  SENDI t3, TAG_REDUCE
+  j     do_wfi
+
+spike_count_ack_root:
+  li    t0, STOP_ADDR
+  sw    zero, 0(t0)
+  j     do_wfi
 
 #if MNIST_RECURRENT_MODE != MT_REC_SCATTER
 final_reduce_dispatch:
@@ -1411,12 +1492,6 @@ root_weight_done:
 #if MNIST_PIPELINE_INPUT_PREPARE == 1
   sw    a1, H_FF_EXPECTED(gp)
 #endif
-  /* a2 is this step's spike sum; a1 may already describe the next input step. */
-  lw    t0, H_COMPLETED_STEPS(gp)
-  lw    t1, H_WARMUP_STEPS(gp)
-  bltu  t0, t1, root_spikes_counted
-  SPIKE_COUNT_ADD a2, (SPM_BASE + SPIKE_COUNT_MNIST), t3, t4, t5, t6
-root_spikes_counted:
 #if MNIST_RECURRENT_MODE == MT_REC_SCATTER
   li    ROOT_PHASE_TMP, 1
   sw    ROOT_PHASE_TMP, H_ROOT_STEP_DONE(gp)
@@ -1435,9 +1510,11 @@ root_final_done:
   beqz  t1, root_success
   bne   t1, a1, root_checksum_fail
 root_success:
-  SPIKE_COUNT_EMIT (SPM_BASE + SPIKE_COUNT_MNIST), t3, t4, t5
-  li    ROOT_PHASE_TMP, STOP_ADDR
-  sw    zero, 0(ROOT_PHASE_TMP)
+  li    a0, 0
+  li    a1, 0
+  li    a2, 0
+  li    a3, SPIKE_COUNT_REPORT
+  YIELDI zero, TAG_PHASE_START
   j     do_wfi
 
 root_checksum_fail:
@@ -1450,12 +1527,8 @@ fail_root:
 
 /* Terminal helpers: a0=phase, a2/a3=low/high value. */
 reduce_local:
-  li    a3, 0
-  li    a1, PHASE_WEIGHT_UPDATE
-  bne   a0, a1, reduce_local_pair
-  li    a1, SPM_BASE + SPIKE_COUNT_MNIST
-  lw    a3, SPIKE_COUNT_LOCAL(a1)
 reduce_local_pair:
+  li    a3, 0
   li    a1, 1
   YIELDI zero, TAG_REDUCE
   j     do_wfi
@@ -1555,6 +1628,7 @@ input_prepare_fired:
   sw    a4, IN_FLAGS(t2)
   lw    a4, IN_GLOBAL(t2)
   bgez  a4, input_prepare_not_primary
+  SPIKE_COUNT_INC (SPM_BASE + SPIKE_COUNT_MNIST), t0, t1
   addi  a6, a6, 1
 input_prepare_not_primary:
   lw    a4, IN_WEIGHT_OFFSET(t2)
@@ -1616,6 +1690,7 @@ input_prepare_range_fired:
   sw    a4, IN_FLAGS(t2)
   lw    a4, IN_GLOBAL(t2)
   bgez  a4, input_prepare_range_not_primary
+  SPIKE_COUNT_INC (SPM_BASE + SPIKE_COUNT_MNIST), t0, t1
   addi  a6, a6, 1
 input_prepare_range_not_primary:
   lw    a4, IN_WEIGHT_OFFSET(t2)
@@ -2094,10 +2169,6 @@ input_prepare_join_done:
 #include "mnist_neuron_pair.inc"
 
 neuron_update_finalize:
-  /* Both local SMT results have joined; count actual E and I firings once. */
-  add   t0, s8, s9
-  li    t1, SPM_BASE + SPIKE_COUNT_MNIST
-  sw    t0, SPIKE_COUNT_LOCAL(t1)
 #if MNIST_TRACE_BUNDLE == 0
   li    s10, 0
   li    s11, 0
@@ -2765,7 +2836,6 @@ finish_input_traces:
   bnez  t2, do_wfi
   li    t0, 4
   csrw  0x714, t0
-  li    t6, 0
   lw    t1, H_FIRED_COUNT(gp)
   beqz  t1, finish_input_trace_done
   lw    t0, H_FIRED_VECTOR_OFFSET(gp)
@@ -2773,9 +2843,6 @@ finish_input_traces:
   add   t0, t0, gp
 finish_input_trace_loop:
   lw    t2, 4(t0)
-  lw    t3, IN_GLOBAL(t2)
-  srli  t3, t3, 31
-  add   t6, t6, t3
 #if MNIST_RULE == MT_RULE_THREE
   li    t3, F_ONE
   sw    t3, IN_PRE_TRACE(t2)
@@ -2790,9 +2857,6 @@ finish_input_trace_loop:
   addi  t1, t1, -1
   bnez  t1, finish_input_trace_loop
 finish_input_trace_done:
-  /* Preserve the current logical count before pipelined next-step preparation. */
-  li    t0, SPM_BASE + SPIKE_COUNT_MNIST
-  sw    t6, SPIKE_COUNT_LOCAL(t0)
 #if MNIST_PIPELINE_INPUT_PREPARE == 1
   lw    t0, H_NEURON_LOCAL_VALUE(gp)
   bltz  t0, phase_input_prepare

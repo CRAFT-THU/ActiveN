@@ -562,6 +562,19 @@ br_control:
  SENDI t0,6
 1:
 br_control_leaf:
+ li t0,SPIKE_COUNT_REPORT
+ beq a0,t0,.Lmb_spike_report_local
+ li t0,1
+ bne a0,t0,.Lmb_spike_measure_start_done
+ lw t1,H_STEP(gp)
+ lw t2,H_WARMUP(gp)
+ bne t1,t2,.Lmb_spike_measure_start_done
+ li t0,BR_BASE+SPIKE_COUNT_BRUNEL
+ lw t1,SPIKE_COUNT_STATE(t0)
+ andi t1,t1,SPIKE_COUNT_STATE_ACTIVE
+ bnez t1,.Lmb_spike_measure_start_done
+ SPIKE_COUNT_RESET (BR_BASE + SPIKE_COUNT_BRUNEL), t0, t1
+.Lmb_spike_measure_start_done:
  li t4,MB_BASE
  sw a0,B_QUERY(t4)
  li t0,1
@@ -983,6 +996,8 @@ mb_update_tokens_drained: # SMT1; zero-margin updater queue had priority
  j br_idle
 
 br_broadcast:
+ li t0,SPIKE_COUNT_REPORT
+ beq a0,t0,.Lmb_spike_report_broadcast
  mv a4,a0
  li t0,3
  bleu a0,t0,1f
@@ -997,6 +1012,14 @@ br_broadcast:
  li t0,1
  SENDI t0,10
 3: mv a0,a4
+ YIELDI 6
+ j br_idle
+.Lmb_spike_report_broadcast:
+ li a1,0
+ li a2,0
+ li a3,0
+ li t0,1
+ SENDI t0,10
  YIELDI 6
  j br_idle
 
@@ -1022,7 +1045,17 @@ br_report_leaf:
  srli t0,t0,1
  YIELD_TO t0,7
  j br_idle
+.Lmb_spike_report_local:
+ SPIKE_COUNT_EMIT (BR_BASE + SPIKE_COUNT_BRUNEL), t0, t1, t2
+ li a0,SPIKE_COUNT_ACK_PHASE
+ li a1,0
+ li a2,0
+ li a3,0
+ YIELDI 7
+ j br_idle
 .Lmb_root_report:
+ li t0,SPIKE_COUNT_ACK_PHASE
+ beq a0,t0,.Lmb_spike_report_ack_root
  beqz a0,.Lmb_boot_report
  li t0,1
  beq a0,t0,.Lmb_begin_forward
@@ -1050,7 +1083,6 @@ br_report_leaf:
  lw t0,H_STEP(gp)
  lw t2,H_WARMUP(gp)
  bleu t0,t2,.Lmb_spikes_counted
- SPIKE_COUNT_ADD t1, (BR_BASE + SPIKE_COUNT_BRUNEL), t3, t4, t5, t6
 .Lmb_spikes_counted:
  sw t0,H_COMPLETED(gp)
  lw t1,H_WARMUP(gp)
@@ -1062,7 +1094,9 @@ br_report_leaf:
  bne t0,t1,.Lmb_next_step
  li t1,0x40000004
  sw zero,0(t1)
- SPIKE_COUNT_EMIT (BR_BASE + SPIKE_COUNT_BRUNEL), t3, t4, t5
+ li a0,SPIKE_COUNT_REPORT
+ j br_broadcast
+.Lmb_spike_report_ack_root:
  li a0,0
  j br_halt
 .Lmb_boot_report:

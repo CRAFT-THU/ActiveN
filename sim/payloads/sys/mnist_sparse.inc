@@ -299,6 +299,17 @@ sparse_fail:
  * this handler on thread 1. Reset DONE before publishing the phase.
  */
 sparse_start:
+  li t0, SPIKE_COUNT_REPORT
+  beq a0, t0, sparse_report_start
+  li t0, SPIKE_COUNT_START
+  bne a1, t0, sparse_start_marker_done
+  SPIKE_COUNT_RESET (SPM_BASE + SPIKE_COUNT_MNIST), t0, t1
+  li t0, SPM_BASE + SPIKE_COUNT_MNIST
+  lw t1, SPIKE_COUNT_STATE(t0)
+  ori t1, t1, SPIKE_COUNT_STATE_START_PENDING
+  sw t1, SPIKE_COUNT_STATE(t0)
+  li a1, 0
+sparse_start_marker_done:
 #if MNIST_SPARSE_MC_DRAIN
   /* The preceding global reverse reduction joins both threads everywhere.
    * Restore receive enables before any new reverse responses can be issued.
@@ -324,22 +335,62 @@ sparse_start:
   beqz t0, sparse_start_local
 sparse_start_children:
   add t2, t1, t0
+  li t3, SPM_BASE + SPIKE_COUNT_MNIST
+  lw t4, SPIKE_COUNT_STATE(t3)
+  andi t4, t4, SPIKE_COUNT_STATE_START_PENDING
+  beqz t4, sparse_start_child_normal
+  li a1, SPIKE_COUNT_START
+sparse_start_child_normal:
   SENDI t2, TAG_START
   srli t0, t0, 1
   bnez t0, sparse_start_children
 sparse_start_local:
+  li a1, 0
+  li t0, SPM_BASE + SPIKE_COUNT_MNIST
+  lw t1, SPIKE_COUNT_STATE(t0)
+  li t2, -1
+  xori t2, t2, SPIKE_COUNT_STATE_START_PENDING
+  and t1, t1, t2
+  sw t1, SPIKE_COUNT_STATE(t0)
   YIELDI zero, TAG_PHASE
   j sparse_wait
-/* Reduction input: phase, subtree size, additive value, reverse spike sum or
- * terminal XOR. The spike word refers to this step even after preparation. */
+
+sparse_report_start:
+  lw t1, H_ID(gp)
+  lw t0, H_TREE_SIZE(gp)
+  srli t0, t0, 1
+sparse_report_children:
+  beqz t0, sparse_report_local
+  add t2, t1, t0
+  li a0, SPIKE_COUNT_REPORT
+  li a1, 0
+  li a2, 0
+  li a3, 0
+  SENDI t2, TAG_START
+  srli t0, t0, 1
+  j sparse_report_children
+sparse_report_local:
+  SPIKE_COUNT_EMIT (SPM_BASE + SPIKE_COUNT_MNIST), t0, t1, t2
+  li t0, SPM_BASE + SPIKE_COUNT_MNIST
+  li t1, 1
+  sw t1, SPIKE_COUNT_ACK(t0)
+  lw t0, H_TREE_PARENT(gp)
+  beqz t0, sparse_report_root_wait
+  li a0, SPIKE_COUNT_ACK_PHASE
+  li a1, 1
+  li a2, 0
+  li a3, 0
+  SENDI t0, TAG_REDUCE
+sparse_report_root_wait:
+  j sparse_wait
+
+/* Reduction input: phase, subtree size, additive value, and terminal XOR. */
 sparse_reduce_local:
   lw a0, H_PHASE(gp)
   li a1, 1
-  li t0, PH_REVERSE
-  bne a0, t0, sparse_reduce
-  li t0, SPM_BASE + SPIKE_COUNT_MNIST
-  lw a3, SPIKE_COUNT_LOCAL(t0)
 sparse_reduce:
+  li t0, SPIKE_COUNT_ACK_PHASE
+  beq a0, t0, sparse_count_ack
   lw t0, H_PHASE(gp)
   bne a0, t0, sparse_fail
   lw t0, H_REDUCE_COUNT(gp)
@@ -351,12 +402,7 @@ sparse_reduce:
   add t2, t2, a2
   sw t2, H_REDUCE_VALUE(gp)
   lw t3, H_CHECKSUM(gp)
-  li t4, PH_REVERSE
-  beq a0, t4, sparse_reduce_spikes
   xor t3, t3, a3
-  j sparse_reduce_store
-sparse_reduce_spikes:
-  add t3, t3, a3
 sparse_reduce_store:
   sw t3, H_CHECKSUM(gp)
   bne t0, t1, sparse_wait
@@ -369,6 +415,26 @@ sparse_reduce_store:
   j sparse_wait
 sparse_reduce_root:
   YIELDI zero, 0x403
+  j sparse_wait
+
+sparse_count_ack:
+  li t0, SPM_BASE + SPIKE_COUNT_MNIST
+  lw t1, SPIKE_COUNT_ACK(t0)
+  add t1, t1, a1
+  sw t1, SPIKE_COUNT_ACK(t0)
+  lw t2, H_TREE_SIZE(gp)
+  bne t1, t2, sparse_wait
+  lw t3, H_TREE_PARENT(gp)
+  beqz t3, sparse_count_ack_root
+  mv a1, t2
+  li a0, SPIKE_COUNT_ACK_PHASE
+  li a2, 0
+  li a3, 0
+  SENDI t3, TAG_REDUCE
+  j sparse_wait
+sparse_count_ack_root:
+  li t0, STOP_ADDR
+  sw zero, 0(t0)
   j sparse_wait
 sparse_root:
 #if MNIST_SPARSE_FUSE_NEURON
@@ -413,7 +479,6 @@ sparse_step_done:
   sw t0, H_STEPS(gp)
   lw t1, H_WARMUP(gp)
   bleu t0, t1, sparse_timer_stopped
-  SPIKE_COUNT_ADD a3, (SPM_BASE + SPIKE_COUNT_MNIST), t2, t3, t4, t5
   li t2, TIMER_ADDR
   sw zero, 0(t2)
 sparse_timer_stopped:
@@ -440,6 +505,11 @@ sparse_step_start_phase:
   li a0, PH_PREPARE
 sparse_step_launch:
   li a1, 0
+  lw t0, H_STEPS(gp)
+  lw t1, H_WARMUP(gp)
+  bne t0, t1, sparse_step_send
+  li a1, SPIKE_COUNT_START
+sparse_step_send:
   YIELDI zero, TAG_START
   j sparse_wait
 sparse_final_done:
@@ -449,9 +519,11 @@ sparse_final_done:
   beqz t1, sparse_final_success
   bne a3, t1, sparse_fail
 sparse_final_success:
-  SPIKE_COUNT_EMIT (SPM_BASE + SPIKE_COUNT_MNIST), t3, t4, t5
-  li t0, STOP_ADDR
-  sw zero, 0(t0)
+  li a0, SPIKE_COUNT_REPORT
+  li a1, 0
+  li a2, 0
+  li a3, 0
+  YIELDI zero, TAG_START
   j sparse_wait
 sparse_phase:
 #if MNIST_SPARSE_COMPACT_SCHEDULE
@@ -550,6 +622,10 @@ sparse_prepare_row:
   fmul.s t1, t1, s4
   sw t1, IN_PRE_TRACE(s1)
   beqz t0, sparse_prepare_next
+  lw t3, IN_GLOBAL(s1)
+  bgez t3, sparse_prepare_primary_done
+  SPIKE_COUNT_INC (SPM_BASE + SPIKE_COUNT_MNIST), t0, t1
+sparse_prepare_primary_done:
   addi t1, gp, H_FIRED_COUNT
   li t2, 1
   amoadd.w t2, t2, (t1)
@@ -1028,12 +1104,9 @@ sparse_neuron:
   li s4, 0
   li s5, 0
   li s6, 0
-  li s1, 0
 sparse_neuron_loop:
   jal s7, neuron_pair_update
   add s6, s6, s8
-  add s1, s1, s8
-  add s1, s1, s9
   lw t0, EXC_SLOT(s0)
   li t1, 32
   bgeu t0, t1, sparse_neuron_hi
@@ -1049,8 +1122,6 @@ sparse_neuron_next:
   addi s3, s3, -1
   bnez s3, sparse_neuron_loop
   sw s6, H_LOCAL_SPIKES(gp)
-  li t0, SPM_BASE + SPIKE_COUNT_MNIST
-  sw s1, SPIKE_COUNT_LOCAL(t0)
   mv a0, s4
   mv a1, s5
   li a2, 0
@@ -1900,13 +1971,9 @@ sparse_reverse_drained:
   lw t0, H_INPUT_BASE(gp)
   add t0, t0, gp
   lw t1, H_INPUT_COUNT(gp)
-  li t4, 0
 sparse_pre_commit_loop:
   lw t2, IN_FLAGS(t0)
   beqz t2, sparse_pre_commit_next
-  lw t5, IN_GLOBAL(t0)
-  srli t5, t5, 31
-  add t4, t4, t5
   li t3, F_ONE
 #if MNIST_RULE != MT_RULE_THREE
   lw t2, IN_PRE_TRACE(t0)
@@ -1917,8 +1984,6 @@ sparse_pre_commit_next:
   addi t0, t0, INPUT_SIZE
   addi t1, t1, -1
   bnez t1, sparse_pre_commit_loop
-  li t0, SPM_BASE + SPIKE_COUNT_MNIST
-  sw t4, SPIKE_COUNT_LOCAL(t0)
 #if MNIST_SPARSE_COMPACT_SCHEDULE
   /* All reverse handlers have finished their weight/state reads before the
    * last received increment. Prepare the next input step before reducing,
@@ -1938,8 +2003,7 @@ sparse_reverse_terminal:
   li a0, PH_REVERSE
   li a1, 1
   li a2, 0
-  li t0, SPM_BASE + SPIKE_COUNT_MNIST
-  lw a3, SPIKE_COUNT_LOCAL(t0)
+  li a3, 0
   YIELDI zero, TAG_REDUCE
   j sparse_wait
 #if MNIST_SPARSE_MC_DRAIN

@@ -1,42 +1,41 @@
 import unittest
 
-from spike_counts import parse_spike_total
+from spike_counts import parse_spike_counts, parse_spike_total
 
 
 class SpikeCountLogTest(unittest.TestCase):
-    def test_zero_and_full_width(self):
-        self.assertEqual(parse_spike_total(
-            "[Periph] Output: 53504b31\n[Periph] Output: 0\n"
-            "[Periph] Output: 0\n[System] Result: 0 (0x0)\n"), 0)
-        self.assertEqual(parse_spike_total(
-            "[Periph] Output: 53504b31\n[Periph] Output: 89abcdef\n"
-            "[Periph] Output: 12345678\n[System] Result: 0 (0x0)\n"),
-            0x1234567889ABCDEF)
+    def test_tagged_local_counts_and_sum(self):
+        log = ("[Periph] Output: 0\n"
+               "[Periph] Output: 40000003\n[Periph] Output: 40000007\n"
+               "[System] Result: 0 (0x0)\n")
+        self.assertEqual(parse_spike_counts(log), [3, 7])
+        self.assertEqual(parse_spike_counts(log, expected_pus=2), [3, 7])
+        self.assertEqual(parse_spike_total(log, expected_pus=2), 10)
 
-    def test_checksum_equal_to_marker(self):
-        self.assertEqual(parse_spike_total(
-            "[Periph] Output: 53504b31\n[Periph] Output: 53504b31\n"
-            "[Periph] Output: 7\n[Periph] Output: 0\n"
-            "[System] Result: 0 (0x0)\n[System] Timer: 123 cycles\n"), 7)
+    def test_prior_output_is_not_a_report_record(self):
+        log = ("[Periph] Output: 40000009\n"
+               "[Periph] Output: 40000001\n[Periph] Output: 40000002\n"
+               "[System] Result: 0 (0x0)\n")
+        self.assertEqual(parse_spike_counts(log, expected_pus=2), [1, 2])
 
     def test_incomplete_or_failed_run(self):
-        frame = "[Periph] Output: 53504b31\n[Periph] Output: 1\n[Periph] Output: 0\n"
+        frame = "[Periph] Output: 40000001\n"
         for suffix in ("", "[System] Timed out at cycle 99\n",
                        "[System] Interrupted at cycle 99\n", "[System] Result: 1 (0x1)\n",
                        "[System] Result: 0 (0x1)\n",
                        "[System] Result: 0 (0x0)\n[System] Result: 0 (0x0)\n"):
             with self.subTest(suffix=suffix), self.assertRaises(ValueError):
-                parse_spike_total(frame + suffix)
+                parse_spike_counts(frame + suffix)
 
-    def test_frame_must_be_complete_and_last(self):
+    def test_tag_and_record_validation(self):
         success = "[System] Result: 0 (0x0)\n"
-        for words in ([], ["53504b31"], ["53504b31", "1"], ["1", "2", "3"],
-                      ["53504b31", "1", "0", "9"], ["53504b31", "100000000", "0"],
-                      ["53504b31", "-1", "0"], ["53504b31", "xyz", "0"]):
+        for words in ([], ["40000001"], ["1", "2"], ["40000001", "1"],
+                      ["40000001", "40000002", "40000003"]):
             with self.subTest(words=words), self.assertRaises(ValueError):
-                parse_spike_total("".join(f"[Periph] Output: {w}\n" for w in words) + success)
+                parse_spike_counts("".join(f"[Periph] Output: {w}\n" for w in words) + success,
+                                   expected_pus=4)
         with self.assertRaises(ValueError):
-            parse_spike_total(success + "[Periph] Output: 53504b31\n")
+            parse_spike_counts(success + "[Periph] Output: 40000001\n")
 
 
 if __name__ == "__main__":

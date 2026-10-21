@@ -807,6 +807,7 @@ br_pow04:
  li t4,0
  li t1,1
  STATUS_STORE t1,N_FIRE(t5)
+ SPIKE_COUNT_INC (BR_BASE + SPIKE_COUNT_BRUNEL), t0, t1
  /* Only firing neurons append; the integration join publishes the complete
   * list before forward/reverse/trace-finalization readers can run. */
  amoadd.w t3,t1,(a2)
@@ -979,6 +980,19 @@ br_control:
 1:
 /* Boot selects this entry directly on nodes whose report handler is a leaf. */
 br_control_leaf:
+ li t0,SPIKE_COUNT_REPORT
+ beq a0,t0,.Lspike_report_local
+ li t0,1
+ bne a0,t0,.Lspike_measure_start_done
+ lw t1,H_STEP(gp)
+ lw t2,H_WARMUP(gp)
+ bne t1,t2,.Lspike_measure_start_done
+ li t0,BR_BASE+SPIKE_COUNT_BRUNEL
+ lw t1,SPIKE_COUNT_STATE(t0)
+ andi t1,t1,SPIKE_COUNT_STATE_ACTIVE
+ bnez t1,.Lspike_measure_start_done
+ SPIKE_COUNT_RESET (BR_BASE + SPIKE_COUNT_BRUNEL), t0, t1
+.Lspike_measure_start_done:
  li t0,4
  beq a0,t0,2f
  li t0,5
@@ -1064,6 +1078,8 @@ br_control_leaf:
  j br_idle
 /* Root-only broadcast and the simulator's phase-marker ABI. */
 br_broadcast:
+ li t0,SPIKE_COUNT_REPORT
+ beq a0,t0,.Lspike_report_broadcast
  mv a4,a0
  li t0,4
  beq a0,t0,2f
@@ -1081,6 +1097,14 @@ br_broadcast:
  li t0,1
  SENDI t0,10
 2: mv a0,a4
+ YIELDI 2
+ j br_idle
+.Lspike_report_broadcast:
+ li a1,0
+ li a2,0
+ li a3,0
+ li t0,1
+ SENDI t0,10
  YIELDI 2
  j br_idle
 .globl br_report
@@ -1110,7 +1134,17 @@ br_report_leaf:
  srli t0,t0,1
  YIELD_TO t0,3
  j br_idle
+.Lspike_report_local:
+ SPIKE_COUNT_EMIT (BR_BASE + SPIKE_COUNT_BRUNEL), t0, t1, t2
+ li a0,SPIKE_COUNT_ACK_PHASE
+ li a1,0
+ li a2,0
+ li a3,0
+ YIELDI BR_REPORT_ID
+ j br_idle
 .Lroot_report:
+ li t0,SPIKE_COUNT_ACK_PHASE
+ beq a0,t0,.Lspike_report_ack_root
  beqz a0,.Lreport_boot
  li t0,1
  beq a0,t0,.Lreport_integrate
@@ -1126,7 +1160,6 @@ br_report_leaf:
  lw t0,H_STEP(gp)
  lw t2,H_WARMUP(gp)
  bleu t0,t2,.Lreport_spikes_counted
- SPIKE_COUNT_ADD t1, (BR_BASE + SPIKE_COUNT_BRUNEL), t3, t4, t5, t6
 .Lreport_spikes_counted:
  sw t0,H_COMPLETED(gp)
  lw t1,H_WARMUP(gp)
@@ -1138,7 +1171,9 @@ br_report_leaf:
  bne t0,t1,.Lnext_forward
  li t1,0x40000004
  sw zero,0(t1)
- SPIKE_COUNT_EMIT (BR_BASE + SPIKE_COUNT_BRUNEL), t3, t4, t5
+ li a0,SPIKE_COUNT_REPORT
+ j br_broadcast
+.Lspike_report_ack_root:
  li a0,0
  j br_halt
 .Lreport_boot:

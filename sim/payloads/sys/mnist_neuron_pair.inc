@@ -57,6 +57,7 @@ neuron_pair_exc_active:
   ori   t1, t1, NEURON_FIRED
   sw    t1, EXC_FLAGS(s0)
   li    s9, 1
+  SPIKE_COUNT_INC (SPM_BASE + SPIKE_COUNT_MNIST), t0, t1
 
 neuron_pair_exc_done:
   li    s8, 0
@@ -102,6 +103,7 @@ neuron_pair_inh_active:
   li    t4, NEURON_FIRED
   sw    t4, INH_FLAGS(s2)
   li    s8, 1
+  SPIKE_COUNT_INC (SPM_BASE + SPIKE_COUNT_MNIST), t0, t1
 
 neuron_pair_inh_done:
   /* Preserve the model's one-step recurrent delay within this pair. */
