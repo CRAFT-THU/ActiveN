@@ -97,9 +97,11 @@ set(RAMULATOR_CONFIG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/ramulator-config)
 set(RAMULATOR_CONFIG_PY ${RAMULATOR_CONFIG_DIR}/hbm1-8ch.py)
 set(RAMULATOR_CONFIG_HBM2_PY ${RAMULATOR_CONFIG_DIR}/hbm2-1ch.py)
 set(RAMULATOR_CONFIG_HBM2E_PY ${RAMULATOR_CONFIG_DIR}/hbm2e-1ch.py)
+set(RAMULATOR_CONFIG_HBM3_PY ${RAMULATOR_CONFIG_DIR}/hbm3-1ch.py)
 set(RAMULATOR_CONFIG_YAML ${CMAKE_CURRENT_BINARY_DIR}/ramulator.yaml)
 set(RAMULATOR_CONFIG_HBM2_YAML ${CMAKE_CURRENT_BINARY_DIR}/ramulator-hbm2-1ch.yaml)
 set(RAMULATOR_CONFIG_HBM2E_YAML ${CMAKE_CURRENT_BINARY_DIR}/ramulator-hbm2e-1ch.yaml)
+set(RAMULATOR_CONFIG_HBM3_YAML ${CMAKE_CURRENT_BINARY_DIR}/ramulator-hbm3-1ch.yaml)
 add_custom_command(
     OUTPUT ${RAMULATOR_CONFIG_YAML}
     COMMAND ${Python3_EXECUTABLE} -m ramulator export
@@ -124,10 +126,19 @@ add_custom_command(
     COMMENT "Exporting the 1.6-GHz HBM2-derived extension configuration"
     VERBATIM
 )
+add_custom_command(
+    OUTPUT ${RAMULATOR_CONFIG_HBM3_YAML}
+    COMMAND ${Python3_EXECUTABLE} -B -m ramulator export
+            ${RAMULATOR_CONFIG_HBM3_PY} -o ${RAMULATOR_CONFIG_HBM3_YAML}
+    DEPENDS ${RAMULATOR_CONFIG_HBM3_PY}
+    COMMENT "Exporting one-channel HBM3 Ramulator configuration"
+    VERBATIM
+)
 add_custom_target(gen_ramulator_config DEPENDS
     ${RAMULATOR_CONFIG_YAML}
     ${RAMULATOR_CONFIG_HBM2_YAML}
     ${RAMULATOR_CONFIG_HBM2E_YAML}
+    ${RAMULATOR_CONFIG_HBM3_YAML}
 )
 
 add_executable(test_hbm2e_timing EXCLUDE_FROM_ALL tests/hbm2e_timing.cpp)
