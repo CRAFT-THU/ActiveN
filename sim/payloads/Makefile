@@ -168,6 +168,14 @@ sys/no_receipt_store_test.bin: sys/no_receipt_store_test.S sys/linker_system.ld
 	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -O1 -o sys/no_receipt_store_test.elf sys/no_receipt_store_test.S
 	${PREFIX}objcopy -j .text -j .data -O binary sys/no_receipt_store_test.elf $@
 
+sys/global_idle_test.bin: sys/global_idle_test.S sys/linker_system.ld
+	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DMC_INDEX=0 -o sys/global_idle_test.elf $<
+	${PREFIX}objcopy -j .text -j .data -O binary sys/global_idle_test.elf $@
+
+sys/global_idle_dram1.bin: sys/global_idle_test.S sys/linker_system.ld
+	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DMC_INDEX=1 -o sys/global_idle_dram1.elf $<
+	${PREFIX}objcopy -j .text -j .data -O binary sys/global_idle_dram1.elf $@
+
 # Two distinct MC images for the fixed 64-PU / 2-MC / 64-byte-line regression.
 sys/manual_async_test.bin: sys/manual_async_test.S sys/linker_system.ld
 	${PREFIX}gcc -mabi=ilp32 -march=rv32i_zicsr -nostdlib -nostartfiles -Wl,-T,sys/linker_system.ld -DMC_INDEX=0 -o sys/manual_async_test.elf $<
@@ -203,7 +211,7 @@ sys/mnist_sparse.bin: force-mnist-train sys/mnist_train.S sys/mnist_sparse.inc s
 
 force-mnist-train:
 
-sys-tests: sys/pingpong_test.bin sys/sha256_concurrent.bin sys/spm_init.bin sys/barrier_test.bin sys/local_send_test.bin sys/no_receipt_store_test.bin sys/random_noc_test.bin sys/config_rom_test.bin sys/manual_async_test.bin sys/manual_async_dram1.bin
+sys-tests: sys/pingpong_test.bin sys/sha256_concurrent.bin sys/spm_init.bin sys/barrier_test.bin sys/local_send_test.bin sys/no_receipt_store_test.bin sys/random_noc_test.bin sys/config_rom_test.bin sys/manual_async_test.bin sys/manual_async_dram1.bin sys/global_idle_test.bin sys/global_idle_dram1.bin
 	@echo "All system tests built successfully"
 
 clean:

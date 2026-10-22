@@ -142,6 +142,12 @@ add_custom_target(gen_ramulator_config DEPENDS
 )
 
 add_executable(test_hbm2e_timing EXCLUDE_FROM_ALL tests/hbm2e_timing.cpp)
+add_executable(test_idle_delay EXCLUDE_FROM_ALL tests/idle_delay.cpp)
+add_custom_target(check_idle_delay
+    COMMAND $<TARGET_FILE:test_idle_delay>
+    DEPENDS test_idle_delay
+    VERBATIM
+)
 target_link_libraries(test_hbm2e_timing PRIVATE Ramulator::ramulator)
 add_custom_target(check_hbm2e_timing
     COMMAND $<TARGET_FILE:test_hbm2e_timing> ${RAMULATOR_CONFIG_HBM2E_YAML}

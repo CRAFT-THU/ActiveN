@@ -953,6 +953,9 @@ int main(int argc, char **argv) {
     .default_value(uint32_t(8))
     .scan<'u', uint32_t>();
 
+  program.add_argument("--soft-idle-delay")
+    .help("Soft global idle delay in cycles, 0..63 (default: 4; cosim requires 4)");
+
   program.add_argument("--soft-memif-mshrs")
     .help("Software DRAM MSHR count, 1..65536 (default: 256; overrides SOFT_MEMIF_MSHRS)");
   program.add_argument("--soft-memif-allocation")
@@ -1031,6 +1034,27 @@ int main(int argc, char **argv) {
   SystemConfig cli_cfg;
   cli_cfg.numPU = program.get<uint32_t>("--pu");
   cli_cfg.numMC = program.get<uint32_t>("--mc");
+  const auto idle_delay_arg = program.present<string>("--soft-idle-delay");
+  size_t soft_idle_delay = 4;
+  if (idle_delay_arg) {
+    if (!use_soft) {
+      cerr << "Error: --soft-idle-delay requires --soft\n";
+      return 1;
+    }
+    try {
+      soft_idle_delay = soft_mem::parseNonnegative(*idle_delay_arg, "--soft-idle-delay");
+      if (soft_idle_delay > 63)
+        throw std::invalid_argument("--soft-idle-delay must be in 0..63");
+    } catch (const std::exception &error) {
+      cerr << "Error: " << error.what() << '\n';
+      return 1;
+    }
+  }
+  // Matches the current System.scala IDLE_LATENCY elaboration constant.
+  if (use_hard && soft_idle_delay != 4) {
+    cerr << "Error: cosim requires --soft-idle-delay 4 to match RTL\n";
+    return 1;
+  }
   {
     auto s = program.get<string>("--mc-size");
     uint64_t mc_size = 0;
@@ -1153,7 +1177,8 @@ int main(int argc, char **argv) {
 #endif
 
   if (use_soft) {
-    auto soft = make_unique<SoftSystemBackend>(cli_cfg, soft_threads, memoryExperiment);
+    auto soft = make_unique<SoftSystemBackend>(cli_cfg, soft_threads,
+                                              memoryExperiment, soft_idle_delay);
     if (fst_tracer) soft->attachTrace(fst_tracer.get(), 0);
     system.addBackend(std::move(soft));
     cerr << "[Main] Soft backend enabled" << endl;

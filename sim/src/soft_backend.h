@@ -15,6 +15,7 @@
 #include "soft_verilated/soft_rtl.h"
 #include "soft_components.h"
 #include "soft_mem.h"
+#include "idle_delay.h"
 #include "system.h"
 #include "util.h"
 
@@ -199,9 +200,11 @@ class SoftSystemBackend : public SystemBackend {
 
   const soft_mem::ExperimentConfig memoryExperiment;
   SystemConfig cfg;
+  IdleDelay idleDelay;
+  bool rawSystemIdle = false;
+  bool delayedSystemIdle = false;
 
-  // The cycle EDGE after which reset is released. For K cycles of reset
-  // set this to K - 1 (0-based; cycle increments after step).
+  // The frontend starts at cycle 1; this edge is the last held in reset.
   size_t releaseResetAfter;
 
   Topology topo;
@@ -250,6 +253,7 @@ class SoftSystemBackend : public SystemBackend {
   bool memifNocAccepted(size_t memifIdx) const;
   std::unique_ptr<Flit> takeMemifFlit(size_t memifIdx);
   bool ringCanInject(size_t memifIdx) const;
+  bool ringOutputEmpty(size_t memifIdx) const;
 
   void stageWorkResolve(size_t threadId);
   void stageMemifWork(size_t threadId);
@@ -272,7 +276,8 @@ class SoftSystemBackend : public SystemBackend {
 
  public:
   explicit SoftSystemBackend(SystemConfig cfg, size_t threads = 8,
-                             soft_mem::ExperimentConfig experiment = {});
+                             soft_mem::ExperimentConfig experiment = {},
+                             size_t idleDelayCycles = 4);
   ~SoftSystemBackend() override = default;
   SoftSystemBackend(const SoftSystemBackend &) = delete;
   SoftSystemBackend &operator=(const SoftSystemBackend &) = delete;

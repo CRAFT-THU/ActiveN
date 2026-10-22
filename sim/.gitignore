@@ -21,3 +21,4 @@
 !/tests/soft_noc_reservation.cpp
 !/tests/hbm2e_timing.cpp
 !/tests/test_bolt_optimize.py
+!/tests/idle_delay.cpp

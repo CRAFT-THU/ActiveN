@@ -255,10 +255,18 @@ bool SoftSystemBackend::ringCanInject(size_t memifIdx) const {
          (!ring.validAt(memifIdx) || memif_ring_accept[memifIdx]);
 }
 
+bool SoftSystemBackend::ringOutputEmpty(size_t memifIdx) const {
+  // Slots are indexed at the receiving MemIf. The next slot is this
+  // MemIf's registered forwarding-queue output (System.scala ring wiring).
+  return !ring.validAt((memifIdx + 1) % (cfg.numMC + 1));
+}
+
 SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads,
-                                     soft_mem::ExperimentConfig experiment)
+                                     soft_mem::ExperimentConfig experiment,
+                                     size_t idleDelayCycles)
   : memoryExperiment(soft_mem::checkedExperimentConfig(experiment)),
     cfg(std::move(cfg_in)),
+    idleDelay(idleDelayCycles),
     releaseResetAfter(10),
     topo(cfg.numPU, cfg.numMC),
     periph(0, 16, [&]() {
@@ -319,7 +327,8 @@ SoftSystemBackend::SoftSystemBackend(SystemConfig cfg_in, size_t threads,
   const size_t PU_PER_MC = cfg.numPU / cfg.numMC;
   const size_t CLUSTER_PER_MC = PU_PER_MC / soft_mem::CLUSTER_SIZE;
   std::cerr << "[Soft NoC] space_multiplier=" << soft_noc::spaceMultiplier()
-            << " router_queue_depth=" << ROUTER_Q_DEPTH << '\n';
+            << " router_queue_depth=" << ROUTER_Q_DEPTH
+            << " idle_delay=" << idleDelayCycles << '\n';
   std::cerr << "[Soft MemIf] slots=" << memoryExperiment.slots
             << " merge=" << (memoryExperiment.merge ? "on" : "off")
             << " allocation=" << soft_mem::allocationName(memoryExperiment.allocation)
@@ -512,6 +521,17 @@ void SoftSystemBackend::stage(uint64_t cycle, const std::vector<MemBusIn> &in) {
   }
 
   stageDone.arrive_and_wait();
+
+  // All cores are settled and every worker is waiting at stepStart. Observe
+  // pre-edge state here, before any core, router, or MemIf can commit.
+  rawSystemIdle = true;
+  for (size_t pu = 1; pu <= cfg.numPU; ++pu)
+    rawSystemIdle = rawSystemIdle && cores[pu]->idle &&
+                    routers[pu].rt.totalFlits() == 0;
+  for (size_t mc = 0; mc < cfg.numMC; ++mc)
+    rawSystemIdle = rawSystemIdle && drams[mc].idle(ringOutputEmpty(mc + 1)) &&
+                    drams[mc].distributorsIdle();
+  delayedSystemIdle = idleDelay.output(rawSystemIdle);
 }
 
 void SoftSystemBackend::stageWorkResolve(size_t threadId) {
@@ -646,6 +666,7 @@ void SoftSystemBackend::step(uint64_t cycle) {
   }
 
   stepDone.arrive_and_wait();
+  idleDelay.step(rawSystemIdle, cycle <= releaseResetAfter);
 
   // The RTL holds every MemIf idle-notification register in reset through
   // this edge. Other soft MemIf state cannot change while requests are gated.
@@ -683,8 +704,9 @@ void SoftSystemBackend::stepPeriphWork(size_t threadId) {
         .eject = static_cast<bool>(memif_ring_accept[0]),
         .canInject = ringCanInject(0),
         .injected = &injected,
+        .outputEmpty = ringOutputEmpty(0),
       },
-      memif_ext[0], flitView, memifNocAccepted(0));
+      memif_ext[0], flitView, memifNocAccepted(0), delayedSystemIdle);
 }
 
 void SoftSystemBackend::stepMemifWork(size_t threadId) {
@@ -707,6 +729,7 @@ void SoftSystemBackend::stepMemifWork(size_t threadId) {
       .eject = static_cast<bool>(memif_ring_accept[memifIdx]),
       .canInject = ringCanInject(memifIdx),
       .injected = &injected,
+      .outputEmpty = ringOutputEmpty(memifIdx),
     };
 
     const size_t m = memifIdx - 1;

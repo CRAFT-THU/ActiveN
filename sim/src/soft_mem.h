@@ -190,6 +190,8 @@ struct RingIntf {
   bool canInject;
   // Whether a injection actually happened
   bool *injected;
+  // Committed output queue of this MemIf, not its incoming ring slot.
+  bool outputEmpty = true;
 };
 
 // Base class for software memory interface
@@ -716,6 +718,17 @@ public:
     return (puEnd - puStart) / CLUSTER_SIZE;
   }
 
+  bool idle(bool ringOutputEmpty) const noexcept {
+    return allocated.none() && bulkQueue.empty() && bcstEgressQueue.empty() &&
+           ringOutputEmpty;
+  }
+
+  bool distributorsIdle() const noexcept {
+    for (size_t dist = 0; dist < numClusters(); ++dist)
+      if (unicastPipes[dist] || !bcstQueues[dist].empty()) return false;
+    return true;
+  }
+
   size_t bulkQueueOccupancy() const noexcept { return bulkQueue.size(); }
   size_t broadcastInflightCount() const noexcept { return bcstInflight; }
   const CycleEvents &cycleEvents() const noexcept { return lastCycleEvents; }
@@ -831,7 +844,7 @@ public:
     }
 
     const Flit *acceptedFlit = flit ? &flit->first.get() : nullptr;
-    idleStep(allocated.none() && bulkQueue.empty() && bcstEgressQueue.empty(),
+    idleStep(idle(ring.outputEmpty),
              acceptedFlit, nocOutAccepted);
 
     const auto allocSlot = mshrAllocSlot();
@@ -1079,12 +1092,14 @@ public:
     RingIntf ring,
     MemBusIn &mem,
     std::optional<std::pair<std::reference_wrapper<const Flit>, uint8_t>> flit,
-    bool nocOutAccepted
+    bool nocOutAccepted,
+    bool systemIdle
   ) __attribute__((always_inline)) {
     *ring.injected = false;
 
     const Flit *acceptedFlit = flit ? &flit->first.get() : nullptr;
-    idleStep(allocated.none(), acceptedFlit, nocOutAccepted);
+    idleStep(allocated.none() && ring.outputEmpty && systemIdle,
+             acceptedFlit, nocOutAccepted);
 
     // Remember alloc slots
     auto allocSlot = mshrAllocSlot();
