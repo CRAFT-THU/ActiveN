@@ -1,6 +1,9 @@
 /* Shared compile-time proxy geometry. The ordinary neuron/header ABI stays fixed. */
 #ifndef BRUNEL_PROXY_CONFIG_H
 #define BRUNEL_PROXY_CONFIG_H
+#ifndef BR_READY
+#define BR_READY 0
+#endif
 #ifndef BR_BULK
 #define BR_BULK 0
 #endif
@@ -106,7 +109,16 @@
 #define BR_PROXY_ROWS 0xd00
 #define BR_PROXY_CAPACITY (22 * BR_PROXY_SIZE)
 #endif
-#define BR_PROXY_MAGIC (0x50580000 | (BR_PROXY_RELAY << 9) | (BR_PROXY_TRACES << 8) | BR_PROXY_SIZE)
+#if BR_READY
+#if BR_MORRISON || BR_BULK || !BR_PROXY || BR_PROXY_TRACES || BR_PROXY_RELAY || BR_PROXY_SIZE != 4
+#error Ready Brunel requires the 80-byte home-G4 ABI
+#endif
+#include "brunel_ready_layout.h"
+#define BR_PROXY_PIPELINE_MAGIC BR_READY_MAGIC_BITS
+#else
+#define BR_PROXY_PIPELINE_MAGIC 0
+#endif
+#define BR_PROXY_MAGIC (0x50580000 | (BR_PROXY_RELAY << 9) | (BR_PROXY_TRACES << 8) | BR_PROXY_SIZE | BR_PROXY_PIPELINE_MAGIC)
 #define BR_RELAY_UPDATES (BR_PROXY && BR_PROXY_RELAY)
 #define BR_HOME_UPDATES (BR_PROXY && !BR_PROXY_TRACES && !BR_PROXY_RELAY)
 #endif

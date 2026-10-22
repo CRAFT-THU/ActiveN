@@ -271,9 +271,17 @@ def write_weights(images, ref):
 def generate(args):
     if args.warmup < 0 or args.timed < 1 or args.presim < 0:
         raise ValueError("timed must be positive; warmup/presim nonnegative")
+    pipeline = getattr(args, "pipeline", "legacy")
+    if pipeline not in ("legacy", "ready"):
+        raise ValueError("unknown Brunel pipeline")
+    if pipeline == "ready" and (args.proxy_groups, args.proxy_size, args.proxy_updates) != (
+            "consecutive", 4, "home"):
+        raise ValueError("ready pipeline requires consecutive home G4")
     if args.payload is None:
         variant = (f"_proxy_{args.proxy_updates}_g{args.proxy_size}"
                    if getattr(args, "proxy_groups", "none") != "none" else "")
+        if pipeline == "ready":
+            variant += "_ready"
         args.payload = (Path(__file__).resolve().parents[1] / "sim/payloads/sys"
                         / f"brunel_{args.rule}{variant}.bin")
     payload = args.payload.read_bytes()
@@ -297,7 +305,7 @@ def generate(args):
     else:
         import brunel_proxy
         images, addresses, proxy = brunel_proxy.layout(
-            ref, proxy_mode, args.proxy_size, args.proxy_updates)
+            ref, proxy_mode, args.proxy_size, args.proxy_updates, pipeline)
     history = []
     for t in range(args.presim):
         history.append(ref.tick())
@@ -494,6 +502,7 @@ def generate(args):
             np.savez(out / f"reference-{t + 1:04}.npz", neurons=ref.n, weights=ref.w)
     manifest = dict(
         rule=args.rule,
+        pipeline=pipeline,
         proxy_groups=proxy_mode,
         proxy_size=group_size,
         proxy_updates=None if proxy is None else proxy["updates"],
@@ -541,7 +550,7 @@ def generate(args):
             fired_list_capacity=25,
             fired_count_offset=212,
             forward_weight_bytes=4,
-            mshr_entries=16,
+            mshr_entries=64 if pipeline == "ready" else 16,
             mshr_entry_bytes=64,
             replay_offset=0x2D80,
             replay_record_bytes=8,
@@ -566,6 +575,15 @@ def generate(args):
             pus=PU, mcs=MC, memory_line_bytes=LINE, spm_bytes=16384, smt_pipes=2
         ),
     )
+    if pipeline == "ready":
+        manifest["spm"].update(mshr_offset=0x1800, ready_ring_offset=0x2800,
+            ready_ring_entries=64, pending_issuer_offset=0x2900,
+            pending_issuer_bytes=32, read_credits=16,
+            ready_header_offsets=dict(alloc=152, count=156, head=160, tail=164,
+                                      active=168, credit=180))
+        manifest["completion"] = "dedicated handler15; permanent updater tokens6/7"
+        manifest["forward_completion"] = "proxy wakeup; counted global delivery barrier"
+        manifest["timestep_fence"] = "all PU-to-MC P2 markers, then global MC-idle reduction"
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print("generated", out, flush=True)
 
@@ -588,6 +606,8 @@ def main():
     p.add_argument("--proxy-size", type=int, choices=(2, 4, 8), default=4)
     p.add_argument("--proxy-updates", choices=("replicated", "home", "relay"), default="replicated",
                    help="post-active learning: replicated proxy trace, neuron home, or home trace relayed to proxy")
+    p.add_argument("--pipeline", choices=("legacy", "ready"), default="legacy",
+                   help="ready: 64 descriptors, both SMT updaters and timestep write fence; consecutive home G4 only")
     generate(p.parse_args())
 
 

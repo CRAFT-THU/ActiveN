@@ -114,6 +114,20 @@ BR_ASSERT(BR_NEURONS + BR_MAX_NEURONS * sizeof(BrNeuron) <= BR_BUFFER,
 BR_ASSERT(BR_BUFFER + BR_BUFFER_WORDS * 4 <= BR_MSHR, "buffer capacity");
 BR_ASSERT(BR_FIRED_LIST + BR_MAX_NEURONS * 4 <= BR_MSHR, "fired list capacity");
 BR_ASSERT(sizeof(BrMshr) == 64, "MSHR ABI");
+#if BR_READY
+BR_ASSERT(BR_PROXY_ROWS + BR_PROXY_CAPACITY * sizeof(BrProxyRow) == BR_READY_MSHR,
+          "ready descriptors follow G4 proxy rows");
+BR_ASSERT(BR_READY_MSHR + BR_READY_SLOTS * sizeof(BrMshr) == BR_READY_RING,
+          "ready descriptor pool");
+BR_ASSERT(BR_READY_RING + BR_READY_SLOTS * 4 == BR_READY_PENDING, "ready ring");
+BR_ASSERT(BR_READY_PENDING + BR_READY_PENDING_BYTES <= BR_READ, "pending issuer");
+BR_ASSERT(offsetof(BrHeader, buffer_bytes) == BR_READY_ALLOC, "ready allocation cursor");
+BR_ASSERT(offsetof(BrHeader, mshr_count) == BR_READY_COUNT, "ready descriptor count");
+BR_ASSERT(offsetof(BrHeader, mshr_head) == BR_READY_HEAD, "ready head");
+BR_ASSERT(offsetof(BrHeader, mshr_tail) == BR_READY_TAIL, "ready tail");
+BR_ASSERT(offsetof(BrHeader, mshr_scheduled) == BR_READY_ACTIVE, "ready active updaters");
+BR_ASSERT(offsetof(BrHeader, mshr_peak) == BR_READY_CREDIT, "ready read credits");
+#endif
 BR_ASSERT(BR_MSHR + BR_MSHRS * sizeof(BrMshr) == BR_READ, "MSHR capacity");
 BR_ASSERT(offsetof(BrHeader, buffer_bytes) == 152, "buffer control ABI");
 BR_ASSERT(offsetof(BrHeader, neuron_end) == 112, "neuron-end pointer ABI");

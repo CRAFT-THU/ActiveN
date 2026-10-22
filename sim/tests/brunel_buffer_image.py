@@ -32,7 +32,15 @@ def check(images):
         if proxy:
             from brunel_proxy import CONFIG, ROWS, capacity, groups, magic
             group_size = manifest["proxy_size"]
-            assert s[(CONFIG + 56) // 4] == magic(group_size, manifest["proxy_updates"])
+            pipeline = manifest.get("pipeline", "legacy")
+            assert s[(CONFIG + 56) // 4] == magic(group_size, manifest["proxy_updates"],
+                                                pipeline, manifest["proxy_groups"])
+            if pipeline == "ready":
+                assert (manifest["proxy_groups"], group_size, manifest["proxy_updates"]) == ("consecutive", 4, "home")
+                assert manifest["spm"]["mshr_offset"] == 0x1800
+                assert manifest["spm"]["mshr_entries"] == 64
+                assert manifest["spm"]["ready_ring_offset"] == 0x2800
+                assert manifest["spm"]["pending_issuer_offset"] == 0x2900
             members, rank = groups(manifest["proxy_groups"], group_size)
             np.testing.assert_array_equal(s[CONFIG // 4:CONFIG // 4 + group_size], members[pu] + 1)
             assert not np.any(s[0x900 // 4:CONFIG // 4])

@@ -286,7 +286,8 @@ def validate_buffer(args, manifest, initial, log, steps):
                     raise ValueError("non-replicating variant unexpectedly replicated traces")
                 if cfg[11] != group_size or cfg[10] != cfg[12] or cfg[15]:
                     raise ValueError("incomplete group notification exchange")
-                if cfg[14] != magic(group_size, manifest["proxy_updates"]):
+                if cfg[14] != magic(group_size, manifest["proxy_updates"],
+                                    manifest.get("pipeline", "legacy"), manifest["proxy_groups"]):
                     raise ValueError("wrong proxy variant magic")
                 jobs = spm[JOBS // 4:JOBS // 4 + int(cfg[10])]
                 expected_jobs = 0x20000000 + ROWS + np.flatnonzero(rows[:, 1]) * 32
@@ -308,6 +309,13 @@ def validate_buffer(args, manifest, initial, log, steps):
                 raise ValueError("stack guard damaged")
             if np.any(spm[0x2900 // 4 + 11 : 0x2D00 // 4 : 16]):
                 raise ValueError("live MSHR at timestep boundary")
+            if manifest.get("pipeline", "legacy") == "ready":
+                if (manifest["proxy_groups"], group_size, manifest["proxy_updates"]) != ("consecutive", 4, "home"):
+                    raise ValueError("ready pipeline placement mismatch")
+                if np.any(spm[0x1800 // 4 + 11:0x2800 // 4:16]):
+                    raise ValueError("live ready descriptor at timestep boundary")
+                if any(spm[i // 4] for i in (152, 156, 160, 164, 168, 180, 0x2910)):
+                    raise ValueError("ready queue/issuer/credit did not drain")
             if manifest.get("fired_list"):
                 count = int(spm[manifest["spm"]["fired_count_offset"] // 4])
                 nn = int(spm[4])
@@ -412,8 +420,11 @@ def validate_buffer(args, manifest, initial, log, steps):
         ):
             s[key] = int(value)
         previous = current
-        s["maximum_buffer_bytes_per_pu"] = max(int(spm[38]) for spm in spms)
-        s["mshr_peak_per_pu"] = max(int(spm[45]) for spm in spms)
+        ready_pipeline = manifest.get("pipeline", "legacy") == "ready"
+        # Ready reuses these words for the allocation cursor/current credits.
+        # Boundary zeros do not establish a maximum occupancy during the step.
+        s["maximum_buffer_bytes_per_pu"] = None if ready_pipeline else max(int(spm[38]) for spm in spms)
+        s["mshr_peak_per_pu"] = None if ready_pipeline else max(int(spm[45]) for spm in spms)
         s["record_peak_per_pu"] = max(int(spm[replay + 1]) for spm in spms)
         if "stream_offset" in manifest["spm"]:
             stream = manifest["spm"]["stream_offset"] // 4
@@ -449,15 +460,16 @@ def validate_buffer(args, manifest, initial, log, steps):
         raise ValueError("missing timer")
     report = dict(
         rule=manifest["rule"],
+        pipeline=manifest.get("pipeline", "legacy"),
         kernel=manifest["kernel"],
         steps=steps,
         neurons=comparisons,
         cycles_per_timestep=int(timer[1]) / len(timed),
         average_per_timestep={k: sum(s[k] for s in timed) / len(timed) for k in keys},
-        maximum_buffer_bytes_per_pu=max(
+        maximum_buffer_bytes_per_pu=None if ready_pipeline else max(
             s["maximum_buffer_bytes_per_pu"] for s in steps
         ),
-        mshr_peak_per_pu=max(s["mshr_peak_per_pu"] for s in steps),
+        mshr_peak_per_pu=None if ready_pipeline else max(s["mshr_peak_per_pu"] for s in steps),
         record_peak_per_pu=max(s["record_peak_per_pu"] for s in steps),
         weights=dict(
             count=len(observed),

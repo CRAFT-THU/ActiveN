@@ -7,6 +7,8 @@
 !/tests/check_spm_dump.py
 !/tests/spm_dpi.cpp
 !/tests/brunel_buffer_image.py
+!/tests/brunel_ready_stress.inc
+!/tests/brunel_ready_stress.py
 !/tests/brunel_asm_numeric.S
 !/tests/brunel_pow04.cpp
 !/tests/morrison_images.py

@@ -473,6 +473,8 @@ br_ltp_morrison:
  */
 #if BR_BULK
 #include "morrison_ready_runtime.inc"
+#elif BR_READY
+#include "brunel_ready_runtime.inc"
 #else
 br_mshr_retire:
  lw t0,H_MSHR_COUNT(gp)
@@ -673,7 +675,11 @@ br_reverse:
  mv a4,a1
  mv a5,a2
  mv a6,t2
+#if BR_READY
+ j br_ready_accept
+#else
  jal t6,br_mshr_allocate
+#endif
 #endif
 #endif
 8:
@@ -993,6 +999,16 @@ br_control_leaf:
  bnez t1,.Lspike_measure_start_done
  SPIKE_COUNT_RESET (BR_BASE + SPIKE_COUNT_BRUNEL), t0, t1
 .Lspike_measure_start_done:
+#if BR_READY
+#ifdef BR_READY_TEST
+ li t0,9
+ beq a0,t0,br_ready_test_start
+#endif
+ li t0,7
+ beq a0,t0,br_ready_idle_start
+ li t0,8
+ beq a0,t0,br_ready_finalize_start
+#endif
  li t0,4
  beq a0,t0,2f
  li t0,5
@@ -1003,6 +1019,24 @@ br_control_leaf:
  li t0,1
  bne a0,t0,6f
  sw zero,H_JOIN_COUNT(gp)
+#if BR_READY
+ /* Ready workers have permanent handlers; only their masks cross phases. */
+ csrci 0x716,8
+ csrci 0x717,16
+ csrci 0x714,8
+ la t0,br_work
+ csrw 0x708,t0
+ la t0,br_proxy_receive
+ csrw 0x705,t0
+ li t0,19
+ csrw 0x715,t0
+ la t0,br_proxy_wait
+ csrw 0x70e,t0
+ li t0,0x00010002
+ csrw 0x72e,t0
+ li t0,8
+ csrw 0x71e,t0
+#endif
 #if BR_MORRISON
  /* Prior phase 6 completed globally. New deliveries cannot start until
   * every PU has reported this integration, so these resets cannot race. */
@@ -1061,6 +1095,18 @@ br_control_leaf:
  sw zero,H_WORK_MC(gp)
  sw zero,H_SENT(gp)
  sw zero,H_WORK_NEURON(gp)
+#if BR_READY
+ li t0,3
+ bne a0,t0,.Lready_not_reverse
+ /* Proxy-wait token was consumed before our forward producer report. */
+ csrw 0x71e,zero
+ la t0,br_ready_issue
+ csrw 0x70e,t0
+ li t0,0x00010004
+ csrw 0x72e,t0
+ csrsi 0x714,8
+.Lready_not_reverse:
+#endif
 #if BR_PROXY
  li t0,2
  beq a0,t0,.Lproxy_start
@@ -1081,6 +1127,10 @@ br_broadcast:
  li t0,SPIKE_COUNT_REPORT
  beq a0,t0,.Lspike_report_broadcast
  mv a4,a0
+#if BR_READY
+ li t0,7
+ bgeu a0,t0,2f           # idle/finalization remain inside finish marker5
+#endif
  li t0,4
  beq a0,t0,2f
  li t0,5
@@ -1156,7 +1206,16 @@ br_report_leaf:
  beq a0,t0,.Lquery_forward
  li t0,5
  beq a0,t0,.Lquery_reverse
+#if BR_READY
+ li t0,6
+ beq a0,t0,br_ready_routes_closed
+ li t0,7
+ beq a0,t0,br_ready_memory_closed
+#endif
  /* Finish: all nodes and memory notifications are drained. */
+#if BR_READY && defined(BR_READY_TEST)
+ j br_ready_test_done
+#endif
  lw t0,H_STEP(gp)
  lw t2,H_WARMUP(gp)
  bleu t0,t2,.Lreport_spikes_counted
@@ -1177,6 +1236,10 @@ br_report_leaf:
  li a0,0
  j br_halt
 .Lreport_boot:
+#if BR_READY && defined(BR_READY_TEST)
+ li a0,9
+ j br_broadcast
+#endif
  lw t0,H_WARMUP(gp)
  bnez t0,.Lnext_forward
  li t0,0x40000004
@@ -1484,6 +1547,9 @@ br_boot:
  sw zero,H_ISSUED(gp)
  sw zero,H_CONSUMED(gp)
 .Lboot_report:
+#if BR_READY
+ jal ra,br_ready_boot
+#endif
  SPIKE_COUNT_INIT (BR_BASE + SPIKE_COUNT_BRUNEL), t0
 #if !BR_MORRISON
  addi t0,gp,256
@@ -1641,9 +1707,17 @@ br_proxy_receive:
  add t1,t1,a2
  sw t1,G_EXPECTED(t0)
 .Lproxy_receive_done:
+#if BR_READY
+ /* Publish job/marker updates before enabling the single parked wait token. */
+ csrsi 0x71e,8
+#endif
  j br_idle
 .globl br_proxy_wait
 br_proxy_wait:
+#if BR_READY
+ /* Clearing before reading the conditions prevents a lost concurrent wake. */
+ csrci 0x71e,8
+#endif
  li t0,BR_BASE+PROXY_CONFIG
  lw t1,G_MARKERS(t0)
  li t2,BR_PROXY_SIZE
@@ -1993,6 +2067,10 @@ br_work_advance:
  j .Lwork_continue
 br_work_flush:
 .Lwork_finish:
+#if BR_READY
+ j br_ready_finish
+br_ready_trace_finish:
+#endif
 .Lflush_done:
  jal ra,br_drain
  lw t0,H_MSHR_COUNT(gp)
@@ -2044,7 +2122,11 @@ br_work_flush:
 .Lproxy_increment_done:
 #endif
  INC H_STEP,t0
+#if BR_READY
+ li a0,8
+#else
  li a0,6
+#endif
  lw a1,H_FIRE_COUNT(gp)
  j .Lwork_send_report
 br_work_report:
@@ -2120,4 +2202,7 @@ snn_init:
 
 #if BR_BULK
 #include "morrison_bulk_runtime.inc"
+#endif
+#if BR_READY && defined(BR_READY_TEST)
+#include "../../tests/brunel_ready_stress.inc"
 #endif

@@ -11,8 +11,13 @@ def capacity(size):
     return 22 * size
 
 
-def magic(size, updates):
-    return 0x50580000 | ({"home": 0, "replicated": 1, "relay": 2}[updates] << 8) | size
+def magic(size, updates, pipeline="legacy", mode="consecutive"):
+    if pipeline not in ("legacy", "ready"):
+        raise ValueError("unknown Brunel pipeline")
+    if pipeline == "ready" and (size, updates, mode) != (4, "home", "consecutive"):
+        raise ValueError("ready pipeline requires consecutive home G4")
+    flags = 0xc00 if pipeline == "ready" else 0
+    return 0x50580000 | ({"home": 0, "replicated": 1, "relay": 2}[updates] << 8) | size | flags
 
 
 def topology():
@@ -83,7 +88,8 @@ def assign(pre, post, members):
     return owners, dict(home_mean_hops=before / len(pre), proxy_mean_hops=after / len(pre))
 
 
-def layout(ref, mode, size=4, updates="replicated"):
+def layout(ref, mode, size=4, updates="replicated", pipeline="legacy"):
+    magic(size, updates, pipeline, mode)
     members, rank = groups(mode, size)
     owners, plastic_hops = assign(ref.pre, ref.post, members)
     static_owners, static_hops = assign(ref.sp, ref.st, members)
@@ -116,6 +122,7 @@ def layout(ref, mode, size=4, updates="replicated"):
     ref.n[:, 19] = ROWS + slots * 32
     return images, addresses, dict(members=members, rank=rank, owners=owners,
         static_owners=static_owners, rows=rows, slots=slots, size=size, updates=updates,
+        pipeline=pipeline, mode=mode,
         placement=dict(plastic=plastic_hops, static=static_hops,
                        balance="each neuron's plastic and static row separately differ by at most one edge"))
 
@@ -139,6 +146,7 @@ def initialize_spm(blob, pu, plan, neurons):
     config = np.zeros(16, dtype=np.uint32)
     config[:plan["size"]] = plan["members"][pu] + 1
     config[8:10] = count, 0x20000000 + ROWS + exc * 32
-    config[14] = magic(plan["size"], plan["updates"])
+    config[14] = magic(plan["size"], plan["updates"], plan.get("pipeline", "legacy"),
+                       plan.get("mode", "consecutive"))
     blob[CONFIG:CONFIG + config.nbytes] = config.tobytes()
     blob[ROWS:ROWS + rows.nbytes] = rows.tobytes()

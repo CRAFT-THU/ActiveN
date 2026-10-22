@@ -61,7 +61,11 @@ _start:
   # Spike delivery is safe on both SMT threads: the input accumulator uses
   # LR/SC, while the learning writeback targets are independent.
   INSTALL 1,SPIKE_ENTRY,28,0x00020002
+#if BR_READY
+  INSTALL 2,br_control,20,0x00040006
+#else
   INSTALL 2,br_control,20,0x00030005
+#endif
   INSTALL 3,br_report,20,0x00020004
 #if BR_RELAY_UPDATES
   # SMT1 relays immutable home traces while SMT0 updates proxy weights. The
@@ -69,7 +73,12 @@ _start:
   INSTALL 4,br_proxy_update,11,0x000a0011
   INSTALL 7,br_reverse,19,0x00010012
 #else
+#if BR_READY
+  # Early reverse messages stay queued until the local phase binding is ready.
+  INSTALL 4,br_reverse,4,0x000a0011
+#else
   INSTALL 4,br_reverse,12,0x000a0011
+#endif
 #endif
 #if BR_PROXY
   # Notifications only write metadata; SMT1 can receive while SMT0 sends.
@@ -77,7 +86,14 @@ _start:
   INSTALL 13,br_proxy_notify,8,0x00050008
   INSTALL 14,br_proxy_wait,8,0x00010002
 #endif
+#if BR_READY
+  # One persistent token per updater; completions enable the corresponding SMT.
+  INSTALL 6,br_ready_update,0,0x00030006
+  INSTALL 7,br_ready_update,0,0x00030006
+  INSTALL 15,br_ready_completion,18,0
+#else
   INSTALL 6,br_mshr_service,8,0x00020003
+#endif
   INSTALL 8,br_work,8,0x0018001f
   INSTALL 9,br_integrate,24,0x00010002
   INSTALL 10,idle,16,0

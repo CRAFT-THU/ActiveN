@@ -219,6 +219,7 @@ endif
 BRUNEL_ASM_FLAGS ?=
 BRUNEL_SOURCES = Makefile sys/brunel.S sys/brunel_runtime.S sys/brunel_asm_layout.inc sys/brunel_rule.inc sys/brunel_proxy_config.h sys/linker_brunel.ld
 BRUNEL_SOURCES += sys/morrison_layout.h sys/spike_count.h
+BRUNEL_SOURCES += sys/brunel_ready_layout.h sys/brunel_ready_runtime.inc
 BRUNEL_BUILD_FLAGS = -mabi=ilp32 -march=rv32ia_zmmul_zfinx_zicsr -Os -msmall-data-limit=0 -ffreestanding -fno-builtin -nostdlib -nostartfiles -Wl,-T,sys/linker_brunel.ld -DMNIST_TRAIN=1 -DMEM_LINE_BYTES=32 -DBR_ASM_RUNTIME=1
 .PHONY: brunel-select-rule
 brunel-select-rule:
@@ -246,6 +247,19 @@ sys/brunel_additive_proxy_$(1)_g$(2).bin sys/brunel_morrison_proxy_$(1)_g$(2).bi
 	$${PREFIX}objcopy -j .text -j .data -O binary $$(@:.bin=.elf) $$@
 endef
 $(foreach variant,replicated home relay,$(foreach size,2 4 8,$(eval $(call BRUNEL_PROXY_VARIANT,$(variant),$(size)))))
+
+# Explicit opt-in; retained home-G4 targets continue to build the legacy path.
+sys/brunel_additive_proxy_home_g4_ready.bin: BR_RULE_ID = 0
+sys/brunel_morrison_proxy_home_g4_ready.bin: BR_RULE_ID = 1
+sys/brunel_additive_proxy_home_g4_ready.bin sys/brunel_morrison_proxy_home_g4_ready.bin: $(BRUNEL_SOURCES)
+	${PREFIX}gcc $(BRUNEL_BUILD_FLAGS) -DBR_RULE=$(BR_RULE_ID) -DBR_PROXY=1 -DBR_PROXY_SIZE=4 -DBR_PROXY_TRACES=0 -DBR_PROXY_RELAY=0 -DBR_READY=1 $(BRUNEL_ASM_FLAGS) -o $(@:.bin=.elf) sys/brunel.S sys/brunel_runtime.S
+	${PREFIX}objcopy -j .text -j .data -O binary $(@:.bin=.elf) $@
+
+sys/brunel_additive_ready_stress.bin: BR_RULE_ID = 0
+sys/brunel_morrison_ready_stress.bin: BR_RULE_ID = 1
+sys/brunel_additive_ready_stress.bin sys/brunel_morrison_ready_stress.bin: $(BRUNEL_SOURCES) ../tests/brunel_ready_stress.inc
+	${PREFIX}gcc $(BRUNEL_BUILD_FLAGS) -DBR_RULE=$(BR_RULE_ID) -DBR_PROXY=1 -DBR_PROXY_SIZE=4 -DBR_PROXY_TRACES=0 -DBR_PROXY_RELAY=0 -DBR_READY=1 -DBR_READY_TEST=1 $(BRUNEL_ASM_FLAGS) -o $(@:.bin=.elf) sys/brunel.S sys/brunel_runtime.S
+	${PREFIX}objcopy -j .text -j .data -O binary $(@:.bin=.elf) $@
 
 # Whole-row range jobs with two shared 2 KiB banks and 64 descriptors; ABI3.
 sys/morrison_bulk.bin: $(BRUNEL_SOURCES) sys/morrison_bulk_layout.h sys/morrison_bulk_runtime.inc sys/morrison_tree_runtime.inc sys/morrison_ready_runtime.inc
