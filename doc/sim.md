@@ -10,12 +10,27 @@ The benchmark environment should use 512PU + 16MC. For these configurations, you
 
 Further configuration of the benchmark environment:
 - Assume 1.5GHz frequency
-- Always use ramulator. Select 2 x HBM2e (1.6GHz frequency)
+- Always use Ramulator with the [HBM3 configuration](#hbm3-memory-configuration): one 16-GiB stack with sixteen channels (1 GiB per MC).
 - Always enable icache init
 - Always use 1 timestep as warmup. If you think the testing contract does not allow a warmup period, notify the user.
 - Remember to use the timer in the peripheral interface.
 
 Sometimes, for experimental works (e.g. testing the feasibility of an ongoing RTL work), the software backend and hardware system implementation can partially diverges. However, during all these conditions, the user have to explicitly told you to allow this. Otherwise, flag the divergence of software and RTL to the user. And in all these cases, the core interface / ISA should be backward-compatible with the test being run.
+
+## HBM3 memory configuration
+
+Use [sim/ramulator-config/hbm3-1ch.py](../sim/ramulator-config/hbm3-1ch.py).
+It selects the pinned Ramulator `HBM3_16Gb_8hi` organization,
+`HBM3_6400Mbps` timing preset and native `HBM34` controller. Each MC instantiates
+one channel; 16 MCs provide 16 GiB total. The 32-bit pseudochannels and eight-beat
+bursts give 32-byte transactions, matching the benchmark interface without a
+bus-width converter.
+
+`HBM3_6400Mbps` means 6.4 Gbit/s per data pin, with 3.2-GHz data strobes and a
+1.6-GHz command clock. The preset supplies the memory clock and timing
+constraints. `--freq-ghz` continues to set the core/NoC frequency.
+
+Since the command clock is exactly twice the speed of the data strobes, we used twice the interface width in our simulator frontend so that the bandwidth matches. In the eyes of the backend, it's operating on a 8B-wide bus with 1.6GHz frequency, just like a HBM2e physical channel. This is intentional, and should guarantee relatively accurate HBM3 benchmark result.
 
 ## Build directories and benchmarking simulator binary consistency
 
