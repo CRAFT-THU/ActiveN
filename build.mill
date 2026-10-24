@@ -6,6 +6,8 @@ import mill.api.internal.RootModule
 import os.Path
 
 object ActiveN extends ScalaModule with ScalafmtModule { m =>
+  override def mainClass = Some("koneko.Main")
+  override def moduleDeps = Seq(PPAHardFloat, PPAFudian)
   override def scalaVersion = "2.13.18"
   override def scalacOptions = Seq(
     "-language:reflectiveCalls",
@@ -22,4 +24,19 @@ object ActiveN extends ScalaModule with ScalafmtModule { m =>
   override def scalacPluginMvnDeps = Seq(
     mvn"org.chipsalliance:::chisel-plugin:7.11.0",
   )
+}
+
+trait PPAFloatLibrary extends ScalaModule {
+  override def scalaVersion = "2.13.18"
+  override def scalacOptions = Seq("-language:reflectiveCalls")
+  override def mvnDeps = Seq(mvn"org.chipsalliance::chisel:7.11.0")
+  override def scalacPluginMvnDeps = Seq(mvn"org.chipsalliance:::chisel-plugin:7.11.0")
+}
+
+object PPAHardFloat extends PPAFloatLibrary {
+  override def moduleDir = mill.api.BuildCtx.workspaceRoot / "dep" / "ppa-hardfloat"
+}
+
+object PPAFudian extends PPAFloatLibrary {
+  override def moduleDir = mill.api.BuildCtx.workspaceRoot / "dep" / "ppa-fudian"
 }

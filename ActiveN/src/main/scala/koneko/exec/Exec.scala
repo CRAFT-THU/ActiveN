@@ -147,9 +147,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
 
   // FPU, remove if
   val fpu = if(param.useFPU) {
-    val fpu = Module(new FPU(param.fpuPipeline))
-    fpu.io.clock := clock
-    fpu.io.reset := reset
+    val fpu = Module(new SelectedFPU(param.fpuImplementation, param.fpuPipeline))
     fpu.io.a := rs1val
     fpu.io.b := rs2val
     fpu.io.funct7 := uop.funct7

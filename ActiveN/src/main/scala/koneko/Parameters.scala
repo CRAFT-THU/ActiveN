@@ -16,6 +16,9 @@ case class CoreParameters(
   val spmClockGating: Boolean = false,
   val eventClockGating: Boolean = false,
   val fpuPipeline: Boolean = false,
+  val fpuImplementation: String = "cvfpu",
+  // Extra response stages at Core ingress and MemIf response/ring boundaries.
+  val responsePipelineStages: Int = 0,
   val useFPU: Boolean = true,
   val pipeCnt: Int = 2,
 
@@ -28,6 +31,9 @@ case class CoreParameters(
   // Depth of the broadcast queue in front of the evQueue
   val bcastQueueDepth: Int = 8,
 ) {
+  require(Set("cvfpu", "hardfloat", "hardfloat-normal", "fudian").contains(fpuImplementation),
+    "Unknown FPU implementation")
+  require(responsePipelineStages >= 0, "Response pipeline stage count must be nonnegative")
   require(scratchpadSize % 4 == 0)
   require(!spmSram || (scratchpadSize == 16384 && memBusWidth == 512),
     "The ASAP7 scratchpad macro experiment requires 16 KiB and 512-bit memory lines")

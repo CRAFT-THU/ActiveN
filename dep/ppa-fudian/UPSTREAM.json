@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/OpenXiangShan/fudian",
+  "commit": "e1bd4695ca7beb36a5ce7357e9527ad9e95b9ec1",
+  "archive_sha256": "3c5b3dbf154740803bb9fc98f8178d349460026fe26f6e80c76ed0de16edcc3b",
+  "source_prefix": "src/main/scala/"
+}

@@ -55,6 +55,19 @@ object Common {
     output
   }
 
+  // Fixed latency, one beat per cycle. Hold invalid payloads so synthesis can
+  // clock-gate the wide data registers; validity still advances every cycle.
+  // Invalid payloads need no reset; every validity stage starts empty.
+  def delayValid[D <: Data](input: ValidIO[D], stages: Int): ValidIO[D] = {
+    require(stages >= 0)
+    (0 until stages).foldLeft(input) { (previous, _) =>
+      val next = Wire(Valid(chiselTypeOf(input.bits)))
+      next.valid := RegNext(previous.valid, false.B)
+      next.bits := RegEnable(previous.bits, previous.valid)
+      next
+    }
+  }
+
   def invalid[D <: Data](gen: D): ValidIO[D] = {
     val ret = Wire(Valid(gen.cloneType))
     ret.bits := DontCare

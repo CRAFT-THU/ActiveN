@@ -190,6 +190,10 @@ abstract class MemIf(
     val resp = Flipped(Valid(new GlobalMemResp))
   })
 
+  // Delay the complete external response before either DRAM processing or
+  // PeripheralIf's arbitration against its internally generated ROM response.
+  final protected val externalResp = Common.delayValid(mem.resp, coreParams.responsePipelineStages)
+
   private val flitArb = Module(new FlitArb(nocIn(0).bits.cloneType, numReq))
   for (ci <- 0 until numReq) flitArb.io.in(ci) <> nocIn(ci)
   final protected val flit = flitArb.io.out
@@ -197,13 +201,18 @@ abstract class MemIf(
   // Common MSHR states
   final protected val allocated = RegInit(VecInit(Seq.fill(inflight)(false.B)))
   private val mshrs     = Reg(Vec(inflight, new MSHR))
-  // Whether this request is issued
+  // Tracks issue only for the response assertions; request ordering uses issueQ.
   private val issued    = Reg(Vec(inflight, Bool()))
   // Whether this request is fulfilled
   private val fulfilled = Reg(Vec(inflight, Bool()))
   // Buffers either write data, or response data, or both (for AMO)
   // We cannot reduce this to 32 bit: ICache fetches whole lines, and AMOs
   private val buffer    = Reg(Vec(inflight, UInt(coreParams.memBusWidth.W)))
+
+  // Preserve allocation order at the external memory interface. Each queued
+  // index owns an allocated MSHR, so a newly allocated slot always fits here.
+  private val issueQ = Module(new Queue(UInt(log2Ceil(inflight).W), inflight))
+  assert(!issueQ.io.enq.valid || issueQ.io.enq.ready, "Issue queue should never block")
 
   // Allocation inputs
   protected class Alloc extends Bundle {
@@ -220,6 +229,8 @@ abstract class MemIf(
 
   alloc.ready := !allocated.asUInt.andR // Not full
   val allocIdx = PriorityEncoder(allocated.map(!_))
+  issueQ.io.enq.bits := allocIdx
+  issueQ.io.enq.valid := alloc.fire
   when(alloc.fire) {
     mshrs(allocIdx) := alloc.bits.mshr
     buffer(allocIdx) := alloc.bits.data
@@ -269,9 +280,9 @@ abstract class MemIf(
 
   // Outgoing request
   final protected val req = Wire(Decoupled(new GlobalMemReq))
-  val issueMap = allocated.asUInt & ~issued.asUInt
-  val issueIdx = Common.rr(issueMap, req.fire, "issueIdx")
-  req.valid := issueMap.orR
+  val issueIdx = issueQ.io.deq.bits
+  req.valid := issueQ.io.deq.valid
+  issueQ.io.deq.ready := req.ready
   req.bits.id := issueIdx
   req.bits.addr := mshrs(issueIdx).address
   req.bits.wdata := buffer(issueIdx)
@@ -313,10 +324,31 @@ abstract class MemIf(
     (local, remote)
   }
 
-  final protected val (ringRecv, ringFwd) = splitLocal(ringIn)
+  private val ringIngress = if (coreParams.responsePipelineStages == 0) {
+    ringIn
+  } else {
+    val incoming = Wire(Valid(new RingResp))
+    incoming.valid := ringIn.valid
+    incoming.bits := ringIn.bits
+    val delayed = Common.delayValid(incoming, coreParams.responsePipelineStages)
+    val internal = Wire(Decoupled(new RingResp))
+    internal.valid := delayed.valid
+    internal.bits := delayed.bits
+    ringIn.ready := true.B
+    // The integrated ring always drains: priority local ejection cannot block,
+    // and each depth-2 forwarding queue has at most one occupied entry.
+    // Check the actual consumer, not the hardwired outward-facing ready.
+    assert(!internal.valid || internal.ready, "Delayed ring ingress must never stall")
+    internal
+  }
+  final protected val (ringRecv, ringFwd) = splitLocal(ringIngress)
   final protected val (ucstLocal, ringSend) = splitLocal(ucstEject)
 
   private val ringFwdQueue = Module(new Queue(new RingResp, 2))
+  if (coreParams.responsePipelineStages > 0) {
+    assert(ringFwdQueue.io.count <= 1.U, "Ring forwarding occupancy invariant violated")
+    assert(!ringOut.valid || ringOut.ready, "Ring egress must never stall")
+  }
   private val ringSendGated = Wire(Decoupled(new RingResp))
   ringSendGated.bits := ringSend.bits
   ringSendGated.valid := ringSend.valid && ringFwdQueue.io.count === 0.U
@@ -422,8 +454,7 @@ class DRAMIf(
   mem.req.valid := req.valid
   mem.req.bits := req.bits
   req.ready := mem.req.ready
-  resp.valid := mem.resp.valid
-  resp.bits := mem.resp.bits
+  resp := externalResp
 
   // DRAMIf-specific state for scatter/broadcast
   // Scatter: multi-read command (tag=0xFF02) followed by multiple beats of response data,
@@ -524,7 +555,10 @@ class DRAMIf(
     arb.io.in(0) <> ringDist(ci)
     arb.io.in(1) <> scalarDist(ci)
 
-    unicast(ci) := arb.io.out
+    val selected = Wire(Valid(new RingResp))
+    selected.valid := arb.io.out.valid
+    selected.bits := arb.io.out.bits
+    unicast(ci) := Common.delayValid(selected, coreParams.responsePipelineStages)
     arb.io.out.ready := true.B
 
     broadcast(ci) <> bcstDists(ci)
@@ -543,7 +577,7 @@ class PeripheralIf(
   val configHits = configROM.map({ case (addr, data) => ((req.bits.addr & addrMask) === addr.U, data.U(busParams.core.memBusWidth.W)) }).toSeq
   val configHit = VecInit(configHits.map(_._1)).asUInt.orR
   val configReadout = Mux1H(configHits)
-  val configGrant = !mem.resp.valid
+  val configGrant = !externalResp.valid
   val configResp = Wire(Valid(new GlobalMemResp))
   configResp.valid := req.valid && configHit && configGrant
   configResp.bits.id := req.bits.id
@@ -554,8 +588,8 @@ class PeripheralIf(
   req.ready := Mux(configHit, configGrant, mem.req.ready)
 
   // Response arbitration
-  resp.bits := Mux(mem.resp.valid, mem.resp.bits, configResp.bits)
-  resp.valid := mem.resp.valid || configResp.valid
+  resp.bits := Mux(externalResp.valid, externalResp.bits, configResp.bits)
+  resp.valid := externalResp.valid || configResp.valid
 
   // We don't have any local distributor
   def isLocal(puId: UInt): Bool = false.B

@@ -19,6 +19,9 @@ object Main extends App {
     "spmClockGating" -> p.spmClockGating,
     "eventClockGating" -> p.eventClockGating,
     "fpuPipeline" -> p.fpuPipeline,
+    "fpuImplementation" -> p.fpuImplementation,
+    "responsePayloadClockGating" -> true,
+    "responsePipelineStages" -> p.responsePipelineStages,
     "useFPU" -> p.useFPU,
     "pipeCnt" -> p.pipeCnt,
     "sendQueueDepth" -> p.sendQueueDepth,
@@ -49,6 +52,8 @@ object Main extends App {
   var spmClockGating: Boolean = false
   var eventClockGating: Boolean = false
   var fpuPipeline: Boolean = false
+  var fpuImplementation: String = "cvfpu"
+  var responsePipelineStages: Int = 0
   var output: Option[String] = None
   var spliter = args.indexOf("--")
   val (mainArgs, otherArgs) = if (spliter >= 0) {
@@ -72,6 +77,8 @@ object Main extends App {
         println("  --spm-clock-gating  Clock only scratchpad banks accessed by the LSU (requires --spm-sram)")
         println("  --event-clock-gating  Clock FIFO ports only on write or head refresh (requires --event-sram)")
         println("  --fpu-pipeline   Move the FPU output register inside CVFPU, preserving latency")
+        println("  --fpu-impl=<name>  cvfpu (default), hardfloat, hardfloat-normal, or fudian; all retain the existing writeback latency")
+        println("  --insert-stages=<N>  Add N cycles at Core unicast ingress and MemIf unicast egress, ring ingress, and external response ingress. Default: 0")
         println("  --output=<path>  Set output path for generated files. Default: ./generated/core or ./generated/system")
         sys.exit(0)
       }
@@ -82,6 +89,19 @@ object Main extends App {
       case "--spm-clock-gating" => spmClockGating = true
       case "--event-clock-gating" => eventClockGating = true
       case "--fpu-pipeline" => fpuPipeline = true
+      case a if a.startsWith("--fpu-impl=") => {
+        fpuImplementation = a.stripPrefix("--fpu-impl=")
+        require(Set("cvfpu", "hardfloat", "hardfloat-normal", "fudian").contains(fpuImplementation),
+          s"Unknown FPU implementation: $fpuImplementation")
+      }
+      case a if a.startsWith("--insert-stages=") => {
+        a.stripPrefix("--insert-stages=").toIntOption match {
+          case Some(n) if n >= 0 => responsePipelineStages = n
+          case _ =>
+            println(s"Invalid response pipeline stage count: ${a.stripPrefix("--insert-stages=")}")
+            sys.exit(1)
+        }
+      }
       case a if a.startsWith("--pu=") => {
         pu = a.stripPrefix("--pu=").toIntOption
         if (pu.isEmpty) {
@@ -134,7 +154,9 @@ object Main extends App {
     eventSram = eventSram,
     spmClockGating = spmClockGating,
     eventClockGating = eventClockGating,
-    fpuPipeline = fpuPipeline
+    fpuPipeline = fpuPipeline,
+    fpuImplementation = fpuImplementation,
+    responsePipelineStages = responsePipelineStages
   )
 
   val subdir = if (system) "system" else "core"

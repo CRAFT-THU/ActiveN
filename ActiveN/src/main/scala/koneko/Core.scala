@@ -59,7 +59,7 @@ class Core(implicit val params: CoreParameters) extends Module {
 
   // Memory response from external -> encoder -> crossbar
   // Broadcast responses (tag=0xFFFF from MemDistributor) go to BIU instead
-  crossbar.downstream.resp := mem.unicast
+  crossbar.downstream.resp := Common.delayValid(mem.unicast, params.responsePipelineStages)
   exec.bcast               <> mem.broadcast
 
   fetch.decoded <> exec.dec

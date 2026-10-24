@@ -1,3 +1,209 @@
+## 2026-10-25: 30 ps synthesis reserve — two Core reruns complete, Fudian running
+
+All three approved Core reruns use **1.5 GHz, ASAP7 SLVT TT 0.7 V / 25 C**,
+with the exact October 23 RTL snapshots (base `da8c51d` plus their recorded
+uncommitted changes). DC now uses **30 ps critical range** and **80 ps setup
+uncertainty**; hold uncertainty stays 50 ps. Before exporting to PnR, setup
+uncertainty returns to **50 ps**, with no recompilation. Thus the extra 30 ps
+is a synthesis reserve target; all final comparisons use the original timing
+constraints. No RTL, pipeline latency, timing exception or SRAM model changed.
+
+As of approximately 02:52 +08 on October 25:
+
+| Core backend | State | Nominal synthesis setup WNS (ps) | Final routed setup WNS / failures | Non-SRAM hold WNS / failures | Cell + macro area (um2) | Vectorless power (mW) |
+|---|---|---:|---:|---:|---:|---:|
+| HardFloat | Complete | +30.0007 | -5.642474 / 19 | -39.709747 / 6 | 33448.74 | 15.15296 |
+| Simplified HardFloat | Complete | +17.4467 | -1.801312 / 19 | -0.067800 / 3 | 33102.64 | 15.33645 |
+| Fudian | Synthesis active | pending | pending | pending | pending | pending |
+
+Full HardFloat improved routed setup from -13.382 ps / 89 failures to
+-5.642 ps / 19. Simplified HardFloat setup changed from -1.089 ps / 7 to
+-1.801 ps / 19, while non-SRAM hold improved from -49.736 to -0.068 ps.
+Neither completed run is timing/physical clean (5829 / 5750 route DRCs).
+Simplified HardFloat did not achieve the full synthesis reserve: its tightened
+DC report has about -12.55 ps WNS, despite passing nominal synthesis setup.
+Existing predictive RC/PG and SRAM power/leakage limitations still apply.
+
+The interrupted session launched HardFloat PID/SID 2881782 and simplified
+HardFloat 2882077 at 00:48; both completed by 01:58. Fudian had only uploaded.
+After resumption its archive hash was verified and supervisor **2928828** was
+launched at **02:48:35**, PPID 1, in
+`/home/meow/copilot/tmp/ActiveN-fpu-margin-fudian-20261025/Core`.
+It passed HDL/link, verified 80 SRAM macros and logged the intended 80/50/30 ps
+optimization settings; ICC2 starts automatically after synthesis. The other
+backend directories use the same prefix with `hardfloat` / `hardfloat-normal`.
+
+Original Fudian's -17.249 ps path is instruction bit 12 -> decode/event-scheduling
+control -> next-PC selection -> retimed ICache PC/tag comparison. It suffers
+**71.793 ps adverse clock skew**, with 555.763 ps clock-to-D delay. Frontend RTL
+is byte-identical across variants, but whole-Core retiming and physical/clock
+optimization produce different register boundaries, loads and clock arrivals.
+Frontend/control plus clock balance is the next timing focus; no frontend RTL
+change is included in these reruns.
+
+Scripts, provenance, detailed path analysis and launch record:
+[`fpu-margin-20261025/README.md`](copilot/ppa/fpu-margin-20261025/README.md).
+
+### Ordered-issue DRAMIf completed independently
+
+The October 23 ordered-issue/gated-response DRAMIf run completed October 24
+06:43 +08. Final routed: setup **-354.007843 ps / 9301 failing checks**, hold
+**-237.260223 ps / 2301**, area **129744.43 um2**, vectorless power
+**85.30067 mW**, **18407 route DRCs**. Its worst setup path still ends at
+`mem_req_bits_wdata[274]`. It improves on the ungated response-stage predecessor
+(-479.969 ps, 135.2067 mW, 855325 DRCs), but remains far from timing closure.
+It has no SRAM macros. This is a separate experiment, not one of the three
+Core margin reruns. Reports are saved under
+`copilot/tmp/ppa/fpu-margin-20261025/status-20261025/DRAMIf/`.
+
+## 2026-10-23: ordered DRAM issue and three alternative FPU runs launched
+
+Source base **da8c51d41a3b30134d3357aea6faf128819139c1**, with uncommitted
+experiment changes; no new commit was created. All runs use **1.5 GHz
+(666.666667 ps), ASAP7 SLVT TT, 0.7 V / 25 C**, 50 ps clock uncertainty,
+100 ps min/max external I/O delays, whole-design retiming, automatic clock
+gating, synthesis hold repair, high-effort physical optimization and three
+post-route optimization passes. No new FPU false/multicycle paths were added.
+
+Detached DC -> ICC2 pipelines on `meow@radl-spr-01.bj.intel.com`:
+
+| Experiment | Launch time (+08:00) | Supervisor PID/SID | Server directory under `/home/meow/copilot/tmp/` |
+|---|---|---:|---|
+| DRAMIf: ordered issue + gated response payloads | October 23 14:24:49 | 2354489 | `ActiveN-ordered-gated-20261023/DRAMIf` |
+| Core: standard HardFloat | October 23 14:41:59 | 2359908 | `ActiveN-fpu-hardfloat-20261023/Core` |
+| Core: simplified-recoding HardFloat | October 23 14:42:02 | 2360225 | `ActiveN-fpu-hardfloat-normal-20261023/Core` |
+| Core: Fudian | October 23 14:42:05 | 2360537 | `ActiveN-fpu-fudian-20261023/Core` |
+
+All supervisors have parent PID 1 and separate sessions; the pipelines survive
+SSH disconnect and automatically start ICC2 after successful DC completion.
+At the post-launch check, all three Core jobs passed HDL compilation/linking
+and reported `INPUT_MACRO_COUNT 80`, with no substantive DC errors; DRAMIf
+was mapping. Initial Core startup spent several minutes traversing the
+configured license servers, then proceeded without environment changes.
+These are running experiments, **not new timing/area/power results**.
+
+DRAMIf selectively ports the allocation-order issue-index queue from mnist
+`0a5d9b1df54c31c70d1d5dad49b4d0aec9f6f871`. Packet format and idle definition
+remain unchanged. Its immutable RTL patch SHA256 is
+`441a21da5d3ec951a064e81d150f5e07bfa407d662407d2405b846d628ee49a7`.
+The previous two response stages remain at the same interfaces and latency;
+payload registers now enable only on incoming valid, while valid bits advance
+unconditionally. This permits automatic clock gating; it is not supply power
+gating. DRAMIf MSHR data remains flop-based. The common MemIf issue queue also
+applies to PeripheralIf, without importing mnist's packet/idle protocol changes.
+
+All Core experiments keep two SMT threads, one ICache line, 16 KiB scratchpad,
+existing event queues, **80 SRAM macros**, SRAM clock gating, two response
+stages with gated payloads and the existing **two-cycle FPU issue-to-writeback
+budget**. IEEE FP32 remains in the shared register file. Each FPU has one
+internal register boundary and can accept an operation every cycle.
+Standard HardFloat and Fudian support the existing instruction/rounding set;
+simplified HardFloat preserves normal numbers, zeros, infinities and NaNs but
+excludes subnormal inputs/results from correctness scope. Its normal recoding
+still adjusts the exponent by 129; it is not pure wiring.
+
+Pinned libraries: HardFloat `c1105e6ac6a0dd90fc80893efc4830ab609005d3`, Fudian
+`e1bd4695ca7beb36a5ce7357e9527ad9e95b9ec1`; upstream sources are unmodified.
+Immutable source-inventory SHA256 values (include new untracked source):
+
+| Core backend | Source snapshot SHA256 |
+|---|---|
+| HardFloat | `434ada93c09e57914a8819f4b0c24f0d5ee91a98a75fdd65f6cea38f140553ee` |
+| Simplified HardFloat | `0f204a8e2d12ddc4812e29375939f9fd836352fcfb6b04f229cf0eb5a866c447` |
+| Fudian | `6fe1a4189f0968a28d74e90a7fdef70cfbfcf2ae608983e9d7507c6add47fb4e` |
+
+Focused Verilator checks against Berkeley SoftFloat's RISC-V specialization
+passed **282,764 operations each** for HardFloat and Fudian, and **259,229
+in-scope comparisons** for simplified HardFloat, including all rounding modes,
+conversions, special values, back-to-back operations, internal register latency
+and 16,633 idle bubbles. Core and 64-PU/2-MC RTL were regenerated for every
+backend; standard generated/core and generated/system retain default CVFPU.
+Full-system regression, simulator alignment and post-retiming equivalence are
+not claimed; the first two remain user-deferred.
+
+Reproduction scripts and details:
+[`ordered-gated-20261023/README.md`](copilot/ppa/ordered-gated-20261023/README.md),
+[`fpu-experiments-20261023/README.md`](copilot/ppa/fpu-experiments-20261023/README.md).
+Existing predictive RC/PG and SRAM power-model limitations remain, including
+missing scratchpad leakage. Vectorless power is not workload-measured power.
+
+### Completed predecessor: ungated two-response-stage experiment
+
+DRAMIf's previous October 21 run finished routing on October 23 at 00:35;
+this supersedes the October 22 "still routing" status below.
+
+| Block / final routed | Setup WNS (ps) / failing checks | Non-SRAM hold WNS (ps) / failing checks | Cell + macro area (um2) | Vectorless power (mW) |
+|---|---:|---:|---:|---:|
+| Core | -31.699419 / 216 | -11.194229 / 11 | 33534.671 | 16.82355 |
+| DRAMIf | -479.969025 / 13306 | -250.515 / 1918 | 135121.81 | 135.2067 |
+
+Neither block met timing. DRAMIf's setup count is path-group checks across
+12,793 unique failing endpoints. It has 855,325 signal-route DRCs (743,403
+shorts), so these are diagnostic estimates from an unclosed physical design.
+Its worst path runs from retimed issue state through request selection to
+`mem_req_bits_wdata[213]`; other major failures involve NoC allocation/clock
+gating and internal MSHR state. Clock-related power grew from 7.789 to
+40.531 mW, contributing to the previous power increase. The new ordered issue
+queue and response payload enables target these problems; improvement is not
+yet measured. Detailed predecessor analysis is saved in
+`copilot/tmp/ppa/response-stages-20261021/status-20261023/DRAMIf/analysis/`.
+
+## 2026-10-22: two-stage experiment — Core complete, DRAMIf still routing
+
+At approximately 10:10–10:23 +08:00, Core's detached synthesis/PnR pipeline
+has completed successfully (October 21, 13:27:48), but **timing is not met**.
+DRAMIf synthesis completed; ICC2 is still active in `route_auto`, before the
+three post-route optimization passes. Both use 1.5 GHz, SLVT TT, 0.7 V / 25 C.
+
+| Block / completed stage | Setup WNS (ps) / failing checks | Non-SRAM hold WNS (ps) / failing checks | Cell + macro area (um2) | Vectorless power (mW) |
+|---|---:|---:|---:|---:|
+| Core / final routed | -31.699419 / 216 | -11.194229 / 11 | 33534.671 | 16.82355 |
+| DRAMIf / synthesis only | +0.00146484 / 0 | -32.3152 / 8310 | 104176.430 | 49.276 |
+
+Core's I/O setup groups now pass (input-to-register +0.19 ps,
+register-to-output +0.59 ps); remaining setup failures are internal. The worst
+path is FMA sum register to `exec/rs2val_reg[24]`. The worst logic hold path
+is flop-based ICache data storage to its read-data register, not an SRAM-model
+exception. Raw hold count is 16, including five excluded SRAM checks.
+Setup failures decreased from 652 to 216 versus the October 17 baseline;
+worst setup slack did not improve. Core has 5715 remaining signal-route DRCs.
+DRAMIf final routed PPA is pending; its large intermediate routing DRC counts
+must not be interpreted as final timing or physical results.
+
+Core area/power include the existing SRAM views; missing scratchpad leakage
+and predictive physical-model limitations remain. Local assertion validation
+is deferred by explicit user instruction; simulator alignment is out of scope.
+Detailed status and source provenance are in
+[`response-stages-20261021/README.md`](copilot/ppa/response-stages-20261021/README.md).
+
+## 2026-10-21: two response stages — new Core/DRAMIf runs launched
+
+New experiment: `--insert-stages=2` / `responsePipelineStages=2` adds two
+unconditional register stages at Core unicast ingress, DRAMIf unicast egress,
+MemIf ring ingress and external memory-response ingress. Ring input ready is
+constant true; assertions check actual internal acceptance, forwarding-queue
+occupancy and ring egress. PeripheralIf uses the delayed external response for
+ROM arbitration. Idle detection is unchanged. Software-NoC alignment is excluded
+by user instruction, so this configuration must use hard RTL simulation.
+
+Source base: `da8c51d`, plus the uncommitted RTL patch SHA256
+`b0bd7ccc51c44d7b2c83a2062f7a30cfce1c29cd5f02db13caf16c7c405c20a2`.
+The additional MemIf redesign mentioned in discussion is not yet implemented
+and is not included. Both Core and 64-PU/2-MC RTL were regenerated with existing
+SRAM, SRAM clock gating and FPU pipeline options enabled.
+
+Detached DC → ICC2 pipelines launched at 12:17:35 +08:00 on
+`meow@radl-spr-01.bj.intel.com`, under
+`/home/meow/copilot/tmp/ActiveN-response-stages-20261021`:
+Core supervisor PID/SID **2141846**, DRAMIf **2141880**; both parent PID 1.
+Same 1.5 GHz, SLVT TT 0.7 V / 25 C, I/O delays, uncertainty, high effort,
+whole-design retiming, hold repair and three post-route optimization passes as
+the preceding experiment. Existing SRAM/RC/PG limitations still apply.
+These are running experiments, not new PPA results.
+
+Scripts, configuration, provenance and validation status:
+[`copilot/ppa/response-stages-20261021/README.md`](copilot/ppa/response-stages-20261021/README.md).
+
 ## High-effort synthesis and PnR results — verified 2026-10-21
 
 All three detached pipelines **completed on October 17**, including synthesis,

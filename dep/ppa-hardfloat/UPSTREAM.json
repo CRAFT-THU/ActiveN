@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/ucb-bar/berkeley-hardfloat",
+  "commit": "c1105e6ac6a0dd90fc80893efc4830ab609005d3",
+  "archive_sha256": "55f9c47f73c5a0ff347ff0ff4fc72b6966ffaa6b6d29998a00b3956dce512de7",
+  "source_prefix": "hardfloat/src/main/scala/"
+}
