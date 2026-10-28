@@ -287,6 +287,7 @@ class Exec(implicit val param: CoreParameters) extends Module {
   assert(!eyield || s0step, "effectivelyYield -> s0step")
 
   biu.enmasks := enmasks
+  biu.handlers := handlers
   biu.accepting := eidlings
   // scheduled mask is a subset of accepting threads
   assert((biu.sched.wakeup & biu.accepting) === biu.sched.wakeup)
@@ -482,7 +483,8 @@ class Exec(implicit val param: CoreParameters) extends Module {
   s1done := MuxCase(true.B, s1donesrc)
 
   for(i <- 0 until param.pipeCnt) {
-    brs(i).bits := Mux(biuBrs(i).valid, handlers(biuBrs(i).bits), rvBrs(i).bits)
+    val eventPC = Mux(sendFastPath && uop.smsel(i), handlers(msgLocalHandler), biu.sched.pc)
+    brs(i).bits := Mux(biuBrs(i).valid, eventPC, rvBrs(i).bits)
     brs(i).valid := biuBrs(i).valid || rvBrs(i).valid
   }
 

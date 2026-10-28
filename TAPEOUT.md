@@ -1,3 +1,57 @@
+## 2026-10-28: full HardFloat Core meets 1.5 GHz routed timing
+
+Base commit **ce187fe8d0e4681d9915255b07404dbde96e6645**, plus the uncommitted `EventScheduler`, BIU and Exec
+changes recorded in the experiment's source inventory. The scheduler precomputes
+decisions and handler PCs for each accepting-thread mask, then selects using
+actual availability. No state, latency, priority, quota or early-WFI behavior
+changes. All other Core assumptions remain **1.5 GHz, ASAP7 SLVT TT 0.7 V /
+25 C, two SMT threads, 1-line ICache, 80 SRAM macros, two enabled response stages,
+full retiming and clock gating**. DC setup uncertainty=80 ps, critical range=30 ps;
+PnR/final setup and hold uncertainty=50 ps, external I/O delays=100 ps.
+
+| Full HardFloat configuration | Routed setup WNS / failures | Non-SRAM hold WNS / failures | Cell+macro area (um2) | Vectorless power (mW) | Route DRCs |
+|---|---:|---:|---:|---:|---:|
+| Previous 30 ps synthesis-reserve run | -5.642474 ps / 19 | -39.709747 ps / 6 | 33448.74 | 15.15296 | 5829 |
+| Precomputed scheduler, i01 | -5.522609 ps / 14 | -0.085056 ps / 5 | 34218.021 | 17.75801 | 10674 |
+| **i01 + timing-only post-route repair (selected)** | **+4.950821 ps / 0** | **+0.401616 ps / 0** | **34311.625** | **17.82331** | **10869** |
+
+**Selected result independently reproduced by reopening `Core/repair_1` in a
+fresh ICC2 process. All four timing groups have zero setup and zero raw hold
+violations, including SRAM checks; raw hold WNS is also +0.401616 ps.** No
+additional false/multicycle paths were introduced. The remaining 10869 routing
+DRCs mean this is timing closure in the existing predictive flow, **not physical
+signoff**. Existing predictive RC/PG and SRAM power-view limitations apply.
+
+The first i01 run completed October 25 07:58 +08. Its remaining failures included
+event-payload selection into the register file and Hart-ID-to-event-SRAM paths.
+The October 28 repair closed them in one route_opt pass, with power recovery
+disabled and temporary setup/hold uncertainty 60/55 ps. Every final report and
+the saved checkpoint use the original **50/50 ps** uncertainties and 100 ps I/O
+delays. The clock stays at 1.5 GHz; no frequency relaxation was used.
+
+Unconstrained RTL combinational equivalence passed for 1/2/3 threads, including
+all scheduler payload, PC, ready and wakeup outputs. A dual-Core differential
+simulation passed seven workloads with identical outputs every evaluated cycle:
+AUIPC, ICache, memory copy, scratchpad, two FPU tests and local-send/WFI wakeup.
+The 64-PU hard-system build exceeded local RAM. The representative **16-PU/1-MC
+hard-system regression passed**: local-send (201 cycles), ping-pong (66259),
+and randomized NoC traffic (315725). Both simulators were rebuilt; the rebuilt
+single-Core ICache test also passed. No software-model alignment or
+post-retiming formal equivalence is claimed.
+
+Run/checkpoint provenance:
+- Full HardFloat repair on a copy of the routed checkpoint: completed **3912023**, root
+  `/home/meow/copilot/tmp/ActiveN-frontend-i01-hardfloat-repair01-20261028`.
+  Selected checkpoint `design.ndm`, block `Core/repair_1`; reports in
+  `reports/pass1`, independent timing audit and final DEF/SPEF in `audit`.
+- RTL source inventory SHA256:
+  `13d6f1fe53eb24f88ebcd60467089e85195e8167da33a384c31489d6b8d2f2c8`.
+- Fudian comparison **3911240** was stopped after independently confirming
+  HardFloat closure; no completed Fudian result from this frontend experiment.
+
+Scripts, source hashes, validation and reports:
+[`frontend-20261025/README.md`](copilot/ppa/frontend-20261025/README.md).
+
 ## 2026-10-25: 30 ps synthesis reserve — two Core reruns complete, Fudian running
 
 All three approved Core reruns use **1.5 GHz, ASAP7 SLVT TT 0.7 V / 25 C**,

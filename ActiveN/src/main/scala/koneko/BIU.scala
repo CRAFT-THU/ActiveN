@@ -35,10 +35,12 @@ class BIU(implicit val param: CoreParameters) extends Module {
   // Bitmask for enabled handlers
   val enmasks = IO(Input(Vec(16, UInt(param.pipeCnt.W))))
   val accepting = IO(Input(UInt(param.pipeCnt.W)))
+  val handlers = IO(Input(Vec(16, UInt(32.W))))
 
   // Send out: current schedulable events, or the pushed event at the same cycle (at lower priority)
   val sched = IO(new Bundle {
     val handler = UInt(4.W) // We have 16 handlers
+    val pc = UInt(32.W)
     val regs = Vec(4, UInt(32.W))
     val wakeup = UInt(param.pipeCnt.W)
   })
@@ -123,24 +125,23 @@ class BIU(implicit val param: CoreParameters) extends Module {
   // Scheduling
   //////////////////////////
 
-  val scheduleArb = Module(new Arbiter(Vec(4, UInt(32.W)), 16)).suggestName("scheduleArb")
+  val scheduler = Module(new EventScheduler(param.pipeCnt))
+  scheduler.io.accepting := accepting
+  scheduler.io.enmasks := enmasks
+  scheduler.io.handlers := handlers
+  scheduler.io.available := VecInit(evQueues.map(_.deq.valid)).asUInt
+  scheduler.io.data := VecInit(evQueues.map(_.deq.bits))
+  val eligible = Wire(Vec(16, Bool()))
   for (i <- 0 until 16) {
-    val enabled = (enmasks(i) & accepting).orR
     val marginSatisfied = sendQueue.count +& margins(i) +& liveQuota <= param.sendQueueDepth.U
-    val schedulable = enabled && marginSatisfied
-    val gated = evQueues(i).deq.gatedBy(schedulable).suggestName(s"gated_$i")
-    scheduleArb.io.in(i) <> gated
+    eligible(i) := marginSatisfied
+    evQueues(i).deq.ready := scheduler.io.ready(i)
     schedulables(i) := marginSatisfied && evQueues(i).deq.valid
   }
-  val scheduled = scheduleArb.io.chosen
-  sched.handler := scheduleArb.io.chosen
-  sched.regs := scheduleArb.io.out.bits
-  sched.wakeup := Fill(param.pipeCnt, scheduleArb.io.out.valid) & PriorityEncoderOH(accepting & enmasks(scheduleArb.io.chosen))
-
-  // If anything is schedulable, then we schedule them
-  // This is safe because we already gates by accepting
-  // So scheduleArb.io.out.valid implies wakeup
-  // and we have wakeup being a subset of accepting
-  scheduleArb.io.out.ready := true.B
-  assert(!scheduleArb.io.out.valid || sched.wakeup.orR)
+  scheduler.io.eligible := eligible.asUInt
+  sched.handler := scheduler.io.handler
+  sched.regs := scheduler.io.regs
+  sched.pc := scheduler.io.pc
+  sched.wakeup := scheduler.io.wakeup
+  assert(!(scheduler.io.ready & scheduler.io.available).orR || sched.wakeup.orR)
 }
